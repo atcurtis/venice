@@ -3,9 +3,11 @@ package com.linkedin.venice.pushstatushelper;
 import static com.linkedin.venice.common.PushStatusStoreUtils.SERVER_INCREMENTAL_PUSH_PREFIX;
 import static com.linkedin.venice.common.PushStatusStoreUtils.getServerIncrementalPushKey;
 import static com.linkedin.venice.pushmonitor.ExecutionStatus.END_OF_INCREMENTAL_PUSH_RECEIVED;
-import static org.mockito.ArgumentMatchers.*;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anySet;
+import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.mock;
@@ -13,6 +15,7 @@ import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertEqualsDeep;
 import static org.testng.Assert.assertNotEquals;
 
@@ -29,6 +32,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -363,6 +367,108 @@ public class PushStatusStoreReaderTest {
     when(completableFutureMock.get(anyLong(), any())).thenReturn(null);
 
     // Test that push status store reader will also return null instead of empty map in this case
-    Assert.assertNull(storeReaderSpy.getVersionStatus(storeName, storeVersion));
+    Assert.assertNull(storeReaderSpy.getVersionStatus(storeName, storeVersion, Optional.empty()));
+  }
+
+  @Test
+  public void testGetInstanceStatus() {
+    PushStatusStoreReader mockReader = mock(PushStatusStoreReader.class);
+    doCallRealMethod().when(mockReader).getInstanceStatus(any(), any());
+
+    doReturn(-1l).when(mockReader).getHeartbeat("store_1", "instance_1");
+    assertEquals(
+        mockReader.getInstanceStatus("store_1", "instance_1"),
+        PushStatusStoreReader.InstanceStatus.BOOTSTRAPPING);
+
+    doReturn(1000l).when(mockReader).getHeartbeat("store_1", "instance_1");
+    doReturn(true).when(mockReader).isInstanceAlive(anyLong());
+    assertEquals(mockReader.getInstanceStatus("store_1", "instance_1"), PushStatusStoreReader.InstanceStatus.ALIVE);
+
+    doReturn(false).when(mockReader).isInstanceAlive(anyLong());
+    assertEquals(mockReader.getInstanceStatus("store_1", "instance_1"), PushStatusStoreReader.InstanceStatus.DEAD);
+  }
+
+  @Test
+  public void testGetPartitionStatusAsyncSuccess() throws Exception {
+    // Setup
+    PushStatusStoreReader storeReaderSpy =
+        spy(new PushStatusStoreReader(d2ClientMock, CLUSTER_DISCOVERY_D2_SERVICE_NAME, 10));
+    doReturn(storeClientMock).when(storeReaderSpy).getVeniceClient(anyString());
+
+    String storeName = "testStore";
+    int version = 1;
+    int partitionId = 2;
+    Optional<String> incrementalPushVersion = Optional.empty();
+    Optional<String> incrementalPushPrefix = Optional.empty();
+
+    // Create the expected result map
+    Map<CharSequence, Integer> expectedMap = new HashMap<>();
+    expectedMap.put("instance1", 1);
+    expectedMap.put("instance2", 2);
+
+    PushStatusValue mockStatusValue = mock(PushStatusValue.class);
+    mockStatusValue.instances = expectedMap;
+
+    when(storeClientMock.get(any(PushStatusKey.class))).thenReturn(CompletableFuture.completedFuture(mockStatusValue));
+
+    // Execute the method
+    CompletableFuture<Map<CharSequence, Integer>> future = storeReaderSpy.getPartitionOrVersionStatusAsync(
+        storeName,
+        version,
+        partitionId,
+        incrementalPushVersion,
+        incrementalPushPrefix,
+        false);
+
+    Map<CharSequence, Integer> result = future.get(5, TimeUnit.SECONDS);
+
+    // Verify the result
+    Assert.assertEquals(expectedMap, result);
+    verify(storeClientMock).get(any(PushStatusKey.class));
+  }
+
+  @Test
+  public void testGetPartitionStatusAsyncExceptionHandling() throws Exception {
+    // Setup
+    PushStatusStoreReader storeReaderSpy =
+        spy(new PushStatusStoreReader(d2ClientMock, CLUSTER_DISCOVERY_D2_SERVICE_NAME, 10));
+    doReturn(storeClientMock).when(storeReaderSpy).getVeniceClient(anyString());
+
+    String storeName = "testStore";
+    int version = 1;
+    int partitionId = 2;
+    Optional incrementalPushVersion = Optional.empty();
+    Optional incrementalPushPrefix = Optional.empty();
+
+    // Mock an exception during async call
+    when(storeClientMock.get(any(PushStatusKey.class))).thenReturn(CompletableFuture.supplyAsync(() -> {
+      throw new RuntimeException("Simulated exception");
+    }));
+
+    // Execute the method
+    CompletableFuture<Map<String, Integer>> future = storeReaderSpy.getPartitionOrVersionStatusAsync(
+        storeName,
+        version,
+        partitionId,
+        incrementalPushVersion,
+        incrementalPushPrefix,
+        false);
+
+    try {
+      future.get(5, TimeUnit.SECONDS);
+    } catch (ExecutionException e) {
+      Assert.assertTrue(e.getCause() instanceof VeniceException);
+      Assert.assertTrue(e.getCause().getMessage().contains("Simulated exception"));
+      verify(storeClientMock).get(any(PushStatusKey.class));
+    }
+  }
+
+  @Test
+  public void testClientConfig() {
+    PushStatusStoreReader storeReaderSpy =
+        spy(new PushStatusStoreReader(d2ClientMock, CLUSTER_DISCOVERY_D2_SERVICE_NAME, 10));
+
+    ClientConfig clientConfig = storeReaderSpy.getClientConfig(storeName);
+    Assert.assertFalse(clientConfig.isStatTrackingEnabled());
   }
 }

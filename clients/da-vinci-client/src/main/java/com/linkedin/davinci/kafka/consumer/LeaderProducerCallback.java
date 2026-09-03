@@ -3,11 +3,10 @@ package com.linkedin.davinci.kafka.consumer;
 import com.linkedin.davinci.store.record.ValueRecord;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.kafka.protocol.Delete;
-import com.linkedin.venice.kafka.protocol.KafkaMessageEnvelope;
 import com.linkedin.venice.kafka.protocol.Put;
-import com.linkedin.venice.message.KafkaKey;
-import com.linkedin.venice.pubsub.api.PubSubMessage;
+import com.linkedin.venice.pubsub.api.DefaultPubSubMessage;
 import com.linkedin.venice.pubsub.api.PubSubProduceResult;
+import com.linkedin.venice.pubsub.api.PubSubSymbolicPosition;
 import com.linkedin.venice.serialization.avro.AvroProtocolDefinition;
 import com.linkedin.venice.serialization.avro.ChunkedValueManifestSerializer;
 import com.linkedin.venice.storage.protocol.ChunkedValueManifest;
@@ -18,21 +17,26 @@ import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.writer.ChunkAwareCallback;
 import com.linkedin.venice.writer.VeniceWriter;
 import java.nio.ByteBuffer;
+import java.util.function.Consumer;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 
 public class LeaderProducerCallback implements ChunkAwareCallback {
-  private static final Logger LOGGER = LogManager.getLogger(LeaderFollowerStoreIngestionTask.class);
+  private static final Logger LOGGER = LogManager.getLogger(LeaderProducerCallback.class);
   private static final RedundantExceptionFilter REDUNDANT_LOGGING_FILTER =
       RedundantExceptionFilter.getRedundantExceptionFilter();
+  private static final Consumer<PubSubProduceResult> NO_OP = produceResult -> {};
+  private static final double LEADER_PRODUCER_COMPLETION_LATENCY_THRESHOLD_MS = 30000;
+  private Consumer<PubSubProduceResult> onCompletionFunction = NO_OP; // ran before onCompletion() runs
+  private Consumer<PubSubProduceResult> onCompletionCallback = NO_OP; // ran after onCompletion() runs
 
   protected static final ChunkedValueManifestSerializer CHUNKED_VALUE_MANIFEST_SERIALIZER =
       new ChunkedValueManifestSerializer(false);
   protected static final ByteBuffer EMPTY_BYTE_BUFFER = ByteBuffer.allocate(0);
 
   protected final LeaderFollowerStoreIngestionTask ingestionTask;
-  private final PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> sourceConsumerRecord;
+  private final DefaultPubSubMessage sourceConsumerRecord;
   private final PartitionConsumptionState partitionConsumptionState;
   private final int partition;
   private final String kafkaUrl;
@@ -56,7 +60,7 @@ public class LeaderProducerCallback implements ChunkAwareCallback {
 
   public LeaderProducerCallback(
       LeaderFollowerStoreIngestionTask ingestionTask,
-      PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> sourceConsumerRecord,
+      DefaultPubSubMessage sourceConsumerRecord,
       PartitionConsumptionState partitionConsumptionState,
       LeaderProducedRecordContext leaderProducedRecordContext,
       int partition,
@@ -72,8 +76,13 @@ public class LeaderProducerCallback implements ChunkAwareCallback {
     this.beforeProcessingRecordTimestampNs = beforeProcessingRecordTimestampNs;
   }
 
+  LeaderProducedRecordContext getLeaderProducedRecordContext() {
+    return leaderProducedRecordContext;
+  }
+
   @Override
   public void onCompletion(PubSubProduceResult produceResult, Exception e) {
+    this.onCompletionFunction.accept(produceResult);
     if (e != null) {
       ingestionTask.getVersionedDIVStats()
           .recordLeaderProducerFailure(ingestionTask.getStoreName(), ingestionTask.versionNumber);
@@ -84,11 +93,19 @@ public class LeaderProducerCallback implements ChunkAwareCallback {
             sourceConsumerRecord.getTopicPartition(),
             e);
       }
+      // Produce failed: complete the persisted-to-DB future exceptionally so waiters fail fast instead of blocking
+      // indefinitely (e.g. leader topic-switch's getLastLeaderPersistFuture().get(), and the graceful-shutdown Global
+      // RT DIV sync relay, which keys its fail-fast off this future). On success it is completed in the drainer.
+      leaderProducedRecordContext.completePersistedToDBFuture(e);
     } else {
+      // Look up the monitor once: when no session is attached this keeps the success hot path free of any
+      // extra timing work (zero-cost when not in use), and the same reference is reused for every metric below.
+      PartitionIngestionMonitor ingestionMonitor = partitionConsumptionState.getIngestionMonitor();
+      long callbackStartNs = ingestionMonitor != null ? System.nanoTime() : 0;
       long currentTimeForMetricsMs = System.currentTimeMillis();
       /**
        * performs some sanity checks for chunks.
-       * key may be null in case of producing control messages with direct api's like
+       * key may be null in case of producing control messages with direct APIs like
        * {@link VeniceWriter#SendControlMessage} or {@link VeniceWriter#asyncSendControlMessage}
        */
       if (chunkedValueManifest != null) {
@@ -115,12 +132,27 @@ public class LeaderProducerCallback implements ChunkAwareCallback {
       // queuing to drainer.
       // this indicates how much time kafka took to deliver the message to broker.
       if (!ingestionTask.isUserSystemStore()) {
+        double leaderProducerCompletionLatencyMs = LatencyUtils.getElapsedTimeFromNSToMS(produceTimeNs);
         ingestionTask.getVersionIngestionStats()
             .recordLeaderProducerCompletionTime(
                 ingestionTask.getStoreName(),
                 ingestionTask.versionNumber,
-                LatencyUtils.getElapsedTimeFromNSToMS(produceTimeNs),
+                leaderProducerCompletionLatencyMs,
                 currentTimeForMetricsMs);
+        // Warn if producer completion latency exceeds threshold
+        if (leaderProducerCompletionLatencyMs > LEADER_PRODUCER_COMPLETION_LATENCY_THRESHOLD_MS) {
+          if (!REDUNDANT_LOGGING_FILTER
+              .isRedundantException(partitionConsumptionState.getReplicaId(), "HighProducerLatency")) {
+            LOGGER.warn(
+                "High leader producer completion latency detected for replica: {}, latency: {} ms, threshold: {} ms",
+                partitionConsumptionState.getReplicaId(),
+                leaderProducerCompletionLatencyMs,
+                LEADER_PRODUCER_COMPLETION_LATENCY_THRESHOLD_MS);
+          }
+        }
+        if (ingestionMonitor != null) {
+          ingestionMonitor.recordLeaderCompletionLatencyNs(System.nanoTime() - produceTimeNs);
+        }
         if (ingestionTask.isHybridMode() && sourceConsumerRecord.getTopicPartition().getPubSubTopic().isRealTime()
             && partitionConsumptionState.hasLagCaughtUp()) {
           ingestionTask.getVersionIngestionStats()
@@ -137,7 +169,7 @@ public class LeaderProducerCallback implements ChunkAwareCallback {
         leaderProducedRecordContext.setKeyBytes(key);
       }
       int producedRecordNum = 0;
-      int producedRecordSize = 0;
+      long producedRecordSize = 0;
       // produce to drainer buffer service for further processing.
       try {
         /**
@@ -145,7 +177,7 @@ public class LeaderProducerCallback implements ChunkAwareCallback {
          * Otherwise, queue the chunks and manifest individually to drainer service.
          */
         if (chunkedValueManifest == null) {
-          leaderProducedRecordContext.setProducedOffset(produceResult.getOffset());
+          leaderProducedRecordContext.setProducedPosition(produceResult.getPubSubPosition());
           ingestionTask.produceToStoreBufferService(
               sourceConsumerRecord,
               leaderProducedRecordContext,
@@ -179,11 +211,11 @@ public class LeaderProducerCallback implements ChunkAwareCallback {
           manifestPut.schemaId = AvroProtocolDefinition.CHUNKED_VALUE_MANIFEST.getCurrentProtocolVersion();
           LeaderProducedRecordContext producedRecordForManifest = LeaderProducedRecordContext.newPutRecordWithFuture(
               leaderProducedRecordContext.getConsumedKafkaClusterId(),
-              leaderProducedRecordContext.getConsumedOffset(),
+              leaderProducedRecordContext.getConsumedPosition(),
               key,
               manifestPut,
               leaderProducedRecordContext.getPersistedToDBFuture());
-          producedRecordForManifest.setProducedOffset(produceResult.getOffset());
+          producedRecordForManifest.setProducedPosition(produceResult.getPubSubPosition());
           ingestionTask.produceToStoreBufferService(
               sourceConsumerRecord,
               producedRecordForManifest,
@@ -205,6 +237,11 @@ public class LeaderProducerCallback implements ChunkAwareCallback {
                   LatencyUtils.getElapsedTimeFromMsToMs(currentTimeForMetricsMs),
                   currentTimeForMetricsMs);
         }
+        if (ingestionMonitor != null) {
+          ingestionMonitor.recordLeaderCallbackLatencyNs(System.nanoTime() - callbackStartNs);
+          ingestionMonitor.recordLeaderProduced(producedRecordSize);
+        }
+        this.onCompletionCallback.accept(produceResult);
       } catch (Exception oe) {
         boolean endOfPushReceived = partitionConsumptionState.isEndOfPushReceived();
         LOGGER.error(
@@ -212,7 +249,7 @@ public class LeaderProducerCallback implements ChunkAwareCallback {
             ingestionTask.ingestionTaskName,
             endOfPushReceived,
             sourceConsumerRecord.getTopicPartition(),
-            sourceConsumerRecord.getOffset(),
+            sourceConsumerRecord.getPosition(),
             oe);
         // If EOP is not received yet, set the ingestion task exception so that ingestion will fail eventually.
         if (!endOfPushReceived) {
@@ -246,18 +283,25 @@ public class LeaderProducerCallback implements ChunkAwareCallback {
     this.rmdChunks = rmdChunks;
     this.oldValueManifest = oldValueManifest;
     this.oldRmdManifest = oldRmdManifest;
-    if (getPartitionConsumptionState() == null) {
+
+    // We access the PCS via this getter for unit test mocking purposes...
+    PartitionConsumptionState pcs = getPartitionConsumptionState();
+    if (pcs == null) {
       LOGGER.error("PartitionConsumptionState is missing in chunk producer callback");
       return;
     }
-    // TransientRecord map is indexed by non-chunked key.
-    if (getIngestionTask().isTransientRecordBufferUsed()) {
+    if (getIngestionTask().isTransientRecordBufferUsed(pcs)) {
+      if (getSourceConsumerRecord().getKey().isGlobalRtDiv()) {
+        // Global RT DIV messages are synthetic (not from RT) and have no transient record — expected.
+        return;
+      }
       PartitionConsumptionState.TransientRecord record =
-          getPartitionConsumptionState().getTransientRecord(getSourceConsumerRecord().getKey().getKey());
+          // TransientRecord map is indexed by non-chunked key.
+          pcs.getTransientRecord(getSourceConsumerRecord().getKey().getKey());
       if (record != null) {
         record.setValueManifest(chunkedValueManifest);
         record.setRmdManifest(chunkedRmdManifest);
-      } else if (partitionConsumptionState.isEndOfPushReceived()) {
+      } else {
         String msg = "Transient record is missing when trying to update value/RMD manifest for resource: "
             + Utils.getReplicaId(ingestionTask.getKafkaVersionTopic(), partition);
         if (!REDUNDANT_LOGGING_FILTER.isRedundantException(msg)) {
@@ -267,7 +311,7 @@ public class LeaderProducerCallback implements ChunkAwareCallback {
     }
   }
 
-  private void recordProducerStats(int producedRecordSize, int producedRecordNum) {
+  private void recordProducerStats(long producedRecordSize, int producedRecordNum) {
     ingestionTask.getVersionIngestionStats()
         .recordLeaderProduced(
             ingestionTask.getStoreName(),
@@ -310,7 +354,7 @@ public class LeaderProducerCallback implements ChunkAwareCallback {
       chunkPut.schemaId = AvroProtocolDefinition.CHUNK.getCurrentProtocolVersion();
       LeaderProducedRecordContext producedRecordForChunk =
           LeaderProducedRecordContext.newChunkPutRecord(ByteUtils.extractByteArray(chunkKey), chunkPut);
-      producedRecordForChunk.setProducedOffset(-1);
+      producedRecordForChunk.setProducedPosition(PubSubSymbolicPosition.EARLIEST);
       ingestionTask.produceToStoreBufferService(
           sourceConsumerRecord,
           producedRecordForChunk,
@@ -336,7 +380,7 @@ public class LeaderProducerCallback implements ChunkAwareCallback {
       chunkDelete.replicationMetadataPayload = EMPTY_BYTE_BUFFER;
       LeaderProducedRecordContext producedRecordForChunk =
           LeaderProducedRecordContext.newChunkDeleteRecord(ByteUtils.extractByteArray(chunkKey), chunkDelete);
-      producedRecordForChunk.setProducedOffset(-1);
+      producedRecordForChunk.setProducedPosition(PubSubSymbolicPosition.EARLIEST);
       ingestionTask.produceToStoreBufferService(
           sourceConsumerRecord,
           producedRecordForChunk,
@@ -347,12 +391,20 @@ public class LeaderProducerCallback implements ChunkAwareCallback {
     }
   }
 
+  public void setOnCompletionFunction(Consumer<PubSubProduceResult> onCompletionFunction) {
+    this.onCompletionFunction = onCompletionFunction;
+  }
+
+  public void setOnCompletionCallback(Consumer<PubSubProduceResult> onCompletionCallback) {
+    this.onCompletionCallback = onCompletionCallback;
+  }
+
   // Visible for VeniceWriter unit test.
   public PartitionConsumptionState getPartitionConsumptionState() {
     return partitionConsumptionState;
   }
 
-  public PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> getSourceConsumerRecord() {
+  public DefaultPubSubMessage getSourceConsumerRecord() {
     return sourceConsumerRecord;
   }
 

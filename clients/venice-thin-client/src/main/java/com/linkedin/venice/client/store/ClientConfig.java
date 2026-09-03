@@ -31,8 +31,11 @@ public class ClientConfig<T extends SpecificRecord> {
   private String storeName;
   private String veniceURL;
   private String statsPrefix;
+  private Class specificKeyClass = null;
   private Class<T> specificValueClass = null;
+  private Schema specificValueSchema = null;
   private boolean isVsonClient = false;
+  private boolean isStatTrackingEnabled = true;
 
   // D2 specific settings
   private boolean isD2Routing = false;
@@ -50,6 +53,7 @@ public class ClientConfig<T extends SpecificRecord> {
   private boolean retryOnAllErrors = false;
   private int retryCount = 1;
   private long retryBackOffInMs = 0;
+  private Executor retryExecutor = null;
   private boolean useBlackHoleDeserializer = false;
   private boolean forceClusterDiscoveryAtStartTime = false;
   private boolean projectionFieldValidation = true;
@@ -63,6 +67,9 @@ public class ClientConfig<T extends SpecificRecord> {
 
   // HttpTransport settings
   private int maxConnectionsPerRoute; // only for HTTP1
+
+  // NativeMetadataRepository settings
+  private boolean useRequestBasedMetaRepository = false;
 
   private int maxConnectionsTotal; // only for HTTP1
 
@@ -92,8 +99,11 @@ public class ClientConfig<T extends SpecificRecord> {
         // Basic settings
         .setStoreName(config.getStoreName())
         .setVeniceURL(config.getVeniceURL())
+        .setSpecificKeyClass(config.getSpecificKeyClass())
         .setSpecificValueClass(config.getSpecificValueClass())
+        .setSpecificValueSchema(config.getSpecificValueSchema())
         .setVsonClient(config.isVsonClient())
+        .setStatTrackingEnabled(config.isStatTrackingEnabled())
 
         // D2 specific settings
         .setD2ServiceName(config.getD2ServiceName())
@@ -101,7 +111,7 @@ public class ClientConfig<T extends SpecificRecord> {
         .setD2ZkTimeout(config.getD2ZkTimeout())
         .setD2Client(config.getD2Client())
         .setD2Routing(config.isD2Routing()) // This should be the last of the D2 configs since it is an inferred config
-                                            // and we want the cloned config to match the source config
+        // and we want the cloned config to match the source config
 
         // Performance-related settings
         .setMetricsRepository(config.getMetricsRepository())
@@ -111,6 +121,7 @@ public class ClientConfig<T extends SpecificRecord> {
         .setRetryOnAllErrors(config.isRetryOnAllErrorsEnabled())
         .setRetryCount(config.getRetryCount())
         .setRetryBackOffInMs(config.getRetryBackOffInMs())
+        .setRetryExecutor(config.getRetryExecutor())
         .setUseBlackHoleDeserializer(config.isUseBlackHoleDeserializer())
         // Security settings
         .setHttps(config.isHttps())
@@ -184,12 +195,30 @@ public class ClientConfig<T extends SpecificRecord> {
     return this;
   }
 
+  public Schema getSpecificValueSchema() {
+    return specificValueSchema;
+  }
+
+  public ClientConfig<T> setSpecificValueSchema(Schema specificValueSchema) {
+    this.specificValueSchema = specificValueSchema;
+    return this;
+  }
+
   public Class<T> getSpecificValueClass() {
     return specificValueClass;
   }
 
   public ClientConfig<T> setSpecificValueClass(Class<T> specificValueClass) {
     this.specificValueClass = specificValueClass;
+    return this;
+  }
+
+  public Class<T> getSpecificKeyClass() {
+    return specificKeyClass;
+  }
+
+  public ClientConfig<T> setSpecificKeyClass(Class specificKeyClass) {
+    this.specificKeyClass = specificKeyClass;
     return this;
   }
 
@@ -219,6 +248,15 @@ public class ClientConfig<T extends SpecificRecord> {
       setD2Routing(false);
     }
 
+    return this;
+  }
+
+  public boolean isStatTrackingEnabled() {
+    return isStatTrackingEnabled;
+  }
+
+  public ClientConfig<T> setStatTrackingEnabled(boolean statTrackingEnabled) {
+    this.isStatTrackingEnabled = statTrackingEnabled;
     return this;
   }
 
@@ -274,6 +312,15 @@ public class ClientConfig<T extends SpecificRecord> {
 
   public ClientConfig<T> setMaxConnectionsPerRoute(int maxConnectionsPerRoute) {
     this.maxConnectionsPerRoute = maxConnectionsPerRoute;
+    return this;
+  }
+
+  public boolean isUseRequestBasedMetaRepository() {
+    return useRequestBasedMetaRepository;
+  }
+
+  public ClientConfig<T> setUseRequestBasedMetaRepository(boolean useRequestBasedMetaRepository) {
+    this.useRequestBasedMetaRepository = useRequestBasedMetaRepository;
     return this;
   }
 
@@ -415,6 +462,15 @@ public class ClientConfig<T extends SpecificRecord> {
 
   public long getRetryBackOffInMs() {
     return retryBackOffInMs;
+  }
+
+  public Executor getRetryExecutor() {
+    return retryExecutor;
+  }
+
+  public ClientConfig<T> setRetryExecutor(Executor retryExecutor) {
+    this.retryExecutor = retryExecutor;
+    return this;
   }
 
   public boolean isUseBlackHoleDeserializer() {

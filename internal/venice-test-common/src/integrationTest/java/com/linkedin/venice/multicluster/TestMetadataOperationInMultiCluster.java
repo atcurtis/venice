@@ -1,9 +1,9 @@
 package com.linkedin.venice.multicluster;
 
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.DEFAULT_KEY_FIELD_PROP;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.DEFAULT_VALUE_FIELD_PROP;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.VENICE_STORE_NAME_PROP;
 import static com.linkedin.venice.utils.TestWriteUtils.getTempDataDirectory;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.DEFAULT_KEY_FIELD_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.DEFAULT_VALUE_FIELD_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_STORE_NAME_PROP;
 
 import com.linkedin.venice.controllerapi.ControllerClient;
 import com.linkedin.venice.controllerapi.ControllerResponse;
@@ -44,7 +44,8 @@ public class TestMetadataOperationInMultiCluster {
     String keySchema = "\"string\"";
     String valSchema = "\"string\"";
 
-    VeniceMultiClusterCreateOptions options = new VeniceMultiClusterCreateOptions.Builder(2).numberOfControllers(3)
+    VeniceMultiClusterCreateOptions options = new VeniceMultiClusterCreateOptions.Builder().numberOfClusters(2)
+        .numberOfControllers(3)
         .numberOfServers(1)
         .numberOfRouters(1)
         .regionName(VeniceClusterWrapperConstants.STANDALONE_REGION_NAME)
@@ -133,7 +134,8 @@ public class TestMetadataOperationInMultiCluster {
 
   @Test
   public void testRunVPJInMultiCluster() throws Exception {
-    VeniceMultiClusterCreateOptions options = new VeniceMultiClusterCreateOptions.Builder(2).numberOfControllers(3)
+    VeniceMultiClusterCreateOptions options = new VeniceMultiClusterCreateOptions.Builder().numberOfClusters(2)
+        .numberOfControllers(3)
         .numberOfServers(1)
         .numberOfRouters(1)
         .regionName(VeniceClusterWrapperConstants.STANDALONE_REGION_NAME)

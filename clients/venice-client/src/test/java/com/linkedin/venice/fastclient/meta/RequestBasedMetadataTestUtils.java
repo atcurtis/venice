@@ -2,11 +2,9 @@ package com.linkedin.venice.fastclient.meta;
 
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
-import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -29,13 +27,16 @@ import com.linkedin.venice.fastclient.ClientConfig;
 import com.linkedin.venice.fastclient.stats.ClusterStats;
 import com.linkedin.venice.fastclient.stats.FastClientStats;
 import com.linkedin.venice.fastclient.transport.R2TransportClient;
+import com.linkedin.venice.meta.ExternalStorageReadMode;
 import com.linkedin.venice.meta.QueryAction;
+import com.linkedin.venice.meta.StorageMode;
 import com.linkedin.venice.metadata.response.MetadataResponseRecord;
 import com.linkedin.venice.metadata.response.VersionProperties;
 import com.linkedin.venice.read.RequestType;
 import com.linkedin.venice.serialization.avro.AvroProtocolDefinition;
 import com.linkedin.venice.serializer.SerializerDeserializerFactory;
 import io.tehuti.metrics.MetricsRepository;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -43,7 +44,6 @@ import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 import org.apache.avro.Schema;
 
 
@@ -54,7 +54,9 @@ public class RequestBasedMetadataTestUtils {
   public static final String NEW_REPLICA_NAME = "host3";
   public static final String KEY_SCHEMA = "\"string\"";
   public static final String VALUE_SCHEMA = "\"string\"";
-  private static final byte[] DICTIONARY = ZstdWithDictCompressor.buildDictionaryOnSyntheticAvroData();
+  public static final String SERVER_D2_SERVICE = "test-d2-service";
+  public static final String CLUSTER_NAME = "test-cluster";
+  static final byte[] DICTIONARY = ZstdWithDictCompressor.buildDictionaryOnSyntheticAvroData();
 
   public static ClientConfig getMockClientConfig(String storeName) {
     return getMockClientConfig(storeName, false, true);
@@ -64,16 +66,26 @@ public class RequestBasedMetadataTestUtils {
       String storeName,
       boolean firstConnWarmupFails,
       boolean isMetadataConnWarmupEnabled) {
+    return getMockClientConfig(storeName, firstConnWarmupFails, isMetadataConnWarmupEnabled, null);
+  }
+
+  public static ClientConfig getMockClientConfig(
+      String storeName,
+      boolean firstConnWarmupFails,
+      boolean isMetadataConnWarmupEnabled,
+      ScheduledExecutorService metadataRefreshExecutor) {
     ClientConfig clientConfig = mock(ClientConfig.class);
     ClusterStats clusterStats = new ClusterStats(new MetricsRepository(), storeName);
     doReturn(getMockR2Client(firstConnWarmupFails)).when(clientConfig).getR2Client();
     doReturn(1L).when(clientConfig).getMetadataRefreshIntervalInSeconds();
     doReturn(1L).when(clientConfig).getMetadataConnWarmupTimeoutInSeconds();
     doReturn(isMetadataConnWarmupEnabled).when(clientConfig).isMetadataConnWarmupEnabled();
+    doReturn(metadataRefreshExecutor).when(clientConfig).getMetadataRefreshExecutor();
     doReturn(storeName).when(clientConfig).getStoreName();
     doReturn(clusterStats).when(clientConfig).getClusterStats();
     doReturn(ClientRoutingStrategyType.LEAST_LOADED).when(clientConfig).getClientRoutingStrategyType();
     doReturn(mock(FastClientStats.class)).when(clientConfig).getStats(RequestType.SINGLE_GET);
+    doReturn(mock(InstanceHealthMonitor.class)).when(clientConfig).getInstanceHealthMonitor();
     return clientConfig;
   }
 
@@ -141,7 +153,8 @@ public class RequestBasedMetadataTestUtils {
         2,
         "com.linkedin.venice.partitioner.DefaultVenicePartitioner",
         Collections.unmodifiableMap(partitionerParams),
-        1);
+        1,
+        StorageMode.INTERNAL.getValue());
     Map<CharSequence, List<CharSequence>> routeMap = new HashMap<>();
     routeMap.put("0", Collections.singletonList(REPLICA1_NAME));
     routeMap.put("1", Collections.singletonList(REPLICA2_NAME));
@@ -156,7 +169,8 @@ public class RequestBasedMetadataTestUtils {
         1,
         routeMap,
         helixGroupMap,
-        150);
+        150,
+        ExternalStorageReadMode.VENICE_ONLY.getValue());
 
     byte[] metadataBody = SerializerDeserializerFactory.getAvroGenericSerializer(MetadataResponseRecord.SCHEMA$)
         .serialize(metadataResponse);
@@ -190,10 +204,81 @@ public class RequestBasedMetadataTestUtils {
     return d2TransportClient;
   }
 
+  /**
+   * A {@link D2TransportClient} whose METADATA endpoint returns three responses in sequence, driving REPLICA1_NAME
+   * through present -> absent (replaced by NEW_REPLICA_NAME) -> present across three refreshes.
+   */
+  public static D2TransportClient getMockD2TransportClientCycling(String storeName) {
+    D2TransportClient d2TransportClient = mock(D2TransportClient.class);
+
+    Map<CharSequence, List<CharSequence>> withReplica1 = new HashMap<>();
+    withReplica1.put("0", Collections.singletonList(REPLICA1_NAME));
+    withReplica1.put("1", Collections.singletonList(REPLICA2_NAME));
+    Map<CharSequence, List<CharSequence>> withoutReplica1 = new HashMap<>();
+    withoutReplica1.put("0", Collections.singletonList(NEW_REPLICA_NAME));
+    withoutReplica1.put("1", Collections.singletonList(REPLICA2_NAME));
+
+    int metadataResponseSchemaId = AvroProtocolDefinition.SERVER_METADATA_RESPONSE.getCurrentProtocolVersion();
+    CompletableFuture<TransportClientResponse> state1 = CompletableFuture.completedFuture(
+        new TransportClientResponse(
+            metadataResponseSchemaId,
+            CompressionStrategy.NO_OP,
+            buildCyclingMetadataBody(withReplica1)));
+    CompletableFuture<TransportClientResponse> state2 = CompletableFuture.completedFuture(
+        new TransportClientResponse(
+            metadataResponseSchemaId + 1,
+            CompressionStrategy.NO_OP,
+            buildCyclingMetadataBody(withoutReplica1)));
+    CompletableFuture<TransportClientResponse> state3 = CompletableFuture.completedFuture(
+        new TransportClientResponse(
+            metadataResponseSchemaId,
+            CompressionStrategy.NO_OP,
+            buildCyclingMetadataBody(withReplica1)));
+
+    when(d2TransportClient.get(eq(QueryAction.METADATA.toString().toLowerCase() + "/" + storeName)))
+        .thenReturn(state1, state2, state3);
+
+    TransportClientResponse dictionaryResponse = new TransportClientResponse(0, CompressionStrategy.NO_OP, DICTIONARY);
+    doReturn(CompletableFuture.completedFuture(dictionaryResponse)).when(d2TransportClient)
+        .get(eq(QueryAction.DICTIONARY.toString().toLowerCase() + "/" + storeName + "/" + CURRENT_VERSION));
+
+    return d2TransportClient;
+  }
+
+  private static byte[] buildCyclingMetadataBody(Map<CharSequence, List<CharSequence>> routeMap) {
+    Map<String, String> partitionerParams = new HashMap<>();
+    partitionerParams.put("testKey", "testValue");
+    VersionProperties versionProperties = new VersionProperties(
+        CURRENT_VERSION,
+        CompressionStrategy.ZSTD_WITH_DICT.getValue(),
+        2,
+        "com.linkedin.venice.partitioner.DefaultVenicePartitioner",
+        Collections.unmodifiableMap(partitionerParams),
+        1,
+        StorageMode.INTERNAL.getValue());
+    Map<CharSequence, Integer> helixGroupMap = new HashMap<>();
+    helixGroupMap.put(REPLICA1_NAME, 0);
+    helixGroupMap.put(REPLICA2_NAME, 1);
+    helixGroupMap.put(NEW_REPLICA_NAME, 0);
+    MetadataResponseRecord metadataResponse = new MetadataResponseRecord(
+        versionProperties,
+        Collections.singletonList(CURRENT_VERSION),
+        Collections.singletonMap("1", KEY_SCHEMA),
+        Collections.singletonMap("1", VALUE_SCHEMA),
+        1,
+        routeMap,
+        helixGroupMap,
+        150,
+        ExternalStorageReadMode.VENICE_ONLY.getValue());
+    return SerializerDeserializerFactory.getAvroGenericSerializer(MetadataResponseRecord.SCHEMA$)
+        .serialize(metadataResponse);
+  }
+
   public static D2ServiceDiscovery getMockD2ServiceDiscovery(D2TransportClient d2TransportClient, String storeName) {
     D2ServiceDiscovery d2ServiceDiscovery = mock(D2ServiceDiscovery.class);
-
     D2ServiceDiscoveryResponse d2ServiceDiscoveryResponse = new D2ServiceDiscoveryResponse();
+    d2ServiceDiscoveryResponse.setServerD2Service(SERVER_D2_SERVICE);
+    d2ServiceDiscoveryResponse.setCluster(CLUSTER_NAME);
 
     doReturn(d2ServiceDiscoveryResponse).when(d2ServiceDiscovery)
         .find(eq(d2TransportClient), eq(storeName), anyBoolean());
@@ -208,6 +293,136 @@ public class RequestBasedMetadataTestUtils {
         .createVersionSpecificCompressorIfNotExist(CompressionStrategy.ZSTD_WITH_DICT, resourceName, DICTIONARY);
   }
 
+  /**
+   * Build a {@link TransportClientResponse} that mimics a successful METADATA fetch reporting the supplied current
+   * version, with externalStorageReadMode defaulting to VENICE_ONLY and storageMode defaulting to INTERNAL.
+   */
+  public static TransportClientResponse buildMetadataResponse(int currentVersion) {
+    return buildMetadataResponse(currentVersion, ExternalStorageReadMode.VENICE_ONLY);
+  }
+
+  /**
+   * Build a {@link TransportClientResponse} that mimics a successful METADATA fetch reporting the supplied current
+   * version and {@code externalStorageReadMode}, with storageMode defaulting to INTERNAL. Used by tests that need to
+   * drive a real {@code (previousVersion, newVersion)} version-switch transition through
+   * {@link RequestBasedMetadata#updateCache(boolean)} and/or to flip externalStorageReadMode across refreshes. The
+   * response carries full routing for the supplied version so {@code whetherToSwitchToFetchedCurrentVersion} returns
+   * true (single replica per partition is enough; the partition-resources-ready check looks at non-empty routing per
+   * partition).
+   */
+  public static TransportClientResponse buildMetadataResponse(
+      int currentVersion,
+      ExternalStorageReadMode externalStorageReadMode) {
+    return buildMetadataResponse(currentVersion, externalStorageReadMode.getValue(), StorageMode.INTERNAL.getValue());
+  }
+
+  /**
+   * Build a {@link TransportClientResponse} reporting the supplied current version, {@code externalStorageReadMode},
+   * and current-version {@code storageMode}.
+   */
+  public static TransportClientResponse buildMetadataResponse(
+      int currentVersion,
+      ExternalStorageReadMode externalStorageReadMode,
+      StorageMode storageMode) {
+    return buildMetadataResponse(currentVersion, externalStorageReadMode.getValue(), storageMode.getValue());
+  }
+
+  /**
+   * Lower-level overload that accepts the raw int for externalStorageReadMode, with storageMode defaulting to
+   * INTERNAL. Used by forward-compat tests that need to inject a wire value the client's
+   * {@link com.linkedin.venice.meta.ExternalStorageReadMode} enum does not yet recognize.
+   */
+  public static TransportClientResponse buildMetadataResponse(int currentVersion, int rawExternalStorageReadMode) {
+    return buildMetadataResponse(currentVersion, rawExternalStorageReadMode, StorageMode.INTERNAL.getValue());
+  }
+
+  /**
+   * Lowest-level overload that accepts raw ints for both externalStorageReadMode and storageMode. Used by
+   * forward-compat tests that need to inject wire values that this client's {@link ExternalStorageReadMode} and/or
+   * {@link StorageMode} enums do not yet recognize.
+   */
+  public static TransportClientResponse buildMetadataResponse(
+      int currentVersion,
+      int rawExternalStorageReadMode,
+      int rawStorageMode) {
+    Map<String, String> partitionerParams = new HashMap<>();
+    partitionerParams.put("testKey", "testValue");
+    VersionProperties versionProperties = new VersionProperties(
+        currentVersion,
+        CompressionStrategy.ZSTD_WITH_DICT.getValue(),
+        2,
+        "com.linkedin.venice.partitioner.DefaultVenicePartitioner",
+        Collections.unmodifiableMap(partitionerParams),
+        1,
+        rawStorageMode);
+    Map<CharSequence, List<CharSequence>> routeMap = new HashMap<>();
+    routeMap.put("0", Collections.singletonList(REPLICA1_NAME));
+    routeMap.put("1", Collections.singletonList(REPLICA2_NAME));
+    Map<CharSequence, Integer> helixGroupMap = new HashMap<>();
+    helixGroupMap.put(REPLICA1_NAME, 0);
+    helixGroupMap.put(REPLICA2_NAME, 1);
+    // Active versions = {currentVersion} only so isCurrentVersionActive(stale value) is false → forces the switch
+    // even before partition-resources-ready logic kicks in.
+    MetadataResponseRecord metadataResponse = new MetadataResponseRecord(
+        versionProperties,
+        Collections.singletonList(currentVersion),
+        Collections.singletonMap("1", KEY_SCHEMA),
+        Collections.singletonMap("1", VALUE_SCHEMA),
+        1,
+        routeMap,
+        helixGroupMap,
+        150,
+        rawExternalStorageReadMode);
+    byte[] body = SerializerDeserializerFactory.getAvroGenericSerializer(MetadataResponseRecord.SCHEMA$)
+        .serialize(metadataResponse);
+    int metadataResponseSchemaId = AvroProtocolDefinition.SERVER_METADATA_RESPONSE.getCurrentProtocolVersion();
+    return new TransportClientResponse(metadataResponseSchemaId, CompressionStrategy.NO_OP, body);
+  }
+
+  /**
+   * Build a {@link TransportClientResponse} that reports {@code fetchedCurrentVersion} as the server-side current
+   * version while leaving its partition resources incomplete (partition 1 of 2 has no ready replicas), so
+   * {@link RequestBasedMetadata#whetherToSwitchToFetchedCurrentVersion} defers the switch and the client keeps
+   * serving {@code servingVersion}.
+   */
+  public static TransportClientResponse buildDeferredSwitchMetadataResponse(
+      int servingVersion,
+      int fetchedCurrentVersion,
+      StorageMode fetchedCurrentVersionStorageMode) {
+    Map<String, String> partitionerParams = new HashMap<>();
+    partitionerParams.put("testKey", "testValue");
+    VersionProperties versionProperties = new VersionProperties(
+        fetchedCurrentVersion,
+        CompressionStrategy.ZSTD_WITH_DICT.getValue(),
+        2,
+        "com.linkedin.venice.partitioner.DefaultVenicePartitioner",
+        Collections.unmodifiableMap(partitionerParams),
+        1,
+        fetchedCurrentVersionStorageMode.getValue());
+    // Partition 1 is present but empty rather than omitted, so updateCache's routing-info loop does not see a null
+    // while isPartitionResourcesReady() still returns false.
+    Map<CharSequence, List<CharSequence>> routeMap = new HashMap<>();
+    routeMap.put("0", Collections.singletonList(REPLICA1_NAME));
+    routeMap.put("1", Collections.emptyList());
+    Map<CharSequence, Integer> helixGroupMap = new HashMap<>();
+    helixGroupMap.put(REPLICA1_NAME, 0);
+    // Both versions active, so incomplete partition routing is the only reason the switch is deferred.
+    MetadataResponseRecord metadataResponse = new MetadataResponseRecord(
+        versionProperties,
+        Collections.unmodifiableList(Arrays.asList(servingVersion, fetchedCurrentVersion)),
+        Collections.singletonMap("1", KEY_SCHEMA),
+        Collections.singletonMap("1", VALUE_SCHEMA),
+        1,
+        routeMap,
+        helixGroupMap,
+        150,
+        ExternalStorageReadMode.EXTERNAL_ONLY.getValue());
+    byte[] body = SerializerDeserializerFactory.getAvroGenericSerializer(MetadataResponseRecord.SCHEMA$)
+        .serialize(metadataResponse);
+    int metadataResponseSchemaId = AvroProtocolDefinition.SERVER_METADATA_RESPONSE.getCurrentProtocolVersion();
+    return new TransportClientResponse(metadataResponseSchemaId, CompressionStrategy.NO_OP, body);
+  }
+
   public static RouterBackedSchemaReader getMockRouterBackedSchemaReader() {
     RouterBackedSchemaReader metadataResponseSchemaReader = mock(RouterBackedSchemaReader.class);
     int latestSchemaId = AvroProtocolDefinition.SERVER_METADATA_RESPONSE.getCurrentProtocolVersion();
@@ -219,21 +434,14 @@ public class RequestBasedMetadataTestUtils {
 
   public static RequestBasedMetadata getMockMetaData(ClientConfig clientConfig, String storeName)
       throws InterruptedException {
-    return getMockMetaData(clientConfig, storeName, getMockRouterBackedSchemaReader(), false, false, false, null);
+    return getMockMetaData(clientConfig, storeName, getMockRouterBackedSchemaReader(), false, false, false);
   }
 
   public static RequestBasedMetadata getMockMetaData(
       ClientConfig clientConfig,
       String storeName,
       boolean metadataChange) throws InterruptedException {
-    return getMockMetaData(
-        clientConfig,
-        storeName,
-        getMockRouterBackedSchemaReader(),
-        metadataChange,
-        false,
-        false,
-        null);
+    return getMockMetaData(clientConfig, storeName, getMockRouterBackedSchemaReader(), metadataChange, false, false);
   }
 
   public static RequestBasedMetadata getMockMetaData(
@@ -241,7 +449,7 @@ public class RequestBasedMetadataTestUtils {
       String storeName,
       RouterBackedSchemaReader routerBackedSchemaReader,
       boolean metadataChange) throws InterruptedException {
-    return getMockMetaData(clientConfig, storeName, routerBackedSchemaReader, metadataChange, false, false, null);
+    return getMockMetaData(clientConfig, storeName, routerBackedSchemaReader, metadataChange, false, false);
   }
 
   public static RequestBasedMetadata getMockMetaData(
@@ -249,16 +457,14 @@ public class RequestBasedMetadataTestUtils {
       String storeName,
       boolean metadataChange,
       boolean mockMetadataUpdateFailure,
-      boolean firstUpdateFails,
-      ScheduledExecutorService scheduler) throws InterruptedException {
+      boolean firstUpdateFails) throws InterruptedException {
     return getMockMetaData(
         clientConfig,
         storeName,
         getMockRouterBackedSchemaReader(),
         metadataChange,
         mockMetadataUpdateFailure,
-        firstUpdateFails,
-        scheduler);
+        firstUpdateFails);
   }
 
   public static RequestBasedMetadata getMockMetaData(
@@ -267,8 +473,7 @@ public class RequestBasedMetadataTestUtils {
       RouterBackedSchemaReader routerBackedSchemaReader,
       boolean metadataChange,
       boolean mockMetadataUpdateFailure,
-      boolean firstUpdateFails,
-      ScheduledExecutorService scheduler) throws InterruptedException {
+      boolean firstUpdateFails) throws InterruptedException {
     return getMockMetaData(
         clientConfig,
         storeName,
@@ -276,7 +481,6 @@ public class RequestBasedMetadataTestUtils {
         metadataChange,
         mockMetadataUpdateFailure,
         firstUpdateFails,
-        scheduler,
         AvroCompatibilityHelper.parse(KEY_SCHEMA),
         AvroCompatibilityHelper.parse(VALUE_SCHEMA));
   }
@@ -288,40 +492,34 @@ public class RequestBasedMetadataTestUtils {
       boolean metadataChange,
       boolean mockMetadataUpdateFailure,
       boolean firstUpdateFails,
-      ScheduledExecutorService scheduler,
       Schema storeKeySchema,
-      Schema storeValueSchema) throws InterruptedException {
+      Schema storeValueSchema) {
     D2TransportClient d2TransportClient =
         getMockD2TransportClient(storeName, metadataChange, storeKeySchema, storeValueSchema);
     D2ServiceDiscovery d2ServiceDiscovery = getMockD2ServiceDiscovery(d2TransportClient, storeName);
     RequestBasedMetadata requestBasedMetadata;
     if (mockMetadataUpdateFailure) {
-      requestBasedMetadata = mock(RequestBasedMetadata.class);
-      doAnswer(invocation -> null).when(requestBasedMetadata).discoverD2Service();
+      requestBasedMetadata = new RequestBasedMetadata(clientConfig, d2TransportClient) {
+        private boolean firstUpdate = true;
 
-      if (firstUpdateFails) {
-        doAnswer(invocation -> {
-          throw new VeniceClientException("update cache exception");
-        }).doAnswer(invocation -> null).when(requestBasedMetadata).updateCache(anyBoolean());
-      } else {
-        doAnswer(invocation -> null).when(requestBasedMetadata).updateCache(anyBoolean());
-      }
+        @Override
+        void discoverD2Service() {
+          // no-op
+        }
 
-      doCallRealMethod().when(requestBasedMetadata).setIsReadyLatch(any());
-      doCallRealMethod().when(requestBasedMetadata).getIsReadyLatch();
-      doCallRealMethod().when(requestBasedMetadata).setScheduler(any());
-      doCallRealMethod().when(requestBasedMetadata).getScheduler();
-      doCallRealMethod().when(requestBasedMetadata).setRefreshIntervalInSeconds(anyLong());
-      doCallRealMethod().when(requestBasedMetadata).getRefreshIntervalInSeconds();
+        @Override
+        synchronized List<Runnable> updateCache(boolean onDemandRefresh) {
+          if (firstUpdateFails && firstUpdate) {
+            firstUpdate = false;
+            throw new VeniceClientException("update cache exception");
+          }
+          // otherwise no-op; nothing to fire on the deferred-callback list
+          return Collections.emptyList();
+        }
+      };
+
       requestBasedMetadata.setIsReadyLatch(new CountDownLatch(1));
-      ScheduledExecutorService mockScheduler = mock(ScheduledExecutorService.class);
-      requestBasedMetadata.setScheduler(mockScheduler);
       requestBasedMetadata.setRefreshIntervalInSeconds(RequestBasedMetadata.DEFAULT_REFRESH_INTERVAL_IN_SECONDS);
-      doAnswer(invocation -> {
-        scheduler.schedule((Runnable) invocation.getArgument(0), invocation.getArgument(1), invocation.getArgument(2));
-        return null;
-      }).when(mockScheduler).schedule(any(Runnable.class), anyLong(), any(TimeUnit.class));
-      doCallRealMethod().when(requestBasedMetadata).start();
     } else {
       requestBasedMetadata = new RequestBasedMetadata(clientConfig, d2TransportClient);
     }

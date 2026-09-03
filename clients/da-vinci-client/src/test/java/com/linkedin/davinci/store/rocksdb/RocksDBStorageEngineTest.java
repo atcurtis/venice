@@ -1,23 +1,34 @@
 package com.linkedin.davinci.store.rocksdb;
 
 import static com.linkedin.davinci.store.AbstractStorageEngine.METADATA_PARTITION_ID;
+import static com.linkedin.venice.utils.TestUtils.DEFAULT_PUBSUB_CONTEXT_FOR_UNIT_TESTING;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import com.linkedin.davinci.config.VeniceStoreVersionConfig;
 import com.linkedin.davinci.stats.AggVersionedStorageEngineStats;
 import com.linkedin.davinci.storage.StorageService;
-import com.linkedin.davinci.store.AbstractStorageEngine;
 import com.linkedin.davinci.store.AbstractStorageEngineTest;
+import com.linkedin.davinci.store.StorageEngine;
+import com.linkedin.davinci.store.StorageEngineAccessor;
+import com.linkedin.venice.kafka.protocol.GUID;
+import com.linkedin.venice.kafka.protocol.state.ProducerPartitionState;
 import com.linkedin.venice.kafka.protocol.state.StoreVersionState;
+import com.linkedin.venice.kafka.validation.SegmentStatus;
+import com.linkedin.venice.kafka.validation.checksum.CheckSumType;
 import com.linkedin.venice.meta.PersistenceType;
 import com.linkedin.venice.meta.ReadOnlyStoreRepository;
 import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.offsets.OffsetRecord;
+import com.linkedin.venice.pubsub.adapter.kafka.common.ApacheKafkaOffsetPosition;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
 import com.linkedin.venice.serialization.avro.AvroProtocolDefinition;
 import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.VeniceProperties;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
 import java.util.Set;
 import org.testng.Assert;
 import org.testng.annotations.AfterClass;
@@ -26,7 +37,7 @@ import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
 
-public class RocksDBStorageEngineTest extends AbstractStorageEngineTest {
+public class RocksDBStorageEngineTest extends AbstractStorageEngineTest<RocksDBStorageEngine> {
   private static final int PARTITION_ID = 0;
   private StorageService storageService;
   private VeniceStoreVersionConfig storeConfig;
@@ -53,7 +64,8 @@ public class RocksDBStorageEngineTest extends AbstractStorageEngineTest {
         AvroProtocolDefinition.PARTITION_STATE.getSerializer(),
         mockReadOnlyStoreRepository);
     storeConfig = new VeniceStoreVersionConfig(topicName, serverProps, PersistenceType.ROCKS_DB);
-    testStoreEngine = storageService.openStoreForNewPartition(storeConfig, PARTITION_ID, () -> null);
+    testStoreEngine = StorageEngineAccessor
+        .getInnerStorageEngine(storageService.openStoreForNewPartition(storeConfig, PARTITION_ID, () -> null));
     createStoreForTest();
   }
 
@@ -113,20 +125,55 @@ public class RocksDBStorageEngineTest extends AbstractStorageEngineTest {
 
   @Test
   public void testGetAndPutPartitionOffset() {
-    AbstractStorageEngine testStorageEngine = getTestStoreEngine();
+    StorageEngine testStorageEngine = getTestStoreEngine();
     Assert.assertEquals(testStorageEngine.getType(), PersistenceType.ROCKS_DB);
     RocksDBStorageEngine rocksDBStorageEngine = (RocksDBStorageEngine) testStorageEngine;
-    OffsetRecord offsetRecord = new OffsetRecord(AvroProtocolDefinition.PARTITION_STATE.getSerializer());
-    offsetRecord.setCheckpointLocalVersionTopicOffset(666L);
+    OffsetRecord offsetRecord = new OffsetRecord(
+        AvroProtocolDefinition.PARTITION_STATE.getSerializer(),
+        DEFAULT_PUBSUB_CONTEXT_FOR_UNIT_TESTING);
+
+    int segment = 0;
+    int sequence = 10;
+    String kafkaUrl = "kafkaUrl";
+    ProducerPartitionState ppState = createProducerPartitionState(segment, sequence);
+    GUID guid = new GUID();
+    offsetRecord.setRealtimeTopicProducerState(kafkaUrl, guid, ppState);
+    PubSubPosition p666 = ApacheKafkaOffsetPosition.of(666L);
+    offsetRecord.checkpointLocalVtPosition(p666);
     rocksDBStorageEngine.putPartitionOffset(PARTITION_ID, offsetRecord);
-    Assert.assertEquals(rocksDBStorageEngine.getPartitionOffset(PARTITION_ID).get().getLocalVersionTopicOffset(), 666L);
+    Assert.assertEquals(
+        rocksDBStorageEngine.getPartitionOffset(PARTITION_ID, DEFAULT_PUBSUB_CONTEXT_FOR_UNIT_TESTING)
+            .get()
+            .getCheckpointedLocalVtPosition(),
+        p666);
+    ProducerPartitionState ppStateFromRocksDB =
+        rocksDBStorageEngine.getPartitionOffset(PARTITION_ID, DEFAULT_PUBSUB_CONTEXT_FOR_UNIT_TESTING)
+            .get()
+            .getRealTimeProducerState(kafkaUrl, guid);
+    Assert.assertEquals(ppStateFromRocksDB.getSegmentNumber(), segment);
+    Assert.assertEquals(ppStateFromRocksDB.getMessageSequenceNumber(), sequence);
     rocksDBStorageEngine.clearPartitionOffset(PARTITION_ID);
-    Assert.assertEquals(rocksDBStorageEngine.getPartitionOffset(PARTITION_ID).isPresent(), false);
+    Assert.assertEquals(
+        rocksDBStorageEngine.getPartitionOffset(PARTITION_ID, DEFAULT_PUBSUB_CONTEXT_FOR_UNIT_TESTING).isPresent(),
+        false);
+  }
+
+  private ProducerPartitionState createProducerPartitionState(int segment, int sequence) {
+    ProducerPartitionState ppState = new ProducerPartitionState();
+    ppState.segmentNumber = segment;
+    ppState.segmentStatus = SegmentStatus.IN_PROGRESS.getValue();
+    ppState.messageSequenceNumber = sequence;
+    ppState.messageTimestamp = System.currentTimeMillis();
+    ppState.checksumType = CheckSumType.NONE.getValue();
+    ppState.checksumState = ByteBuffer.allocate(0);
+    ppState.aggregates = new HashMap<>();
+    ppState.debugInfo = new HashMap<>();
+    return ppState;
   }
 
   @Test
   public void testGetAndPutStoreVersionState() {
-    AbstractStorageEngine testStorageEngine = getTestStoreEngine();
+    StorageEngine testStorageEngine = getTestStoreEngine();
     Assert.assertEquals(testStorageEngine.getType(), PersistenceType.ROCKS_DB);
     RocksDBStorageEngine rocksDBStorageEngine = (RocksDBStorageEngine) testStorageEngine;
 
@@ -144,16 +191,21 @@ public class RocksDBStorageEngineTest extends AbstractStorageEngineTest {
 
   @Test
   public void testIllegalPartitionIdInGetAndPutPartitionOffset() {
-    AbstractStorageEngine testStorageEngine = getTestStoreEngine();
+    StorageEngine testStorageEngine = getTestStoreEngine();
     Assert.assertEquals(testStorageEngine.getType(), PersistenceType.ROCKS_DB);
     RocksDBStorageEngine rocksDBStorageEngine = (RocksDBStorageEngine) testStorageEngine;
 
     Assert.assertThrows(
         IllegalArgumentException.class,
-        () -> rocksDBStorageEngine
-            .putPartitionOffset(-1, new OffsetRecord(AvroProtocolDefinition.PARTITION_STATE.getSerializer())));
+        () -> rocksDBStorageEngine.putPartitionOffset(
+            -1,
+            new OffsetRecord(
+                AvroProtocolDefinition.PARTITION_STATE.getSerializer(),
+                DEFAULT_PUBSUB_CONTEXT_FOR_UNIT_TESTING)));
 
-    Assert.assertThrows(IllegalArgumentException.class, () -> rocksDBStorageEngine.getPartitionOffset(-1));
+    Assert.assertThrows(
+        IllegalArgumentException.class,
+        () -> rocksDBStorageEngine.getPartitionOffset(-1, DEFAULT_PUBSUB_CONTEXT_FOR_UNIT_TESTING));
   }
 
   @Test
@@ -164,6 +216,14 @@ public class RocksDBStorageEngineTest extends AbstractStorageEngineTest {
   @Test
   public void testUpdate() {
     super.testUpdate();
+    StorageEngine testStorageEngine = getTestStoreEngine();
+    Assert.assertEquals(testStorageEngine.getType(), PersistenceType.ROCKS_DB);
+    RocksDBStorageEngine rocksDBStorageEngine = (RocksDBStorageEngine) testStorageEngine;
+    Set<Integer> persistedPartitionIds = rocksDBStorageEngine.getPersistedPartitionIds();
+    Assert.assertEquals(persistedPartitionIds.size(), 2);
+    Assert.assertTrue(persistedPartitionIds.contains(PARTITION_ID));
+    Assert.assertTrue(persistedPartitionIds.contains(METADATA_PARTITION_ID));
+    Assert.assertEquals(2, rocksDBStorageEngine.getStats().getKeyCountEstimate());
   }
 
   @Test
@@ -195,7 +255,7 @@ public class RocksDBStorageEngineTest extends AbstractStorageEngineTest {
 
   @Test
   public void testGetPersistedPartitionIds() {
-    AbstractStorageEngine testStorageEngine = getTestStoreEngine();
+    StorageEngine testStorageEngine = getTestStoreEngine();
     Assert.assertEquals(testStorageEngine.getType(), PersistenceType.ROCKS_DB);
     RocksDBStorageEngine rocksDBStorageEngine = (RocksDBStorageEngine) testStorageEngine;
     Set<Integer> persistedPartitionIds = rocksDBStorageEngine.getPersistedPartitionIds();
@@ -217,7 +277,7 @@ public class RocksDBStorageEngineTest extends AbstractStorageEngineTest {
 
   @Test
   public void testHasConflictPersistedStoreEngineConfig() {
-    AbstractStorageEngine testStorageEngine = getTestStoreEngine();
+    StorageEngine testStorageEngine = getTestStoreEngine();
     RocksDBStorageEngine rocksDBStorageEngine = (RocksDBStorageEngine) testStorageEngine;
     RocksDBServerConfig rocksDBServerConfigMock = mock(RocksDBServerConfig.class);
     when(rocksDBServerConfigMock.getTransformerValueSchema()).thenReturn("not_null");
@@ -228,5 +288,60 @@ public class RocksDBStorageEngineTest extends AbstractStorageEngineTest {
 
     Assert.assertTrue(result);
 
+  }
+
+  @Test
+  public void testDropPartitionDirectoryRemovesOnDiskDir() {
+    RocksDBStorageEngine rocksDBStorageEngine = (RocksDBStorageEngine) getTestStoreEngine();
+
+    int extraPartitionId = PARTITION_ID + 7777;
+    storageService.openStoreForNewPartition(storeConfig, extraPartitionId, () -> null);
+    Assert.assertTrue(
+        rocksDBStorageEngine.getPersistedPartitionIds().contains(extraPartitionId),
+        "Newly added partition should be persisted on disk before drop.");
+
+    // Close the partition first so RocksDB releases file handles before the directory is deleted.
+    rocksDBStorageEngine.closePartition(extraPartitionId);
+
+    rocksDBStorageEngine.dropPartitionDirectory(extraPartitionId);
+
+    Assert.assertFalse(
+        rocksDBStorageEngine.getPersistedPartitionIds().contains(extraPartitionId),
+        "Partition directory should be gone after dropPartitionDirectory.");
+  }
+
+  @Test
+  public void testDropPartitionDirectoryNoopWhenAbsent() {
+    RocksDBStorageEngine rocksDBStorageEngine = (RocksDBStorageEngine) getTestStoreEngine();
+    int missingPartitionId = PARTITION_ID + 99999;
+    Assert.assertFalse(rocksDBStorageEngine.getPersistedPartitionIds().contains(missingPartitionId));
+    // Should not throw even though there is nothing to delete.
+    rocksDBStorageEngine.dropPartitionDirectory(missingPartitionId);
+  }
+
+  @Test
+  public void testGetPutDeleteGlobalRtDivMetadata() {
+    RocksDBStorageEngine rocksDBStorageEngine = (RocksDBStorageEngine) getTestStoreEngine();
+    byte[] key1 = "grtd-key-1".getBytes(StandardCharsets.UTF_8);
+    byte[] value1 = "grtd-value-1".getBytes(StandardCharsets.UTF_8);
+    byte[] key2 = "grtd-key-2".getBytes(StandardCharsets.UTF_8);
+    byte[] value2 = "grtd-value-2".getBytes(StandardCharsets.UTF_8);
+
+    // Missing key returns null
+    Assert.assertNull(rocksDBStorageEngine.getGlobalRtDivMetadata(key1));
+
+    // Put and get round-trip
+    rocksDBStorageEngine.putGlobalRtDivMetadata(key1, value1);
+    Assert.assertEquals(rocksDBStorageEngine.getGlobalRtDivMetadata(key1), value1);
+
+    // Different keys are stored independently
+    rocksDBStorageEngine.putGlobalRtDivMetadata(key2, value2);
+    Assert.assertEquals(rocksDBStorageEngine.getGlobalRtDivMetadata(key1), value1);
+    Assert.assertEquals(rocksDBStorageEngine.getGlobalRtDivMetadata(key2), value2);
+
+    // Delete and verify absent
+    rocksDBStorageEngine.deleteGlobalRtDivMetadata(key1);
+    Assert.assertNull(rocksDBStorageEngine.getGlobalRtDivMetadata(key1));
+    Assert.assertEquals(rocksDBStorageEngine.getGlobalRtDivMetadata(key2), value2);
   }
 }

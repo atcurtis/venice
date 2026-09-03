@@ -1,64 +1,108 @@
 package com.linkedin.venice.hadoop.task.datawriter;
 
+import static com.linkedin.venice.ConfigKeys.PUBSUB_BROKER_ADDRESS;
 import static com.linkedin.venice.ConfigKeys.PUSH_JOB_GUID_LEAST_SIGNIFICANT_BITS;
 import static com.linkedin.venice.ConfigKeys.PUSH_JOB_GUID_MOST_SIGNIFICANT_BITS;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.ALLOW_DUPLICATE_KEY;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.DEFAULT_IS_DUPLICATED_KEY_ALLOWED;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.DERIVED_SCHEMA_ID_PROP;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.ENABLE_WRITE_COMPUTE;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.STORAGE_QUOTA_PROP;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.TELEMETRY_MESSAGE_INTERVAL;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.TOPIC_PROP;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.VALUE_SCHEMA_ID_PROP;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.VSON_PUSH;
+import static com.linkedin.venice.ConfigKeys.PUSH_JOB_VIEW_CONFIGS;
+import static com.linkedin.venice.guid.GuidUtils.DEFAULT_GUID_GENERATOR_IMPLEMENTATION;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.ALLOW_DUPLICATE_KEY;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.COMPRESSION_STRATEGY;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.DEFAULT_IS_DUPLICATED_KEY_ALLOWED;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.DEFAULT_PUSH_JOB_EXTERNAL_STORAGE_BATCHPUT_RETRIES;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.DEFAULT_PUSH_JOB_EXTERNAL_STORAGE_BATCHPUT_RETRY_BACKOFF_MS;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.DEFAULT_PUSH_JOB_EXTERNAL_STORAGE_BATCH_SIZE;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.DEFAULT_PUSH_JOB_EXTERNAL_STORAGE_FAIL_OPEN_ON_REGION_FAILURE;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.DERIVED_SCHEMA_ID_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.ENABLE_WRITE_COMPUTE;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.INCREMENTAL_PUSH_RATE_LIMITER_TYPE;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.INCREMENTAL_PUSH_WRITE_QUOTA_RECORDS_PER_SECOND_PER_PARTITION;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.INCREMENTAL_PUSH_WRITE_QUOTA_TIME_WINDOW_MS;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.KAFKA_INPUT_SOURCE_COMPRESSION_STRATEGY;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.KAFKA_INPUT_TOPIC;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.PUSH_JOB_EXTERNAL_STORAGE_BATCHPUT_RETRIES;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.PUSH_JOB_EXTERNAL_STORAGE_BATCHPUT_RETRY_BACKOFF_MS;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.PUSH_JOB_EXTERNAL_STORAGE_BATCH_SIZE;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.PUSH_JOB_EXTERNAL_STORAGE_FAIL_OPEN_ON_REGION_FAILURE;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.PUSH_JOB_EXTERNAL_STORAGE_WRITER_CLASS;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.RMD_SCHEMA_DIR;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.RMD_SCHEMA_ID_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.RMD_SCHEMA_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.STORAGE_QUOTA_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.TELEMETRY_MESSAGE_INTERVAL;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.TOPIC_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VALUE_SCHEMA_DIR;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VALUE_SCHEMA_ID_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_PUSH_DESTINATION_PUBSUB_BROKER;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_REPUSH_SOURCE_PUBSUB_BROKER;
 
 import com.linkedin.avroutil1.compatibility.AvroCompatibilityHelper;
 import com.linkedin.venice.ConfigKeys;
 import com.linkedin.venice.annotation.NotThreadsafe;
+import com.linkedin.venice.annotation.VisibleForTesting;
+import com.linkedin.venice.compression.CompressionStrategy;
+import com.linkedin.venice.compression.CompressorFactory;
+import com.linkedin.venice.compression.VeniceCompressor;
 import com.linkedin.venice.exceptions.RecordTooLargeException;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.exceptions.VeniceResourceAccessException;
 import com.linkedin.venice.guid.GuidUtils;
 import com.linkedin.venice.hadoop.InputStorageQuotaTracker;
 import com.linkedin.venice.hadoop.engine.EngineTaskConfigProvider;
-import com.linkedin.venice.hadoop.input.recordreader.AbstractVeniceRecordReader;
-import com.linkedin.venice.hadoop.input.recordreader.avro.VeniceAvroRecordReader;
-import com.linkedin.venice.hadoop.input.recordreader.vson.VeniceVsonRecordReader;
+import com.linkedin.venice.hadoop.input.kafka.KafkaInputUtils;
+import com.linkedin.venice.hadoop.schema.HDFSSchemaSource;
 import com.linkedin.venice.hadoop.task.TaskTracker;
 import com.linkedin.venice.meta.Store;
+import com.linkedin.venice.meta.Version;
+import com.linkedin.venice.meta.VersionImpl;
+import com.linkedin.venice.meta.ViewConfig;
 import com.linkedin.venice.partitioner.VenicePartitioner;
 import com.linkedin.venice.pubsub.api.PubSubProduceResult;
 import com.linkedin.venice.pubsub.api.PubSubProducerCallback;
 import com.linkedin.venice.serialization.DefaultSerializer;
 import com.linkedin.venice.serializer.FastSerializerDeserializerFactory;
 import com.linkedin.venice.serializer.RecordDeserializer;
+import com.linkedin.venice.throttle.EventThrottler;
+import com.linkedin.venice.throttle.GuavaRateLimiter;
+import com.linkedin.venice.throttle.TokenBucket;
+import com.linkedin.venice.throttle.VeniceRateLimiter;
 import com.linkedin.venice.utils.ByteUtils;
+import com.linkedin.venice.utils.DictionaryUtils;
 import com.linkedin.venice.utils.PartitionUtils;
 import com.linkedin.venice.utils.SystemTime;
 import com.linkedin.venice.utils.Time;
 import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.VeniceProperties;
+import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
+import com.linkedin.venice.utils.lazy.Lazy;
+import com.linkedin.venice.views.MaterializedView;
+import com.linkedin.venice.views.VeniceView;
+import com.linkedin.venice.views.ViewUtils;
+import com.linkedin.venice.vpj.ExternalStorageWriteUtils;
 import com.linkedin.venice.writer.AbstractVeniceWriter;
+import com.linkedin.venice.writer.ComplexVeniceWriter;
 import com.linkedin.venice.writer.DeleteMetadata;
 import com.linkedin.venice.writer.PutMetadata;
 import com.linkedin.venice.writer.VeniceWriter;
 import com.linkedin.venice.writer.VeniceWriterFactory;
 import com.linkedin.venice.writer.VeniceWriterOptions;
-import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.time.Clock;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
 import java.util.Properties;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiFunction;
 import java.util.function.Consumer;
 import org.apache.avro.Schema;
-import org.apache.avro.generic.GenericDatumWriter;
-import org.apache.avro.io.Encoder;
+import org.apache.avro.generic.GenericRecord;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -70,6 +114,58 @@ import org.apache.logging.log4j.Logger;
 @NotThreadsafe
 public abstract class AbstractPartitionWriter extends AbstractDataWriterTask implements Closeable {
   private static final Logger LOGGER = LogManager.getLogger(AbstractPartitionWriter.class);
+
+  /*
+   * A model class to hold multiple attributes passed from the reducers of VPJ to the writer class. Ideally, we can extract
+   * this class even higher and use it higher up in the call chain to avoid leaking spark abstractions into the code
+   * through vanilla spark rows. However, that is tabled for a separate refactoring effort.
+   */
+  public static class VeniceRecordWithMetadata {
+    private final byte[] value;
+
+    private final byte[] rmd;
+
+    /**
+     * Per-record value schema ID extracted from the source Kafka message. Used during KIF repush to preserve
+     * schema. A value of -1 indicates the per-record ID is not available,
+     * in which case {@link AbstractPartitionWriter#extract} falls back to the global value schema ID
+     */
+    private final int valueSchemaId;
+
+    /**
+     * Per-record RMD (replication metadata) version ID extracted from the source Kafka message. A value of -1
+     * indicates the per-record ID is not available, in which case {@link AbstractPartitionWriter#extract}
+     * falls back to the global RMD schema ID configured at job start.
+     */
+    private final int rmdVersionId;
+
+    public VeniceRecordWithMetadata(byte[] value, byte[] rmd) {
+      this(value, rmd, -1, -1);
+    }
+
+    public VeniceRecordWithMetadata(byte[] value, byte[] rmd, int valueSchemaId, int rmdVersionId) {
+      this.value = value;
+      this.rmd = rmd;
+      this.valueSchemaId = valueSchemaId;
+      this.rmdVersionId = rmdVersionId;
+    }
+
+    public byte[] getValue() {
+      return value;
+    }
+
+    public byte[] getRmd() {
+      return rmd;
+    }
+
+    public int getValueSchemaId() {
+      return valueSchemaId;
+    }
+
+    public int getRmdVersionId() {
+      return rmdVersionId;
+    }
+  }
 
   public static class VeniceWriterMessage {
     private final byte[] keyBytes;
@@ -106,6 +202,11 @@ public abstract class AbstractPartitionWriter extends AbstractDataWriterTask imp
           if (rmdPayload.remaining() == 0) {
             throw new VeniceException("Found empty replication metadata");
           }
+
+          if (rmdVersionId <= 0) {
+            throw new VeniceException("Found replication metadata without a valid schema id");
+          }
+
           if (valueBytes == null) {
             DeleteMetadata deleteMetadata = new DeleteMetadata(valueSchemaId, rmdVersionId, rmdPayload);
             writer.delete(keyBytes, callback, deleteMetadata);
@@ -121,7 +222,8 @@ public abstract class AbstractPartitionWriter extends AbstractDataWriterTask imp
       };
     }
 
-    private Consumer<AbstractVeniceWriter<byte[], byte[], byte[]>> getConsumer() {
+    @VisibleForTesting
+    Consumer<AbstractVeniceWriter<byte[], byte[], byte[]>> getConsumer() {
       return consumer;
     }
 
@@ -145,13 +247,20 @@ public abstract class AbstractPartitionWriter extends AbstractDataWriterTask imp
   private long lastTimeThroughputWasLoggedInNS = System.nanoTime();
   private long lastMessageCompletedCount = 0;
 
+  private Lazy<VeniceWriterFactory> veniceWriterFactory;
   private AbstractVeniceWriter<byte[], byte[], byte[]> veniceWriter = null;
+  private VeniceWriter<byte[], byte[], byte[]> mainWriter = null;
+  private ComplexVeniceWriter[] childWriters = null;
   private int valueSchemaId = -1;
+
+  private int rmdSchemaId = -1;
+  private Schema rmdSchema = null;
   private int derivedValueSchemaId = -1;
   private boolean enableWriteCompute = false;
 
   private VeniceProperties props;
   private long telemetryMessageInterval;
+  private boolean enableUncompressedRecordSizeLimit;
   private DuplicateKeyPrinter duplicateKeyPrinter;
   private Exception sendException = null;
 
@@ -167,6 +276,11 @@ public abstract class AbstractPartitionWriter extends AbstractDataWriterTask imp
    * This doesn't need to be atomic since {@link #processValuesForKey(byte[], Iterator, DataWriterTaskTracker)} will be called sequentially.
    */
   private long messageSent = 0;
+
+  protected long getMessageSent() {
+    return messageSent;
+  }
+
   private final AtomicLong messageCompleted = new AtomicLong();
   private final AtomicLong messageErrored = new AtomicLong();
   private long timeOfLastReduceFunctionEndInNS = 0;
@@ -178,6 +292,19 @@ public abstract class AbstractPartitionWriter extends AbstractDataWriterTask imp
   private boolean hasDuplicateKeyWithDistinctValue = false;
   private boolean hasRecordTooLargeFailure = false;
   private boolean isDuplicateKeyAllowed = DEFAULT_IS_DUPLICATED_KEY_ALLOWED;
+  private HDFSSchemaSource schemaSource;
+  private Map<Integer, Schema> valueSchemaMap;
+  private Map<Integer, RecordDeserializer<GenericRecord>> valueDeserializerCache;
+  private final Lazy<CompressorFactory> compressorFactory = Lazy.of(CompressorFactory::new);
+  private Lazy<VeniceCompressor> compressor;
+
+  // Incremental push write quota throttler
+  private VeniceRateLimiter recordsThrottler = null;
+  /**
+   * Accumulated throttle time across all calls. Only accessed from the single-threaded
+   * {@link #processValuesForKey} call path, so no synchronization is needed (class is @NotThreadsafe).
+   */
+  private long totalThrottleTimeMs = 0;
 
   /**
    * Compute engines will kill a task if it's inactive for a configured time. This time might be is too short for the
@@ -187,7 +314,10 @@ public abstract class AbstractPartitionWriter extends AbstractDataWriterTask imp
    */
   private final ScheduledExecutorService taskProgressHeartbeatScheduler = Executors.newScheduledThreadPool(1);
 
-  public void processValuesForKey(byte[] key, Iterator<byte[]> values, DataWriterTaskTracker dataWriterTaskTracker) {
+  public void processValuesForKey(
+      byte[] key,
+      Iterator<VeniceRecordWithMetadata> values,
+      DataWriterTaskTracker dataWriterTaskTracker) {
     this.dataWriterTaskTracker = dataWriterTaskTracker;
     final long timeOfLastReduceFunctionStartInNS = System.nanoTime();
     if (timeOfLastReduceFunctionEndInNS > 0) {
@@ -217,6 +347,15 @@ public abstract class AbstractPartitionWriter extends AbstractDataWriterTask imp
     updateExecutionTimeStatus(timeOfLastReduceFunctionStartInNS);
   }
 
+  // For testing purpose
+  protected void setVeniceWriterFactory(VeniceWriterFactory factory) {
+    this.veniceWriterFactory = Lazy.of(() -> factory);
+  }
+
+  public VeniceWriterFactory getVeniceWriterFactory() {
+    return veniceWriterFactory.get();
+  }
+
   protected DataWriterTaskTracker getDataWriterTaskTracker() {
     return dataWriterTaskTracker;
   }
@@ -233,9 +372,13 @@ public abstract class AbstractPartitionWriter extends AbstractDataWriterTask imp
     return enableWriteCompute;
   }
 
+  protected Schema getRmdSchema() {
+    return rmdSchema;
+  }
+
   protected VeniceWriterMessage extract(
       byte[] keyBytes,
-      Iterator<byte[]> values,
+      Iterator<VeniceRecordWithMetadata> values,
       DataWriterTaskTracker dataWriterTaskTracker) {
     /**
      * Don't use {@link BytesWritable#getBytes()} since it could be padded or modified by some other records later on.
@@ -243,15 +386,42 @@ public abstract class AbstractPartitionWriter extends AbstractDataWriterTask imp
     if (!values.hasNext()) {
       throw new VeniceException("There is no value corresponding to key bytes: " + ByteUtils.toHexString(keyBytes));
     }
-    byte[] valueBytes = values.next();
+
+    VeniceRecordWithMetadata valueRecord = values.next();
+    byte[] valueBytes = valueRecord.getValue();
+    // Handle empty RMD the same way as null - don't wrap empty byte array into ByteBuffer
+    byte[] rmdBytes = valueRecord.getRmd();
+    ByteBuffer rmd = (rmdBytes == null || rmdBytes.length == 0) ? null : ByteBuffer.wrap(rmdBytes);
+
+    // Drop the record entirely if both value and RMD are null since it doesn't carry any information.
+    // This can happen when the input is from Kafka and the record is a tombstone (null value) without replication
+    // metadata.
+    if (valueBytes == null && rmd == null) {
+      return null;
+    }
+
     if (duplicateKeyPrinter == null) {
       throw new VeniceException("'DuplicateKeyPrinter' is not initialized properly");
     }
-    duplicateKeyPrinter.detectAndHandleDuplicateKeys(keyBytes, valueBytes, values, dataWriterTaskTracker);
+    duplicateKeyPrinter.detectAndHandleDuplicateKeys(valueBytes, values, dataWriterTaskTracker);
+
+    // Use per-record schema IDs if available, otherwise fall back to global IDs
+    int effectiveValueSchemaId = valueRecord.getValueSchemaId() > 0 ? valueRecord.getValueSchemaId() : valueSchemaId;
+    int effectiveRmdVersionId = valueRecord.getRmdVersionId() > 0 ? valueRecord.getRmdVersionId() : rmdSchemaId;
+
+    if (effectiveValueSchemaId <= 0) {
+      throw new VeniceException(
+          "Invalid effective value schema ID: " + effectiveValueSchemaId + " (per-record: "
+              + valueRecord.getValueSchemaId() + ", global: " + valueSchemaId
+              + "). Ensure VALUE_SCHEMA_ID_PROP is configured or records carry valid schema IDs.");
+    }
+
     return new VeniceWriterMessage(
         keyBytes,
         valueBytes,
-        valueSchemaId,
+        effectiveValueSchemaId,
+        effectiveRmdVersionId,
+        rmd,
         getCallback(),
         isEnableWriteCompute(),
         getDerivedValueSchemaId());
@@ -267,7 +437,9 @@ public abstract class AbstractPartitionWriter extends AbstractDataWriterTask imp
     if (this.hasRecordTooLargeFailure) {
       return true;
     }
-    final boolean hasRecordTooLargeFailure = dataWriterTaskTracker.getRecordTooLargeFailureCount() > 0;
+    final boolean hasRecordTooLargeFailure = (dataWriterTaskTracker.getRecordTooLargeFailureCount() > 0
+        || (dataWriterTaskTracker.getUncompressedRecordTooLargeFailureCount() > 0
+            && this.enableUncompressedRecordSizeLimit));
     if (hasRecordTooLargeFailure) {
       this.hasRecordTooLargeFailure = true;
     }
@@ -333,41 +505,307 @@ public abstract class AbstractPartitionWriter extends AbstractDataWriterTask imp
     if (veniceWriter == null) {
       veniceWriter = createBasicVeniceWriter();
     }
+    // Apply throttling for incremental pushes if enabled
+    maybeThrottleIncrementalPush(dataWriterTaskTracker);
     writerConsumer.accept(veniceWriter);
     messageSent++;
     telemetry();
     dataWriterTaskTracker.trackRecordSentToPubSub();
   }
 
-  private VeniceWriter<byte[], byte[], byte[]> createBasicVeniceWriter() {
-    Properties writerProps = props.toProperties();
-    // Closing segments based on elapsed time should always be disabled in data writer compute jobs to prevent storage
-    // nodes from consuming out of order keys when speculative execution is enabled.
-    writerProps.put(VeniceWriter.MAX_ELAPSED_TIME_FOR_SEGMENT_IN_MS, -1);
+  /**
+   * Apply throttling for incremental pushes based on configured write quotas.
+   * This method will block if the write rate exceeds the configured quota.
+   */
+  private void maybeThrottleIncrementalPush(DataWriterTaskTracker dataWriterTaskTracker) {
+    if (recordsThrottler == null) {
+      return;
+    }
 
+    long startNanos = System.nanoTime();
+    recordsThrottler.acquirePermit(1);
+    long throttleTimeMs = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNanos);
+    if (throttleTimeMs <= 0) {
+      return;
+    }
+    totalThrottleTimeMs += throttleTimeMs;
+    dataWriterTaskTracker.trackIncrementalPushThrottledTime(throttleTimeMs);
+    if ((messageSent + 1) % telemetryMessageInterval == 0) {
+      LOGGER.info(
+          "Incremental push throttling active: throttled for {} ms on this message, total throttle time: {} ms",
+          throttleTimeMs,
+          totalThrottleTimeMs);
+    }
+  }
+
+  @VisibleForTesting
+  boolean isIncrementalPushThrottlingEnabled() {
+    return recordsThrottler != null;
+  }
+
+  @VisibleForTesting
+  VeniceRateLimiter getRecordsThrottler() {
+    return recordsThrottler;
+  }
+
+  @VisibleForTesting
+  void invokeThrottleForTesting(DataWriterTaskTracker tracker) {
+    maybeThrottleIncrementalPush(tracker);
+  }
+
+  protected AbstractVeniceWriter<byte[], byte[], byte[]> createBasicVeniceWriter() {
     EngineTaskConfigProvider engineTaskConfigProvider = getEngineTaskConfigProvider();
     Properties jobProps = engineTaskConfigProvider.getJobProps();
-
-    // Use the UUID bits created by the VPJ driver to build a producerGUID deterministically
-    writerProps.put(GuidUtils.GUID_GENERATOR_IMPLEMENTATION, GuidUtils.DETERMINISTIC_GUID_GENERATOR_IMPLEMENTATION);
-    writerProps.put(PUSH_JOB_GUID_MOST_SIGNIFICANT_BITS, jobProps.getProperty(PUSH_JOB_GUID_MOST_SIGNIFICANT_BITS));
-    writerProps.put(PUSH_JOB_GUID_LEAST_SIGNIFICANT_BITS, jobProps.getProperty(PUSH_JOB_GUID_LEAST_SIGNIFICANT_BITS));
-    VeniceWriterFactory veniceWriterFactoryFactory = new VeniceWriterFactory(writerProps);
+    VeniceWriterFactory veniceWriterFactoryFactory = veniceWriterFactory.get();
     boolean chunkingEnabled = props.getBoolean(VeniceWriter.ENABLE_CHUNKING, false);
     boolean rmdChunkingEnabled = props.getBoolean(VeniceWriter.ENABLE_RMD_CHUNKING, false);
+    String maxRecordSizeBytesStr = (String) jobProps
+        .getOrDefault(VeniceWriter.MAX_RECORD_SIZE_BYTES, String.valueOf(VeniceWriter.UNLIMITED_MAX_RECORD_SIZE));
     VenicePartitioner partitioner = PartitionUtils.getVenicePartitioner(props);
 
+    String topicName = props.getString(TOPIC_PROP);
     VeniceWriterOptions options =
-        new VeniceWriterOptions.Builder(props.getString(TOPIC_PROP)).setKeySerializer(new DefaultSerializer())
-            .setValueSerializer(new DefaultSerializer())
-            .setWriteComputeSerializer(new DefaultSerializer())
+        new VeniceWriterOptions.Builder(topicName).setKeyPayloadSerializer(new DefaultSerializer())
+            .setValuePayloadSerializer(new DefaultSerializer())
+            .setWriteComputePayloadSerializer(new DefaultSerializer())
             .setChunkingEnabled(chunkingEnabled)
             .setRmdChunkingEnabled(rmdChunkingEnabled)
             .setTime(SystemTime.INSTANCE)
             .setPartitionCount(getPartitionCount())
             .setPartitioner(partitioner)
+            .setMaxRecordSizeBytes(Integer.parseInt(maxRecordSizeBytesStr))
             .build();
-    return veniceWriterFactoryFactory.createVeniceWriter(options);
+    String flatViewConfigMapString = props.getString(PUSH_JOB_VIEW_CONFIGS, "");
+    AbstractVeniceWriter<byte[], byte[], byte[]> baseWriter;
+    if (!flatViewConfigMapString.isEmpty()) {
+      mainWriter = veniceWriterFactoryFactory.createVeniceWriter(options);
+      baseWriter = createCompositeVeniceWriter(
+          veniceWriterFactoryFactory,
+          mainWriter,
+          flatViewConfigMapString,
+          topicName,
+          chunkingEnabled,
+          rmdChunkingEnabled);
+    } else {
+      baseWriter = veniceWriterFactoryFactory.createVeniceWriter(options);
+    }
+    return maybeDecorateForDualWriteToExternalStorage(baseWriter, topicName);
+  }
+
+  /**
+   * If the VPJ dual-write external-storage gate is on, reflectively load the configured
+   * {@link ExternalStorageWriter} impl, configure it for this task, and wrap {@code baseWriter} so each
+   * record lands in both Venice and the external sink. Otherwise return {@code baseWriter} unchanged.
+   */
+  private AbstractVeniceWriter<byte[], byte[], byte[]> maybeDecorateForDualWriteToExternalStorage(
+      AbstractVeniceWriter<byte[], byte[], byte[]> baseWriter,
+      String topicName) {
+    if (!ExternalStorageWriteUtils.isDualWriteToExternalStorageFromVpjEnabled(props)) {
+      return baseWriter;
+    }
+    List<String> dualWriteRegions = ExternalStorageWriteUtils.getDualWriteTargetRegions(props);
+    // From here on, anything that throws must release the already-constructed Kafka-side writers
+    // ({@code baseWriter} for the no-views case; {@code mainWriter} + {@code childWriters} for the
+    // composite-view case) AND any per-region external writers already loaded in this method. The reflective
+    // loader closes the external writer it is constructing on configure failure, but earlier successfully
+    // loaded regional writers and the Kafka side aren't protected by it. Wrap the whole decoration so a
+    // retry-prone Spark task doesn't pile up producer/connection leaks across attempts.
+    List<ExternalStorageWriter> externalWriters = new ArrayList<>(dualWriteRegions.size());
+    try {
+      // Validate the buffer threshold and retry policy before touching the impl so a bad config can't
+      // allocate (and then leak) external resources.
+      int batchSize = props.getInt(PUSH_JOB_EXTERNAL_STORAGE_BATCH_SIZE, DEFAULT_PUSH_JOB_EXTERNAL_STORAGE_BATCH_SIZE);
+      if (batchSize < 1) {
+        throw new VeniceException(PUSH_JOB_EXTERNAL_STORAGE_BATCH_SIZE + " must be >= 1, got " + batchSize);
+      }
+      int batchPutRetries =
+          props.getInt(PUSH_JOB_EXTERNAL_STORAGE_BATCHPUT_RETRIES, DEFAULT_PUSH_JOB_EXTERNAL_STORAGE_BATCHPUT_RETRIES);
+      if (batchPutRetries < 0) {
+        throw new VeniceException(PUSH_JOB_EXTERNAL_STORAGE_BATCHPUT_RETRIES + " must be >= 0, got " + batchPutRetries);
+      }
+      long batchPutRetryBackoffMs = props.getLong(
+          PUSH_JOB_EXTERNAL_STORAGE_BATCHPUT_RETRY_BACKOFF_MS,
+          DEFAULT_PUSH_JOB_EXTERNAL_STORAGE_BATCHPUT_RETRY_BACKOFF_MS);
+      if (batchPutRetryBackoffMs < 0) {
+        throw new VeniceException(
+            PUSH_JOB_EXTERNAL_STORAGE_BATCHPUT_RETRY_BACKOFF_MS + " must be >= 0, got " + batchPutRetryBackoffMs);
+      }
+      boolean failOpenOnRegionFailure = props.getBoolean(
+          PUSH_JOB_EXTERNAL_STORAGE_FAIL_OPEN_ON_REGION_FAILURE,
+          DEFAULT_PUSH_JOB_EXTERNAL_STORAGE_FAIL_OPEN_ON_REGION_FAILURE);
+      String writerClassName = props.getString(PUSH_JOB_EXTERNAL_STORAGE_WRITER_CLASS);
+      int partitionId = getEngineTaskConfigProvider().getTaskId();
+      // One external writer per DUAL_WRITE region; each is configured with its region name so the impl
+      // routes to that region's endpoint. loadAndConfigure validates the class implements
+      // ExternalStorageWriter, instantiates it, and closes the impl on configure() failure so
+      // partially-initialized writers don't leak.
+      for (String region: dualWriteRegions) {
+        externalWriters
+            .add(ExternalStorageWriteUtils.loadAndConfigure(writerClassName, props, topicName, partitionId, region));
+      }
+      // Optional per-region rate limiting. The configured global record/byte rate is the budget for one
+      // region; it is split evenly across this region's partitionCount partition-writer tasks, so each task
+      // (including this one) gets its own throttler sized to globalRate/partitionCount. Separate instances per
+      // region keep each region at its full per-region budget rather than sharing one bucket. The quota source
+      // sits behind ExternalStorageWriteQuotaProvider so it can later derive from something other than config.
+      ExternalStorageWriteQuotaProvider quota = new ConfigBackedExternalStorageWriteQuotaProvider(props);
+      long externalRecordRate = quota.getRecordRatePerSecond();
+      long externalByteRate = quota.getByteRatePerSecond();
+      List<ExternalStorageWriteThrottler> throttlers =
+          buildExternalStorageThrottlers(externalRecordRate, externalByteRate, dualWriteRegions.size());
+      LOGGER.info(
+          "Dual-write to external storage enabled for replica {} via impl {} for regions {} "
+              + "(batchSize={}, batchPutRetries={}, batchPutRetryBackoffMs={}, failOpenOnRegionFailure={}, "
+              + "recordThrottle={}, byteThrottle={})",
+          Utils.getReplicaId(topicName, partitionId),
+          writerClassName,
+          dualWriteRegions,
+          batchSize,
+          batchPutRetries,
+          batchPutRetryBackoffMs,
+          failOpenOnRegionFailure,
+          describeThrottle(externalRecordRate, "records/sec"),
+          describeThrottle(externalByteRate, "bytes/sec"));
+      return new DualWriteVeniceWriter(
+          topicName,
+          baseWriter,
+          externalWriters,
+          dualWriteRegions,
+          throttlers,
+          batchSize,
+          batchPutRetries,
+          batchPutRetryBackoffMs,
+          failOpenOnRegionFailure,
+          getDataWriterTaskTracker());
+    } catch (RuntimeException t) {
+      for (ExternalStorageWriter externalWriter: externalWriters) {
+        Utils.closeQuietlyWithErrorLogged(externalWriter);
+      }
+      Utils.closeQuietlyWithErrorLogged(baseWriter);
+      if (mainWriter != null) {
+        Utils.closeQuietlyWithErrorLogged(mainWriter);
+      }
+      if (childWriters != null) {
+        for (AbstractVeniceWriter<byte[], byte[], byte[]> child: childWriters) {
+          Utils.closeQuietlyWithErrorLogged(child);
+        }
+      }
+      throw t;
+    }
+  }
+
+  /**
+   * Build the per-region throttler list for the dual-write fan-out, or {@code null} when neither a record nor
+   * a byte quota is configured (throttling off). Each region gets an independent throttler instance so the
+   * per-region budgets are enforced separately; the configured global rate is split evenly across the
+   * {@link #getPartitionCount()} partition-writer tasks.
+   */
+  @VisibleForTesting
+  List<ExternalStorageWriteThrottler> buildExternalStorageThrottlers(
+      long globalRecordRate,
+      long globalByteRate,
+      int regionCount) {
+    List<ExternalStorageWriteThrottler> throttlers = new ArrayList<>(regionCount);
+    boolean anyEnabled = false;
+    for (int i = 0; i < regionCount; i++) {
+      ExternalStorageWriteThrottler throttler =
+          ExternalStorageWriteThrottler.create(globalRecordRate, globalByteRate, getPartitionCount());
+      throttlers.add(throttler);
+      anyEnabled |= throttler != null;
+    }
+    return anyEnabled ? throttlers : null;
+  }
+
+  /** Render one throttle dimension for logs: {@code "off"} when disabled ({@code <= 0}), else its per-region rate. */
+  private static String describeThrottle(long globalRatePerSecond, String unit) {
+    return globalRatePerSecond <= 0 ? "off" : globalRatePerSecond + " " + unit + " per region";
+  }
+
+  /**
+   * Create {@link CompositeVeniceWriter} for writing to materialized views. If a
+   * {@link com.linkedin.venice.partitioner.ComplexVenicePartitioner} is involved we will also initialize schema, deser,
+   * and compressor in order to provide the appropriate value extractor. Calling compressor.get() eagerly to force out
+   * any potential issues early and protect against property/config changes later.
+   */
+  private AbstractVeniceWriter<byte[], byte[], byte[]> createCompositeVeniceWriter(
+      VeniceWriterFactory factory,
+      VeniceWriter<byte[], byte[], byte[]> mainWriter,
+      String flatViewConfigMapString,
+      String topicName,
+      boolean chunkingEnabled,
+      boolean rmdChunkingEnabled) {
+    try {
+      Map<String, ViewConfig> viewConfigMap = ViewUtils.parseViewConfigMapString(flatViewConfigMapString);
+      childWriters = new ComplexVeniceWriter[viewConfigMap.size()];
+      String storeName = Version.parseStoreFromKafkaTopicName(topicName);
+      int versionNumber = Version.parseVersionFromKafkaTopicName(topicName);
+      // TODO using a dummy Version to get venice writer options could be error prone. Alternatively we could change
+      // the abstract method, getWriterOptionsBuilder's signature.
+      Version version = new VersionImpl(storeName, versionNumber, "ignored");
+      version.setChunkingEnabled(chunkingEnabled);
+      version.setRmdChunkingEnabled(rmdChunkingEnabled);
+      // Default deser and decompress function for simple partitioner where value provider is never going to be used.
+      BiFunction<byte[], Integer, GenericRecord> valueExtractor = (valueBytes, valueSchemaId) -> null;
+      boolean complexPartitionerConfigured = false;
+      int index = 0;
+      for (ViewConfig viewConfig: viewConfigMap.values()) {
+        VeniceView view = ViewUtils
+            .getVeniceView(viewConfig.getViewClassName(), new Properties(), storeName, viewConfig.getViewParameters());
+        String viewTopic = view.getTopicNamesAndConfigsForVersion(versionNumber).keySet().stream().findAny().get();
+        if (view instanceof MaterializedView) {
+          MaterializedView materializedView = (MaterializedView) view;
+          if (materializedView.getViewPartitioner()
+              .getPartitionerType() == VenicePartitioner.VenicePartitionerType.COMPLEX
+              && !complexPartitionerConfigured) {
+            // Initialize value schemas, deser cache and other variables needed by ComplexVenicePartitioner
+            initializeSchemaSourceAndDeserCache();
+            compressor.get();
+            valueExtractor = (valueBytes, valueSchemaId) -> {
+              byte[] decompressedBytes;
+              if (compressor.get() == null) {
+                decompressedBytes = valueBytes;
+              } else {
+                try {
+                  decompressedBytes =
+                      ByteUtils.extractByteArray(compressor.get().decompress(valueBytes, 0, valueBytes.length));
+                } catch (IOException e) {
+                  throw new VeniceException("Unable to decompress value bytes", e);
+                }
+              }
+              return valueDeserializerCache.computeIfAbsent(valueSchemaId, this::getValueDeserializer)
+                  .deserialize(decompressedBytes);
+            };
+            // We only need to configure these variables once per CompositeVeniceWriter
+            complexPartitionerConfigured = true;
+          }
+          childWriters[index++] =
+              factory.createComplexVeniceWriter(view.getWriterOptionsBuilder(viewTopic, version).build());
+        } else {
+          throw new UnsupportedOperationException("Only materialized view is supported in VPJ");
+        }
+      }
+      return new CompositeVeniceWriter<byte[], byte[], byte[]>(
+          topicName,
+          mainWriter,
+          childWriters,
+          new ChildWriterProducerCallback(),
+          valueExtractor);
+    } catch (Exception e) {
+      String errorMessage = String.format("Failed to create composite writer for push to store version: %s", topicName);
+      LOGGER.error(errorMessage, e);
+      throw new VeniceException(errorMessage);
+    }
+  }
+
+  private void initializeSchemaSourceAndDeserCache() throws IOException {
+    schemaSource = new HDFSSchemaSource(props.getString(VALUE_SCHEMA_DIR), props.getString(RMD_SCHEMA_DIR));
+    valueSchemaMap = schemaSource.fetchValueSchemas();
+    valueDeserializerCache = new VeniceConcurrentHashMap<>();
+  }
+
+  private RecordDeserializer<GenericRecord> getValueDeserializer(int valueSchemaId) {
+    Schema schema = valueSchemaMap.get(valueSchemaId);
+    return FastSerializerDeserializerFactory.getFastAvroGenericDeserializer(schema, schema);
   }
 
   private void telemetry() {
@@ -411,13 +849,63 @@ public abstract class AbstractPartitionWriter extends AbstractDataWriterTask imp
       logMessageProgress();
       if (veniceWriter != null) {
         boolean shouldEndAllSegments = false;
+        IOException closeError = null;
         try {
-          veniceWriter.flush();
-          shouldEndAllSegments = messageErrored.get() == 0 && messageSent == messageCompleted.get()
-              && (dataWriterTaskTracker == null || dataWriterTaskTracker.getProgress() == TaskTracker.PROGRESS_COMPLETED
-                  || dataWriterTaskTracker.getProgress() == TaskTracker.PROGRESS_NOT_SUPPORTED);
+          try {
+            veniceWriter.flush();
+            shouldEndAllSegments = messageErrored.get() == 0 && messageSent == messageCompleted.get()
+                && (dataWriterTaskTracker == null
+                    || dataWriterTaskTracker.getProgress() == TaskTracker.PROGRESS_COMPLETED
+                    || dataWriterTaskTracker.getProgress() == TaskTracker.PROGRESS_NOT_SUPPORTED);
+          } finally {
+            try {
+              veniceWriter.close(shouldEndAllSegments);
+            } catch (IOException e) {
+              closeError = e;
+            }
+          }
         } finally {
-          veniceWriter.close(shouldEndAllSegments);
+          // When views are configured we also need to close the per-view child writers and the inner
+          // main version-topic writer. Check {@code mainWriter != null} rather than
+          // {@code veniceWriter instanceof CompositeVeniceWriter} so the cleanup still runs when the
+          // composite is wrapped by a {@link DualWriteVeniceWriter} (dual-write + views combination).
+          // {@code mainWriter} is non-null iff {@code createBasicVeniceWriter} took the composite
+          // branch. The cleanup runs in this {@code finally} so that an exception from
+          // {@code veniceWriter.close(...)} above (e.g. an {@link IOException} bubbling out of
+          // {@code ExternalStorageWriter.close()} via {@code DualWriteVeniceWriter}) does not orphan
+          // the underlying view writers. Cascading errors are attached to the first one via
+          // {@link Throwable#addSuppressed}.
+          if (mainWriter != null) {
+            if (childWriters != null) {
+              for (AbstractVeniceWriter childWriter: childWriters) {
+                try {
+                  childWriter.close(shouldEndAllSegments);
+                } catch (IOException | RuntimeException e) {
+                  if (closeError == null) {
+                    closeError = e instanceof IOException ? (IOException) e : new IOException(e);
+                  } else {
+                    closeError.addSuppressed(e);
+                  }
+                }
+              }
+            }
+            try {
+              mainWriter.close(shouldEndAllSegments);
+            } catch (Exception e) {
+              // Static type {@code VeniceWriter.close(boolean)} doesn't declare {@link IOException},
+              // so this catch is currently {@link RuntimeException}-shaped, but use {@link Exception}
+              // so a future change that introduces a checked close exception (or a wrapped runtime
+              // surface from a Closeable resource) still ends up in the suppression chain.
+              if (closeError == null) {
+                closeError = e instanceof IOException ? (IOException) e : new IOException(e);
+              } else {
+                closeError.addSuppressed(e);
+              }
+            }
+          }
+        }
+        if (closeError != null) {
+          throw closeError;
         }
       }
       maybePropagateCallbackException();
@@ -426,6 +914,12 @@ public abstract class AbstractPartitionWriter extends AbstractDataWriterTask imp
       if (messageSent != messageCompleted.get()) {
         throw new VeniceException(
             "Message sent: " + messageSent + " doesn't match message completed: " + messageCompleted.get());
+      }
+      if (schemaSource != null) {
+        schemaSource.close();
+      }
+      if (compressorFactory.isPresent()) {
+        compressorFactory.get().close();
       }
     } finally {
       Utils.closeQuietlyWithErrorLogged(duplicateKeyPrinter);
@@ -444,15 +938,49 @@ public abstract class AbstractPartitionWriter extends AbstractDataWriterTask imp
 
   @Override
   protected void configureTask(VeniceProperties props) {
-    this.props = props;
+    /*
+     * Resolve PUBSUB_BROKER_ADDRESS from VENICE_PUSH_DESTINATION_PUBSUB_BROKER so that all downstream
+     * code (VeniceWriterFactory, DictionaryUtils, etc.) can find the broker address without relying
+     * on KAFKA_BOOTSTRAP_SERVERS in the global config. This is done once here rather than at each
+     * point of use.
+     *
+     * For regular HDFS-input pushes: VeniceWriterFactory uses this to produce to the destination broker.
+     * For KIF repush: the destination broker differs from the source broker (cross-fabric scenario),
+     * so this resolution ensures VeniceWriterFactory always targets the correct destination, not the
+     * input source broker. The compressor lazy also reads the ZSTD dictionary from the destination
+     * topic (TOPIC_PROP), which the VPJ driver populated before launching the compute job.
+     */
+    VeniceProperties resolvedProps;
+    if (props.containsKey(VENICE_PUSH_DESTINATION_PUBSUB_BROKER)) {
+      Properties enriched = props.toProperties();
+      enriched.setProperty(PUBSUB_BROKER_ADDRESS, props.getString(VENICE_PUSH_DESTINATION_PUBSUB_BROKER));
+      resolvedProps = new VeniceProperties(enriched);
+    } else if (props.containsKey(KAFKA_INPUT_TOPIC)) {
+      /* Repush requires an explicit destination broker to avoid writing to the source broker. */
+      throw new VeniceException(
+          VENICE_PUSH_DESTINATION_PUBSUB_BROKER + " is required for KIF repush but was not found in task properties");
+    } else {
+      resolvedProps = props;
+    }
+    this.props = resolvedProps;
     this.isDuplicateKeyAllowed = props.getBoolean(ALLOW_DUPLICATE_KEY, false);
     this.valueSchemaId = props.getInt(VALUE_SCHEMA_ID_PROP);
     this.derivedValueSchemaId = (props.containsKey(DERIVED_SCHEMA_ID_PROP)) ? props.getInt(DERIVED_SCHEMA_ID_PROP) : -1;
     this.enableWriteCompute = (props.containsKey(ENABLE_WRITE_COMPUTE)) && props.getBoolean(ENABLE_WRITE_COMPUTE);
     this.duplicateKeyPrinter = initDuplicateKeyPrinter(props);
     this.telemetryMessageInterval = props.getInt(TELEMETRY_MESSAGE_INTERVAL, 10000);
+    this.enableUncompressedRecordSizeLimit =
+        props.getBoolean(VeniceWriter.ENABLE_UNCOMPRESSED_RECORD_SIZE_LIMIT, false);
     this.callback = new PartitionWriterProducerCallback();
+    String rmdSchemaProp = props.getString(RMD_SCHEMA_PROP, "");
+    if (rmdSchemaProp.isEmpty()) {
+      this.rmdSchema = null;
+    } else {
+      this.rmdSchemaId = props.getInt(RMD_SCHEMA_ID_PROP);
+      this.rmdSchema = AvroCompatibilityHelper.parse(props.getString(RMD_SCHEMA_PROP));
+    }
     initStorageQuotaFields(props);
+    initIncrementalPushThrottlers(props);
     /**
      * A dummy background task that reports progress every 5 minutes.
      */
@@ -461,6 +989,46 @@ public abstract class AbstractPartitionWriter extends AbstractDataWriterTask imp
         this.dataWriterTaskTracker.heartbeat();
       }
     }, 0, 5, TimeUnit.MINUTES);
+
+    veniceWriterFactory = Lazy.of(() -> {
+      Properties writerProps = this.props.toProperties();
+      // Closing segments based on elapsed time should always be disabled in data writer compute jobs to prevent storage
+      // nodes from consuming out of order keys when speculative execution is enabled.
+      writerProps.put(VeniceWriter.MAX_ELAPSED_TIME_FOR_SEGMENT_IN_MS, -1);
+      EngineTaskConfigProvider engineTaskConfigProvider = getEngineTaskConfigProvider();
+      Properties jobProps = engineTaskConfigProvider.getJobProps();
+      // Use the UUID bits created by the VPJ driver to build a producerGUID deterministically
+      String guidGenerator = jobProps.getProperty(GuidUtils.GUID_GENERATOR_IMPLEMENTATION);
+      if (guidGenerator == null || !guidGenerator.equals(DEFAULT_GUID_GENERATOR_IMPLEMENTATION)) {
+        writerProps.put(GuidUtils.GUID_GENERATOR_IMPLEMENTATION, GuidUtils.DETERMINISTIC_GUID_GENERATOR_IMPLEMENTATION);
+        writerProps.put(PUSH_JOB_GUID_MOST_SIGNIFICANT_BITS, jobProps.getProperty(PUSH_JOB_GUID_MOST_SIGNIFICANT_BITS));
+        writerProps
+            .put(PUSH_JOB_GUID_LEAST_SIGNIFICANT_BITS, jobProps.getProperty(PUSH_JOB_GUID_LEAST_SIGNIFICANT_BITS));
+      }
+      return new VeniceWriterFactory(writerProps);
+    });
+
+    compressor = Lazy.of(() -> {
+      if (props.containsKey(KAFKA_INPUT_TOPIC)) {
+        // Configure compressor using kafka input configs
+        String sourceVersion = props.getString(KAFKA_INPUT_TOPIC);
+        String repushSourcePubsubBroker = props.getString(VENICE_REPUSH_SOURCE_PUBSUB_BROKER);
+        CompressionStrategy strategy =
+            CompressionStrategy.valueOf(props.getString(KAFKA_INPUT_SOURCE_COMPRESSION_STRATEGY));
+        return KafkaInputUtils
+            .getCompressor(compressorFactory.get(), strategy, repushSourcePubsubBroker, sourceVersion, props);
+      } else {
+        CompressionStrategy strategy = CompressionStrategy.valueOf(props.getString(COMPRESSION_STRATEGY));
+        if (strategy == CompressionStrategy.ZSTD_WITH_DICT) {
+          String topicName = props.getString(TOPIC_PROP);
+          ByteBuffer dict = DictionaryUtils.readDictionaryFromKafka(topicName, props);
+          return compressorFactory.get()
+              .createVersionSpecificCompressorIfNotExist(strategy, topicName, ByteUtils.extractByteArray(dict));
+        } else {
+          return compressorFactory.get().getCompressor(strategy);
+        }
+      }
+    });
   }
 
   private void initStorageQuotaFields(VeniceProperties props) {
@@ -474,6 +1042,72 @@ public abstract class AbstractPartitionWriter extends AbstractDataWriterTask imp
     } else {
       exceedQuota = inputStorageQuotaTracker.exceedQuota(getTotalIncomingDataSizeInBytes());
     }
+  }
+
+  /**
+   * Initialize the incremental-push write-quota throttler from the driver-computed per-partition quota. The driver
+   * already folded in the incremental-push / separate-real-time-topic / disabled decision and the global-quota split
+   * (see {@link IncrementalPushWriteQuotaUtils#perPartitionQuotaForPush}), so a forwarded value {@code <= 0} means no
+   * throttling and this method is a no-op.
+   */
+  private void initIncrementalPushThrottlers(VeniceProperties props) {
+    long perPartitionRecordsPerSecond =
+        props.getLong(INCREMENTAL_PUSH_WRITE_QUOTA_RECORDS_PER_SECOND_PER_PARTITION, -1);
+    if (perPartitionRecordsPerSecond <= 0) {
+      return;
+    }
+
+    String storeName = Version.parseStoreFromKafkaTopicName(props.getString(TOPIC_PROP));
+    String rateLimiterTypeStr = props
+        .getString(INCREMENTAL_PUSH_RATE_LIMITER_TYPE, VeniceRateLimiter.RateLimiterType.GUAVA_RATE_LIMITER.name());
+    VeniceRateLimiter.RateLimiterType rateLimiterType;
+    try {
+      rateLimiterType = VeniceRateLimiter.RateLimiterType.valueOf(rateLimiterTypeStr);
+    } catch (IllegalArgumentException e) {
+      rateLimiterType = VeniceRateLimiter.RateLimiterType.GUAVA_RATE_LIMITER;
+      LOGGER.warn(
+          "Invalid incremental push rate limiter type '{}' for store {}, falling back to {}",
+          rateLimiterTypeStr,
+          storeName,
+          rateLimiterType);
+    }
+
+    switch (rateLimiterType) {
+      case EVENT_THROTTLER_WITH_SILENT_REJECTION:
+        this.recordsThrottler = new EventThrottler(
+            perPartitionRecordsPerSecond,
+            storeName + "_incremental_push_records_throttler",
+            true,
+            EventThrottler.REJECT_STRATEGY);
+        break;
+      case TOKEN_BUCKET_INCREMENTAL_REFILL:
+      case TOKEN_BUCKET_GREEDY_REFILL:
+        long timeWindowMs = props.getLong(INCREMENTAL_PUSH_WRITE_QUOTA_TIME_WINDOW_MS, 1000);
+        if (timeWindowMs <= 0) {
+          LOGGER.warn(
+              "Invalid incremental push time window {} ms for store {}, falling back to default 1000 ms",
+              timeWindowMs,
+              storeName);
+          timeWindowMs = 1000;
+        }
+        int capacityMultiple = rateLimiterType == VeniceRateLimiter.RateLimiterType.TOKEN_BUCKET_GREEDY_REFILL ? 5 : 2;
+        this.recordsThrottler = TokenBucket.tokenBucketFromRcuPerSecond(
+            perPartitionRecordsPerSecond,
+            1.0,
+            timeWindowMs,
+            capacityMultiple,
+            Clock.systemUTC());
+        break;
+      case GUAVA_RATE_LIMITER:
+      default:
+        this.recordsThrottler = new GuavaRateLimiter(perPartitionRecordsPerSecond);
+        break;
+    }
+    LOGGER.info(
+        "Initialized incremental push records throttler for store {}: {} records/sec per partition-writer task, type: {}",
+        storeName,
+        perPartitionRecordsPerSecond,
+        rateLimiterType);
   }
 
   /**
@@ -542,26 +1176,15 @@ public abstract class AbstractPartitionWriter extends AbstractDataWriterTask imp
 
     private final boolean isDupKeyAllowed;
 
-    private final Schema keySchema;
-    private final RecordDeserializer<?> keyDeserializer;
-    private final GenericDatumWriter<Object> avroDatumWriter;
     private int numOfDupKey = 0;
 
     DuplicateKeyPrinter(VeniceProperties props) {
       this.isDupKeyAllowed = props.getBoolean(ALLOW_DUPLICATE_KEY, false);
-
-      AbstractVeniceRecordReader schemaReader = props.getBoolean(VSON_PUSH, false)
-          ? new VeniceVsonRecordReader(props)
-          : VeniceAvroRecordReader.fromProps(props);
-      this.keySchema = schemaReader.getKeySchema();
-      this.keyDeserializer = FastSerializerDeserializerFactory.getFastAvroGenericDeserializer(keySchema, keySchema);
-      this.avroDatumWriter = new GenericDatumWriter<>(keySchema);
     }
 
     protected void detectAndHandleDuplicateKeys(
-        byte[] keyBytes,
         byte[] valueBytes,
-        Iterator<byte[]> values,
+        Iterator<VeniceRecordWithMetadata> values,
         DataWriterTaskTracker dataWriterTaskTracker) {
       if (numOfDupKey > MAX_NUM_OF_LOG) {
         return;
@@ -571,12 +1194,13 @@ public abstract class AbstractPartitionWriter extends AbstractDataWriterTask imp
       int identicalValuesToKeyCount = 0;
 
       while (values.hasNext()) {
-        if (Arrays.equals(values.next(), valueBytes)) {
+        if (Arrays.equals(values.next().getValue(), valueBytes)) {
           // Identical values map to the same key. E.g. key:[ value_1, value_1]
           identicalValuesToKeyCount++;
           if (shouldPrint) {
             shouldPrint = false;
-            LOGGER.warn(printDuplicateKey(keyBytes));
+            numOfDupKey++;
+            LOGGER.warn("There are multiple records for the same key");
           }
         } else {
           // Distinct values map to the same key. E.g. key:[ value_1, value_2 ]
@@ -585,28 +1209,14 @@ public abstract class AbstractPartitionWriter extends AbstractDataWriterTask imp
           if (isDupKeyAllowed) {
             if (shouldPrint) {
               shouldPrint = false;
-              LOGGER.warn(printDuplicateKey(keyBytes));
+              numOfDupKey++;
+              LOGGER.warn("There are multiple records for the same key");
             }
           }
         }
       }
       dataWriterTaskTracker.trackDuplicateKeyWithIdenticalValue(identicalValuesToKeyCount);
       dataWriterTaskTracker.trackDuplicateKeyWithDistinctValue(distinctValuesToKeyCount);
-    }
-
-    private String printDuplicateKey(byte[] keyBytes) {
-      Object keyRecord = keyDeserializer.deserialize(keyBytes);
-      try (ByteArrayOutputStream output = new ByteArrayOutputStream()) {
-        Encoder jsonEncoder = AvroCompatibilityHelper.newJsonEncoder(keySchema, output, false);
-        avroDatumWriter.write(keyRecord, jsonEncoder);
-        jsonEncoder.flush();
-        output.flush();
-
-        numOfDupKey++;
-        return String.format("There are multiple records for key:\n%s", new String(output.toByteArray()));
-      } catch (IOException exception) {
-        throw new VeniceException(exception);
-      }
     }
 
     @Override
@@ -638,6 +1248,18 @@ public abstract class AbstractPartitionWriter extends AbstractDataWriterTask imp
         }
       }
 
+      // Report progress so compute framework won't kill current task when it finishes
+      // sending all the messages to PubSub system, but not yet flushed and closed.
+      dataWriterTaskTracker.heartbeat();
+    }
+  }
+
+  public class ChildWriterProducerCallback implements PubSubProducerCallback {
+    @Override
+    public void onCompletion(PubSubProduceResult produceResult, Exception exception) {
+      if (exception != null) {
+        LOGGER.error("Exception thrown in composite writer's child send message callback", exception);
+      }
       // Report progress so compute framework won't kill current task when it finishes
       // sending all the messages to PubSub system, but not yet flushed and closed.
       dataWriterTaskTracker.heartbeat();

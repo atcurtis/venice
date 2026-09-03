@@ -9,8 +9,21 @@ public class TopicPartitionIngestionInfo {
   private long offsetLag;
   private double msgRate;
   private double byteRate;
-  private int consumerIdx;
-  private long elapsedTimeSinceLastPollInMs;
+  private String consumerIdStr;
+  /**
+   * Tracks how much time has passed since the last Kafka consumer poll operation, regardless of whether any records were received.
+   * This field helps monitor the overall consumer health and polling activity.
+   * For example, if this value is too high, it might indicate that the consumer is not actively polling or is experiencing issues.
+   */
+  private long elapsedTimeSinceLastConsumerPollInMs;
+  /**
+   * Tracks how much time has passed since the last time any records were actually received for this specific topic partition.
+   * Unlike elapsedTimeSinceLastConsumerPollInMs which tracks any poll attempt, this field only considers polls that returned data
+   * for this particular partition.
+   * This helps identify partitions that haven't received new data for a while, which could indicate upstream issues or partition-specific delays.
+   */
+  private long elapsedTimeSinceLastRecordForPartitionInMs;
+  private String versionTopicName;
 
   @JsonCreator
   public TopicPartitionIngestionInfo(
@@ -18,14 +31,18 @@ public class TopicPartitionIngestionInfo {
       @JsonProperty("offsetLag") long offsetLag,
       @JsonProperty("msgRate") double msgRate,
       @JsonProperty("byteRate") double byteRate,
-      @JsonProperty("consumerIdx") int consumerIdx,
-      @JsonProperty("elapsedTimeSinceLastPollInMs") long elapsedTimeSinceLastPollInMs) {
+      @JsonProperty("consumerIdStr") String consumerIdStr,
+      @JsonProperty("elapsedTimeSinceLastPollInMs") long elapsedTimeSinceLastConsumerPollInMs,
+      @JsonProperty("elapsedTimeSinceLastPolledRecordsInMs") long elapsedTimeSinceLastRecordForPartitionInMs,
+      @JsonProperty("versionTopicName") String versionTopicName) {
     this.latestOffset = latestOffset;
     this.offsetLag = offsetLag;
     this.msgRate = msgRate;
     this.byteRate = byteRate;
-    this.consumerIdx = consumerIdx;
-    this.elapsedTimeSinceLastPollInMs = elapsedTimeSinceLastPollInMs;
+    this.consumerIdStr = consumerIdStr;
+    this.elapsedTimeSinceLastConsumerPollInMs = elapsedTimeSinceLastConsumerPollInMs;
+    this.elapsedTimeSinceLastRecordForPartitionInMs = elapsedTimeSinceLastRecordForPartitionInMs;
+    this.versionTopicName = versionTopicName;
   }
 
   public long getLatestOffset() {
@@ -56,20 +73,36 @@ public class TopicPartitionIngestionInfo {
     this.byteRate = byteRate;
   }
 
-  public int getConsumerIdx() {
-    return consumerIdx;
+  public String getConsumerIdStr() {
+    return consumerIdStr;
   }
 
-  public void setConsumerIdx(int consumerIdx) {
-    this.consumerIdx = consumerIdx;
+  public void setConsumerIdStr(String consumerIdStr) {
+    this.consumerIdStr = consumerIdStr;
   }
 
-  public long getElapsedTimeSinceLastPollInMs() {
-    return elapsedTimeSinceLastPollInMs;
+  public long getElapsedTimeSinceLastConsumerPollInMs() {
+    return elapsedTimeSinceLastConsumerPollInMs;
   }
 
-  public void setElapsedTimeSinceLastPollInMs(long elapsedTimeSinceLastPollInMs) {
-    this.elapsedTimeSinceLastPollInMs = elapsedTimeSinceLastPollInMs;
+  public void setElapsedTimeSinceLastConsumerPollInMs(long elapsedTimeSinceLastConsumerPollInMs) {
+    this.elapsedTimeSinceLastConsumerPollInMs = elapsedTimeSinceLastConsumerPollInMs;
+  }
+
+  public long getElapsedTimeSinceLastRecordForPartitionInMs() {
+    return elapsedTimeSinceLastRecordForPartitionInMs;
+  }
+
+  public void setElapsedTimeSinceLastRecordForPartitionInMs(long elapsedTimeSinceLastRecordForPartitionInMs) {
+    this.elapsedTimeSinceLastRecordForPartitionInMs = elapsedTimeSinceLastRecordForPartitionInMs;
+  }
+
+  public String getVersionTopicName() {
+    return versionTopicName;
+  }
+
+  public void setVersionTopicName(String versionTopicName) {
+    this.versionTopicName = versionTopicName;
   }
 
   @Override
@@ -85,8 +118,12 @@ public class TopicPartitionIngestionInfo {
         && this.offsetLag == topicPartitionIngestionInfo.getOffsetLag()
         && Double.doubleToLongBits(this.msgRate) == Double.doubleToLongBits(topicPartitionIngestionInfo.getMsgRate())
         && Double.doubleToLongBits(this.byteRate) == Double.doubleToLongBits(topicPartitionIngestionInfo.getByteRate())
-        && this.consumerIdx == topicPartitionIngestionInfo.getConsumerIdx()
-        && this.elapsedTimeSinceLastPollInMs == topicPartitionIngestionInfo.getElapsedTimeSinceLastPollInMs();
+        && this.consumerIdStr.equals(topicPartitionIngestionInfo.getConsumerIdStr())
+        && this.elapsedTimeSinceLastConsumerPollInMs == topicPartitionIngestionInfo
+            .getElapsedTimeSinceLastConsumerPollInMs()
+        && this.elapsedTimeSinceLastRecordForPartitionInMs == topicPartitionIngestionInfo
+            .getElapsedTimeSinceLastRecordForPartitionInMs()
+        && this.versionTopicName.equals(topicPartitionIngestionInfo.getVersionTopicName());
   }
 
   @Override
@@ -95,8 +132,18 @@ public class TopicPartitionIngestionInfo {
     result = 31 * result + Long.hashCode(offsetLag);
     result = 31 * result + Double.hashCode(msgRate);
     result = 31 * result + Double.hashCode(byteRate);
-    result = 31 * result + consumerIdx;
-    result = 31 * result + Long.hashCode(elapsedTimeSinceLastPollInMs);
+    result = 31 * result + consumerIdStr.hashCode();
+    result = 31 * result + Long.hashCode(elapsedTimeSinceLastConsumerPollInMs);
+    result = 31 * result + Long.hashCode(elapsedTimeSinceLastRecordForPartitionInMs);
+    result = 31 * result + versionTopicName.hashCode();
     return result;
+  }
+
+  @Override
+  public String toString() {
+    return "{" + "latestOffset:" + latestOffset + ", offsetLag:" + offsetLag + ", msgRate:" + msgRate + ", byteRate:"
+        + byteRate + ", consumerIdStr:" + consumerIdStr + ", elapsedTimeSinceLastConsumerPollInMs:"
+        + elapsedTimeSinceLastConsumerPollInMs + ", elapsedTimeSinceLastRecordForPartitionInMs:"
+        + elapsedTimeSinceLastRecordForPartitionInMs + ", versionTopicName:" + versionTopicName + '}';
   }
 }

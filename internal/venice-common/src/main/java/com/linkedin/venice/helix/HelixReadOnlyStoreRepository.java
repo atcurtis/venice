@@ -22,9 +22,7 @@ public class HelixReadOnlyStoreRepository extends CachedReadOnlyStoreRepository 
   public HelixReadOnlyStoreRepository(
       ZkClient zkClient,
       HelixAdapterSerializer compositeSerializer,
-      String clusterName,
-      int refreshAttemptsForZkReconnect,
-      long refreshIntervalForZkReconnectInMs) {
+      String clusterName) {
     /**
      * HelixReadOnlyStoreRepository is used in router, server, fast-client, da-vinci and system store.
      * Its centralized locking should NOT be shared with other classes. Create a new instance.
@@ -82,9 +80,13 @@ public class HelixReadOnlyStoreRepository extends CachedReadOnlyStoreRepository 
   }
 
   protected void onStoreChanged(Store newStore) {
-    Store oldStore = putStore(newStore);
-    if (oldStore == null) {
-      LOGGER.warn("Out of order store change notification, storeName={}.", newStore.getName());
+    // The watch payload is the raw store znode (versions=[] post-migration). Re-read through getStoreFromZk so
+    // hydrateVersionsFromZk pulls the per-version znodes into the cached copy.
+    String storeName = newStore.getName();
+    boolean wasCached = storeMap.containsKey(storeName);
+    refreshOneStore(storeName);
+    if (!wasCached) {
+      LOGGER.warn("Out of order store change notification, storeName={}.", storeName);
     }
   }
 
@@ -118,15 +120,12 @@ public class HelixReadOnlyStoreRepository extends CachedReadOnlyStoreRepository 
 
   private final CachedResourceZkStateListener zkStateListener = new CachedResourceZkStateListener(this);
 
-  private final IZkChildListener zkStoreRepositoryListener = new IZkChildListener() {
-    @Override
-    public void handleChildChange(String path, List<String> children) {
-      if (!path.equals(clusterStoreRepositoryPath)) {
-        LOGGER.warn("Notification path mismatch, path={}, expected={}.", path, clusterStoreRepositoryPath);
-        return;
-      }
-      onRepositoryChanged(children);
+  private final IZkChildListener zkStoreRepositoryListener = (path, children) -> {
+    if (!path.equals(clusterStoreRepositoryPath)) {
+      LOGGER.warn("Notification path mismatch, path={}, expected={}.", path, clusterStoreRepositoryPath);
+      return;
     }
+    onRepositoryChanged(children);
   };
 
   private final IZkDataListener zkStoreListener = new IZkDataListener() {

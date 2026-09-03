@@ -1,17 +1,21 @@
 package com.linkedin.venice.hadoop.input.kafka.ttl;
 
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.REPUSH_TTL_ENABLE;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.REPUSH_TTL_POLICY;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.REPUSH_TTL_START_TIMESTAMP;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.RMD_SCHEMA_DIR;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.VALUE_SCHEMA_DIR;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.VENICE_STORE_NAME_PROP;
 import static com.linkedin.venice.schema.rmd.RmdConstants.REPLICATION_CHECKPOINT_VECTOR_FIELD_NAME;
 import static com.linkedin.venice.schema.rmd.RmdConstants.TIMESTAMP_FIELD_NAME;
 import static com.linkedin.venice.utils.TestWriteUtils.getTempDataDirectory;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.KAFKA_INPUT_SOURCE_COMPRESSION_STRATEGY;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.KAFKA_INPUT_TOPIC;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.REPUSH_TTL_ENABLE;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.REPUSH_TTL_POLICY;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.REPUSH_TTL_START_TIMESTAMP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.RMD_SCHEMA_DIR;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VALUE_SCHEMA_DIR;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_REPUSH_SOURCE_PUBSUB_BROKER;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_STORE_NAME_PROP;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 
+import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.controllerapi.ControllerClient;
 import com.linkedin.venice.controllerapi.MultiSchemaResponse;
 import com.linkedin.venice.hadoop.FilterChain;
@@ -59,6 +63,9 @@ public class TestVeniceKafkaInputTTLFilter {
     validProps.put(RMD_SCHEMA_DIR, getTempDataDirectory().getAbsolutePath());
     validProps.put(VALUE_SCHEMA_DIR, getTempDataDirectory().getAbsolutePath());
     validProps.put(VENICE_STORE_NAME_PROP, TEST_STORE);
+    validProps.put(KAFKA_INPUT_SOURCE_COMPRESSION_STRATEGY, CompressionStrategy.NO_OP.toString());
+    validProps.put(VENICE_REPUSH_SOURCE_PUBSUB_BROKER, "dummy");
+    validProps.put(KAFKA_INPUT_TOPIC, TEST_STORE + "_v1");
     VeniceProperties valid = new VeniceProperties(validProps);
     // set up HDFS schema source to write dummy RMD schemas on temp directory
     setupHDFS(valid);
@@ -170,6 +177,36 @@ public class TestVeniceKafkaInputTTLFilter {
         FastSerializerDeserializerFactory.getFastAvroGenericSerializer(RMD_SCHEMA)
             .serialize(generateRmdRecordWithValueLevelTimeStamp(timestamp)));
     return value;
+  }
+
+  @Test
+  public void testBatchRmdSentinelTimestampZeroNotFiltered() {
+    // ts=0 is the batch sentinel RMD written by addRmdToBatchPushForHybridStores.
+    // These records must NOT be TTL-filtered — they have no real timestamp.
+    // After RT writes arrive, DCR replaces ts=0 with a real timestamp.
+    KafkaInputMapperValue batchSentinel = generateKIMWithRmdTimeStamp(0L, false);
+    Assert.assertFalse(
+        filterWithSupportedPolicy.checkAndMaybeFilterValue(batchSentinel),
+        "Batch sentinel RMD (ts=0) must NOT be filtered by TTL");
+  }
+
+  @Test
+  public void testExpiredTimestampIsFiltered() {
+    // Verify that a real expired timestamp IS filtered (to confirm ts=0 guard is specific)
+    long expiredTimestamp = DUMMY_CURRENT_TIMESTAMP - (TTL_IN_SECONDS_DEFAULT * Time.MS_PER_SECOND + 1);
+    KafkaInputMapperValue expired = generateKIMWithRmdTimeStamp(expiredTimestamp, false);
+    Assert.assertTrue(
+        filterWithSupportedPolicy.checkAndMaybeFilterValue(expired),
+        "Expired real timestamp must be filtered by TTL");
+  }
+
+  @Test
+  public void testRecentTimestampNotFiltered() {
+    // Verify that a recent timestamp is NOT filtered
+    KafkaInputMapperValue recent = generateKIMWithRmdTimeStamp(DUMMY_CURRENT_TIMESTAMP, false);
+    Assert.assertFalse(
+        filterWithSupportedPolicy.checkAndMaybeFilterValue(recent),
+        "Recent timestamp must NOT be filtered by TTL");
   }
 
   private GenericRecord generateRmdRecordWithValueLevelTimeStamp(long timestamp) {

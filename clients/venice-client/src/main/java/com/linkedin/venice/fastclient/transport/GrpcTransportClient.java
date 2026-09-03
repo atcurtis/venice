@@ -12,19 +12,17 @@ import com.linkedin.venice.client.store.transport.TransportClient;
 import com.linkedin.venice.client.store.transport.TransportClientResponse;
 import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.fastclient.GrpcClientConfig;
-import com.linkedin.venice.grpc.GrpcErrorCodes;
 import com.linkedin.venice.grpc.GrpcUtils;
 import com.linkedin.venice.protocols.VeniceClientRequest;
 import com.linkedin.venice.protocols.VeniceReadServiceGrpc;
 import com.linkedin.venice.protocols.VeniceServerResponse;
+import com.linkedin.venice.response.VeniceReadResponseStatus;
 import com.linkedin.venice.security.SSLFactory;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import io.grpc.ChannelCredentials;
 import io.grpc.Grpc;
-import io.grpc.InsecureChannelCredentials;
 import io.grpc.ManagedChannel;
 import io.grpc.Status;
-import io.grpc.TlsChannelCredentials;
 import io.grpc.stub.StreamObserver;
 import java.io.IOException;
 import java.util.Arrays;
@@ -74,7 +72,7 @@ public class GrpcTransportClient extends InternalTransportClient {
     this.port = port;
     this.serverGrpcChannels = new VeniceConcurrentHashMap<>();
     this.stubCache = new VeniceConcurrentHashMap<>();
-    this.channelCredentials = buildChannelCredentials(sslFactory);
+    this.channelCredentials = GrpcUtils.buildChannelCredentials(sslFactory);
   }
 
   @Override
@@ -97,25 +95,6 @@ public class GrpcTransportClient extends InternalTransportClient {
     }
 
     r2TransportClientForNonStorageOps.close();
-  }
-
-  @VisibleForTesting
-  ChannelCredentials buildChannelCredentials(SSLFactory sslFactory) {
-    // TODO: Evaluate if this needs to fail instead since it depends on plain text support on server
-    if (sslFactory == null) {
-      return InsecureChannelCredentials.create();
-    }
-
-    try {
-      TlsChannelCredentials.Builder tlsBuilder = TlsChannelCredentials.newBuilder()
-          .keyManager(GrpcUtils.getKeyManagers(sslFactory))
-          .trustManager(GrpcUtils.getTrustManagers(sslFactory));
-      return tlsBuilder.build();
-    } catch (Exception e) {
-      throw new VeniceClientException(
-          "Failed to initialize SSL channel credentials for Venice gRPC Transport Client",
-          e);
-    }
   }
 
   @VisibleForTesting
@@ -267,7 +246,7 @@ public class GrpcTransportClient extends InternalTransportClient {
 
     @Override
     public void onNext(VeniceServerResponse value) {
-      if (value.getErrorCode() != GrpcErrorCodes.OK) {
+      if (value.getErrorCode() != VeniceReadResponseStatus.OK.getCode()) {
         handleResponseError(value);
         return;
       }
@@ -309,21 +288,16 @@ public class GrpcTransportClient extends InternalTransportClient {
       String errorMessage = response.getErrorMessage();
       Exception exception;
 
-      switch (statusCode) {
-        case GrpcErrorCodes.BAD_REQUEST:
-          exception = new VeniceClientHttpException(errorMessage, statusCode);
-          break;
-        case GrpcErrorCodes.TOO_MANY_REQUESTS:
-          exception = new VeniceClientRateExceededException(errorMessage);
-          break;
-        case GrpcErrorCodes.KEY_NOT_FOUND:
-          exception = null;
-          break;
-        default:
-          exception = new VeniceClientException(
-              String
-                  .format("An unexpected error occurred with status code: %d, message: %s", statusCode, errorMessage));
-          break;
+      VeniceReadResponseStatus responseStatus = VeniceReadResponseStatus.fromCode(statusCode);
+      if (responseStatus == VeniceReadResponseStatus.BAD_REQUEST) {
+        exception = new VeniceClientHttpException(errorMessage, statusCode);
+      } else if (responseStatus == VeniceReadResponseStatus.TOO_MANY_REQUESTS) {
+        exception = new VeniceClientRateExceededException(errorMessage);
+      } else if (responseStatus == VeniceReadResponseStatus.KEY_NOT_FOUND) {
+        exception = null;
+      } else {
+        exception = new VeniceClientException(
+            String.format("An unexpected error occurred with status code: %d, message: %s", statusCode, errorMessage));
       }
 
       if (exception != null) {

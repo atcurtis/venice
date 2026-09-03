@@ -4,14 +4,20 @@ import static org.apache.avro.Schema.Type;
 import static org.apache.avro.Schema.create;
 import static org.apache.avro.Schema.createArray;
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNotEquals;
 import static org.testng.Assert.assertTrue;
 
+import com.linkedin.alpini.base.misc.ImmutableMapEntry;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.apache.avro.generic.GenericData;
 import org.testng.Assert;
 import org.testng.annotations.Test;
@@ -107,6 +113,27 @@ public class CollectionUtilsTest {
     assertNotEquals(CollectionUtils.substituteEmptyMap(populatedMap), Collections.emptyMap());
   }
 
+  @Test
+  public void testIsEmpty() {
+    assertTrue(CollectionUtils.isEmpty((Map) null));
+    assertTrue(CollectionUtils.isEmpty(Collections.emptyMap()));
+    assertTrue(CollectionUtils.isEmpty(new HashMap<>()));
+    assertFalse(CollectionUtils.isEmpty(CollectionUtils.mapBuilder().put("foo", "bar").build()));
+    assertFalse(CollectionUtils.isEmpty(CollectionUtils.mapBuilder().put("foo", "bar").put("bar", "baz").build()));
+
+    assertTrue(CollectionUtils.isEmpty((Collection) null));
+    assertTrue(CollectionUtils.isEmpty(Collections.emptyList()));
+    assertTrue(CollectionUtils.isEmpty(new ArrayList()));
+    assertFalse(CollectionUtils.isEmpty(Collections.singletonList("foo")));
+    assertFalse(CollectionUtils.isEmpty(Arrays.asList("foo", "bar")));
+
+    assertTrue(CollectionUtils.isEmpty((Set) null));
+    assertTrue(CollectionUtils.isEmpty(Collections.emptySet()));
+    assertTrue(CollectionUtils.isEmpty(new HashSet()));
+    assertFalse(CollectionUtils.isEmpty(Collections.singleton("foo")));
+    assertFalse(CollectionUtils.isEmpty(CollectionUtils.setOf("foo", "bar")));
+  }
+
   private void populateIntegerList(List<Integer> list) {
     list.add(1);
     list.add(2);
@@ -164,5 +191,39 @@ public class CollectionUtilsTest {
       res = res * 31 + stringVal.hashCode();
       return res;
     }
+  }
+
+  @Test
+  public void testMapBuilder() {
+    Map<String, Integer> map = CollectionUtils.<String, Integer>mapBuilder().build();
+    Assert.assertEquals(map.size(), 0);
+
+    map = CollectionUtils.<String, Integer>mapBuilder().add(ImmutableMapEntry.make("TEST", 1)).build();
+    Assert.assertEquals(map.size(), 1);
+    Assert.assertSame(map.get("TEST"), 1);
+
+    map = CollectionUtils.<String, Integer>mapBuilder()
+        .add(ImmutableMapEntry.make("TEST", 1))
+        .add(ImmutableMapEntry.make("FOO", 2))
+        .build();
+    Assert.assertEquals(map.size(), 2);
+    Assert.assertSame(map.get("TEST"), 1);
+    Assert.assertSame(map.get("FOO"), 2);
+  }
+
+  @Test
+  public void testSetOf0() {
+    Set<String> set = CollectionUtils.setOf(Collections.emptyList());
+    Assert.assertEquals(set.size(), 0);
+
+    set = CollectionUtils.setOf(new String[0]);
+    Assert.assertEquals(set.size(), 0);
+  }
+
+  @Test
+  public void testSetOf1() {
+    Set<String> set = CollectionUtils.setOf("TEST");
+    Assert.assertEquals(set.size(), 1);
+    Assert.assertTrue(set.contains("TEST"));
   }
 }

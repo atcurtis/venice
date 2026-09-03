@@ -1,11 +1,11 @@
 package com.linkedin.davinci.kafka.consumer;
 
 import com.linkedin.davinci.config.VeniceServerConfig;
-import com.linkedin.venice.kafka.protocol.KafkaMessageEnvelope;
-import com.linkedin.venice.message.KafkaKey;
-import com.linkedin.venice.pubsub.api.PubSubMessage;
+import com.linkedin.davinci.validation.PartitionTracker;
+import com.linkedin.venice.pubsub.api.DefaultPubSubMessage;
 import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
 import io.tehuti.metrics.MetricsRepository;
+import java.util.concurrent.CompletableFuture;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -23,7 +23,10 @@ public class SeparatedStoreBufferService extends AbstractStoreBufferService {
   private final int sortedPoolSize;
   private final int unsortedPoolSize;
 
-  SeparatedStoreBufferService(VeniceServerConfig serverConfig, MetricsRepository metricsRepository) {
+  SeparatedStoreBufferService(
+      VeniceServerConfig serverConfig,
+      MetricsRepository metricsRepository,
+      String clusterName) {
     this(
         serverConfig.getDrainerPoolSizeSortedInput(),
         serverConfig.getDrainerPoolSizeUnsortedInput(),
@@ -32,15 +35,19 @@ public class SeparatedStoreBufferService extends AbstractStoreBufferService {
             serverConfig.getStoreWriterBufferMemoryCapacity(),
             serverConfig.getStoreWriterBufferNotifyDelta(),
             serverConfig.isStoreWriterBufferAfterLeaderLogicEnabled(),
+            serverConfig.getLogContext(),
             metricsRepository,
-            true),
+            true,
+            clusterName),
         new StoreBufferService(
             serverConfig.getDrainerPoolSizeUnsortedInput(),
             serverConfig.getStoreWriterBufferMemoryCapacity(),
             serverConfig.getStoreWriterBufferNotifyDelta(),
             serverConfig.isStoreWriterBufferAfterLeaderLogicEnabled(),
+            serverConfig.getLogContext(),
             metricsRepository,
-            false));
+            false,
+            clusterName));
     LOGGER.info(
         "Created separated store buffer service with {} sorted drainers and {} unsorted drainers queues with capacity of {}",
         sortedPoolSize,
@@ -60,17 +67,19 @@ public class SeparatedStoreBufferService extends AbstractStoreBufferService {
     this.unsortedStoreBufferServiceDelegate = unsortedStoreBufferServiceDelegate;
   }
 
+  private StoreBufferService getDelegate(StoreIngestionTask ingestionTask) {
+    return ingestionTask.isHybridMode() ? unsortedStoreBufferServiceDelegate : sortedStoreBufferServiceDelegate;
+  }
+
   @Override
   public void putConsumerRecord(
-      PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> consumerRecord,
+      DefaultPubSubMessage consumerRecord,
       StoreIngestionTask ingestionTask,
       LeaderProducedRecordContext leaderProducedRecordContext,
       int partition,
       String kafkaUrl,
       long beforeProcessingRecordTimestampNs) throws InterruptedException {
-    StoreBufferService chosenSBS =
-        ingestionTask.isHybridMode() ? unsortedStoreBufferServiceDelegate : sortedStoreBufferServiceDelegate;
-    chosenSBS.putConsumerRecord(
+    getDelegate(ingestionTask).putConsumerRecord(
         consumerRecord,
         ingestionTask,
         leaderProducedRecordContext,
@@ -80,9 +89,34 @@ public class SeparatedStoreBufferService extends AbstractStoreBufferService {
   }
 
   @Override
-  public void drainBufferedRecordsFromTopicPartition(PubSubTopicPartition topicPartition) throws InterruptedException {
-    sortedStoreBufferServiceDelegate.drainBufferedRecordsFromTopicPartition(topicPartition);
-    unsortedStoreBufferServiceDelegate.drainBufferedRecordsFromTopicPartition(topicPartition);
+  public void drainBufferedRecordsFromTopicPartition(PubSubTopicPartition topicPartition, long timeoutMs)
+      throws InterruptedException {
+    sortedStoreBufferServiceDelegate.drainBufferedRecordsFromTopicPartition(topicPartition, timeoutMs);
+    unsortedStoreBufferServiceDelegate.drainBufferedRecordsFromTopicPartition(topicPartition, timeoutMs);
+  }
+
+  @Override
+  public CompletableFuture<Void> execSyncOffsetCommandAsync(
+      PubSubTopicPartition topicPartition,
+      StoreIngestionTask ingestionTask) throws InterruptedException {
+    return getDelegate(ingestionTask).execSyncOffsetCommandAsync(topicPartition, ingestionTask);
+  }
+
+  @Override
+  public CompletableFuture<Void> execSyncGlobalRtDivAsync(
+      PubSubTopicPartition topicPartition,
+      StoreIngestionTask ingestionTask) throws InterruptedException {
+    return getDelegate(ingestionTask).execSyncGlobalRtDivAsync(topicPartition, ingestionTask);
+  }
+
+  @Override
+  public CompletableFuture<Void> execSyncOffsetFromSnapshotAsync(
+      PubSubTopicPartition topicPartition,
+      PartitionTracker vtDivSnapshot,
+      CompletableFuture<Void> lastRecordPersistedFuture,
+      StoreIngestionTask ingestionTask) throws InterruptedException {
+    return getDelegate(ingestionTask)
+        .execSyncOffsetFromSnapshotAsync(topicPartition, vtDivSnapshot, lastRecordPersistedFuture, ingestionTask);
   }
 
   @Override

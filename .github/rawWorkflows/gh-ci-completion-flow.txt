@@ -1,0 +1,17 @@
+  # This workflow gets skipped if all upstream jobs succeeded, but it runs (and fails) if any upstream failed.
+  # This is what we want since GitHub required actions do not block merging when skipped, but can block it when failed.
+  $FlowName:
+    strategy:
+      fail-fast: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    needs: $Dependency
+    timeout-minutes: $TimeOut
+    if: ${{ cancelled() || contains(needs.*.result, 'cancelled') || contains(needs.*.result, 'failure') }}
+    steps:
+      - name: NoGood
+        shell: bash
+        run: |
+          echo "Some workflows have failed!"
+          exit 1

@@ -1,7 +1,7 @@
 package com.linkedin.venice.integration.utils;
 
 import com.linkedin.venice.exceptions.VeniceException;
-import com.linkedin.venice.utils.ExceptionUtils;
+import com.linkedin.venice.utils.LogContext;
 import com.linkedin.venice.utils.Utils;
 import java.io.Closeable;
 import java.io.File;
@@ -10,7 +10,6 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.apache.commons.io.FileUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.apache.logging.log4j.ThreadContext;
 
 
 /**
@@ -58,10 +57,15 @@ public abstract class ProcessWrapper implements Closeable {
     }
 
     /**
-     * Since {@link ZKServerWrapper} is using singleton mode, currently, there is no way to close it explicitly, but at exit.
-     * So no need to report the following error for {@link ZkServerWrapper}, and this hook will be in charge of closing it properly.
+     * Shutdown hook ensures resources are cleaned up even if @AfterClass doesn't run
+     * (e.g., when Gradle sends SIGTERM for forkEvery recycling).
      */
-    this.shutdownHook = new Thread(() -> closeAudit("JVM shutdown time"));
+    this.shutdownHook = new Thread(() -> {
+      if (!closeCalled) {
+        LOGGER.warn("Closing {} via shutdown hook (was not explicitly closed)", serviceName);
+        close();
+      }
+    });
     if (!(getClass().equals(ZkServerWrapper.class) && ZkServerWrapper.isSingleton())) {
       Runtime.getRuntime().addShutdownHook(shutdownHook);
     }
@@ -99,15 +103,14 @@ public abstract class ProcessWrapper implements Closeable {
     return serviceName;
   }
 
-  public String getComponentTagForLogging() {
+  public LogContext getComponentTagForLogging() {
     /**
      * We intentionally ignore hostname here since it will be always 'localhost' for the local integration tests.
      */
-    return getServiceName() + "-" + getPort();
-  }
-
-  public static String getComponentTagPrefix(String prefix) {
-    return prefix.isEmpty() ? "" : prefix + "-";
+    return LogContext.newBuilder()
+        .setComponentName(getServiceName())
+        .setInstanceName(Utils.getHelixNodeIdentifier(getHost(), getPort()))
+        .build();
   }
 
   /**
@@ -125,7 +128,7 @@ public abstract class ProcessWrapper implements Closeable {
        */
       Thread startThread = new Thread(() -> {
         // Setup component tag for logging
-        ThreadContext.put("component", getComponentTagForLogging());
+        LogContext.setLogContext(getComponentTagForLogging());
         try {
           internalStart();
         } catch (Exception e) {
@@ -133,7 +136,11 @@ public abstract class ProcessWrapper implements Closeable {
         }
       });
       startThread.start();
-      startThread.join();
+      startThread.join(180_000);
+      if (startThread.isAlive()) {
+        LOGGER.warn("{} startup thread did not complete within 180s", serviceName);
+        startThread.interrupt();
+      }
       if (startException.get() != null) {
         throw startException.get();
       }
@@ -210,19 +217,6 @@ public abstract class ProcessWrapper implements Closeable {
       }
     } catch (IOException e) {
       LOGGER.error("Failed to delete {}'s data directory: {}", serviceName, dataDirectory.getAbsolutePath(), e);
-    }
-  }
-
-  private void closeAudit(String context) {
-    if (!closeCalled) {
-      System.out.println(
-          getClass().getSimpleName() + " was not closed! Constructed at:\n"
-              + ExceptionUtils.stackTraceToString(constructionCallstack));
-    } else if (closeThrowable != null) {
-      System.err.println(
-          context + ": " + getClass().getSimpleName() + " was closed but failed to stop! Constructed at:\n"
-              + ExceptionUtils.stackTraceToString(constructionCallstack) + "\n\nClose failure details:\n"
-              + ExceptionUtils.stackTraceToString(closeThrowable));
     }
   }
 }

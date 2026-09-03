@@ -3,13 +3,15 @@ package com.linkedin.venice.cleaner;
 import com.linkedin.davinci.kafka.consumer.StoreIngestionService;
 import com.linkedin.davinci.storage.StorageEngineRepository;
 import com.linkedin.davinci.storage.StorageService;
-import com.linkedin.davinci.store.AbstractStorageEngine;
+import com.linkedin.davinci.store.StorageEngine;
 import com.linkedin.venice.exceptions.VeniceNoStoreException;
 import com.linkedin.venice.meta.ReadOnlyStoreRepository;
 import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.service.AbstractVeniceService;
 import com.linkedin.venice.stats.LeakedResourceCleanerStats;
+import com.linkedin.venice.utils.DaemonThreadFactory;
+import com.linkedin.venice.utils.LogContext;
 import com.linkedin.venice.utils.Time;
 import io.tehuti.metrics.MetricsRepository;
 import java.util.HashMap;
@@ -34,6 +36,7 @@ public class LeakedResourceCleaner extends AbstractVeniceService {
   private final StoreIngestionService ingestionService;
   private final StorageService storageService;
   private final LeakedResourceCleanerStats stats;
+  private final LogContext logContext;
   private long nonExistentStoreCleanupInterval = Time.MS_PER_DAY;
 
   public LeakedResourceCleaner(
@@ -42,21 +45,21 @@ public class LeakedResourceCleaner extends AbstractVeniceService {
       ReadOnlyStoreRepository storeRepository,
       StoreIngestionService ingestionService,
       StorageService storageService,
-      MetricsRepository metricsRepository) {
+      MetricsRepository metricsRepository,
+      LogContext logContext) {
     this.storageEngineRepository = storageEngineRepository;
     this.pollIntervalMs = pollIntervalMs;
     this.storeRepository = storeRepository;
     this.ingestionService = ingestionService;
     this.storageService = storageService;
     this.stats = new LeakedResourceCleanerStats(metricsRepository);
+    this.logContext = logContext;
   }
 
   @Override
   public boolean startInner() {
     cleaner = new LeakedResourceCleanerRunnable(storageEngineRepository);
-    runner = new Thread(cleaner);
-    runner.setName("Storage Leaked Resource cleaner");
-    runner.setDaemon(true);
+    runner = new DaemonThreadFactory("Storage-Leaked-Resource-Cleaner", logContext).newThread(cleaner);
     runner.start();
 
     return true;
@@ -91,8 +94,8 @@ public class LeakedResourceCleaner extends AbstractVeniceService {
           break;
         }
 
-        List<AbstractStorageEngine> storageEngines = storageEngineRepository.getAllLocalStorageEngines();
-        for (AbstractStorageEngine storageEngine: storageEngines) {
+        List<StorageEngine> storageEngines = storageEngineRepository.getAllLocalStorageEngines();
+        for (StorageEngine storageEngine: storageEngines) {
           String resourceName = storageEngine.getStoreVersionName();
           try {
             Store store;

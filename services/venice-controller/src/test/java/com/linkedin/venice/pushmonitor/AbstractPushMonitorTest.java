@@ -13,6 +13,7 @@ import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -25,16 +26,17 @@ import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertNull;
 import static org.testng.Assert.assertTrue;
 
-import com.linkedin.venice.controller.VeniceControllerConfig;
+import com.linkedin.venice.controller.VeniceControllerClusterConfig;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.helix.HelixCustomizedViewOfflinePushRepository;
 import com.linkedin.venice.helix.HelixState;
 import com.linkedin.venice.helix.ResourceAssignment;
 import com.linkedin.venice.ingestion.control.RealTimeTopicSwitcher;
 import com.linkedin.venice.meta.BufferReplayPolicy;
-import com.linkedin.venice.meta.DataReplicationPolicy;
+import com.linkedin.venice.meta.HybridStoreConfig;
 import com.linkedin.venice.meta.HybridStoreConfigImpl;
 import com.linkedin.venice.meta.Instance;
+import com.linkedin.venice.meta.MaterializedViewParameters;
 import com.linkedin.venice.meta.OfflinePushStrategy;
 import com.linkedin.venice.meta.Partition;
 import com.linkedin.venice.meta.PartitionAssignment;
@@ -45,12 +47,21 @@ import com.linkedin.venice.meta.StoreCleaner;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.meta.VersionImpl;
 import com.linkedin.venice.meta.VersionStatus;
+import com.linkedin.venice.meta.ViewConfig;
+import com.linkedin.venice.meta.ViewConfigImpl;
+import com.linkedin.venice.partitioner.DefaultVenicePartitioner;
 import com.linkedin.venice.pushstatushelper.PushStatusStoreReader;
 import com.linkedin.venice.utils.TestUtils;
 import com.linkedin.venice.utils.Time;
 import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.locks.AutoCloseableLock;
 import com.linkedin.venice.utils.locks.ClusterLockManager;
+import com.linkedin.venice.views.MaterializedView;
+import com.linkedin.venice.views.VeniceView;
+import com.linkedin.venice.views.ViewUtils;
+import com.linkedin.venice.writer.VeniceWriter;
+import com.linkedin.venice.writer.VeniceWriterFactory;
+import com.linkedin.venice.writer.VeniceWriterOptions;
 import io.tehuti.metrics.MetricsRepository;
 import io.tehuti.metrics.Sensor;
 import java.util.ArrayList;
@@ -60,10 +71,15 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import org.apache.commons.lang.StringUtils;
+import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
+import org.mockito.stubbing.Answer;
 import org.testng.Assert;
 import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
@@ -78,9 +94,15 @@ public abstract class AbstractPushMonitorTest {
   private AggPushHealthStats mockPushHealthStats;
   protected ClusterLockManager clusterLockManager;
 
-  protected VeniceControllerConfig mockControllerConfig;
+  protected VeniceControllerClusterConfig mockControllerConfig;
 
   protected MetricsRepository mockMetricRepo;
+
+  protected VeniceWriterFactory mockVeniceWriterFactory;
+
+  protected VeniceWriter mockVeniceWriter;
+
+  protected AbstractPushMonitor.CurrentVersionChangeNotifier currentVersionChangeNotifier;
 
   private final static String clusterName = Utils.getUniqueString("test_cluster");
   private final static String aggregateRealTimeSourceKafkaUrl = "aggregate-real-time-source-kafka-url";
@@ -89,6 +111,7 @@ public abstract class AbstractPushMonitorTest {
 
   private final static int numberOfPartition = 1;
   private final static int replicationFactor = 3;
+  protected final static String TARGET_REGION_NAME = "targetRegion";
 
   protected AbstractPushMonitor getPushMonitor() {
     return getPushMonitor(mock(RealTimeTopicSwitcher.class));
@@ -110,13 +133,20 @@ public abstract class AbstractPushMonitorTest {
     mockRoutingDataRepo = mock(RoutingDataRepository.class);
     mockPushHealthStats = mock(AggPushHealthStats.class);
     clusterLockManager = new ClusterLockManager(clusterName);
-    mockControllerConfig = mock(VeniceControllerConfig.class);
+    mockControllerConfig = mock(VeniceControllerClusterConfig.class);
+    mockVeniceWriterFactory = mock(VeniceWriterFactory.class);
+    mockVeniceWriter = mock(VeniceWriter.class);
     when(mockMetricRepo.sensor(anyString(), any())).thenReturn(mock(Sensor.class));
     when(mockControllerConfig.isErrorLeaderReplicaFailOverEnabled()).thenReturn(true);
     when(mockControllerConfig.isDaVinciPushStatusEnabled()).thenReturn(true);
     when(mockControllerConfig.getDaVinciPushStatusScanIntervalInSeconds()).thenReturn(5);
     when(mockControllerConfig.getOffLineJobWaitTimeInMilliseconds()).thenReturn(120000L);
     when(mockControllerConfig.getDaVinciPushStatusScanThreadNumber()).thenReturn(4);
+    when(mockControllerConfig.getRegionName()).thenReturn(TARGET_REGION_NAME);
+    when(mockControllerConfig.getProps())
+        .thenReturn(new com.linkedin.venice.utils.VeniceProperties(new java.util.Properties()));
+    when(mockVeniceWriterFactory.createVeniceWriter(any())).thenReturn(mockVeniceWriter);
+    currentVersionChangeNotifier = mock(AbstractPushMonitor.CurrentVersionChangeNotifier.class);
     monitor = getPushMonitor();
   }
 
@@ -259,6 +289,72 @@ public abstract class AbstractPushMonitorTest {
           monitor.getOfflinePushOrThrow("testLoadAllPushes_v" + i).getCurrentStatus(),
           ExecutionStatus.COMPLETED);
     }
+  }
+
+  @Test
+  public void testLoadAllPushesWithPartitionChangeNotification() {
+    int statusCount = 3;
+    doReturn(true).when(mockRoutingDataRepo).containsKafkaTopic("testLoadAllPushes_v3");
+    PartitionAssignment partitionAssignment = mock(PartitionAssignment.class);
+    doReturn(false).when(partitionAssignment).isMissingAssignedPartitions();
+    Partition partition = mock(Partition.class);
+    doReturn(partition).when(partitionAssignment).getPartition(0);
+    Map<Instance, HelixState> instanceToStateMap = new HashMap<>();
+    instanceToStateMap.put(new Instance("instance0", "host0", 1), HelixState.STANDBY);
+    instanceToStateMap.put(new Instance("instance1", "host1", 1), HelixState.STANDBY);
+    instanceToStateMap.put(new Instance("instance2", "host2", 1), HelixState.LEADER);
+    when(partition.getInstanceToHelixStateMap()).thenReturn(instanceToStateMap);
+    doReturn(partitionAssignment).when(mockRoutingDataRepo).getPartitionAssignments("testLoadAllPushes_v3");
+
+    List<OfflinePushStatus> statusList = new ArrayList<>(statusCount);
+    for (int i = 1; i <= statusCount; i++) {
+      String kafkaTopic = "testLoadAllPushes_v" + i;
+      OfflinePushStatus pushStatus = new OfflinePushStatus(
+          kafkaTopic,
+          numberOfPartition,
+          replicationFactor,
+          OfflinePushStrategy.WAIT_N_MINUS_ONE_REPLCIA_PER_PARTITION);
+      if (i == 3) {
+        pushStatus.setCurrentStatus(ExecutionStatus.STARTED);
+      } else {
+        pushStatus.setCurrentStatus(ExecutionStatus.COMPLETED);
+      }
+
+      statusList.add(pushStatus);
+    }
+    doReturn(statusList).when(mockAccessor).loadOfflinePushStatusesAndPartitionStatuses();
+    when(mockAccessor.getOfflinePushStatusAndItsPartitionStatuses(Mockito.anyString())).thenAnswer(invocation -> {
+      String kafkaTopic = invocation.getArgument(0);
+      for (OfflinePushStatus status: statusList) {
+        if (status.getKafkaTopic().equals(kafkaTopic)) {
+          return status;
+        }
+      }
+      return null;
+    });
+
+    OfflinePushStatus v3NewStatus = statusList.get(2).clonePushStatus();
+    doAnswer((Answer<Void>) invocation -> {
+      /**
+       * This is where we make the test case: We want to make sure ZK status changes after initial refresh.
+       * Previously, the offline push status manual refresh happened before subscribing to ZK changes, so there is race
+       * condition when server update ZK status during these two action.
+       * Now push status will be manually refreshed after ZK change subscription, so it should capture this change.
+       */
+      v3NewStatus.setCurrentStatus(ExecutionStatus.COMPLETED);
+      return null;
+    }).when(mockAccessor).subscribePartitionStatusChange(statusList.get(2), monitor);
+    when(mockAccessor.getOfflinePushStatusAndItsPartitionStatuses("testLoadAllPushes_v3")).thenReturn(v3NewStatus);
+
+    monitor.loadAllPushes();
+
+    TestUtils.waitForNonDeterministicAssertion(3, TimeUnit.SECONDS, () -> {
+      for (int i = 1; i <= statusCount; i++) {
+        Assert.assertEquals(
+            monitor.getOfflinePushOrThrow("testLoadAllPushes_v" + i).getCurrentStatus(),
+            ExecutionStatus.COMPLETED);
+      }
+    });
   }
 
   @Test
@@ -665,7 +761,6 @@ public abstract class AbstractPushMonitorTest {
             100,
             100,
             HybridStoreConfigImpl.DEFAULT_HYBRID_TIME_LAG_THRESHOLD,
-            DataReplicationPolicy.NON_AGGREGATE,
             BufferReplayPolicy.REWIND_FROM_EOP));
     // Prepare a mock topic replicator
     RealTimeTopicSwitcher realTimeTopicSwitcher = mock(RealTimeTopicSwitcher.class);
@@ -703,7 +798,7 @@ public abstract class AbstractPushMonitorTest {
     replicaStatuses.get(0).updateStatus(ExecutionStatus.END_OF_PUSH_RECEIVED);
     monitor.onPartitionStatusChange(topic, partitionStatus);
     verify(realTimeTopicSwitcher, times(1)).switchToRealTimeTopic(
-        eq(Version.composeRealTimeTopic(store.getName())),
+        eq(Utils.getRealTimeTopicName(store)),
         eq(topic),
         eq(store),
         eq(aggregateRealTimeSourceKafkaUrl),
@@ -732,7 +827,6 @@ public abstract class AbstractPushMonitorTest {
             100,
             100,
             HybridStoreConfigImpl.DEFAULT_HYBRID_TIME_LAG_THRESHOLD,
-            DataReplicationPolicy.NON_AGGREGATE,
             BufferReplayPolicy.REWIND_FROM_EOP));
     // Prepare a mock topic replicator
     RealTimeTopicSwitcher realTimeTopicSwitcher = mock(RealTimeTopicSwitcher.class);
@@ -772,7 +866,7 @@ public abstract class AbstractPushMonitorTest {
     }
     // Only send one SOBR
     verify(realTimeTopicSwitcher, only()).switchToRealTimeTopic(
-        eq(Version.composeRealTimeTopic(store.getName())),
+        eq(Utils.getRealTimeTopicName(store)),
         eq(topic),
         eq(store),
         eq(aggregateRealTimeSourceKafkaUrl),
@@ -1012,15 +1106,111 @@ public abstract class AbstractPushMonitorTest {
         "Details should change as a side effect of calling getPushStatusAndDetails.");
   }
 
-  protected Store prepareMockStore(String topic, VersionStatus status) {
+  @Test
+  public void testEOPReceivedProcedures() {
+    Map<String, ViewConfig> viewConfigMap = new HashMap<>();
+    String viewName = "testView";
+    int viewPartitionCount = 10;
+    MaterializedViewParameters.Builder viewParamsBuilder = new MaterializedViewParameters.Builder(viewName);
+    viewParamsBuilder.setPartitionCount(viewPartitionCount);
+    viewParamsBuilder.setPartitioner(DefaultVenicePartitioner.class.getCanonicalName());
+    ViewConfig viewConfig = new ViewConfigImpl(MaterializedView.class.getCanonicalName(), viewParamsBuilder.build());
+    viewConfigMap.put(viewName, viewConfig);
+    String topic = getTopic();
+    int versionNumber = Version.parseVersionFromKafkaTopicName(topic);
+    HybridStoreConfig hybridStoreConfig = new HybridStoreConfigImpl(1, 1, 1, BufferReplayPolicy.REWIND_FROM_EOP);
+    Store store = prepareMockStore(topic, VersionStatus.STARTED, viewConfigMap, hybridStoreConfig, "");
+    VeniceView veniceView = ViewUtils.getVeniceView(
+        viewConfig.getViewClassName(),
+        new Properties(),
+        store.getName(),
+        viewConfig.getViewParameters());
+    assertTrue(veniceView instanceof MaterializedView);
+    MaterializedView materializedView = (MaterializedView) veniceView;
+    String viewTopicName =
+        materializedView.getTopicNamesAndConfigsForVersion(versionNumber).keySet().stream().findAny().get();
+    assertNotNull(viewTopicName);
+
+    monitor.startMonitorOfflinePush(
+        topic,
+        numberOfPartition,
+        replicationFactor,
+        OfflinePushStrategy.WAIT_N_MINUS_ONE_REPLCIA_PER_PARTITION);
+    // Prepare the new partition status
+    List<ReplicaStatus> replicaStatuses = new ArrayList<>();
+    for (int i = 0; i < replicationFactor; i++) {
+      ReplicaStatus replicaStatus = new ReplicaStatus("test" + i);
+      replicaStatuses.add(replicaStatus);
+    }
+    // All replicas are in STARTED status
+    ReadOnlyPartitionStatus partitionStatus = new ReadOnlyPartitionStatus(0, replicaStatuses);
+    doReturn(true).when(mockRoutingDataRepo).containsKafkaTopic(topic);
+    doReturn(new PartitionAssignment(topic, 1)).when(mockRoutingDataRepo).getPartitionAssignments(topic);
+    // Check hybrid push status
+    monitor.onPartitionStatusChange(topic, partitionStatus);
+    // Not ready to send EOP to view topics
+    verify(mockVeniceWriterFactory, never()).createVeniceWriter(any());
+    verify(mockVeniceWriter, never()).broadcastEndOfPush(any());
+
+    // One replica received end of push
+    replicaStatuses.get(0).updateStatus(ExecutionStatus.END_OF_PUSH_RECEIVED);
+    monitor.onPartitionStatusChange(topic, partitionStatus);
+    ArgumentCaptor<VeniceWriterOptions> vwOptionsCaptor = ArgumentCaptor.forClass(VeniceWriterOptions.class);
+    verify(mockVeniceWriterFactory, times(1)).createVeniceWriter(vwOptionsCaptor.capture());
+    assertEquals(vwOptionsCaptor.getValue().getPartitionCount(), Integer.valueOf(viewPartitionCount));
+    assertEquals(vwOptionsCaptor.getValue().getTopicName(), viewTopicName);
+    verify(mockVeniceWriter, times(1)).broadcastEndOfPush(any());
+    assertEquals(monitor.getOfflinePushOrThrow(topic).getCurrentStatus(), ExecutionStatus.END_OF_PUSH_RECEIVED);
+
+    // Another replica received end of push. We shouldn't write multiple EOP to view topic(s)
+    replicaStatuses.get(1).updateStatus(ExecutionStatus.END_OF_PUSH_RECEIVED);
+    monitor.onPartitionStatusChange(topic, partitionStatus);
+    verify(mockVeniceWriter, times(1)).broadcastEndOfPush(any());
+  }
+
+  @Test
+  public void testCurrentVersionChangeNotifier() {
+    String topic = getTopic();
+    Store store = prepareMockStore(topic, VersionStatus.STARTED);
+    int newCurrentVersion = Version.parseVersionFromKafkaTopicName(topic);
+    int previousVersion = store.getCurrentVersion();
+    monitor.startMonitorOfflinePush(
+        topic,
+        numberOfPartition,
+        replicationFactor,
+        OfflinePushStrategy.WAIT_N_MINUS_ONE_REPLCIA_PER_PARTITION);
+    monitor.handleCompletedPush(topic);
+    verify(currentVersionChangeNotifier, times(1))
+        .onCurrentVersionChange(store, clusterName, newCurrentVersion, previousVersion);
+  }
+
+  protected Store prepareMockStore(
+      String topic,
+      VersionStatus status,
+      Map<String, ViewConfig> viewConfigMap,
+      HybridStoreConfig hybridStoreConfig,
+      String targetRegions) {
     String storeName = Version.parseStoreFromKafkaTopicName(topic);
     int versionNumber = Version.parseVersionFromKafkaTopicName(topic);
     Store store = TestUtils.createTestStore(storeName, "test", System.currentTimeMillis());
+    store.setViewConfigs(viewConfigMap);
     Version version = new VersionImpl(storeName, versionNumber);
+    if (hybridStoreConfig != null) {
+      version.setHybridStoreConfig(hybridStoreConfig);
+    }
+    if (!StringUtils.isEmpty(targetRegions)) {
+      store.setTargetSwapRegion(targetRegions);
+      version.setVersionSwapDeferred(true);
+      version.setTargetSwapRegion(targetRegions);
+    }
     version.setStatus(status);
     store.addVersion(version);
     doReturn(store).when(mockStoreRepo).getStore(storeName);
     return store;
+  }
+
+  protected Store prepareMockStore(String topic, VersionStatus status) {
+    return prepareMockStore(topic, status, Collections.emptyMap(), null, "");
   }
 
   protected Store prepareMockStore(String topic) {
@@ -1039,7 +1229,7 @@ public abstract class AbstractPushMonitorTest {
     return mockStoreRepo;
   }
 
-  protected VeniceControllerConfig getMockControllerConfig() {
+  protected VeniceControllerClusterConfig getMockControllerConfig() {
     return mockControllerConfig;
   }
 
@@ -1081,5 +1271,241 @@ public abstract class AbstractPushMonitorTest {
 
   protected String getAggregateRealTimeSourceKafkaUrl() {
     return aggregateRealTimeSourceKafkaUrl;
+  }
+
+  protected VeniceWriterFactory getMockVeniceWriterFactory() {
+    return mockVeniceWriterFactory;
+  }
+
+  /**
+   * Data provider for sequential rollforward test scenarios
+   * Each test case covers a different branch of the isSequentialRollForward boolean expression
+   */
+  @org.testng.annotations.DataProvider(name = "sequentialRollForwardTestCases")
+  public Object[][] sequentialRollForwardTestCases() {
+    return new Object[][] {
+        { "versionSwapNotDeferred", "region1,region2,region3", "region1", false, "region1,region2", true },
+        { "targetSwapRegionEmpty", "region1,region2,region3", "region1", true, "", false },
+        { "allConditionsTrue", "region1,region2,region3", "region1", true, "region1,region2", true } };
+  }
+
+  @Test(dataProvider = "sequentialRollForwardTestCases")
+  public void testSequentialRollForwardBranches(
+      String testName,
+      String rolloutOrder,
+      String regionName,
+      boolean isVersionSwapDeferred,
+      String targetSwapRegion,
+      boolean expectVersionSwap) {
+
+    // Setup: Create a store and version
+    String storeName = "testStore_" + testName;
+    String topic = storeName + "_v2";
+    int versionNumber = 2;
+
+    Store mockStore = mock(Store.class);
+    Version mockVersion = mock(Version.class);
+    RealTimeTopicSwitcher mockRealTimeTopicSwitcher = mock(RealTimeTopicSwitcher.class);
+
+    // Mock store setup
+    when(mockStore.getName()).thenReturn(storeName);
+    when(mockStore.getCurrentVersion()).thenReturn(1);
+    when(mockStore.isEnableWrites()).thenReturn(true);
+    when(mockStore.getVersion(versionNumber)).thenReturn(mockVersion);
+
+    // Mock version setup based on test parameters
+    when(mockVersion.isVersionSwapDeferred()).thenReturn(isVersionSwapDeferred);
+    when(mockVersion.getTargetSwapRegion()).thenReturn(targetSwapRegion);
+    when(mockVersion.getStatus()).thenReturn(VersionStatus.PUSHED);
+
+    // Mock controller config based on test parameters
+    when(mockControllerConfig.getDeferredVersionSwapRegionRollforwardOrder()).thenReturn(rolloutOrder);
+    when(mockControllerConfig.getRegionName()).thenReturn(regionName);
+
+    when(mockStoreRepo.getStore(storeName)).thenReturn(mockStore);
+
+    // Create monitor with real time topic switcher
+    AbstractPushMonitor testMonitor = getPushMonitor(mockRealTimeTopicSwitcher);
+
+    // Start monitoring the push
+    testMonitor.startMonitorOfflinePush(topic, 1, 3, OfflinePushStrategy.WAIT_N_MINUS_ONE_REPLCIA_PER_PARTITION);
+
+    // Trigger handleCompletedPush which calls updateStoreVersionStatus internally
+    testMonitor.handleCompletedPush(topic);
+
+    // Verify behavior based on expected results
+    if (expectVersionSwap) {
+      // Verify that version swap was executed (either sequential rollforward or normal push)
+      verify(mockStore, atLeastOnce()).setCurrentVersion(versionNumber);
+      verify(mockRealTimeTopicSwitcher, atLeastOnce()).transmitVersionSwapMessage(mockStore, 1, versionNumber);
+    } else {
+      // Verify that version swap was NOT executed (deferred swap scenario)
+      verify(mockStore, never()).setCurrentVersion(versionNumber);
+      verify(mockRealTimeTopicSwitcher, never()).transmitVersionSwapMessage(any(Store.class), anyInt(), anyInt());
+    }
+
+    // Additional verification: Check that store version status was updated
+    verify(mockStore, atLeastOnce()).updateVersionStatus(versionNumber, VersionStatus.ONLINE);
+  }
+
+  @Test
+  public void testPostVersionSwapHookCalledOnNormalPush() {
+    String storeName = "hookTestStore_normalPush";
+    String topic = storeName + "_v2";
+    int versionNumber = 2;
+
+    Store mockStore = mock(Store.class);
+    Version mockVersion = mock(Version.class);
+    RealTimeTopicSwitcher mockRealTimeTopicSwitcher = mock(RealTimeTopicSwitcher.class);
+
+    when(mockStore.getName()).thenReturn(storeName);
+    when(mockStore.getCurrentVersion()).thenReturn(1);
+    when(mockStore.isEnableWrites()).thenReturn(true);
+    when(mockStore.getVersion(versionNumber)).thenReturn(mockVersion);
+
+    // Normal push: versionSwapDeferred=false, so isNormalPush=true
+    when(mockVersion.isVersionSwapDeferred()).thenReturn(false);
+    when(mockVersion.getTargetSwapRegion()).thenReturn("");
+    when(mockVersion.getStatus()).thenReturn(VersionStatus.PUSHED);
+
+    // Wire up a counting lifecycle hook
+    com.linkedin.venice.meta.LifecycleHooksRecord hookRecord =
+        mock(com.linkedin.venice.meta.LifecycleHooksRecord.class);
+    when(hookRecord.getStoreLifecycleHooksClassName()).thenReturn(CountingHook.class.getName());
+    when(hookRecord.getStoreLifecycleHooksParams()).thenReturn(new java.util.HashMap<>());
+    when(mockStore.getStoreLifecycleHooks()).thenReturn(java.util.Collections.singletonList(hookRecord));
+
+    when(mockControllerConfig.getDeferredVersionSwapRegionRollforwardOrder()).thenReturn("");
+    when(mockControllerConfig.getRegionName()).thenReturn(TARGET_REGION_NAME);
+    when(mockStoreRepo.getStore(storeName)).thenReturn(mockStore);
+
+    CountingHook.resetCount();
+    AbstractPushMonitor testMonitor = getPushMonitor(mockRealTimeTopicSwitcher);
+    testMonitor.startMonitorOfflinePush(topic, 1, 3, OfflinePushStrategy.WAIT_N_MINUS_ONE_REPLCIA_PER_PARTITION);
+    testMonitor.handleCompletedPush(topic);
+
+    Assert.assertEquals(CountingHook.getCount(), 1, "postStoreVersionSwap hook should be called once on normal push");
+  }
+
+  @Test
+  public void testPostVersionSwapHookCalledOnSequentialRollForward() {
+    String storeName = "hookTestStore_seqRollForward";
+    String topic = storeName + "_v2";
+    int versionNumber = 2;
+
+    Store mockStore = mock(Store.class);
+    Version mockVersion = mock(Version.class);
+    RealTimeTopicSwitcher mockRealTimeTopicSwitcher = mock(RealTimeTopicSwitcher.class);
+
+    when(mockStore.getName()).thenReturn(storeName);
+    when(mockStore.getCurrentVersion()).thenReturn(1);
+    when(mockStore.isEnableWrites()).thenReturn(true);
+    when(mockStore.getVersion(versionNumber)).thenReturn(mockVersion);
+
+    // Sequential roll-forward conditions: deferred=true, targetSwapRegion non-empty, region=first in rollout order
+    when(mockVersion.isVersionSwapDeferred()).thenReturn(true);
+    when(mockVersion.getTargetSwapRegion()).thenReturn("region1,region2");
+    when(mockVersion.getStatus()).thenReturn(VersionStatus.PUSHED);
+
+    // Wire up a counting lifecycle hook
+    com.linkedin.venice.meta.LifecycleHooksRecord hookRecord =
+        mock(com.linkedin.venice.meta.LifecycleHooksRecord.class);
+    when(hookRecord.getStoreLifecycleHooksClassName()).thenReturn(CountingHook.class.getName());
+    when(hookRecord.getStoreLifecycleHooksParams()).thenReturn(new java.util.HashMap<>());
+    when(mockStore.getStoreLifecycleHooks()).thenReturn(java.util.Collections.singletonList(hookRecord));
+
+    // region1 is the first region, so isSequentialRollForward=true
+    when(mockControllerConfig.getDeferredVersionSwapRegionRollforwardOrder()).thenReturn("region1,region2,region3");
+    when(mockControllerConfig.getRegionName()).thenReturn("region1");
+    when(mockControllerConfig.getProps())
+        .thenReturn(new com.linkedin.venice.utils.VeniceProperties(new java.util.Properties()));
+    when(mockStoreRepo.getStore(storeName)).thenReturn(mockStore);
+
+    CountingHook.resetCount();
+    AbstractPushMonitor testMonitor = getPushMonitor(mockRealTimeTopicSwitcher);
+    testMonitor.startMonitorOfflinePush(topic, 1, 3, OfflinePushStrategy.WAIT_N_MINUS_ONE_REPLCIA_PER_PARTITION);
+    testMonitor.handleCompletedPush(topic);
+
+    Assert.assertEquals(
+        CountingHook.getCount(),
+        1,
+        "postStoreVersionSwap hook should be called once on sequential roll-forward");
+  }
+
+  @Test
+  public void testPostVersionSwapHookNotCalledOnDeferredSwap() {
+    String storeName = "hookTestStore_deferredSwap";
+    String topic = storeName + "_v2";
+    int versionNumber = 2;
+
+    Store mockStore = mock(Store.class);
+    Version mockVersion = mock(Version.class);
+    RealTimeTopicSwitcher mockRealTimeTopicSwitcher = mock(RealTimeTopicSwitcher.class);
+
+    when(mockStore.getName()).thenReturn(storeName);
+    when(mockStore.getCurrentVersion()).thenReturn(1);
+    when(mockStore.isEnableWrites()).thenReturn(true);
+    when(mockStore.getVersion(versionNumber)).thenReturn(mockVersion);
+
+    // Deferred swap with no target regions: isDeferredSwap=true, no version swap should occur
+    when(mockVersion.isVersionSwapDeferred()).thenReturn(true);
+    when(mockVersion.getTargetSwapRegion()).thenReturn("");
+    when(mockVersion.getStatus()).thenReturn(VersionStatus.PUSHED);
+
+    com.linkedin.venice.meta.LifecycleHooksRecord hookRecord =
+        mock(com.linkedin.venice.meta.LifecycleHooksRecord.class);
+    when(hookRecord.getStoreLifecycleHooksClassName()).thenReturn(CountingHook.class.getName());
+    when(hookRecord.getStoreLifecycleHooksParams()).thenReturn(new java.util.HashMap<>());
+    when(mockStore.getStoreLifecycleHooks()).thenReturn(java.util.Collections.singletonList(hookRecord));
+
+    when(mockControllerConfig.getDeferredVersionSwapRegionRollforwardOrder()).thenReturn("");
+    when(mockControllerConfig.getRegionName()).thenReturn(TARGET_REGION_NAME);
+    when(mockStoreRepo.getStore(storeName)).thenReturn(mockStore);
+
+    CountingHook.resetCount();
+    AbstractPushMonitor testMonitor = getPushMonitor(mockRealTimeTopicSwitcher);
+    testMonitor.startMonitorOfflinePush(topic, 1, 3, OfflinePushStrategy.WAIT_N_MINUS_ONE_REPLCIA_PER_PARTITION);
+    testMonitor.handleCompletedPush(topic);
+
+    Assert.assertEquals(CountingHook.getCount(), 0, "postStoreVersionSwap hook should NOT be called on deferred swap");
+  }
+
+  /**
+   * A lifecycle hook that counts how many times postStoreVersionSwap is invoked.
+   * Uses a static counter so it can be verified across instances created by reflection.
+   * Must be public and static (inner class of abstract test) for ReflectUtils to instantiate it.
+   */
+  public static class CountingHook extends com.linkedin.venice.hooks.StoreLifecycleHooks {
+    private static final java.util.concurrent.atomic.AtomicInteger COUNT =
+        new java.util.concurrent.atomic.AtomicInteger(0);
+
+    public CountingHook(com.linkedin.venice.utils.VeniceProperties props) {
+      super(props);
+    }
+
+    @Override
+    public com.linkedin.venice.hooks.StoreVersionLifecycleEventOutcome postStoreVersionSwap(
+        String clusterName,
+        String storeName,
+        int versionNumber,
+        int previousVersion,
+        String regionName,
+        com.linkedin.venice.utils.lazy.Lazy<com.linkedin.venice.controllerapi.JobStatusQueryResponse> jobStatus,
+        com.linkedin.venice.utils.VeniceProperties storeHooksConfigs) {
+      COUNT.incrementAndGet();
+      return com.linkedin.venice.hooks.StoreVersionLifecycleEventOutcome.PROCEED;
+    }
+
+    public static int getCount() {
+      return COUNT.get();
+    }
+
+    public static void resetCount() {
+      COUNT.set(0);
+    }
+  }
+
+  protected AbstractPushMonitor.CurrentVersionChangeNotifier getCurrentVersionChangeNotifier() {
+    return currentVersionChangeNotifier;
   }
 }

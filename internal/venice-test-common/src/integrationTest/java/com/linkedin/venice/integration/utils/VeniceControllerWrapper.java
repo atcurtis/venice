@@ -15,9 +15,17 @@ import static com.linkedin.venice.ConfigKeys.CLUSTER_TO_D2;
 import static com.linkedin.venice.ConfigKeys.CLUSTER_TO_SERVER_D2;
 import static com.linkedin.venice.ConfigKeys.CONCURRENT_INIT_ROUTINES_ENABLED;
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_ADD_VERSION_VIA_ADMIN_PROTOCOL;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_ADMIN_GRPC_PORT;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_ADMIN_SECURE_GRPC_PORT;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_BACKUP_VERSION_METADATA_FETCH_BASED_CLEANUP_ENABLED;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_BACKUP_VERSION_MIN_CLEANUP_DELAY_MS;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_BACKUP_VERSION_RETENTION_BASED_CLEANUP_ENABLED;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_CLUSTER_REPLICA;
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_NAME;
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_PARENT_MODE;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_ROLLED_BACK_VERSION_RETENTION_MS;
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_SSL_ENABLED;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_STORE_RECREATION_AFTER_DELETION_TIME_WINDOW_SECONDS;
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_SYSTEM_SCHEMA_CLUSTER_NAME;
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_ZK_SHARED_DAVINCI_PUSH_STATUS_SYSTEM_SCHEMA_STORE_AUTO_CREATION_ENABLED;
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_ZK_SHARED_META_SYSTEM_SCHEMA_STORE_AUTO_CREATION_ENABLED;
@@ -29,53 +37,60 @@ import static com.linkedin.venice.ConfigKeys.DEFAULT_REPLICA_FACTOR;
 import static com.linkedin.venice.ConfigKeys.DELAY_TO_REBALANCE_MS;
 import static com.linkedin.venice.ConfigKeys.ENABLE_HYBRID_PUSH_SSL_WHITELIST;
 import static com.linkedin.venice.ConfigKeys.ENABLE_OFFLINE_PUSH_SSL_WHITELIST;
-import static com.linkedin.venice.ConfigKeys.KAFKA_ADMIN_CLASS;
+import static com.linkedin.venice.ConfigKeys.ERROR_PARTITION_AUTO_RESET_LIMIT;
 import static com.linkedin.venice.ConfigKeys.KAFKA_BOOTSTRAP_SERVERS;
 import static com.linkedin.venice.ConfigKeys.KAFKA_REPLICATION_FACTOR;
-import static com.linkedin.venice.ConfigKeys.KAFKA_SECURITY_PROTOCOL;
 import static com.linkedin.venice.ConfigKeys.LOCAL_REGION_NAME;
-import static com.linkedin.venice.ConfigKeys.MIN_ACTIVE_REPLICA;
+import static com.linkedin.venice.ConfigKeys.MIN_NUMBER_OF_UNUSED_KAFKA_TOPICS_TO_PRESERVE;
+import static com.linkedin.venice.ConfigKeys.MULTI_REGION;
 import static com.linkedin.venice.ConfigKeys.NATIVE_REPLICATION_FABRIC_ALLOWLIST;
 import static com.linkedin.venice.ConfigKeys.NATIVE_REPLICATION_SOURCE_FABRIC;
 import static com.linkedin.venice.ConfigKeys.OFFLINE_JOB_START_TIMEOUT_MS;
 import static com.linkedin.venice.ConfigKeys.PARENT_KAFKA_CLUSTER_FABRIC_LIST;
 import static com.linkedin.venice.ConfigKeys.PERSISTENCE_TYPE;
-import static com.linkedin.venice.ConfigKeys.PUB_SUB_ADMIN_ADAPTER_FACTORY_CLASS;
-import static com.linkedin.venice.ConfigKeys.PUB_SUB_CONSUMER_ADAPTER_FACTORY_CLASS;
-import static com.linkedin.venice.ConfigKeys.PUB_SUB_PRODUCER_ADAPTER_FACTORY_CLASS;
+import static com.linkedin.venice.ConfigKeys.PUBSUB_ADMIN_ADAPTER_FACTORY_CLASS;
+import static com.linkedin.venice.ConfigKeys.PUBSUB_CONSUMER_ADAPTER_FACTORY_CLASS;
+import static com.linkedin.venice.ConfigKeys.PUBSUB_PRODUCER_ADAPTER_FACTORY_CLASS;
+import static com.linkedin.venice.ConfigKeys.PUBSUB_SECURITY_PROTOCOL_LEGACY;
 import static com.linkedin.venice.ConfigKeys.PUSH_STATUS_STORE_ENABLED;
 import static com.linkedin.venice.ConfigKeys.SSL_KAFKA_BOOTSTRAP_SERVERS;
 import static com.linkedin.venice.ConfigKeys.SSL_TO_KAFKA_LEGACY;
 import static com.linkedin.venice.ConfigKeys.STORAGE_ENGINE_OVERHEAD_RATIO;
 import static com.linkedin.venice.ConfigKeys.SYSTEM_SCHEMA_INITIALIZATION_AT_START_TIME_ENABLED;
 import static com.linkedin.venice.ConfigKeys.TOPIC_CLEANUP_DELAY_FACTOR;
-import static com.linkedin.venice.ConfigKeys.TOPIC_CLEANUP_SEND_CONCURRENT_DELETES_REQUESTS;
 import static com.linkedin.venice.ConfigKeys.TOPIC_CLEANUP_SLEEP_INTERVAL_BETWEEN_TOPIC_LIST_FETCH_MS;
-import static com.linkedin.venice.ConfigKeys.TOPIC_CREATION_THROTTLING_TIME_WINDOW_MS;
+import static com.linkedin.venice.ConfigKeys.USE_PUSH_STATUS_STORE_FOR_INCREMENTAL_PUSH;
 import static com.linkedin.venice.SSLConfig.DEFAULT_CONTROLLER_SSL_ENABLED;
 import static com.linkedin.venice.integration.utils.VeniceClusterWrapperConstants.CHILD_REGION_NAME_PREFIX;
+import static com.linkedin.venice.stats.VeniceMetricsConfig.OTEL_VENICE_METRICS_ENABLED;
 
 import com.linkedin.d2.balancer.D2Client;
+import com.linkedin.venice.acl.VeniceComponent;
 import com.linkedin.venice.client.store.ClientConfig;
 import com.linkedin.venice.controller.Admin;
 import com.linkedin.venice.controller.VeniceController;
 import com.linkedin.venice.controller.VeniceControllerContext;
 import com.linkedin.venice.controller.VeniceHelixAdmin;
+import com.linkedin.venice.controller.init.SystemStoreInitializationHelper;
 import com.linkedin.venice.controller.kafka.consumer.AdminConsumerService;
 import com.linkedin.venice.controller.supersetschema.SupersetSchemaGenerator;
 import com.linkedin.venice.d2.D2Server;
 import com.linkedin.venice.meta.PersistenceType;
 import com.linkedin.venice.pubsub.PubSubClientsFactory;
-import com.linkedin.venice.pubsub.adapter.kafka.admin.ApacheKafkaAdminAdapter;
+import com.linkedin.venice.pubsub.api.PubSubSecurityProtocol;
 import com.linkedin.venice.servicediscovery.ServiceDiscoveryAnnouncer;
-import com.linkedin.venice.stats.TehutiUtils;
+import com.linkedin.venice.stats.VeniceMetricsConfig;
+import com.linkedin.venice.stats.VeniceMetricsRepository;
+import com.linkedin.venice.utils.LogContext;
 import com.linkedin.venice.utils.PropertyBuilder;
 import com.linkedin.venice.utils.SslUtils;
 import com.linkedin.venice.utils.TestUtils;
 import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.VeniceProperties;
+import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
 import io.tehuti.metrics.MetricsRepository;
 import java.io.File;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -84,7 +99,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
 import org.apache.commons.lang.StringUtils;
-import org.apache.kafka.common.protocol.SecurityProtocol;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -111,10 +125,14 @@ public class VeniceControllerWrapper extends ProcessWrapper {
   private final boolean isParent;
   private final int port;
   private final int securePort;
+  private final int adminGrpcPort;
+  private final int adminSecureGrpcPort;
   private final String zkAddress;
   private final List<ServiceDiscoveryAnnouncer> d2ServerList;
   private final MetricsRepository metricsRepository;
   private final String regionName;
+
+  private final Map<String, D2Client> d2Clients;
 
   private VeniceControllerWrapper(
       String regionName,
@@ -123,27 +141,40 @@ public class VeniceControllerWrapper extends ProcessWrapper {
       VeniceController service,
       int port,
       int securePort,
+      int adminGrpcPort,
+      int adminSecureGrpcPort,
       List<VeniceProperties> configs,
       boolean isParent,
       List<ServiceDiscoveryAnnouncer> d2ServerList,
       String zkAddress,
-      MetricsRepository metricsRepository) {
+      MetricsRepository metricsRepository,
+      Map<String, D2Client> d2Clients) {
     super(serviceName, dataDirectory);
     this.service = service;
     this.configs = configs;
     this.isParent = isParent;
     this.port = port;
     this.securePort = securePort;
+    this.adminGrpcPort = adminGrpcPort;
+    this.adminSecureGrpcPort = adminSecureGrpcPort;
     this.zkAddress = zkAddress;
     this.d2ServerList = d2ServerList;
     this.metricsRepository = metricsRepository;
     this.regionName = regionName;
+    this.d2Clients = d2Clients;
   }
 
   static StatefulServiceProvider<VeniceControllerWrapper> generateService(VeniceControllerCreateOptions options) {
+    // Reduce retry delay for system store initialization from 10s to 1s in integration tests.
+    // The production default (10s) causes participant store setup to take up to 150s under load,
+    // frequently exceeding test timeouts.
+    SystemStoreInitializationHelper.setDelayBetweenStoreUpdateRetries(Duration.ofSeconds(1));
+
     return (serviceName, dataDirectory) -> {
       int adminPort = TestUtils.getFreePort();
       int adminSecurePort = TestUtils.getFreePort();
+      int adminGrpcPort = TestUtils.getFreePort();
+      int adminSecureGrpcPort = TestUtils.getFreePort();
       List<VeniceProperties> propertiesList = new ArrayList<>();
 
       VeniceProperties extraProps = new VeniceProperties(options.getExtraProperties());
@@ -167,25 +198,30 @@ public class VeniceControllerWrapper extends ProcessWrapper {
 
       PubSubClientsFactory pubSubClientsFactory = options.getKafkaBroker().getPubSubClientsFactory();
       for (String clusterName: options.getClusterNames()) {
-        VeniceProperties clusterProps = IntegrationTestUtils
-            .getClusterProps(clusterName, options.getZkAddress(), options.getKafkaBroker(), options.isSslToKafka());
+        VeniceProperties clusterProps = IntegrationTestUtils.getClusterProps(
+            clusterName,
+            options.getZkAddress(),
+            options.getVeniceZkBasePath(),
+            options.getKafkaBroker(),
+            options.isSslToKafka());
 
         // TODO: Validate that these configs are all still used.
         // TODO: Centralize default config values in a single place
         PropertyBuilder builder = new PropertyBuilder().put(clusterProps.toProperties())
+            .put(MULTI_REGION, options.isMultiRegion())
             .put(KAFKA_REPLICATION_FACTOR, 1)
             .put(ADMIN_TOPIC_REPLICATION_FACTOR, 1)
             .put(CONTROLLER_NAME, "venice-controller") // Why is this configurable?
             .put(DEFAULT_REPLICA_FACTOR, options.getReplicationFactor())
             .put(ADMIN_PORT, adminPort)
             .put(ADMIN_SECURE_PORT, adminSecurePort)
+            .put(CONTROLLER_ADMIN_GRPC_PORT, adminGrpcPort)
+            .put(CONTROLLER_ADMIN_SECURE_GRPC_PORT, adminSecureGrpcPort)
             .put(DEFAULT_PARTITION_SIZE, options.getPartitionSize())
             .put(DEFAULT_NUMBER_OF_PARTITION, options.getNumberOfPartitions())
             .put(DEFAULT_MAX_NUMBER_OF_PARTITIONS, options.getMaxNumberOfPartitions())
             .put(CONTROLLER_PARENT_MODE, options.isParent())
             .put(DELAY_TO_REBALANCE_MS, options.getRebalanceDelayMs())
-            .put(MIN_ACTIVE_REPLICA, options.getMinActiveReplica())
-            .put(TOPIC_CREATION_THROTTLING_TIME_WINDOW_MS, 100)
             .put(STORAGE_ENGINE_OVERHEAD_RATIO, DEFAULT_STORAGE_ENGINE_OVERHEAD_RATIO)
             .put(CLUSTER_TO_D2, TestUtils.getClusterToD2String(clusterToD2))
             .put(CLUSTER_TO_SERVER_D2, TestUtils.getClusterToD2String(clusterToServerD2))
@@ -198,13 +234,11 @@ public class VeniceControllerWrapper extends ProcessWrapper {
             // To speed up topic cleanup
             .put(TOPIC_CLEANUP_SLEEP_INTERVAL_BETWEEN_TOPIC_LIST_FETCH_MS, 100)
             .put(TOPIC_CLEANUP_DELAY_FACTOR, 2)
-            .put(KAFKA_ADMIN_CLASS, ApacheKafkaAdminAdapter.class.getName())
             .put(PERSISTENCE_TYPE, PersistenceType.ROCKS_DB)
             // Moving from topic monitor to admin protocol for add version and starting ingestion
             .put(CONTROLLER_ADD_VERSION_VIA_ADMIN_PROTOCOL, true)
             // The first cluster will always be the one to host system schemas...
             .put(CONTROLLER_SYSTEM_SCHEMA_CLUSTER_NAME, options.getClusterNames()[0])
-            .put(TOPIC_CLEANUP_SEND_CONCURRENT_DELETES_REQUESTS, false)
             .put(CONTROLLER_ZK_SHARED_META_SYSTEM_SCHEMA_STORE_AUTO_CREATION_ENABLED, true)
             .put(CONTROLLER_ZK_SHARED_DAVINCI_PUSH_STATUS_SYSTEM_SCHEMA_STORE_AUTO_CREATION_ENABLED, true)
             .put(PUSH_STATUS_STORE_ENABLED, true)
@@ -213,22 +247,43 @@ public class VeniceControllerWrapper extends ProcessWrapper {
             .put(DAVINCI_PUSH_STATUS_SCAN_INTERVAL_IN_SECONDS, 1)
             .put(SYSTEM_SCHEMA_INITIALIZATION_AT_START_TIME_ENABLED, true)
             .put(
-                PUB_SUB_PRODUCER_ADAPTER_FACTORY_CLASS,
+                PUBSUB_PRODUCER_ADAPTER_FACTORY_CLASS,
                 pubSubClientsFactory.getProducerAdapterFactory().getClass().getName())
             .put(
-                PUB_SUB_CONSUMER_ADAPTER_FACTORY_CLASS,
+                PUBSUB_CONSUMER_ADAPTER_FACTORY_CLASS,
                 pubSubClientsFactory.getConsumerAdapterFactory().getClass().getName())
-            .put(
-                PUB_SUB_ADMIN_ADAPTER_FACTORY_CLASS,
-                pubSubClientsFactory.getAdminAdapterFactory().getClass().getName())
-            .put(extraProps.toProperties());
+            .put(PUBSUB_ADMIN_ADAPTER_FACTORY_CLASS, pubSubClientsFactory.getAdminAdapterFactory().getClass().getName())
+            .put(OTEL_VENICE_METRICS_ENABLED, Boolean.TRUE.toString())
+            .put(extraProps.toProperties())
+            // Match the controller-cluster replication factor to the number of controllers (clamped to between 1 and
+            // the production default of 3) so Helix WAGED can place the controller-cluster resource on a cluster with
+            // fewer than 3 controllers. The lower clamp of 1 avoids an invalid IdealState (replicas=0) when a cluster
+            // is built with zero initial controllers and a controller is added later. Applied after extraProps so
+            // specific tests can override it.
+            .putIfAbsent(CONTROLLER_CLUSTER_REPLICA, Math.max(1, Math.min(options.getNumberOfControllers(), 3)))
+            // Set store recreation time window to 0 seconds by default to allow immediate recreation in tests
+            // This is set after extraProps so tests can override it if needed
+            .putIfAbsent(CONTROLLER_STORE_RECREATION_AFTER_DELETION_TIME_WINDOW_SECONDS, 0)
+            // Set min backup version cleanup delay to 0 by default so tests can push multiple versions
+            // in rapid succession without tripping the push-start capacity guard in VeniceHelixAdmin.
+            // Specific tests that exercise the delay can override this via extraProps.
+            .putIfAbsent(CONTROLLER_BACKUP_VERSION_MIN_CLEANUP_DELAY_MS, 0)
+            .putIfAbsent(CONTROLLER_BACKUP_VERSION_RETENTION_BASED_CLEANUP_ENABLED, false)
+            .putIfAbsent(CONTROLLER_BACKUP_VERSION_METADATA_FETCH_BASED_CLEANUP_ENABLED, false)
+            .putIfAbsent(ERROR_PARTITION_AUTO_RESET_LIMIT, 0)
+            .putIfAbsent(MIN_NUMBER_OF_UNUSED_KAFKA_TOPICS_TO_PRESERVE, 2)
+            .putIfAbsent(USE_PUSH_STATUS_STORE_FOR_INCREMENTAL_PUSH, false)
+            // Set rolled-back version retention to 0 by default so tests can push a new version
+            // immediately after a rollback without tripping the rollback-origin retention guard.
+            // Tests that exercise the retention window can override this via extraProps.
+            .putIfAbsent(CONTROLLER_ROLLED_BACK_VERSION_RETENTION_MS, 0);
 
         if (sslEnabled) {
           builder.put(SslUtils.getVeniceLocalSslProperties());
         }
 
         if (options.isSslToKafka()) {
-          builder.put(KAFKA_SECURITY_PROTOCOL, SecurityProtocol.SSL.name);
+          builder.put(PUBSUB_SECURITY_PROTOCOL_LEGACY, PubSubSecurityProtocol.SSL.name());
           builder.put(KafkaTestUtils.getLocalCommonKafkaSSLConfig(SslUtils.getTlsConfiguration()));
         }
 
@@ -236,7 +291,6 @@ public class VeniceControllerWrapper extends ProcessWrapper {
         if (options.isParent()) {
           // Parent controller needs config to route per-cluster requests such as job status
           // This dummy parent controller won't support such requests until we make this config configurable.
-          // go/inclusivecode deferred(Reference will be removed when clients have migrated)
           fabricAllowList =
               extraProps.getStringWithAlternative(CHILD_CLUSTER_ALLOWLIST, CHILD_CLUSTER_WHITELIST, StringUtils.EMPTY);
         } else {
@@ -348,7 +402,14 @@ public class VeniceControllerWrapper extends ProcessWrapper {
       }
 
       D2Client d2Client = D2TestUtils.getAndStartD2Client(options.getZkAddress());
-      MetricsRepository metricsRepository = TehutiUtils.getMetricsRepository(D2_SERVICE_NAME);
+      InMemoryMetricReader inMemoryMetricReader = InMemoryMetricReader.create();
+      VeniceMetricsRepository metricsRepository = new VeniceMetricsRepository(
+          new VeniceMetricsConfig.Builder().setServiceName(D2_SERVICE_NAME)
+              .setMetricPrefix(VeniceController.CONTROLLER_SERVICE_METRIC_PREFIX)
+              .setMetricEntities(VeniceController.CONTROLLER_SERVICE_METRIC_ENTITIES)
+              .extractAndSetOtelConfigs(propertiesList.get(0).getAsMap())
+              .setOtelAdditionalMetricsReader(inMemoryMetricReader)
+              .build());
 
       Optional<ClientConfig> consumerClientConfig = Optional.empty();
       Object clientConfig = options.getExtraProperties().get(VeniceServerWrapper.CLIENT_CONFIG_FOR_CONSUMER);
@@ -360,13 +421,16 @@ public class VeniceControllerWrapper extends ProcessWrapper {
       if (passedSupersetSchemaGenerator instanceof SupersetSchemaGenerator) {
         supersetSchemaGenerator = Optional.of((SupersetSchemaGenerator) passedSupersetSchemaGenerator);
       }
+      Map<String, D2Client> d2Clients = options.getD2Clients();
       VeniceControllerContext ctx = new VeniceControllerContext.Builder().setPropertiesList(propertiesList)
           .setMetricsRepository(metricsRepository)
           .setServiceDiscoveryAnnouncers(d2ServerList)
           .setAuthorizerService(options.getAuthorizerService())
           .setD2Client(d2Client)
+          .setD2Clients(d2Clients)
           .setRouterClientConfig(consumerClientConfig.orElse(null))
           .setExternalSupersetSchemaGenerator(supersetSchemaGenerator.orElse(null))
+          .setAccessController(options.getDynamicAccessController())
           .build();
       VeniceController veniceController = new VeniceController(ctx);
       return new VeniceControllerWrapper(
@@ -376,11 +440,14 @@ public class VeniceControllerWrapper extends ProcessWrapper {
           veniceController,
           adminPort,
           adminSecurePort,
+          adminGrpcPort,
+          adminSecureGrpcPort,
           propertiesList,
           options.isParent(),
           d2ServerList,
           options.getZkAddress(),
-          metricsRepository);
+          metricsRepository,
+          d2Clients);
     };
   }
 
@@ -400,6 +467,22 @@ public class VeniceControllerWrapper extends ProcessWrapper {
 
   public int getSecurePort() {
     return securePort;
+  }
+
+  public int getAdminGrpcPort() {
+    return adminGrpcPort;
+  }
+
+  public int getAdminSecureGrpcPort() {
+    return adminSecureGrpcPort;
+  }
+
+  public String getControllerGrpcUrl() {
+    return getHost() + ":" + getAdminGrpcPort();
+  }
+
+  public String getControllerSecureGrpcUrl() {
+    return getHost() + ":" + getAdminSecureGrpcPort();
   }
 
   public String getControllerUrl() {
@@ -456,6 +539,7 @@ public class VeniceControllerWrapper extends ProcessWrapper {
         new VeniceControllerContext.Builder().setPropertiesList(configs)
             .setServiceDiscoveryAnnouncers(d2ServerList)
             .setD2Client(d2Client)
+            .setD2Clients(d2Clients)
             .build());
   }
 
@@ -495,7 +579,11 @@ public class VeniceControllerWrapper extends ProcessWrapper {
   }
 
   @Override
-  public String getComponentTagForLogging() {
-    return getComponentTagPrefix(regionName) + super.getComponentTagForLogging();
+  public LogContext getComponentTagForLogging() {
+    return LogContext.newBuilder()
+        .setComponentName(VeniceComponent.CONTROLLER.name())
+        .setRegionName(regionName)
+        .setInstanceName(Utils.getHelixNodeIdentifier(getHost(), getPort()))
+        .build();
   }
 }

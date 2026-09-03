@@ -1,19 +1,26 @@
 package com.linkedin.venice.client.store;
 
+import static com.linkedin.venice.client.stats.BasicClientStats.getSuccessfulKeyCount;
+import static com.linkedin.venice.client.stats.BasicClientStats.getUnhealthyRequestHttpStatus;
+
 import com.linkedin.venice.client.exceptions.VeniceClientException;
 import com.linkedin.venice.client.exceptions.VeniceClientHttpException;
+import com.linkedin.venice.client.stats.BasicClientStats;
 import com.linkedin.venice.client.stats.ClientStats;
 import com.linkedin.venice.client.store.streaming.DelegatingTrackingCallback;
 import com.linkedin.venice.client.store.streaming.StreamingCallback;
+import com.linkedin.venice.client.store.streaming.StreamingResponseTracker;
 import com.linkedin.venice.client.store.streaming.VeniceResponseCompletableFuture;
 import com.linkedin.venice.client.store.streaming.VeniceResponseMap;
 import com.linkedin.venice.client.store.streaming.VeniceResponseMapImpl;
 import com.linkedin.venice.compute.ComputeRequestWrapper;
 import com.linkedin.venice.read.RequestType;
+import com.linkedin.venice.stats.ClientType;
 import com.linkedin.venice.stats.TehutiUtils;
 import com.linkedin.venice.utils.LatencyUtils;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import io.tehuti.metrics.MetricsRepository;
+import java.util.Arrays;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Queue;
@@ -21,7 +28,6 @@ import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.BiFunction;
 import org.apache.avro.Schema;
 import org.apache.logging.log4j.LogManager;
@@ -49,27 +55,64 @@ public class StatTrackingStoreClient<K, V> extends DelegatingStoreClient<K, V> {
     super(innerStoreClient);
     MetricsRepository metricsRepository = Optional.ofNullable(clientConfig.getMetricsRepository())
         .orElse(TehutiUtils.getMetricsRepository(STAT_VENICE_CLIENT_NAME));
-    this.singleGetStats = ClientStats
-        .getClientStats(metricsRepository, innerStoreClient.getStoreName(), RequestType.SINGLE_GET, clientConfig);
-    this.multiGetStats = ClientStats
-        .getClientStats(metricsRepository, innerStoreClient.getStoreName(), RequestType.MULTI_GET, clientConfig);
+    this.singleGetStats = ClientStats.getClientStats(
+        metricsRepository,
+        innerStoreClient.getStoreName(),
+        RequestType.SINGLE_GET,
+        clientConfig,
+        ClientType.THIN_CLIENT);
+    this.multiGetStats = ClientStats.getClientStats(
+        metricsRepository,
+        innerStoreClient.getStoreName(),
+        RequestType.MULTI_GET,
+        clientConfig,
+        ClientType.THIN_CLIENT);
     this.multiGetStreamingStats = ClientStats.getClientStats(
         metricsRepository,
         innerStoreClient.getStoreName(),
         RequestType.MULTI_GET_STREAMING,
-        clientConfig);
+        clientConfig,
+        ClientType.THIN_CLIENT);
     this.schemaReaderStats = ClientStats.getClientStats(
         metricsRepository,
         innerStoreClient.getStoreName() + "_" + STAT_SCHEMA_READER,
         RequestType.SINGLE_GET,
-        clientConfig);
-    this.computeStats = ClientStats
-        .getClientStats(metricsRepository, innerStoreClient.getStoreName(), RequestType.COMPUTE, clientConfig);
+        clientConfig,
+        ClientType.THIN_CLIENT);
+    this.computeStats = ClientStats.getClientStats(
+        metricsRepository,
+        innerStoreClient.getStoreName(),
+        RequestType.COMPUTE,
+        clientConfig,
+        ClientType.THIN_CLIENT);
     this.computeStreamingStats = ClientStats.getClientStats(
         metricsRepository,
         innerStoreClient.getStoreName(),
         RequestType.COMPUTE_STREAMING,
-        clientConfig);
+        clientConfig,
+        ClientType.THIN_CLIENT);
+
+    // Wire the cluster-name listener through the decorator chain down to AbstractAvroStoreClient.
+    super.setClusterNameChangeListener(this::onClusterNameUpdated);
+  }
+
+  /**
+   * Invoked by {@link com.linkedin.venice.client.store.AbstractAvroStoreClient} on initial
+   * discovery and on 301-redirect-driven store migrations — same-value dedup happens downstream
+   * in {@link com.linkedin.venice.client.stats.BasicClientStats#onClusterNameUpdated}. Fans out
+   * to every per-{@link RequestType} {@link ClientStats}.
+   */
+  private void onClusterNameUpdated(String newClusterName) {
+    BasicClientStats.fanOutClusterNameUpdate(
+        Arrays.asList(
+            singleGetStats,
+            multiGetStats,
+            multiGetStreamingStats,
+            schemaReaderStats,
+            computeStats,
+            computeStreamingStats),
+        newClusterName,
+        LOGGER);
   }
 
   @Override
@@ -78,7 +121,7 @@ public class StatTrackingStoreClient<K, V> extends DelegatingStoreClient<K, V> {
     CompletableFuture<V> innerFuture = super.get(key, Optional.of(singleGetStats), startTimeInNS);
     singleGetStats.recordRequestKeyCount(1);
     CompletableFuture<V> statFuture = innerFuture
-        .handle((BiFunction<? super V, Throwable, ? extends V>) getStatCallback(singleGetStats, startTimeInNS));
+        .handle((BiFunction<? super V, Throwable, ? extends V>) getStatCallback(singleGetStats, startTimeInNS, 1));
     return AppTimeOutTrackingCompletableFuture.track(statFuture, singleGetStats);
   }
 
@@ -88,29 +131,13 @@ public class StatTrackingStoreClient<K, V> extends DelegatingStoreClient<K, V> {
     CompletableFuture<byte[]> innerFuture = super.getRaw(requestPath, Optional.of(schemaReaderStats), startTimeInNS);
     schemaReaderStats.recordRequestKeyCount(1);
     CompletableFuture<byte[]> statFuture = innerFuture.handle(
-        (BiFunction<? super byte[], Throwable, ? extends byte[]>) getStatCallback(schemaReaderStats, startTimeInNS));
+        (BiFunction<? super byte[], Throwable, ? extends byte[]>) getStatCallback(schemaReaderStats, startTimeInNS, 1));
     return statFuture;
   }
 
   @Override
   public CompletableFuture<Map<K, V>> batchGet(Set<K> keys) throws VeniceClientException {
-    CompletableFuture<Map<K, V>> resultFuture = new CompletableFuture<>();
-    CompletableFuture<VeniceResponseMap<K, V>> streamingResultFuture = streamingBatchGet(keys);
-
-    streamingResultFuture.whenComplete((response, throwable) -> {
-      if (throwable != null) {
-        resultFuture.completeExceptionally(throwable);
-      } else if (!response.isFullResponse()) {
-        resultFuture.completeExceptionally(
-            new VeniceClientException(
-                "Received partial response, returned entry count: " + response.getTotalEntryCount()
-                    + ", and key count: " + keys.size()));
-      } else {
-        resultFuture.complete(response);
-      }
-    });
-    // We intentionally use stats for batch-get streaming since blocking impl of batch-get is deprecated.
-    return AppTimeOutTrackingCompletableFuture.track(resultFuture, multiGetStreamingStats);
+    return AppTimeOutTrackingCompletableFuture.track(internalBatchGet(keys), multiGetStreamingStats);
   }
 
   @Override
@@ -122,51 +149,26 @@ public class StatTrackingStoreClient<K, V> extends DelegatingStoreClient<K, V> {
         () -> new VeniceResponseMapImpl(resultMap, nonExistingKeyList, false),
         keys.size(),
         Optional.of(multiGetStreamingStats));
-    streamingBatchGet(keys, new StreamingCallback<K, V>() {
-      @Override
-      public void onRecordReceived(K key, V value) {
-        if (value != null) {
-          /**
-           * {@link java.util.concurrent.ConcurrentHashMap#put} won't take 'null' as the value.
-           */
-          resultMap.put(key, value);
-        } else {
-          nonExistingKeyList.add(key);
-        }
-      }
-
-      @Override
-      public void onCompletion(Optional<Exception> exception) {
-        if (exception.isPresent()) {
-          resultFuture.completeExceptionally(exception.get());
-        } else {
-          boolean isFullResponse = (resultMap.size() + nonExistingKeyList.size() == keys.size());
-          resultFuture.complete(new VeniceResponseMapImpl(resultMap, nonExistingKeyList, isFullResponse));
-        }
-      }
-    });
+    streamingBatchGet(keys, super.getStreamingCallback(keys, resultMap, nonExistingKeyList, resultFuture));
     return resultFuture;
   }
 
   public void recordRetryCount(RequestType requestType) {
     if (requestType == RequestType.SINGLE_GET) {
-      singleGetStats.recordRequestRetryCount();
+      singleGetStats.recordErrorRetryRequest();
     } else if (requestType == RequestType.MULTI_GET) {
-      multiGetStats.recordRequestRetryCount();
+      multiGetStats.recordErrorRetryRequest();
     } else if (requestType == RequestType.COMPUTE) {
-      computeStats.recordRequestRetryCount();
+      computeStats.recordErrorRetryRequest();
     }
   }
 
   private static class StatTrackingStreamingCallback<K, V> extends DelegatingTrackingCallback<K, V> {
     private final ClientStats stats;
     private final Optional<ClientStats> statsOptional;
-    private final int keyCntForP50;
-    private final int keyCntForP90;
-    private final int keyCntForP95;
-    private final int keyCntForP99;
     private final long preRequestTimeInNS;
-    private final AtomicInteger receivedKeyCnt = new AtomicInteger(0);
+    private final StreamingResponseTracker streamingResponseTracker;
+    private final int requestedKeyCount;
 
     public StatTrackingStreamingCallback(
         StreamingCallback<K, V> callback,
@@ -176,11 +178,9 @@ public class StatTrackingStoreClient<K, V> extends DelegatingStoreClient<K, V> {
       super(callback);
       this.stats = stats;
       this.statsOptional = Optional.of(stats);
-      this.keyCntForP50 = keyCnt / 2;
-      this.keyCntForP90 = keyCnt * 9 / 10;
-      this.keyCntForP95 = keyCnt * 95 / 100;
-      this.keyCntForP99 = keyCnt * 99 / 100;
       this.preRequestTimeInNS = preRequestTimeInNS;
+      this.requestedKeyCount = keyCnt;
+      streamingResponseTracker = new StreamingResponseTracker(stats, keyCnt, preRequestTimeInNS);
     }
 
     @Override
@@ -190,31 +190,7 @@ public class StatTrackingStoreClient<K, V> extends DelegatingStoreClient<K, V> {
 
     @Override
     public void onRecordDeserialized() {
-      int currentKeyCnt = receivedKeyCnt.incrementAndGet();
-      /**
-       * Here is not short-circuiting because the key cnt for each percentile could be same if the total key count
-       * is very small.
-       */
-      if (currentKeyCnt == 1) {
-        stats
-            .recordStreamingResponseTimeToReceiveFirstRecord(LatencyUtils.getElapsedTimeFromNSToMS(preRequestTimeInNS));
-      }
-      if (currentKeyCnt == keyCntForP50) {
-        stats
-            .recordStreamingResponseTimeToReceive50PctRecord(LatencyUtils.getElapsedTimeFromNSToMS(preRequestTimeInNS));
-      }
-      if (currentKeyCnt == keyCntForP90) {
-        stats
-            .recordStreamingResponseTimeToReceive90PctRecord(LatencyUtils.getElapsedTimeFromNSToMS(preRequestTimeInNS));
-      }
-      if (currentKeyCnt == keyCntForP95) {
-        stats
-            .recordStreamingResponseTimeToReceive95PctRecord(LatencyUtils.getElapsedTimeFromNSToMS(preRequestTimeInNS));
-      }
-      if (currentKeyCnt == keyCntForP99) {
-        stats
-            .recordStreamingResponseTimeToReceive99PctRecord(LatencyUtils.getElapsedTimeFromNSToMS(preRequestTimeInNS));
-      }
+      streamingResponseTracker.recordReceived();
     }
 
     @Override
@@ -227,7 +203,8 @@ public class StatTrackingStoreClient<K, V> extends DelegatingStoreClient<K, V> {
           preRequestTimeInNS,
           exception,
           successKeyCount,
-          duplicateEntryCount);
+          duplicateEntryCount,
+          requestedKeyCount);
     }
   }
 
@@ -256,29 +233,32 @@ public class StatTrackingStoreClient<K, V> extends DelegatingStoreClient<K, V> {
         preRequestTimeInNS);
   }
 
+  private static void handleUnhealthyRequest(
+      ClientStats clientStats,
+      Throwable throwable,
+      double latency,
+      int requestedKeyCount) {
+    int httpStatus = getUnhealthyRequestHttpStatus(throwable);
+    clientStats.emitUnhealthyRequestMetricsNonDavinciClient(latency, httpStatus, requestedKeyCount);
+    if (throwable instanceof VeniceClientHttpException) {
+      clientStats.recordHttpRequest(httpStatus);
+    }
+  }
+
   private static void handleMetricTrackingForStreamingCallback(
       ClientStats clientStats,
       long startTimeInNS,
       Optional<Exception> exception,
       int successKeyCnt,
-      int duplicateEntryCnt) {
+      int duplicateEntryCnt,
+      int requestedKeyCount) {
     double latency = LatencyUtils.getElapsedTimeFromNSToMS(startTimeInNS);
     if (exception.isPresent()) {
-      clientStats.recordUnhealthyRequest();
-      clientStats.recordUnhealthyLatency(latency);
-
-      if (exception.get() instanceof VeniceClientHttpException) {
-        VeniceClientHttpException httpException = (VeniceClientHttpException) exception.get();
-        clientStats.recordHttpRequest(httpException.getHttpStatus());
-      } else {
-        // Http related exception logging is being taken care by underlying transporting layer,
-        // and here will dump other kinds of exceptions
-        LOGGER.error("Received exception in streaming callback", exception.get());
-      }
+      handleUnhealthyRequest(clientStats, exception.get(), latency, requestedKeyCount);
     } else {
-      emitRequestHealthyMetrics(clientStats, latency);
+      clientStats.emitHealthyRequestMetricsNonDavinciClient(latency, successKeyCnt, requestedKeyCount);
     }
-    clientStats.recordSuccessRequestKeyCount(successKeyCnt);
+    clientStats.recordResponseKeyCount(successKeyCnt);
     clientStats.recordSuccessDuplicateRequestKeyCount(duplicateEntryCnt);
   }
 
@@ -292,34 +272,26 @@ public class StatTrackingStoreClient<K, V> extends DelegatingStoreClient<K, V> {
     return super.compute(Optional.of(computeStreamingStats), this);
   }
 
-  private static void emitRequestHealthyMetrics(ClientStats clientStats, double latency) {
-    clientStats.recordHealthyRequest();
-    clientStats.recordHealthyLatency(latency);
-  }
-
+  /**
+   * Builds a completion handler that records healthy/unhealthy client metrics. Callers pass the
+   * number of keys originally requested; it feeds the key-count-bucket OTel dimension and the
+   * unhealthy-path recording. {@code T} may be a single value (single-get, getRaw) or a
+   * multi-key result (e.g. {@link Map}) — the caller owns knowing how many keys they asked for.
+   */
   public static <T> BiFunction<? super T, Throwable, ? extends T> getStatCallback(
       ClientStats clientStats,
-      long startTimeInNS) {
+      long startTimeInNS,
+      int requestedKeyCount) {
     return (T value, Throwable throwable) -> {
       double latency = LatencyUtils.getElapsedTimeFromNSToMS(startTimeInNS);
       if (throwable != null) {
-        clientStats.recordUnhealthyRequest();
-        clientStats.recordUnhealthyLatency(latency);
-        if (throwable instanceof VeniceClientHttpException) {
-          VeniceClientHttpException httpException = (VeniceClientHttpException) throwable;
-          clientStats.recordHttpRequest(httpException.getHttpStatus());
-        }
+        handleUnhealthyRequest(clientStats, throwable, latency, requestedKeyCount);
         handleStoreExceptionInternally(throwable);
       }
-      emitRequestHealthyMetrics(clientStats, latency);
 
-      if (value == null) {
-        clientStats.recordSuccessRequestKeyCount(0);
-      } else if (value instanceof Map) {
-        clientStats.recordSuccessRequestKeyCount(((Map) value).size());
-      } else {
-        clientStats.recordSuccessRequestKeyCount(1);
-      }
+      int successfulKeyCount = getSuccessfulKeyCount(value);
+      clientStats.emitHealthyRequestMetricsNonDavinciClient(latency, successfulKeyCount, requestedKeyCount);
+      clientStats.recordResponseKeyCount(successfulKeyCount);
       return value;
     };
   }

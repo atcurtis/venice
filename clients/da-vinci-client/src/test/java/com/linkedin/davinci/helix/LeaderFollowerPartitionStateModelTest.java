@@ -1,30 +1,60 @@
 package com.linkedin.davinci.helix;
 
+import static com.linkedin.venice.helix.HelixState.DROPPED_STATE;
+import static com.linkedin.venice.helix.HelixState.LEADER_STATE;
+import static com.linkedin.venice.helix.HelixState.OFFLINE_STATE;
+import static com.linkedin.venice.helix.HelixState.STANDBY_STATE;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
-import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.doNothing;
+import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertNotNull;
+import static org.testng.Assert.assertNull;
+import static org.testng.Assert.assertTrue;
+import static org.testng.Assert.fail;
 
+import com.linkedin.davinci.config.VeniceServerConfig;
 import com.linkedin.davinci.config.VeniceStoreVersionConfig;
+import com.linkedin.davinci.ingestion.DefaultIngestionBackend;
 import com.linkedin.davinci.ingestion.IngestionBackend;
 import com.linkedin.davinci.kafka.consumer.KafkaStoreIngestionService;
+import com.linkedin.davinci.kafka.consumer.StoreIngestionTask;
 import com.linkedin.davinci.stats.ParticipantStateTransitionStats;
+import com.linkedin.davinci.stats.ingestion.heartbeat.HeartbeatLagMonitorAction;
 import com.linkedin.davinci.stats.ingestion.heartbeat.HeartbeatMonitoringService;
+import com.linkedin.davinci.store.AbstractStorageEngineTest;
+import com.linkedin.davinci.store.AbstractStoragePartition;
+import com.linkedin.davinci.store.StorageEngine;
+import com.linkedin.davinci.store.rocksdb.RocksDBServerConfig;
+import com.linkedin.davinci.store.rocksdb.RocksDBStorageEngineFactory;
 import com.linkedin.venice.helix.HelixPartitionStatusAccessor;
+import com.linkedin.venice.meta.PersistenceType;
 import com.linkedin.venice.meta.ReadOnlyStoreRepository;
 import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.Version;
-import com.linkedin.venice.utils.Pair;
-import java.time.Duration;
+import com.linkedin.venice.meta.VersionStatus;
+import com.linkedin.venice.store.rocksdb.RocksDBUtils;
+import com.linkedin.venice.utils.PropertyBuilder;
+import com.linkedin.venice.utils.TestUtils;
+import com.linkedin.venice.utils.Utils;
+import com.linkedin.venice.utils.VeniceProperties;
+import java.io.File;
+import java.nio.ByteBuffer;
+import java.util.Random;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
+import org.apache.commons.io.FileUtils;
 import org.apache.helix.NotificationContext;
 import org.apache.helix.model.Message;
 import org.testng.annotations.BeforeMethod;
@@ -38,7 +68,7 @@ public class LeaderFollowerPartitionStateModelTest {
   private LeaderFollowerIngestionProgressNotifier notifier;
   private ReadOnlyStoreRepository metadataRepo;
   private CompletableFuture<HelixPartitionStatusAccessor> partitionPushStatusAccessorFuture;
-  private ParticipantStateTransitionStats threadPoolStats;
+  private ParticipantStateTransitionStats stateTransitionStats;
   private HeartbeatMonitoringService heartbeatMonitoringService;
   private LeaderFollowerPartitionStateModel leaderFollowerPartitionStateModel;
   private static final String storeName = "store_85c9234588_1cce12d5";
@@ -51,13 +81,27 @@ public class LeaderFollowerPartitionStateModelTest {
     ingestionBackend = mock(IngestionBackend.class);
     storeIngestionService = mock(KafkaStoreIngestionService.class);
     doReturn(storeIngestionService).when(ingestionBackend).getStoreIngestionService();
+    doReturn(CompletableFuture.completedFuture(null)).when(ingestionBackend)
+        .stopConsumption(any(), anyInt(), anyString());
+    doReturn(CompletableFuture.completedFuture(null)).when(ingestionBackend)
+        .dropStoragePartitionGracefully(any(), anyInt(), anyInt(), anyString());
+
     storeAndServerConfigs = mock(VeniceStoreVersionConfig.class);
+    when(storeAndServerConfigs.getStoreVersionMetadataWaitDuringStateTransitionTimeMs()).thenReturn(5000L);
     notifier = mock(LeaderFollowerIngestionProgressNotifier.class);
     metadataRepo = mock(ReadOnlyStoreRepository.class);
-    partitionPushStatusAccessorFuture = mock(CompletableFuture.class);
-    threadPoolStats = mock(ParticipantStateTransitionStats.class);
+    // Default store mock so waitForVersionToBeAvailable() finds the version immediately
+    Store defaultStore = mock(Store.class);
+    when(defaultStore.getVersion(storeVersion)).thenReturn(mock(Version.class));
+    doReturn(defaultStore).when(metadataRepo).getStoreOrThrow(storeName);
+    partitionPushStatusAccessorFuture = CompletableFuture.completedFuture(mock(HelixPartitionStatusAccessor.class));
+    stateTransitionStats = mock(ParticipantStateTransitionStats.class);
     heartbeatMonitoringService = mock(HeartbeatMonitoringService.class);
-    leaderFollowerPartitionStateModel = new LeaderFollowerPartitionStateModel(
+    leaderFollowerPartitionStateModel = buildModel(notifier);
+  }
+
+  private LeaderFollowerPartitionStateModel buildModel(LeaderFollowerIngestionProgressNotifier notifier) {
+    return new LeaderFollowerPartitionStateModel(
         ingestionBackend,
         storeAndServerConfigs,
         partition,
@@ -65,40 +109,754 @@ public class LeaderFollowerPartitionStateModelTest {
         metadataRepo,
         partitionPushStatusAccessorFuture,
         "instanceName",
-        threadPoolStats,
-        heartbeatMonitoringService);
+        stateTransitionStats,
+        heartbeatMonitoringService,
+        resourceName);
+  }
+
+  /**
+   * Stubs {@code metadataRepo} so the version under test resolves to {@link VersionStatus#STARTED}, satisfying
+   * the per-poll status re-check inside {@code waitUntilFutureVersionLagAcceptable}.
+   */
+  private void stubVersionStarted() {
+    Store store = mock(Store.class);
+    Version mockVersion = mock(Version.class);
+    when(mockVersion.getStatus()).thenReturn(VersionStatus.STARTED);
+    when(store.getVersion(storeVersion)).thenReturn(mockVersion);
+    doReturn(store).when(metadataRepo).getStoreOrThrow(anyString());
   }
 
   @Test
   public void testUpdateLagMonitor() {
     Message message = mock(Message.class);
     NotificationContext context = mock(NotificationContext.class);
-    Store store = mock(Store.class);
-    Version version = mock(Version.class);
     when(message.getResourceName()).thenReturn(resourceName);
+    Store store = mock(Store.class);
+    when(store.getVersionStatus(anyInt())).thenReturn(VersionStatus.STARTED);
+    Version mockVersion = mock(Version.class);
+    when(mockVersion.getStatus()).thenReturn(VersionStatus.STARTED);
+    when(store.getVersion(storeVersion)).thenReturn(mockVersion);
+    doReturn(store).when(metadataRepo).getStoreOrThrow(anyString());
 
     LeaderFollowerPartitionStateModel leaderFollowerPartitionStateModelSpy = spy(leaderFollowerPartitionStateModel);
 
-    // test when both store and version are null
-    when(metadataRepo.waitVersion(eq(storeName), eq(storeVersion), any(Duration.class), anyLong()))
-        .thenReturn(Pair.create(null, null));
+    // STANDBY->LEADER
     leaderFollowerPartitionStateModelSpy.onBecomeLeaderFromStandby(message, context);
-    verify(metadataRepo).waitVersion(eq(storeName), eq(storeVersion), any(Duration.class), anyLong());
-    verify(heartbeatMonitoringService, never()).addLeaderLagMonitor(any(Version.class), anyInt());
+    verify(heartbeatMonitoringService, never()).updateLagMonitor(
+        eq(resourceName),
+        eq(partition),
+        eq(HeartbeatLagMonitorAction.SET_LEADER_MONITOR),
+        anyString());
 
-    // test when store is not null and version is null
-    when(metadataRepo.waitVersion(eq(storeName), eq(storeVersion), any(Duration.class), anyLong()))
-        .thenReturn(Pair.create(store, null));
-    leaderFollowerPartitionStateModelSpy.onBecomeLeaderFromStandby(message, context);
-    verify(metadataRepo, times(2)).waitVersion(eq(storeName), eq(storeVersion), any(Duration.class), anyLong());
-    verify(heartbeatMonitoringService, never()).addLeaderLagMonitor(any(Version.class), anyInt());
+    // LEADER->STANDBY
+    leaderFollowerPartitionStateModelSpy.onBecomeStandbyFromLeader(message, context);
+    verify(heartbeatMonitoringService, never()).updateLagMonitor(
+        eq(resourceName),
+        eq(partition),
+        eq(HeartbeatLagMonitorAction.SET_FOLLOWER_MONITOR),
+        anyString());
 
-    // test both store and version are not null
-    when(metadataRepo.waitVersion(eq(storeName), eq(storeVersion), any(Duration.class), anyLong()))
-        .thenReturn(Pair.create(store, version));
-    doNothing().when(leaderFollowerPartitionStateModelSpy).executeStateTransition(any(), any(), any());
-    leaderFollowerPartitionStateModelSpy.onBecomeLeaderFromStandby(message, context);
-    verify(metadataRepo, times(3)).waitVersion(eq(storeName), eq(storeVersion), any(Duration.class), anyLong());
-    verify(heartbeatMonitoringService).addLeaderLagMonitor(version, partition);
+    // OFFLINE->STANDBY
+    leaderFollowerPartitionStateModelSpy.onBecomeStandbyFromOffline(message, context);
+    verify(heartbeatMonitoringService, times(1)).updateLagMonitor(
+        eq(resourceName),
+        eq(partition),
+        eq(HeartbeatLagMonitorAction.SET_FOLLOWER_MONITOR),
+        anyString());
+
+    // STANDBY->OFFLINE
+    leaderFollowerPartitionStateModelSpy.onBecomeOfflineFromStandby(message, context);
+    verify(heartbeatMonitoringService)
+        .updateLagMonitor(eq(resourceName), eq(partition), eq(HeartbeatLagMonitorAction.REMOVE_MONITOR), anyString());
   }
+
+  @Test
+  public void testStateModelStats() {
+    Message message = mock(Message.class);
+    NotificationContext context = mock(NotificationContext.class);
+    when(message.getResourceName()).thenReturn(resourceName);
+    Store store = mock(Store.class);
+    when(store.getVersionStatus(anyInt())).thenReturn(VersionStatus.STARTED);
+    Version mockVersion = mock(Version.class);
+    when(mockVersion.getStatus()).thenReturn(VersionStatus.STARTED);
+    when(store.getVersion(storeVersion)).thenReturn(mockVersion);
+    doReturn(store).when(metadataRepo).getStoreOrThrow(anyString());
+
+    LeaderFollowerPartitionStateModel leaderFollowerPartitionStateModelSpy = spy(leaderFollowerPartitionStateModel);
+
+    // OFFLINE->STANDBY
+    doReturn(OFFLINE_STATE).when(message).getFromState();
+    doReturn(STANDBY_STATE).when(message).getToState();
+    leaderFollowerPartitionStateModelSpy.onBecomeStandbyFromOffline(message, context);
+    verify(stateTransitionStats).trackStateTransitionStarted(OFFLINE_STATE, STANDBY_STATE);
+    verify(stateTransitionStats).trackStateTransitionCompleted(OFFLINE_STATE, STANDBY_STATE);
+
+    // STANDBY->LEADER
+    doReturn(STANDBY_STATE).when(message).getFromState();
+    doReturn(LEADER_STATE).when(message).getToState();
+    leaderFollowerPartitionStateModelSpy.onBecomeLeaderFromStandby(message, context);
+    verify(stateTransitionStats).trackStateTransitionStarted(STANDBY_STATE, LEADER_STATE);
+    verify(stateTransitionStats).trackStateTransitionCompleted(STANDBY_STATE, LEADER_STATE);
+
+    // LEADER->STANDBY
+    doReturn(LEADER_STATE).when(message).getFromState();
+    doReturn(STANDBY_STATE).when(message).getToState();
+    leaderFollowerPartitionStateModelSpy.onBecomeStandbyFromLeader(message, context);
+    verify(stateTransitionStats).trackStateTransitionStarted(LEADER_STATE, STANDBY_STATE);
+    verify(stateTransitionStats).trackStateTransitionCompleted(LEADER_STATE, STANDBY_STATE);
+
+    // STANDBY->OFFLINE
+    doReturn(STANDBY_STATE).when(message).getFromState();
+    doReturn(OFFLINE_STATE).when(message).getToState();
+    leaderFollowerPartitionStateModelSpy.onBecomeOfflineFromStandby(message, context);
+    verify(stateTransitionStats).trackStateTransitionStarted(STANDBY_STATE, OFFLINE_STATE);
+    verify(stateTransitionStats).trackStateTransitionCompleted(STANDBY_STATE, OFFLINE_STATE);
+
+    // OFFLINE -> DROPPED
+    doReturn(OFFLINE_STATE).when(message).getFromState();
+    doReturn(DROPPED_STATE).when(message).getToState();
+    leaderFollowerPartitionStateModelSpy.onBecomeDroppedFromOffline(message, context);
+    verify(stateTransitionStats).trackStateTransitionStarted(OFFLINE_STATE, DROPPED_STATE);
+    verify(stateTransitionStats).trackStateTransitionCompleted(OFFLINE_STATE, DROPPED_STATE);
+  }
+
+  /**
+   * When the transition handler throws, {@code executeStateTransition} must call
+   * {@link ParticipantStateTransitionStats#trackStateTransitionFailed} (not
+   * {@link ParticipantStateTransitionStats#trackStateTransitionCompleted}) so the in-progress
+   * counter does not leak +1, and the exception must still propagate.
+   */
+  @Test
+  public void testStateTransitionFailureRecordedOnHandlerException() {
+    Message message = mock(Message.class);
+    NotificationContext context = mock(NotificationContext.class);
+    when(message.getResourceName()).thenReturn(resourceName);
+    doReturn(STANDBY_STATE).when(message).getFromState();
+    doReturn(LEADER_STATE).when(message).getToState();
+
+    // The STANDBY->LEADER handler invokes promoteToLeader; force it to throw.
+    doThrow(new RuntimeException("simulated handler failure")).when(storeIngestionService)
+        .promoteToLeader(any(), anyInt(), any());
+
+    try {
+      leaderFollowerPartitionStateModel.onBecomeLeaderFromStandby(message, context);
+      fail("Expected handler exception to propagate");
+    } catch (RuntimeException expected) {
+      assertEquals(expected.getMessage(), "simulated handler failure");
+    }
+
+    verify(stateTransitionStats).trackStateTransitionStarted(STANDBY_STATE, LEADER_STATE);
+    verify(stateTransitionStats).trackStateTransitionFailed(STANDBY_STATE, LEADER_STATE);
+    verify(stateTransitionStats, never()).trackStateTransitionCompleted(STANDBY_STATE, LEADER_STATE);
+  }
+
+  /**
+   * Tests timestamp tracking behavior for graceful drop timing across multiple scenarios.
+   */
+  @Test
+  public void testTimestampTracking() {
+    Message offlineMessage = mock(Message.class);
+    Message droppedMessage = mock(Message.class);
+    NotificationContext context = mock(NotificationContext.class);
+    when(offlineMessage.getResourceName()).thenReturn(resourceName);
+    when(droppedMessage.getResourceName()).thenReturn(resourceName);
+
+    Store store = mock(Store.class);
+    when(store.getCurrentVersion()).thenReturn(storeVersion);
+    doReturn(store).when(metadataRepo).getStoreOrThrow(anyString());
+    when(store.getVersion(storeVersion)).thenReturn(mock(Version.class));
+
+    // Case 1: Timestamp captured during STANDBY->OFFLINE transition
+    when(storeAndServerConfigs.getPartitionGracefulDropDelaySeconds()).thenReturn(0); // No sleep for speed
+    long beforeTransition = System.currentTimeMillis();
+    leaderFollowerPartitionStateModel.onBecomeOfflineFromStandby(offlineMessage, context);
+    long afterTransition = System.currentTimeMillis();
+
+    long capturedTimestamp = leaderFollowerPartitionStateModel.getOfflineTransitionTimestampMs();
+    assertTrue(capturedTimestamp >= beforeTransition, "Case 1: Timestamp should be >= beforeTransition");
+    assertTrue(capturedTimestamp <= afterTransition, "Case 1: Timestamp should be <= afterTransition");
+    assertTrue(capturedTimestamp > 0, "Case 1: Timestamp should be positive");
+
+    // Case 2: Timestamp reset after OFFLINE->DROPPED transition
+    leaderFollowerPartitionStateModel.onBecomeDroppedFromOffline(droppedMessage, context);
+    assertEquals(
+        leaderFollowerPartitionStateModel.getOfflineTransitionTimestampMs(),
+        -1L,
+        "Case 2: Timestamp should be reset to -1 after transition");
+
+    // Case 3: Multiple cycles maintain independent timestamps
+    when(store.getCurrentVersion()).thenReturn(storeVersion + 1); // Non-current to skip sleep
+
+    leaderFollowerPartitionStateModel.onBecomeOfflineFromStandby(offlineMessage, context);
+    long timestamp1 = leaderFollowerPartitionStateModel.getOfflineTransitionTimestampMs();
+    assertTrue(timestamp1 > 0, "Case 3: First cycle timestamp should be positive");
+
+    leaderFollowerPartitionStateModel.onBecomeDroppedFromOffline(droppedMessage, context);
+    assertEquals(
+        leaderFollowerPartitionStateModel.getOfflineTransitionTimestampMs(),
+        -1L,
+        "Case 3: First cycle timestamp should be reset");
+    Utils.sleep(5); // Minimal sleep to ensure different timestamps
+    leaderFollowerPartitionStateModel.onBecomeOfflineFromStandby(offlineMessage, context);
+    long timestamp2 = leaderFollowerPartitionStateModel.getOfflineTransitionTimestampMs();
+    assertTrue(timestamp2 > timestamp1, "Case 3: Second cycle timestamp should be later than first");
+
+    leaderFollowerPartitionStateModel.onBecomeDroppedFromOffline(droppedMessage, context);
+    assertEquals(
+        leaderFollowerPartitionStateModel.getOfflineTransitionTimestampMs(),
+        -1L,
+        "Case 3: Second cycle timestamp should be reset");
+  }
+
+  /**
+   * Tests graceful drop timing scenarios with milliseconds for faster test execution.
+   */
+  @Test
+  public void testGracefulDropTimingScenarios() {
+    Store store = mock(Store.class);
+    when(store.getCurrentVersion()).thenReturn(storeVersion); // Current version
+    doReturn(store).when(metadataRepo).getStoreOrThrow(anyString());
+    when(store.getVersion(storeVersion)).thenReturn(mock(Version.class));
+    NotificationContext context = mock(NotificationContext.class);
+
+    // Case 1: Partial wait - partition offline for some time, should wait for remaining delay
+    // Using 2 second delay and 500ms sleep for more tolerance
+    Message message1 = mock(Message.class);
+    Message offlineMessage1 = mock(Message.class);
+    when(message1.getResourceName()).thenReturn(resourceName);
+    when(offlineMessage1.getResourceName()).thenReturn(resourceName);
+    when(storeAndServerConfigs.getPartitionGracefulDropDelaySeconds()).thenReturn(2); // 2 seconds
+
+    leaderFollowerPartitionStateModel.onBecomeOfflineFromStandby(offlineMessage1, context);
+    Utils.sleep(500); // Sleep 500ms to simulate time spent offline
+
+    long startTime1 = System.currentTimeMillis();
+    leaderFollowerPartitionStateModel.onBecomeDroppedFromOffline(message1, context);
+    long elapsedTime1 = System.currentTimeMillis() - startTime1;
+
+    // Should wait less than full 2000ms since partition already offline for 500ms+
+    // But allow wide tolerance for test overhead (100ms - 1700ms range)
+    assertTrue(
+        elapsedTime1 >= 100 && elapsedTime1 <= 1700,
+        "Case 1: Should wait less than 2000ms (some elapsed), waited: " + elapsedTime1 + "ms");
+    verify(stateTransitionStats, times(1)).incrementThreadBlockedOnOfflineToDroppedTransitionCount();
+    verify(stateTransitionStats, times(1)).decrementThreadBlockedOnOfflineToDroppedTransitionCount();
+    assertEquals(
+        leaderFollowerPartitionStateModel.getOfflineTransitionTimestampMs(),
+        -1L,
+        "Case 1: Timestamp should be reset");
+
+    // Case 2: Skip wait - partition offline longer than delay, should skip sleep entirely
+    Message message2 = mock(Message.class);
+    Message offlineMessage2 = mock(Message.class);
+    when(message2.getResourceName()).thenReturn(resourceName);
+    when(offlineMessage2.getResourceName()).thenReturn(resourceName);
+    when(storeAndServerConfigs.getPartitionGracefulDropDelaySeconds()).thenReturn(0); // 0 seconds delay
+
+    leaderFollowerPartitionStateModel.onBecomeOfflineFromStandby(offlineMessage2, context);
+    Utils.sleep(100); // Sleep 100ms to simulate time spent offline
+
+    long startTime2 = System.currentTimeMillis();
+    leaderFollowerPartitionStateModel.onBecomeDroppedFromOffline(message2, context);
+    long elapsedTime2 = System.currentTimeMillis() - startTime2;
+
+    assertTrue(
+        elapsedTime2 < 100,
+        "Case 2: Should skip sleep (offline longer than delay), waited: " + elapsedTime2 + "ms");
+    verify(stateTransitionStats, times(1)).incrementThreadBlockedOnOfflineToDroppedTransitionCount();
+    verify(stateTransitionStats, times(1)).decrementThreadBlockedOnOfflineToDroppedTransitionCount();
+    assertEquals(
+        leaderFollowerPartitionStateModel.getOfflineTransitionTimestampMs(),
+        -1L,
+        "Case 2: Timestamp should be reset");
+
+    // Case 3: No timestamp - should use full delay
+    Message message3 = mock(Message.class);
+    when(message3.getResourceName()).thenReturn(resourceName);
+
+    assertEquals(
+        leaderFollowerPartitionStateModel.getOfflineTransitionTimestampMs(),
+        -1L,
+        "Case 3: Timestamp should be -1 initially");
+
+    // Use 1 second delay for this case
+    when(storeAndServerConfigs.getPartitionGracefulDropDelaySeconds()).thenReturn(1);
+    long startTime3 = System.currentTimeMillis();
+    leaderFollowerPartitionStateModel.onBecomeDroppedFromOffline(message3, context);
+    long elapsedTime3 = System.currentTimeMillis() - startTime3;
+
+    assertTrue(
+        elapsedTime3 >= 900 && elapsedTime3 <= 1200,
+        "Case 3: Should wait full 1000ms (no timestamp), waited: " + elapsedTime3 + "ms");
+    verify(stateTransitionStats, times(2)).incrementThreadBlockedOnOfflineToDroppedTransitionCount();
+    verify(stateTransitionStats, times(2)).decrementThreadBlockedOnOfflineToDroppedTransitionCount();
+    assertEquals(
+        leaderFollowerPartitionStateModel.getOfflineTransitionTimestampMs(),
+        -1L,
+        "Case 3: Timestamp should remain -1");
+  }
+
+  /**
+   * Tests that non-current version skips graceful drop delay entirely.
+   */
+  @Test
+  public void testNonCurrentVersionSkipsGracefulDrop() {
+    Message message = mock(Message.class);
+    NotificationContext context = mock(NotificationContext.class);
+    when(message.getResourceName()).thenReturn(resourceName);
+    when(storeAndServerConfigs.getPartitionGracefulDropDelaySeconds()).thenReturn(10); // 10 seconds
+
+    Store store = mock(Store.class);
+    when(store.getCurrentVersion()).thenReturn(storeVersion + 1); // NOT current version
+    doReturn(store).when(metadataRepo).getStoreOrThrow(anyString());
+    when(store.getVersion(storeVersion)).thenReturn(mock(Version.class));
+
+    // Transition to OFFLINE first to capture timestamp
+    Message offlineMessage = mock(Message.class);
+    when(offlineMessage.getResourceName()).thenReturn(resourceName);
+    leaderFollowerPartitionStateModel.onBecomeOfflineFromStandby(offlineMessage, context);
+
+    long startTime = System.currentTimeMillis();
+
+    // Execute OFFLINE->DROPPED transition
+    leaderFollowerPartitionStateModel.onBecomeDroppedFromOffline(message, context);
+
+    long elapsedTime = System.currentTimeMillis() - startTime;
+
+    // Should skip graceful drop entirely for non-current version
+    assertTrue(elapsedTime < 1000, "Should not wait for non-current version, waited: " + elapsedTime + "ms");
+
+    // Stats should not be incremented since no actual waiting occurs
+    // (graceful drop is skipped for non-current version, and partition removal future is already complete)
+    verify(stateTransitionStats, never()).incrementThreadBlockedOnOfflineToDroppedTransitionCount();
+    verify(stateTransitionStats, never()).decrementThreadBlockedOnOfflineToDroppedTransitionCount();
+
+    // Verify timestamp is reset
+    long resetTimestamp = leaderFollowerPartitionStateModel.getOfflineTransitionTimestampMs();
+    assertEquals(resetTimestamp, -1L, "Timestamp should be reset to -1 after transition");
+  }
+
+  /**
+   * OFFLINE->STANDBY needs to complete when the current version is demoted to a backup version.
+   */
+  @Test
+  public void testOnStandbyCompletionUponDemotionToBackupVersion() throws Exception {
+    Store store = mock(Store.class);
+    when(store.getCurrentVersion()).thenReturn(storeVersion); // Version starts as current so the latch is created
+    when(store.getBootstrapToOnlineTimeoutInHours()).thenReturn(24); // large timeout for latch await
+    doReturn(store).when(metadataRepo).getStoreOrThrow(anyString());
+    when(store.getVersion(storeVersion)).thenReturn(mock(Version.class));
+    LeaderFollowerIngestionProgressNotifier notifier = new LeaderFollowerIngestionProgressNotifier();
+    LeaderFollowerPartitionStateModel model = buildModel(notifier);
+
+    // Start the OFFLINE -> STANDBY transition in a background thread which should be blocked in
+    // waitConsumptionCompleted, because this is the current version,
+    Message message = mock(Message.class);
+    when(message.getResourceName()).thenReturn(resourceName);
+    NotificationContext context = mock(NotificationContext.class);
+    CompletableFuture<Void> transitionFuture =
+        CompletableFuture.runAsync(() -> model.onBecomeStandbyFromOffline(message, context));
+
+    // Wait until the latch is created, confirming the transition is blocking.
+    TestUtils.waitForNonDeterministicAssertion(
+        5,
+        TimeUnit.SECONDS,
+        () -> assertNotNull(
+            notifier.getIngestionCompleteFlag(resourceName, partition),
+            "Latch must be created for a current-version OFFLINE->STANDBY transition"));
+    assertFalse(transitionFuture.isDone(), "Transition must be blocked waiting for the latch");
+
+    // Simulate CURRENT -> BACKUP version role flip: a newer version has been promoted.
+    when(store.getCurrentVersion()).thenReturn(storeVersion + 1);
+
+    // Simulate StoreIngestionTask.stopTrackingCurrentVersionIngestion() being called
+    notifier.stopped(resourceName, partition, null);
+    TestUtils.waitForNonDeterministicCompletion(5, TimeUnit.SECONDS, transitionFuture::isDone);
+    // Ensure the transition completed successfully (will throw if it completed exceptionally)
+    transitionFuture.join();
+    assertNull(
+        notifier.getIngestionCompleteFlag(resourceName, partition),
+        "Latch should be released/removed after current version is demoted");
+  }
+
+  /**
+   * Integration test that verifies RocksDB deletion rate limiting is honored during
+   * OFFLINE->DROPPED state transition (backup version deletion).
+   * This test creates a real storage engine with data, then triggers the OFFLINE->DROPPED
+   * state transition and verifies that the deletion is throttled according to the configured rate.
+   *
+   * This test also creates a snapshot (simulating blob transfer scenario) to verify that
+   * rate limiting works correctly even when hard links exist.
+   */
+  @Test(groups = { "integration" })
+  public void testOfflineToDroppedTransitionHonorsRateLimiting() throws Exception {
+    // Setup: Create a real storage engine with rate limiting
+    String testDataPath = Utils.getUniqueTempPath();
+    long deletionRateBytesPerSec = 20L * 1024 * 1024; // 20 MB/s
+
+    VeniceProperties veniceServerProperties = new PropertyBuilder()
+        .put(AbstractStorageEngineTest.getServerProperties(PersistenceType.ROCKS_DB).toProperties())
+        .put("data.base.path", testDataPath)
+        .put(
+            RocksDBServerConfig.ROCKSDB_SST_FILE_MANAGER_DELETE_RATE_BYTES_PER_SECOND,
+            String.valueOf(deletionRateBytesPerSec))
+        .build();
+
+    VeniceServerConfig serverConfig = new VeniceServerConfig(veniceServerProperties);
+    RocksDBStorageEngineFactory factory = new RocksDBStorageEngineFactory(serverConfig);
+
+    try {
+      // Create a storage engine with ~200 MB of data
+      final String testStoreName = "test_store_rate_limit";
+      final int testVersion = 1;
+      final String testTopic = Version.composeKafkaTopic(testStoreName, testVersion);
+      final int testPartition = 0;
+
+      VeniceStoreVersionConfig testStoreConfig =
+          new VeniceStoreVersionConfig(testTopic, veniceServerProperties, PersistenceType.ROCKS_DB);
+      StorageEngine storeEngine = factory.getStorageEngine(testStoreConfig);
+      storeEngine.addStoragePartitionIfAbsent(testPartition);
+
+      // Write ~200 MB of data to generate SST files
+      long targetDataSizeBytes = 200L * 1024 * 1024; // 200 MB
+      long valueSizeBytes = 50 * 1024; // 50 KB per value
+      long numRecords = targetDataSizeBytes / valueSizeBytes;
+
+      Random random = new Random(42);
+      byte[] valueBytes = new byte[(int) valueSizeBytes];
+
+      for (int i = 0; i < numRecords; i++) {
+        String keyString = "key_" + i;
+        byte[] keyBytes = keyString.getBytes();
+        random.nextBytes(valueBytes);
+        storeEngine.put(testPartition, keyBytes, ByteBuffer.wrap(valueBytes));
+      }
+
+      // Verify data was written
+      File storeDir = new File(factory.getRocksDBPath(testTopic, testPartition)).getParentFile();
+      assertTrue(storeDir.exists(), "Store directory should exist before deletion");
+
+      // Sync/flush data to disk before creating snapshot
+      AbstractStoragePartition partition = storeEngine.getPartitionOrThrow(testPartition);
+      partition.sync();
+
+      // Create a snapshot to simulate blob transfer scenario
+      // This creates hard links to the SST files, helping test the case where
+      // snapshot exists during backup version deletion
+      partition.createSnapshot();
+
+      // Verify snapshot was created
+      // Note: serverConfig.getRocksDBPath() returns dataBasePath + "/rocksdb"
+      String rocksDBBasePath = serverConfig.getRocksDBPath();
+      String snapshotPath = RocksDBUtils.composeSnapshotDir(rocksDBBasePath, testTopic, testPartition);
+      File partitionSnapshotDir = new File(snapshotPath);
+      assertTrue(partitionSnapshotDir.exists(), "Snapshot directory should exist before deletion");
+
+      // Setup: Create a mock ingestion backend that uses the real storage service
+      KafkaStoreIngestionService mockIngestionService = mock(KafkaStoreIngestionService.class);
+      DefaultIngestionBackend realIngestionBackend = mock(DefaultIngestionBackend.class);
+
+      // When dropStoragePartitionGracefully is called, actually delete the partition
+      when(realIngestionBackend.dropStoragePartitionGracefully(any(), eq(testPartition), anyInt(), anyString()))
+          .thenAnswer(invocation -> {
+            // Simulate the actual deletion by calling factory.removeStorageEngine
+            factory.removeStorageEngine(storeEngine);
+            return CompletableFuture.completedFuture(null);
+          });
+
+      when(realIngestionBackend.getStoreIngestionService()).thenReturn(mockIngestionService);
+      when(realIngestionBackend.stopConsumption(any(), anyInt(), anyString()))
+          .thenReturn(CompletableFuture.completedFuture(null));
+
+      // Setup: Create state model with real backend
+      VeniceStoreVersionConfig stateModelConfig = mock(VeniceStoreVersionConfig.class);
+      when(stateModelConfig.getStopConsumptionTimeoutInSeconds()).thenReturn(60);
+      when(stateModelConfig.getPartitionGracefulDropDelaySeconds()).thenReturn(0); // No graceful drop delay
+
+      ReadOnlyStoreRepository mockMetadataRepo = mock(ReadOnlyStoreRepository.class);
+      Store mockStore = mock(Store.class);
+      when(mockStore.getCurrentVersion()).thenReturn(testVersion + 1); // Not current version
+      doReturn(mockStore).when(mockMetadataRepo).getStoreOrThrow(anyString());
+
+      ParticipantStateTransitionStats mockStats = mock(ParticipantStateTransitionStats.class);
+      HeartbeatMonitoringService mockHeartbeatService = mock(HeartbeatMonitoringService.class);
+      CompletableFuture<HelixPartitionStatusAccessor> mockAccessorFuture =
+          CompletableFuture.completedFuture(mock(HelixPartitionStatusAccessor.class));
+
+      LeaderFollowerPartitionStateModel stateModel = new LeaderFollowerPartitionStateModel(
+          realIngestionBackend,
+          stateModelConfig,
+          testPartition,
+          mock(LeaderFollowerIngestionProgressNotifier.class),
+          mockMetadataRepo,
+          mockAccessorFuture,
+          "testInstance",
+          mockStats,
+          mockHeartbeatService,
+          testTopic);
+
+      // Execute: Trigger OFFLINE->DROPPED state transition
+      Message message = mock(Message.class);
+      when(message.getResourceName()).thenReturn(testTopic);
+      NotificationContext context = mock(NotificationContext.class);
+
+      long startTime = System.currentTimeMillis();
+      stateModel.onBecomeDroppedFromOffline(message, context);
+      long elapsedTime = System.currentTimeMillis() - startTime;
+
+      // Verify: Deletion should be throttled (should take ~10 seconds for 200 MB at 20 MB/s)
+      // This validates that rate limiting works even when a snapshot exists (hard links scenario)
+      double elapsedTimeSec = elapsedTime / 1000.0;
+      assertTrue(
+          elapsedTimeSec >= 8.0,
+          String.format(
+              "Deletion during OFFLINE->DROPPED should be throttled (>= 8 seconds), but took %.2f seconds. "
+                  + "This test includes snapshot creation to verify rate limiting works with hard links.",
+              elapsedTimeSec));
+
+      // Verify: Store directory should be deleted
+      assertFalse(storeDir.exists(), "Store directory should be deleted after OFFLINE->DROPPED transition");
+
+      // Verify: Snapshot directory should also be deleted
+      assertFalse(
+          partitionSnapshotDir.exists(),
+          "Snapshot directory should be deleted after OFFLINE->DROPPED transition");
+
+    } finally {
+      factory.close();
+      try {
+        FileUtils.deleteDirectory(new File(testDataPath));
+      } catch (Exception e) {
+        System.err.println("Failed to cleanup test directory: " + testDataPath + ", error: " + e.getMessage());
+      }
+    }
+  }
+
+  /**
+   * When {@link com.linkedin.venice.ConfigKeys#SERVER_FUTURE_VERSION_STANDBY_LAG_CHECK_ENABLED} is not enabled
+   * (the default), {@code onBecomeStandbyFromOffline} must not invoke {@code waitUntilFutureVersionLagAcceptable}
+   * at all for an in-progress future-version push, preserving the pre-existing (no-wait) behavior.
+   */
+  @Test
+  public void testWaitUntilFutureVersionLagAcceptableDisabledByDefault() throws InterruptedException {
+    Message message = mock(Message.class);
+    NotificationContext context = mock(NotificationContext.class);
+    when(message.getResourceName()).thenReturn(resourceName);
+
+    Store store = mock(Store.class);
+    Version mockVersion = mock(Version.class);
+    when(mockVersion.getStatus()).thenReturn(VersionStatus.STARTED); // push still in progress, not ready
+    when(store.getVersion(storeVersion)).thenReturn(mockVersion);
+    doReturn(store).when(metadataRepo).getStoreOrThrow(anyString());
+    doReturn(store).when(metadataRepo).getStore(anyString());
+
+    LeaderFollowerPartitionStateModel spyModel = spy(leaderFollowerPartitionStateModel);
+    spyModel.onBecomeStandbyFromOffline(message, context);
+
+    verify(spyModel, never()).waitUntilFutureVersionLagAcceptable(anyString());
+  }
+
+  /**
+   * When lag is already within the configured threshold, the wait must return immediately after a single
+   * measurement, without sleeping/polling further.
+   */
+  @Test
+  public void testWaitUntilFutureVersionLagAcceptableProceedsWhenLagWithinThreshold() {
+    when(storeAndServerConfigs.isFutureVersionStandbyLagCheckEnabled()).thenReturn(true);
+    when(storeAndServerConfigs.getFutureVersionStandbyLagThreshold()).thenReturn(100L);
+    when(storeAndServerConfigs.getFutureVersionStandbyLagCheckTimeoutMinutes()).thenReturn(5);
+    when(storeAndServerConfigs.getFutureVersionStandbyLagCheckPollIntervalMinutes()).thenReturn(1);
+    stubVersionStarted();
+
+    StoreIngestionTask ingestionTask = mock(StoreIngestionTask.class);
+    doReturn(ingestionTask).when(storeIngestionService).getStoreIngestionTask(resourceName);
+    doReturn(50L).when(ingestionTask).getLocalVersionTopicLag(partition);
+
+    leaderFollowerPartitionStateModel.waitUntilFutureVersionLagAcceptable(resourceName);
+
+    verify(ingestionTask, times(1)).getLocalVersionTopicLag(partition);
+  }
+
+  /**
+   * When lag starts above the threshold but catches up within the timeout window, the wait must keep polling
+   * (re-measuring lag) until it becomes acceptable, then return.
+   */
+  @Test
+  public void testWaitUntilFutureVersionLagAcceptablePollsUntilLagCatchesUp() {
+    when(storeAndServerConfigs.isFutureVersionStandbyLagCheckEnabled()).thenReturn(true);
+    when(storeAndServerConfigs.getFutureVersionStandbyLagThreshold()).thenReturn(100L);
+    when(storeAndServerConfigs.getFutureVersionStandbyLagCheckTimeoutMinutes()).thenReturn(5);
+    when(storeAndServerConfigs.getFutureVersionStandbyLagCheckPollIntervalMinutes()).thenReturn(0);
+    stubVersionStarted();
+
+    StoreIngestionTask ingestionTask = mock(StoreIngestionTask.class);
+    doReturn(ingestionTask).when(storeIngestionService).getStoreIngestionTask(resourceName);
+    doReturn(200L, 200L, 50L).when(ingestionTask).getLocalVersionTopicLag(partition);
+
+    leaderFollowerPartitionStateModel.waitUntilFutureVersionLagAcceptable(resourceName);
+
+    verify(ingestionTask, times(3)).getLocalVersionTopicLag(partition);
+  }
+
+  /**
+   * If the version transitions away from {@link VersionStatus#STARTED} (e.g. to {@link VersionStatus#KILLED})
+   * while polling, the wait must stop re-checking lag and return immediately on the next poll, rather than
+   * continuing to occupy the state-transition worker thread until the timeout elapses.
+   */
+  @Test
+  public void testWaitUntilFutureVersionLagAcceptableStopsWhenVersionNoLongerStarted() {
+    when(storeAndServerConfigs.isFutureVersionStandbyLagCheckEnabled()).thenReturn(true);
+    when(storeAndServerConfigs.getFutureVersionStandbyLagThreshold()).thenReturn(100L);
+    when(storeAndServerConfigs.getFutureVersionStandbyLagCheckTimeoutMinutes()).thenReturn(5);
+    when(storeAndServerConfigs.getFutureVersionStandbyLagCheckPollIntervalMinutes()).thenReturn(0);
+
+    Store store = mock(Store.class);
+    Version mockVersion = mock(Version.class);
+    // First poll: still STARTED (so lag is measured once); subsequent polls: version has been killed.
+    when(mockVersion.getStatus()).thenReturn(VersionStatus.STARTED, VersionStatus.KILLED);
+    when(store.getVersion(storeVersion)).thenReturn(mockVersion);
+    doReturn(store).when(metadataRepo).getStoreOrThrow(anyString());
+
+    StoreIngestionTask ingestionTask = mock(StoreIngestionTask.class);
+    doReturn(ingestionTask).when(storeIngestionService).getStoreIngestionTask(resourceName);
+    // Lag never catches up, so the only way the loop can exit before the timeout is via the status re-check.
+    doReturn(200L).when(ingestionTask).getLocalVersionTopicLag(partition);
+
+    leaderFollowerPartitionStateModel.waitUntilFutureVersionLagAcceptable(resourceName);
+
+    // Lag should only have been measured once, before the version's status flipped away from STARTED.
+    verify(ingestionTask, times(1)).getLocalVersionTopicLag(partition);
+  }
+
+  /**
+   * When lag never catches up, the wait must give up after the configured timeout and proceed anyway
+   * (best-effort semantics), rather than blocking indefinitely.
+   */
+  @Test
+  public void testWaitUntilFutureVersionLagAcceptableTimesOutAndProceeds() {
+    when(storeAndServerConfigs.isFutureVersionStandbyLagCheckEnabled()).thenReturn(true);
+    when(storeAndServerConfigs.getFutureVersionStandbyLagThreshold()).thenReturn(100L);
+    when(storeAndServerConfigs.getFutureVersionStandbyLagCheckTimeoutMinutes()).thenReturn(0);
+    when(storeAndServerConfigs.getFutureVersionStandbyLagCheckPollIntervalMinutes()).thenReturn(0);
+    stubVersionStarted();
+
+    StoreIngestionTask ingestionTask = mock(StoreIngestionTask.class);
+    doReturn(ingestionTask).when(storeIngestionService).getStoreIngestionTask(resourceName);
+    doReturn(200L).when(ingestionTask).getLocalVersionTopicLag(partition);
+
+    // Must return promptly (best-effort timeout) instead of looping forever.
+    leaderFollowerPartitionStateModel.waitUntilFutureVersionLagAcceptable(resourceName);
+
+    verify(ingestionTask, atLeastOnce()).getLocalVersionTopicLag(partition);
+  }
+
+  /**
+   * When lag cannot be measured (e.g. PubSub error surfaced as {@code Long.MAX_VALUE}), the wait must fail open
+   * and proceed immediately, matching the pre-existing (no-wait) behavior.
+   */
+  @Test
+  public void testWaitUntilFutureVersionLagAcceptableFailsOpenWhenLagCannotBeMeasured() {
+    when(storeAndServerConfigs.isFutureVersionStandbyLagCheckEnabled()).thenReturn(true);
+    when(storeAndServerConfigs.getFutureVersionStandbyLagThreshold()).thenReturn(0L);
+    when(storeAndServerConfigs.getFutureVersionStandbyLagCheckTimeoutMinutes()).thenReturn(5);
+    when(storeAndServerConfigs.getFutureVersionStandbyLagCheckPollIntervalMinutes()).thenReturn(1);
+    stubVersionStarted();
+
+    StoreIngestionTask ingestionTask = mock(StoreIngestionTask.class);
+    doReturn(ingestionTask).when(storeIngestionService).getStoreIngestionTask(resourceName);
+    doReturn(Long.MAX_VALUE).when(ingestionTask).getLocalVersionTopicLag(partition);
+
+    leaderFollowerPartitionStateModel.waitUntilFutureVersionLagAcceptable(resourceName);
+
+    verify(ingestionTask, times(1)).getLocalVersionTopicLag(partition);
+  }
+
+  /**
+   * When no ingestion task is found for the resource (e.g. torn down concurrently), the wait must fail open and
+   * return without throwing.
+   */
+  @Test
+  public void testWaitUntilFutureVersionLagAcceptableFailsOpenWhenNoIngestionTask() {
+    when(storeAndServerConfigs.isFutureVersionStandbyLagCheckEnabled()).thenReturn(true);
+    doReturn(null).when(storeIngestionService).getStoreIngestionTask(resourceName);
+
+    // Should not throw NPE and should return immediately.
+    leaderFollowerPartitionStateModel.waitUntilFutureVersionLagAcceptable(resourceName);
+  }
+
+  /**
+   * OFFLINE-&gt;STANDBY for a future version whose push is still in progress (neither current version nor an
+   * already-ready future version) must route through {@link LeaderFollowerPartitionStateModel#waitUntilFutureVersionLagAcceptable}
+   * instead of the full-completion {@code waitConsumptionCompleted} path.
+   */
+  @Test
+  public void testOnBecomeStandbyFromOfflineUsesLagWaitForInProgressFutureVersion() throws InterruptedException {
+    Message message = mock(Message.class);
+    NotificationContext context = mock(NotificationContext.class);
+    when(message.getResourceName()).thenReturn(resourceName);
+
+    Store store = mock(Store.class);
+    // getCurrentVersion() defaults to 0 (Mockito primitive default), which is not equal to storeVersion (3),
+    // so this replica is not the current version.
+    Version mockVersion = mock(Version.class);
+    when(mockVersion.getStatus()).thenReturn(VersionStatus.STARTED); // push still in progress, not ready
+    when(store.getVersion(storeVersion)).thenReturn(mockVersion);
+    doReturn(store).when(metadataRepo).getStoreOrThrow(anyString());
+    // Utils.isFutureVersion() uses getStore() (not getStoreOrThrow()) to resolve the store.
+    doReturn(store).when(metadataRepo).getStore(anyString());
+    when(storeAndServerConfigs.isFutureVersionStandbyLagCheckEnabled()).thenReturn(true);
+
+    LeaderFollowerPartitionStateModel spyModel = spy(leaderFollowerPartitionStateModel);
+    spyModel.onBecomeStandbyFromOffline(message, context);
+
+    verify(spyModel, times(1)).waitUntilFutureVersionLagAcceptable(resourceName);
+    verify(notifier, never()).waitConsumptionCompleted(anyString(), anyInt(), anyInt(), any());
+  }
+
+  /**
+   * OFFLINE-&gt;STANDBY for the current version must continue to use the full-completion
+   * {@code waitConsumptionCompleted} path, and must not invoke the new lag-based wait.
+   */
+  @Test
+  public void testOnBecomeStandbyFromOfflineUsesFullWaitForCurrentVersion() throws InterruptedException {
+    Message message = mock(Message.class);
+    NotificationContext context = mock(NotificationContext.class);
+    when(message.getResourceName()).thenReturn(resourceName);
+
+    Store store = mock(Store.class);
+    when(store.getCurrentVersion()).thenReturn(storeVersion);
+    when(store.getVersion(storeVersion)).thenReturn(mock(Version.class));
+    doReturn(store).when(metadataRepo).getStoreOrThrow(anyString());
+
+    LeaderFollowerPartitionStateModel spyModel = spy(leaderFollowerPartitionStateModel);
+    spyModel.onBecomeStandbyFromOffline(message, context);
+
+    verify(spyModel, never()).waitUntilFutureVersionLagAcceptable(anyString());
+    verify(notifier, times(1)).waitConsumptionCompleted(eq(resourceName), eq(partition), anyInt(), any());
+  }
+
+  /**
+   * OFFLINE-&gt;STANDBY for a backup version (older than the current serving version) must not use either wait
+   * path: it's neither the current version nor a future version, so it should proceed immediately.
+   */
+  @Test
+  public void testOnBecomeStandbyFromOfflineSkipsBothWaitsForBackupVersion() throws InterruptedException {
+    Message message = mock(Message.class);
+    NotificationContext context = mock(NotificationContext.class);
+    when(message.getResourceName()).thenReturn(resourceName);
+
+    Store store = mock(Store.class);
+    // Current version is newer than this replica's version, so this replica is a backup version.
+    when(store.getCurrentVersion()).thenReturn(storeVersion + 1);
+    when(store.getVersion(storeVersion)).thenReturn(mock(Version.class));
+    doReturn(store).when(metadataRepo).getStoreOrThrow(anyString());
+    doReturn(store).when(metadataRepo).getStore(anyString());
+
+    LeaderFollowerPartitionStateModel spyModel = spy(leaderFollowerPartitionStateModel);
+    spyModel.onBecomeStandbyFromOffline(message, context);
+
+    verify(spyModel, never()).waitUntilFutureVersionLagAcceptable(anyString());
+    verify(notifier, never()).waitConsumptionCompleted(anyString(), anyInt(), anyInt(), any());
+  }
+
 }

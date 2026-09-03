@@ -16,21 +16,46 @@ import java.util.concurrent.CompletableFuture;
  * @param <V> The Type for value
  */
 @Experimental
-public interface VeniceChangelogConsumer<K, V> {
+public interface VeniceChangelogConsumer<K, V> extends AutoCloseable {
   /**
    * @return total number of store partitions
   */
   int getPartitionCount();
 
   /**
-   * Subscribe a set of partitions for a store to this VeniceChangelogConsumer. The VeniceChangelogConsumer should try
-   * to consume messages from all partitions that are subscribed to it.
+   * Subscribe a set of partitions for a store to this VeniceChangelogConsumer, with the earliest position in the topic
+   * for each partition. The VeniceChangelogConsumer should try to consume messages from all partitions that are
+   * subscribed to it.
    *
    * @param partitions the set of partition to subscribe and consume
-   * @return a future which completes when the partitions are ready to be consumed data
-   * @throws a VeniceException if subscribe operation failed for any of the partitions
+   * @return a future which completes when data from the partitions are ready to be consumed
+   * @throws VeniceException if subscribe operation failed for any of the partitions
    */
   CompletableFuture<Void> subscribe(Set<Integer> partitions);
+
+  /**
+   * Subscribe all partitions belonging to a specific store, with the earliest position in the topic for each
+   * partition.
+   *
+   * @return a future which completes when all partitions are ready to be consumed data
+   * @throws VeniceException if subscribe operation failed for any of the partitions
+   */
+  CompletableFuture<Void> subscribeAll();
+
+  /**
+   * Stop ingesting messages from a set of partitions for a specific store.
+   *
+   * @param partitions The set of topic partitions to unsubscribe
+   * @throws VeniceException if unsubscribe operation failed for any of the partitions
+   */
+  void unsubscribe(Set<Integer> partitions);
+
+  /**
+   * Stop ingesting messages from all partitions.
+   *
+   * @throws VeniceException if unsubscribe operation failed for any of the partitions
+   */
+  void unsubscribeAll();
 
   /**
    * Seek to the beginning of the push for a set of partitions.  This is analogous to doing a bootstrap of data for the consumer.
@@ -61,36 +86,8 @@ public interface VeniceChangelogConsumer<K, V> {
    * @return a future which completes when the operation has succeeded for all partitions.
    * @throws VeniceException if seek operation failed for any of the partitions, or seeking was performed on unsubscribed partitions
    */
+  @Deprecated
   CompletableFuture<Void> seekToEndOfPush(Set<Integer> partitions);
-
-  /**
-   * Pause the client on all subscriptions. See {@link #pause(Set)} for more information.
-   *
-   * @throws VeniceException if operation failed for any of the partitions.
-   */
-  void pause();
-
-  /**
-   * Resume the client on all or subset of partitions this client is subscribed to and has paused.
-   *
-   * @throws VeniceException if operation failed for any of the partitions.
-   */
-  void resume(Set<Integer> partitions);
-
-  /**
-   * Pause the client on all subscriptions. See {@link #resume(Set)} for more information.
-   *
-   * @throws VeniceException if operation failed for any of the partitions.
-   */
-  void resume();
-
-  /**
-   * Pause the client on all or subset of partitions this client is subscribed to. Calls to {@link #poll(long)} will not
-   * return results from paused partitions until {@link #resume(Set)} is called again later for those partitions.
-   *
-   * @throws VeniceException if operation failed for any of the partitions.
-   */
-  void pause(Set<Integer> partitions);
 
   /**
    * Seek to the end of the push for all subscribed partitions. See {@link #seekToEndOfPush(Set)} for more information.
@@ -98,6 +95,7 @@ public interface VeniceChangelogConsumer<K, V> {
    * @return a future which completes when the operation has succeeded for all partitions.
    * @throws VeniceException if seek operation failed for any of the partitions.
    */
+  @Deprecated
   CompletableFuture<Void> seekToEndOfPush();
 
   /**
@@ -124,24 +122,18 @@ public interface VeniceChangelogConsumer<K, V> {
    * Note about checkpoints:
    *
    * Checkpoints have the following properties and should be considered:
-   *    -Checkpoints are NOT comparable or valid across partitions.
-   *    -Checkpoints are NOT comparable or valid across colos
-   *    -Checkpoints are NOT comparable across store versions
-   *    -It is not possible to determine the number of events between two checkpoints
-   *    -It is possible that a checkpoint is no longer on retention. In such case, we will return an exception to the caller.
+   *    - Checkpoints are NOT comparable or valid across partitions.
+   *    - Checkpoints are NOT comparable or valid across regions
+   *    - Checkpoints are NOT comparable across store versions
+   *    - It is not possible to determine the number of events between two checkpoints
+   *    - It is possible that a checkpoint is no longer on retention. In such case, we will return an exception to the caller.
    * @param checkpoints
    * @return a future which completes when seek has completed for all partitions
    * @throws VeniceException if seek operation failed for any of the partitions
+   * @throws VeniceCoordinateOutOfRangeException if passed checkpoint is no longer valid
    */
-  CompletableFuture<Void> seekToCheckpoint(Set<VeniceChangeCoordinate> checkpoints);
-
-  /**
-   * Subscribe all partitions belonging to a specific store.
-   *
-   * @return a future which completes when all partitions are ready to be consumed data
-   * @throws a VeniceException if subscribe operation failed for any of the partitions
-   */
-  CompletableFuture<Void> subscribeAll();
+  CompletableFuture<Void> seekToCheckpoint(Set<VeniceChangeCoordinate> checkpoints)
+      throws VeniceCoordinateOutOfRangeException;
 
   /**
    * Seek to the provided timestamps for the specified partitions based on wall clock time for when this message was
@@ -150,13 +142,14 @@ public interface VeniceChangelogConsumer<K, V> {
    * Note, this API can only be used to seek on nearline data applied to the current serving version in Venice.
    * This will not seek on data transmitted via Batch Push. If the provided timestamp is lower than the earliest
    * timestamp on a given stream, the earliest event will be returned. THIS WILL NOT SEEK TO DATA WHICH WAS APPLIED
-   * ON A PREVIOUS VERSION.  You should never seek back in time to a timestamp which is smaller than the current time -
+   * ON A PREVIOUS VERSION. You should never seek back in time to a timestamp which is smaller than the current time -
    * rewindTimeInSeconds configured in the hybrid settings for this Venice store.
    *
    * The timestamp passed to this function should be associated to timestamps processed by this interface. The timestamp
-   * returned by {@link PubSubMessage.getPubSubMessageTime()} refers to the time when Venice processed the event, and
-   * calls to this method will seek based on that sequence of events.  Note: it bears no relation to timestamps provided by
-   * upstream producers when writing to Venice where a user may optionally provide a timestamp at time of producing a record.
+   * returned by {@link PubSubMessage#getPubSubMessageTime()} is the best-available message timestamp: the pub-sub system
+   * timestamp when available, otherwise the Venice producer timestamp. Calls to this method will seek based on that
+   * sequence of events. Note: the precision of the seek depends on the underlying pub-sub system — some systems may
+   * return a position that is close to, but not exactly at, the requested timestamp.
    *
    * @param timestamps a map keyed by a partition ID, and the timestamp checkpoints to seek for each partition.
    * @return
@@ -173,19 +166,37 @@ public interface VeniceChangelogConsumer<K, V> {
   CompletableFuture<Void> seekToTimestamp(Long timestamp);
 
   /**
-   * Stop ingesting messages from a set of partitions for a specific store.
+   * Pause the client on all or subset of partitions this client is subscribed to. Calls to {@link #poll(long)} will not
+   * return results from paused partitions until {@link #resume(Set)} is called again later for those partitions.
    *
-   * @param partitions The set of topic partitions to unsubscribe
-   * @throws a VeniceException if unsubscribe operation failed for any of the partitions
+   * @throws VeniceException if operation failed for any of the partitions.
    */
-  void unsubscribe(Set<Integer> partitions);
+  @Deprecated
+  void pause(Set<Integer> partitions);
 
   /**
-   * Stop ingesting messages from all partitions.
+   * Pause the client on all subscriptions. See {@link #pause(Set)} for more information.
    *
-   * @throws a VeniceException if unsubscribe operation failed for any of the partitions
+   * @throws VeniceException if operation failed for any of the partitions.
    */
-  void unsubscribeAll();
+  @Deprecated
+  void pause();
+
+  /**
+   * Resume the client on all or a subset of partitions this client is subscribed to and has paused.
+   *
+   * @throws VeniceException if operation failed for any of the partitions.
+   */
+  @Deprecated
+  void resume(Set<Integer> partitions);
+
+  /**
+   * Pause the client on all subscriptions. See {@link #resume(Set)} for more information.
+   *
+   * @throws VeniceException if operation failed for any of the partitions.
+   */
+  @Deprecated
+  void resume();
 
   /**
    * Polling function to get any available messages from the underlying system for all partitions subscribed.
@@ -193,7 +204,7 @@ public interface VeniceChangelogConsumer<K, V> {
    * @param timeoutInMs The maximum time to block/wait in between two polling requests (must not be greater than
    *        {@link Long#MAX_VALUE} milliseconds)
    * @return a collection of messages since the last fetch for the subscribed list of topic partitions
-   * @throws a VeniceException if polling operation fails
+   * @throws VeniceException if polling operation fails
    */
   Collection<PubSubMessage<K, ChangeEvent<V>, VeniceChangeCoordinate>> poll(long timeoutInMs);
 
@@ -205,7 +216,17 @@ public interface VeniceChangelogConsumer<K, V> {
   boolean isCaughtUp();
 
   /**
-   * Release the internal resources.
+   * Returns the timestamp of the last heartbeat received for each subscribed partition.
+   * Heartbeats are messages sent periodically by Venice servers to measure lag.
+   *
+   * @return a map of partition number to the timestamp, in milliseconds, of the last
+   *         heartbeat received for that partition.
+   */
+  Map<Integer, Long> getLastHeartbeatPerPartition();
+
+  /**
+   * Releases the internal resources. This consumer instance cannot be restarted or sought after close. Create a new
+   * consumer from {@link VeniceChangelogConsumerClientFactory} to resume consumption.
    */
   void close();
 }

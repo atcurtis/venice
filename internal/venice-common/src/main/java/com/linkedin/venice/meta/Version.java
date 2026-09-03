@@ -1,5 +1,6 @@
 package com.linkedin.venice.meta;
 
+import static com.linkedin.venice.utils.Utils.SEPARATE_TOPIC_SUFFIX;
 import static java.lang.Character.isDigit;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
@@ -7,13 +8,14 @@ import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
 import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.guid.GuidUtils;
+import com.linkedin.venice.stats.dimensions.VeniceDimensionInterface;
+import com.linkedin.venice.stats.dimensions.VeniceMetricsDimensions;
 import com.linkedin.venice.systemstore.schemas.StoreVersion;
 import com.linkedin.venice.views.VeniceView;
 import java.time.Duration;
-import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 
 
 /**
@@ -24,8 +26,8 @@ import java.util.Optional;
 public interface Version extends Comparable<Version>, DataModelBackedStructure<StoreVersion> {
   String VERSION_SEPARATOR = "_v";
   String REAL_TIME_TOPIC_SUFFIX = "_rt";
+  String REAL_TIME_TOPIC_TEMPLATE = "%s_rt_v%d";
   String STREAM_REPROCESSING_TOPIC_SUFFIX = "_sr";
-
   /**
    * Special number indicating no replication metadata version is set.
    */
@@ -36,16 +38,42 @@ public interface Version extends Comparable<Version>, DataModelBackedStructure<S
    */
   String VENICE_RE_PUSH_PUSH_ID_PREFIX = "venice_re_push_";
 
+  String VENICE_TTL_RE_PUSH_PUSH_ID_PREFIX = "venice_ttl_re_push_";
+
+  /**
+   * Prefix used in push id to indicate a regular batch push is made to a store with TTL re-push enabled. This disables
+   * the TTL re-push enabled flag for the corresponding store.
+   */
+  String VENICE_REGULAR_PUSH_WITH_TTL_RE_PUSH_PREFIX = "venice_regular_push_with_ttl_re_push_";
+
+  /**
+   * Prefix used in push id to indicate a compliance/privacy deletion push. These are system-initiated pushes
+   * that can be killed by user-initiated pushes.
+   */
+  String VENICE_COMPLIANCE_PUSH_ID_PREFIX = "venice_compliance_push_";
+
+  int DEFAULT_RT_VERSION_NUMBER = 0;
+
   /**
    * Producer type for writing data to Venice
    */
-  enum PushType {
+  enum PushType implements VeniceDimensionInterface {
     BATCH(0), // Batch jobs will create a new version topic and write to it in a batch manner.
-    STREAM_REPROCESSING(1), // reprocessing jobs will create a new version topic and a reprocessing topic.
+    STREAM_REPROCESSING(1), // Reprocessing jobs will create a new version topic and a reprocessing topic.
     STREAM(2), // Stream jobs will write to a buffer or RT topic.
     INCREMENTAL(3); // Incremental jobs will re-use an existing version topic and write on top of it.
 
     private final int value;
+    private static final Map<Integer, PushType> VALUE_TO_TYPE_MAP = new HashMap<>(4);
+    private static final Map<String, PushType> NAME_TO_TYPE_MAP = new HashMap<>(4);
+
+    // Static initializer for map population
+    static {
+      for (PushType type: PushType.values()) {
+        VALUE_TO_TYPE_MAP.put(type.value, type);
+        NAME_TO_TYPE_MAP.put(type.name(), type);
+      }
+    }
 
     PushType(int value) {
       this.value = value;
@@ -68,15 +96,46 @@ public interface Version extends Comparable<Version>, DataModelBackedStructure<S
     }
 
     public boolean isBatchOrStreamReprocessing() {
-      return isBatch() || isStreamReprocessing();
+      return this == BATCH || this == STREAM_REPROCESSING;
     }
 
+    /**
+     * Retrieve the PushType based on its integer value.
+     *
+     * @param value the integer value of the PushType
+     * @return the corresponding PushType
+     * @throws VeniceException if the value is invalid
+     */
     public static PushType valueOf(int value) {
-      Optional<PushType> pushType = Arrays.stream(values()).filter(p -> p.value == value).findFirst();
-      if (!pushType.isPresent()) {
+      PushType pushType = VALUE_TO_TYPE_MAP.get(value);
+      if (pushType == null) {
         throw new VeniceException("Invalid push type with int value: " + value);
       }
-      return pushType.get();
+      return pushType;
+    }
+
+    /**
+     * Extracts the PushType from its string name.
+     *
+     * @param pushTypeString the string representation of the PushType
+     * @return the corresponding PushType
+     * @throws IllegalArgumentException if the string is invalid
+     */
+    public static PushType extractPushType(String pushTypeString) {
+      PushType pushType = NAME_TO_TYPE_MAP.get(pushTypeString);
+      if (pushType == null) {
+        throw new IllegalArgumentException(
+            String.format(
+                "%s is an invalid push type. Valid push types are: %s",
+                pushTypeString,
+                String.join(", ", NAME_TO_TYPE_MAP.keySet())));
+      }
+      return pushType;
+    }
+
+    @Override
+    public VeniceMetricsDimensions getDimensionName() {
+      return VeniceMetricsDimensions.VENICE_PUSH_JOB_TYPE;
     }
   }
 
@@ -148,6 +207,17 @@ public interface Version extends Comparable<Version>, DataModelBackedStructure<S
 
   void setVersionSwapDeferred(boolean versionSwapDeferred);
 
+  /**
+   * True when the parent auto-converted this push into a targeted-region push because one or more
+   * datacenters were marked degraded at version-creation time. Combined with
+   * {@link #getTargetSwapRegion()}, the degraded-mode recovery service derives which DCs were
+   * excluded — and therefore need post-unmark recovery — via
+   * {@code excludedDcs = all_known_dcs - parseRegions(targetSwapRegion)}.
+   */
+  boolean isDegradedPush();
+
+  void setDegradedPush(boolean isDegradedPush);
+
   int getReplicationFactor();
 
   void setReplicationFactor(int replicationFactor);
@@ -162,13 +232,27 @@ public interface Version extends Comparable<Version>, DataModelBackedStructure<S
 
   void setIncrementalPushEnabled(boolean incrementalPushEnabled);
 
+  boolean isSeparateRealTimeTopicEnabled();
+
+  void setSeparateRealTimeTopicEnabled(boolean separateRealTimeTopicEnabled);
+
   boolean isBlobTransferEnabled();
 
   void setBlobTransferEnabled(boolean blobTransferEnabled);
 
+  String getBlobTransferInServerEnabled();
+
+  void setBlobTransferInServerEnabled(String blobTransferInServerEnabled);
+
+  String getBlobDbEnabled();
+
+  void setBlobDbEnabled(String blobDbEnabled);
+
   boolean isUseVersionLevelIncrementalPushEnabled();
 
   void setUseVersionLevelIncrementalPushEnabled(boolean versionLevelIncrementalPushEnabled);
+
+  boolean isHybrid();
 
   HybridStoreConfig getHybridStoreConfig();
 
@@ -189,6 +273,22 @@ public interface Version extends Comparable<Version>, DataModelBackedStructure<S
   DataRecoveryVersionConfig getDataRecoveryVersionConfig();
 
   void setDataRecoveryVersionConfig(DataRecoveryVersionConfig dataRecoveryVersionConfig);
+
+  void setTargetSwapRegion(String targetRegion);
+
+  String getTargetSwapRegion();
+
+  void setTargetSwapRegionWaitTime(int waitTime);
+
+  int getTargetSwapRegionWaitTime();
+
+  void setIsDavinciHeartbeatReported(boolean isReported);
+
+  boolean getIsDavinciHeartbeatReported();
+
+  void setTargetRegionPromoted(boolean targetRegionPromoted);
+
+  boolean isTargetRegionPromoted();
 
   /**
    * Get the replication metadata version id.
@@ -218,11 +318,42 @@ public interface Version extends Comparable<Version>, DataModelBackedStructure<S
 
   int getRepushSourceVersion();
 
+  void setRepushTtlSeconds(int ttlSeconds);
+
+  int getRepushTtlSeconds();
+
   @JsonIgnore
   int getRmdVersionId();
 
   @JsonIgnore
   void setRmdVersionId(int replicationMetadataVersionId);
+
+  boolean isGlobalRtDivEnabled();
+
+  void setGlobalRtDivEnabled(boolean globalRtDivEnabled);
+
+  void setKeyUrnCompressionEnabled(boolean keyUrnCompressionEnabled);
+
+  boolean isKeyUrnCompressionEnabled();
+
+  void setKeyUrnFields(List<String> keyUrnFields);
+
+  List<String> getKeyUrnFields();
+
+  int getPreviousCurrentVersion();
+
+  void setPreviousCurrentVersion(int previousCurrentVersion);
+
+  /**
+   * Per-version storage mode controlling where data is persisted relative to the configured external storage system.
+   * Defaults to {@link StorageMode#INTERNAL}. Mirrors the {@code storageMode} field staged on {@code StoreVersion}
+   * (StoreMetaValue v44) by PR #2814.
+   *
+   * <p>Field plumbing only at the OSS Venice layer; the actual write semantics live in proprietary code paths.
+   */
+  StorageMode getStorageMode();
+
+  void setStorageMode(StorageMode storageMode);
 
   /**
    * Kafka topic name is composed by store name and version.
@@ -237,6 +368,28 @@ public interface Version extends Comparable<Version>, DataModelBackedStructure<S
 
   static String parseStoreFromVersionTopic(String kafkaTopic) {
     return kafkaTopic.substring(0, getLastIndexOfVersionSeparator(kafkaTopic));
+  }
+
+  static String removeRTVersionSuffix(String kafkaTopic) {
+    int lastIndexOfVersionSeparator = kafkaTopic.lastIndexOf(VERSION_SEPARATOR);
+
+    if (lastIndexOfVersionSeparator == 0) {
+      throw new VeniceException(
+          "There is nothing prior to the version separator '" + VERSION_SEPARATOR + "' in the provided topic name: '"
+              + kafkaTopic + "'");
+    } else if (lastIndexOfVersionSeparator == -1) {
+      return kafkaTopic;
+    }
+
+    int start = lastIndexOfVersionSeparator + VERSION_SEPARATOR.length();
+    int end = kafkaTopic.length();
+
+    for (int i = start; i < end; i++) {
+      if (!isDigit(kafkaTopic.charAt(i))) {
+        return kafkaTopic;
+      }
+    }
+    return kafkaTopic.substring(0, lastIndexOfVersionSeparator);
   }
 
   /**
@@ -263,6 +416,22 @@ public interface Version extends Comparable<Version>, DataModelBackedStructure<S
     return Integer.parseInt(kafkaTopic.substring(versionStartIndex));
   }
 
+  static int parseVersionFromVersionTopicPartition(String kafkaTopic) {
+    int versionStartIndex = getLastIndexOfVersionSeparator(kafkaTopic) + VERSION_SEPARATOR.length();
+
+    // Remove partition number if present
+    // e.g. store_89c1b5c06764_75ba3e03_v1-0
+    String versionString = kafkaTopic.substring(versionStartIndex);
+    versionString =
+        versionString.contains("-") ? versionString.substring(0, versionString.indexOf('-')) : versionString;
+
+    try {
+      return Integer.parseInt(versionString);
+    } catch (NumberFormatException e) {
+      return 1;
+    }
+  }
+
   static int getLastIndexOfVersionSeparator(String kafkaTopic) {
     int lastIndexOfVersionSeparator = kafkaTopic.lastIndexOf(VERSION_SEPARATOR);
     if (lastIndexOfVersionSeparator == -1) {
@@ -285,10 +454,6 @@ public interface Version extends Comparable<Version>, DataModelBackedStructure<S
     return storeName + VERSION_SEPARATOR + versionNumber;
   }
 
-  static String composeRealTimeTopic(String storeName) {
-    return storeName + REAL_TIME_TOPIC_SUFFIX;
-  }
-
   static String composeStreamReprocessingTopic(String storeName, int versionNumber) {
     return composeKafkaTopic(storeName, versionNumber) + STREAM_REPROCESSING_TOPIC_SUFFIX;
   }
@@ -308,7 +473,14 @@ public interface Version extends Comparable<Version>, DataModelBackedStructure<S
     if (!isRealTimeTopic(kafkaTopic)) {
       throw new VeniceException("Kafka topic: " + kafkaTopic + " is not a real-time topic");
     }
-    return kafkaTopic.substring(0, kafkaTopic.length() - REAL_TIME_TOPIC_SUFFIX.length());
+
+    boolean isSeparateRT = kafkaTopic.endsWith(SEPARATE_TOPIC_SUFFIX);
+    if (isSeparateRT) {
+      kafkaTopic = kafkaTopic.substring(0, kafkaTopic.length() - SEPARATE_TOPIC_SUFFIX.length());
+    }
+    String topicWithoutRTVersionSuffix = removeRTVersionSuffix(kafkaTopic);
+    return topicWithoutRTVersionSuffix
+        .substring(0, topicWithoutRTVersionSuffix.length() - REAL_TIME_TOPIC_SUFFIX.length());
   }
 
   static String parseStoreFromStreamReprocessingTopic(String kafkaTopic) {
@@ -336,8 +508,18 @@ public interface Version extends Comparable<Version>, DataModelBackedStructure<S
     return "";
   }
 
-  static boolean isRealTimeTopic(String kafkaTopic) {
-    return kafkaTopic.endsWith(REAL_TIME_TOPIC_SUFFIX);
+  static boolean isRealTimeTopic(String topicName) {
+    // valid rt topics are - abc_rt, abc_rt_v1, abc_rt_sep, abc_rt_v1_sep
+    if (topicName.endsWith(SEPARATE_TOPIC_SUFFIX)) {
+      topicName = topicName.substring(0, topicName.length() - SEPARATE_TOPIC_SUFFIX.length());
+    }
+    String topicWithoutRTVersionSuffix = removeRTVersionSuffix(topicName);
+    return topicWithoutRTVersionSuffix.endsWith(REAL_TIME_TOPIC_SUFFIX);
+  }
+
+  static boolean isIncrementalPushTopic(String topicName) {
+    String topicWithoutVersionSuffix = removeRTVersionSuffix(topicName);
+    return topicWithoutVersionSuffix.endsWith(SEPARATE_TOPIC_SUFFIX);
   }
 
   static boolean isStreamReprocessingTopic(String kafkaTopic) {
@@ -366,6 +548,10 @@ public interface Version extends Comparable<Version>, DataModelBackedStructure<S
 
   static boolean checkVersionSRTopic(String kafkaTopic, boolean checkSR) {
     int lastIndexOfVersionSeparator = kafkaTopic.lastIndexOf(VERSION_SEPARATOR);
+    if (lastIndexOfVersionSeparator != -1
+        && kafkaTopic.substring(0, lastIndexOfVersionSeparator).endsWith(REAL_TIME_TOPIC_SUFFIX)) {
+      return false;
+    }
     if (checkSR && !kafkaTopic.endsWith(STREAM_REPROCESSING_TOPIC_SUFFIX)) {
       return false;
     }
@@ -402,11 +588,89 @@ public interface Version extends Comparable<Version>, DataModelBackedStructure<S
     return VENICE_RE_PUSH_PUSH_ID_PREFIX + pushId;
   }
 
+  static String generateTTLRePushId(String pushId) {
+    return VENICE_TTL_RE_PUSH_PUSH_ID_PREFIX + pushId;
+  }
+
+  static String generateRegularPushWithTTLRePushId(String pushId) {
+    return VENICE_REGULAR_PUSH_WITH_TTL_RE_PUSH_PREFIX + pushId;
+  }
+
+  static String generateCompliancePushId(String pushId) {
+    return VENICE_COMPLIANCE_PUSH_ID_PREFIX + pushId;
+  }
+
+  static boolean isPushIdTTLRePush(String pushId) {
+    if (pushId == null || pushId.isEmpty()) {
+      return false;
+    }
+    return pushId.startsWith(VENICE_TTL_RE_PUSH_PUSH_ID_PREFIX);
+  }
+
   static boolean isPushIdRePush(String pushId) {
     if (pushId == null || pushId.isEmpty()) {
       return false;
     }
     return pushId.startsWith(VENICE_RE_PUSH_PUSH_ID_PREFIX);
+  }
+
+  static boolean isPushIdRegularPushWithTTLRePush(String pushId) {
+    if (pushId == null || pushId.isEmpty()) {
+      return false;
+    }
+    return pushId.startsWith(VENICE_REGULAR_PUSH_WITH_TTL_RE_PUSH_PREFIX);
+  }
+
+  static boolean isPushIdCompliancePush(String pushId) {
+    if (pushId == null || pushId.isEmpty()) {
+      return false;
+    }
+    return pushId.startsWith(VENICE_COMPLIANCE_PUSH_ID_PREFIX);
+  }
+
+  /**
+   * Check if the push ID represents a system-initiated push that can be killed by user-initiated pushes.
+   * This includes regular repushes and compliance pushes.
+   *
+   * @param pushId the push job ID to check
+   * @return true if the push is a killable system push
+   */
+  static boolean isKillableSystemPush(String pushId) {
+    return isPushIdRePush(pushId) || isPushIdCompliancePush(pushId);
+  }
+
+  /**
+   * Determine if an existing push job can be killed by an incoming push job.
+   *
+   * An existing push can be killed if:
+   * 1. The existing push is a killable system push (repush or compliance push), AND
+   * 2. The incoming push is NOT an incremental push, AND
+   * 3. The incoming push is NOT itself a killable system push (i.e., it's a user-initiated push)
+   *
+   * This allows user-initiated batch pushes to preempt system-initiated pushes like repushes
+   * and compliance pushes, but prevents system pushes from killing each other.
+   *
+   * @param existingPushJobId the push job ID of the currently running push
+   * @param incomingPushJobId the push job ID of the new push attempting to start
+   * @param incomingPushType the type of the incoming push
+   * @return true if the existing push can be killed to allow the incoming push to proceed
+   */
+  static boolean canIncomingPushKillExistingPush(
+      String existingPushJobId,
+      String incomingPushJobId,
+      PushType incomingPushType) {
+    // Only killable system pushes (repush, compliance push) can be killed
+    if (!isKillableSystemPush(existingPushJobId)) {
+      return false;
+    }
+
+    // Incremental pushes should not kill existing pushes as it can run in parallel
+    if (incomingPushType.isIncremental()) {
+      return false;
+    }
+
+    // System pushes should not kill other system pushes
+    return !isKillableSystemPush(incomingPushJobId);
   }
 
   static boolean containsHybridVersion(List<Version> versions) {

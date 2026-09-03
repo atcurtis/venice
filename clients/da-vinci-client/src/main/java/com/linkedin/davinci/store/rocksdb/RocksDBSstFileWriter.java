@@ -79,7 +79,6 @@ public class RocksDBSstFileWriter {
   private long recordNumInCurrentSSTFile = 0;
   private long recordNumInAllSSTFiles = 0;
   private String fullPathForTempSSTFileDir;
-  private final String fullPathForPartitionDBSnapshot;
   private Optional<Supplier<byte[]>> expectedChecksumSupplier;
   private final String storeName;
   private final int partitionId;
@@ -108,15 +107,12 @@ public class RocksDBSstFileWriter {
       Options options,
       String fullPathForTempSSTFileDir,
       boolean isRMD,
-      RocksDBServerConfig rocksDBServerConfig,
-      boolean blobTransferEnabled) {
+      RocksDBServerConfig rocksDBServerConfig) {
     this.storeName = storeName;
     this.partitionId = partitionId;
     this.envOptions = envOptions;
     this.options = options;
     this.fullPathForTempSSTFileDir = fullPathForTempSSTFileDir;
-    this.fullPathForPartitionDBSnapshot =
-        blobTransferEnabled ? RocksDBUtils.composeSnapshotDir(dbDir, storeName, partitionId) : null;
     this.isRMD = isRMD;
     this.lastCheckPointedSSTFileNum = isRMD ? ROCKSDB_LAST_FINISHED_RMD_SST_FILE_NO : ROCKSDB_LAST_FINISHED_SST_FILE_NO;
     this.rocksDBServerConfig = rocksDBServerConfig;
@@ -269,7 +265,8 @@ public class RocksDBSstFileWriter {
             throw new VeniceChecksumException(
                 "verifyChecksum: failure. last sstFile checksum didn't match for store: " + storeName + ", partition: "
                     + partitionId + ", sstFile: " + fullPathForLastFinishedSSTFile + ", records: "
-                    + recordNumInLastSSTFile + ", latency(ms): " + LatencyUtils.getElapsedTimeFromMsToMs(startMs));
+                    + recordNumInLastSSTFile + ", latency(ms): " + LatencyUtils.getElapsedTimeFromMsToMs(startMs),
+                partitionId);
           }
         }
       } else if (!isRMD) {
@@ -416,7 +413,7 @@ public class RocksDBSstFileWriter {
       }
       return result;
     } catch (Exception e) {
-      throw new VeniceChecksumException("Checksum mismatch in SST files.", e);
+      throw new VeniceChecksumException("Checksum mismatch in SST files.", e, partitionId);
     } finally {
       /**
        * close the iterator first before closing the reader, otherwise iterator is not closed at all, based on implementation
@@ -458,7 +455,7 @@ public class RocksDBSstFileWriter {
       for (LiveFileMetaData file: oldIngestedSSTFiles) {
         if (Arrays.equals(file.columnFamilyName(), columnFamilyHandle.getName())) {
           count++;
-          rocksDB.deleteFile(file.fileName());
+          rocksDB.deprecated_deleteFile(file.fileName());
         }
       }
       LOGGER.info(
@@ -498,25 +495,6 @@ public class RocksDBSstFileWriter {
           sstFilePaths);
     } catch (RocksDBException e) {
       throw new VeniceException("Received exception during RocksDB#ingestExternalFile", e);
-    }
-  }
-
-  public void createSnapshot(RocksDB rocksDB) {
-    if (fullPathForPartitionDBSnapshot == null || fullPathForPartitionDBSnapshot.isEmpty()) {
-      return;
-    }
-
-    try {
-      Checkpoint checkpoint = createCheckpoint(rocksDB);
-
-      LOGGER.info("Start creating snapshots in directory: {}", this.fullPathForPartitionDBSnapshot);
-      checkpoint.createCheckpoint(this.fullPathForPartitionDBSnapshot);
-
-      LOGGER.info("Finished creating snapshots in directory: {}", this.fullPathForPartitionDBSnapshot);
-    } catch (RocksDBException e) {
-      throw new VeniceException(
-          "Received exception during RocksDB's snapshot creation in directory " + this.fullPathForPartitionDBSnapshot,
-          e);
     }
   }
 

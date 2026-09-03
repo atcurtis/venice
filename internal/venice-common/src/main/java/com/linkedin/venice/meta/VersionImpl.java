@@ -9,6 +9,8 @@ import com.linkedin.venice.systemstore.schemas.StoreViewConfig;
 import com.linkedin.venice.utils.AvroCompatibilityUtils;
 import com.linkedin.venice.utils.AvroRecordUtils;
 import java.time.Duration;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.stream.Collectors;
@@ -234,6 +236,16 @@ public class VersionImpl implements Version {
   }
 
   @Override
+  public boolean isDegradedPush() {
+    return this.storeVersion.isDegradedPush;
+  }
+
+  @Override
+  public void setDegradedPush(boolean isDegradedPush) {
+    this.storeVersion.isDegradedPush = isDegradedPush;
+  }
+
+  @Override
   public int getReplicationFactor() {
     return this.storeVersion.replicationFactor;
   }
@@ -269,6 +281,16 @@ public class VersionImpl implements Version {
   }
 
   @Override
+  public boolean isSeparateRealTimeTopicEnabled() {
+    return storeVersion.separateRealTimeTopicEnabled;
+  }
+
+  @Override
+  public void setSeparateRealTimeTopicEnabled(boolean separateRealTimeTopicEnabled) {
+    this.storeVersion.setSeparateRealTimeTopicEnabled(separateRealTimeTopicEnabled);
+  }
+
+  @Override
   public boolean isBlobTransferEnabled() {
     return this.storeVersion.blobTransferEnabled;
   }
@@ -279,6 +301,26 @@ public class VersionImpl implements Version {
   }
 
   @Override
+  public String getBlobTransferInServerEnabled() {
+    return this.storeVersion.blobTransferInServerEnabled.toString();
+  }
+
+  @Override
+  public void setBlobTransferInServerEnabled(String blobTransferServerEnable) {
+    this.storeVersion.blobTransferInServerEnabled = blobTransferServerEnable;
+  }
+
+  @Override
+  public String getBlobDbEnabled() {
+    return this.storeVersion.blobDbEnabled.toString();
+  }
+
+  @Override
+  public void setBlobDbEnabled(String blobDbEnabled) {
+    this.storeVersion.blobDbEnabled = blobDbEnabled;
+  }
+
+  @Override
   public boolean isUseVersionLevelIncrementalPushEnabled() {
     return this.storeVersion.useVersionLevelIncrementalPushEnabled;
   }
@@ -286,6 +328,11 @@ public class VersionImpl implements Version {
   @Override
   public void setUseVersionLevelIncrementalPushEnabled(boolean versionLevelIncrementalPushEnabled) {
     this.storeVersion.useVersionLevelIncrementalPushEnabled = versionLevelIncrementalPushEnabled;
+  }
+
+  @Override
+  public boolean isHybrid() {
+    return getHybridStoreConfig() != null;
   }
 
   @Override
@@ -371,6 +418,16 @@ public class VersionImpl implements Version {
   }
 
   @Override
+  public void setRepushTtlSeconds(int ttlSeconds) {
+    this.storeVersion.repushTtlSeconds = ttlSeconds;
+  }
+
+  @Override
+  public int getRepushTtlSeconds() {
+    return this.storeVersion.repushTtlSeconds;
+  }
+
+  @Override
   public int getRmdVersionId() {
     return this.storeVersion.timestampMetadataVersionId;
   }
@@ -378,6 +435,99 @@ public class VersionImpl implements Version {
   @Override
   public void setRmdVersionId(int replicationMetadataVersionId) {
     this.storeVersion.timestampMetadataVersionId = replicationMetadataVersionId;
+  }
+
+  @Override
+  public void setTargetSwapRegion(String targetRegion) {
+    this.storeVersion.targetSwapRegion = targetRegion;
+  }
+
+  @Override
+  public String getTargetSwapRegion() {
+    return this.storeVersion.targetSwapRegion.toString();
+  }
+
+  @Override
+  public void setTargetSwapRegionWaitTime(int waitTime) {
+    this.storeVersion.targetSwapRegionWaitTime = waitTime;
+  }
+
+  @Override
+  public int getTargetSwapRegionWaitTime() {
+    return this.storeVersion.targetSwapRegionWaitTime;
+  }
+
+  @Override
+  public void setIsDavinciHeartbeatReported(boolean isReported) {
+    this.storeVersion.isDaVinciHeartBeatReported = isReported;
+  }
+
+  @Override
+  public boolean getIsDavinciHeartbeatReported() {
+    return this.storeVersion.isDaVinciHeartBeatReported;
+  }
+
+  @Override
+  public void setTargetRegionPromoted(boolean targetRegionPromoted) {
+    this.storeVersion.targetRegionPromoted = targetRegionPromoted;
+  }
+
+  @Override
+  public boolean isTargetRegionPromoted() {
+    return this.storeVersion.targetRegionPromoted;
+  }
+
+  @Override
+  public boolean isGlobalRtDivEnabled() {
+    return this.storeVersion.globalRtDivEnabled;
+  }
+
+  @Override
+  public void setGlobalRtDivEnabled(boolean globalRtDivEnabled) {
+    this.storeVersion.globalRtDivEnabled = globalRtDivEnabled;
+  }
+
+  @Override
+  public void setKeyUrnCompressionEnabled(boolean keyUrnCompressionEnabled) {
+    this.storeVersion.keyUrnCompressionEnabled = keyUrnCompressionEnabled;
+  }
+
+  @Override
+  public boolean isKeyUrnCompressionEnabled() {
+    return this.storeVersion.keyUrnCompressionEnabled;
+  }
+
+  @Override
+  public void setKeyUrnFields(List<String> keyUrnFields) {
+    this.storeVersion.keyUrnFields = keyUrnFields.stream().map(Objects::toString).collect(Collectors.toList());
+  }
+
+  @Override
+  public List<String> getKeyUrnFields() {
+    if (this.storeVersion.keyUrnFields == null) {
+      return Collections.emptyList();
+    }
+    return this.storeVersion.keyUrnFields.stream().map(Objects::toString).collect(Collectors.toList());
+  }
+
+  @Override
+  public int getPreviousCurrentVersion() {
+    return this.storeVersion.previousCurrentVersion;
+  }
+
+  @Override
+  public void setPreviousCurrentVersion(int previousCurrentVersion) {
+    this.storeVersion.previousCurrentVersion = previousCurrentVersion;
+  }
+
+  @Override
+  public StorageMode getStorageMode() {
+    return StorageMode.valueOf(this.storeVersion.storageMode);
+  }
+
+  @Override
+  public void setStorageMode(StorageMode storageMode) {
+    this.storeVersion.storageMode = storageMode == null ? StorageMode.INTERNAL.getValue() : storageMode.getValue();
   }
 
   @Override
@@ -450,15 +600,29 @@ public class VersionImpl implements Version {
     clonedVersion.setReplicationFactor(getReplicationFactor());
     clonedVersion.setNativeReplicationSourceFabric(getNativeReplicationSourceFabric());
     clonedVersion.setIncrementalPushEnabled(isIncrementalPushEnabled());
+    clonedVersion.setSeparateRealTimeTopicEnabled(isSeparateRealTimeTopicEnabled());
     clonedVersion.setUseVersionLevelIncrementalPushEnabled(isUseVersionLevelIncrementalPushEnabled());
     clonedVersion.setHybridStoreConfig(getHybridStoreConfig());
     clonedVersion.setUseVersionLevelHybridConfig(isUseVersionLevelHybridConfig());
     clonedVersion.setActiveActiveReplicationEnabled(isActiveActiveReplicationEnabled());
     clonedVersion.setRmdVersionId(getRmdVersionId());
     clonedVersion.setVersionSwapDeferred(isVersionSwapDeferred());
+    clonedVersion.setDegradedPush(isDegradedPush());
     clonedVersion.setRepushSourceVersion(getRepushSourceVersion());
     clonedVersion.setViewConfigs(getViewConfigs());
     clonedVersion.setBlobTransferEnabled(isBlobTransferEnabled());
+    clonedVersion.setBlobTransferInServerEnabled(getBlobTransferInServerEnabled());
+    clonedVersion.setBlobDbEnabled(getBlobDbEnabled());
+    clonedVersion.setTargetSwapRegion(getTargetSwapRegion());
+    clonedVersion.setTargetSwapRegionWaitTime(getTargetSwapRegionWaitTime());
+    clonedVersion.setIsDavinciHeartbeatReported(getIsDavinciHeartbeatReported());
+    clonedVersion.setTargetRegionPromoted(isTargetRegionPromoted());
+    clonedVersion.setGlobalRtDivEnabled(isGlobalRtDivEnabled());
+    clonedVersion.setKeyUrnCompressionEnabled(isKeyUrnCompressionEnabled());
+    clonedVersion.setKeyUrnFields(getKeyUrnFields());
+    clonedVersion.setRepushTtlSeconds(getRepushTtlSeconds());
+    clonedVersion.setPreviousCurrentVersion(getPreviousCurrentVersion());
+    clonedVersion.setStorageMode(getStorageMode());
     return clonedVersion;
   }
 

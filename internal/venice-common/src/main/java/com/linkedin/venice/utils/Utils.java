@@ -1,10 +1,12 @@
 package com.linkedin.venice.utils;
 
 import static com.linkedin.venice.HttpConstants.LOCALHOST;
+import static com.linkedin.venice.meta.Version.REAL_TIME_TOPIC_SUFFIX;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.linkedin.avroutil1.compatibility.AvroCompatibilityHelper;
+import com.linkedin.venice.common.VeniceSystemStoreUtils;
 import com.linkedin.venice.controllerapi.ControllerResponse;
 import com.linkedin.venice.exceptions.ConfigurationException;
 import com.linkedin.venice.exceptions.ErrorType;
@@ -13,30 +15,42 @@ import com.linkedin.venice.exceptions.VeniceHttpException;
 import com.linkedin.venice.helix.HelixState;
 import com.linkedin.venice.helix.Replica;
 import com.linkedin.venice.helix.ResourceAssignment;
+import com.linkedin.venice.meta.HybridStoreConfig;
 import com.linkedin.venice.meta.Instance;
+import com.linkedin.venice.meta.LifecycleHooksRecord;
 import com.linkedin.venice.meta.Partition;
 import com.linkedin.venice.meta.PartitionAssignment;
 import com.linkedin.venice.meta.ReadOnlyStoreRepository;
 import com.linkedin.venice.meta.RoutingDataRepository;
 import com.linkedin.venice.meta.Store;
+import com.linkedin.venice.meta.StoreInfo;
+import com.linkedin.venice.meta.StoreVersionInfo;
 import com.linkedin.venice.meta.Version;
+import com.linkedin.venice.meta.VersionStatus;
+import com.linkedin.venice.pubsub.PubSubTopicImpl;
+import com.linkedin.venice.pubsub.PubSubTopicPartitionImpl;
+import com.linkedin.venice.pubsub.PubSubTopicRepository;
 import com.linkedin.venice.pubsub.api.PubSubTopic;
 import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
+import com.linkedin.venice.pubsub.api.PubSubTopicType;
 import com.linkedin.venice.pushmonitor.ExecutionStatus;
 import com.linkedin.venice.serialization.avro.AvroProtocolDefinition;
 import com.linkedin.venice.serialization.avro.InternalAvroSpecificSerializer;
-import java.io.Closeable;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.lang.management.ManagementFactory;
+import java.lang.management.OperatingSystemMXBean;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.nio.ByteBuffer;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.text.DecimalFormat;
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -51,6 +65,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
+import java.util.TimeZone;
 import java.util.TreeMap;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -77,8 +92,9 @@ public class Utils {
   public static final String WILDCARD_MATCH_ANY = "*";
   public static final String NEW_LINE_CHAR = System.lineSeparator();
   public static final AtomicBoolean SUPPRESS_SYSTEM_EXIT = new AtomicBoolean();
-
+  public static final String SEPARATE_TOPIC_SUFFIX = "_sep";
   public static final String FATAL_DATA_VALIDATION_ERROR = "fatal data validation problem";
+  public static final ByteBuffer EMPTY_BYTE_BUFFER = ByteBuffer.wrap(new byte[0]);
 
   /**
    * Print an error and exit with error code 1
@@ -284,6 +300,21 @@ public class Utils {
     }
   }
 
+  /**
+   * Parses an integer from a string, ensuring that only null or valid integer values are accepted.
+   * Returns defaultValue if the value is null. Throws an exception if the value is invalid.
+   * @param value the string to parse
+   * @param fieldName the name of the field being validated
+   * @param defaultValue the default value to return if the input is null
+   * @return the parsed int value
+   */
+  public static int parseIntOrDefault(String value, String fieldName, int defaultValue) {
+    if (value == null || value.isEmpty()) {
+      return defaultValue;
+    }
+    return parseIntFromString(value, fieldName);
+  }
+
   public static long parseLongFromString(String value, String fieldName) {
     try {
       return Long.parseLong(value);
@@ -297,18 +328,49 @@ public class Utils {
   }
 
   /**
-   * Since {@link Boolean#parseBoolean(String)} does not throw exception and will always return 'false' for
-   * any string that are not equal to 'true', We validate the string by our own.
+   * Parses a boolean from a string, ensuring that only valid boolean values ("true" or "false")
+   * are accepted. Throws an exception if the value is null or invalid.
+   *
+   * @param value the string to parse
+   * @param fieldName the name of the field being validated
+   * @return the parsed boolean value
+   * @throws VeniceHttpException if the value is null or not "true" or "false"
    */
-  public static boolean parseBooleanFromString(String value, String fieldName) {
-    if (value.equalsIgnoreCase("true") || value.equalsIgnoreCase("false")) {
-      return Boolean.parseBoolean(value);
-    } else {
+  public static boolean parseBooleanOrThrow(String value, String fieldName) {
+    if (value == null) {
       throw new VeniceHttpException(
           HttpStatus.SC_BAD_REQUEST,
-          fieldName + " must be a boolean, but value: " + value,
+          fieldName + " must be a boolean, but value is null.",
           ErrorType.BAD_REQUEST);
     }
+    return parseBoolean(value, fieldName);
+  }
+
+  /**
+   * Parses a boolean from a string, ensuring that only null and valid boolean values ("true" or "false")
+   * are accepted. Returns false if the value is null.
+   *
+   * @param value the string to parse
+   * @param fieldName the name of the field being validated
+   * @return the parsed boolean value, or false if the input is null
+   * @throws VeniceHttpException if the value is not "true" or "false"
+   */
+  public static boolean parseBooleanOrFalse(String value, String fieldName) {
+    return value != null && parseBoolean(value, fieldName);
+  }
+
+  /**
+   * Validates the boolean string, allowing only "true" or "false".
+   * Throws an exception if the value is invalid.
+   */
+  private static boolean parseBoolean(String value, String fieldName) {
+    if (!"true".equalsIgnoreCase(value) && !"false".equalsIgnoreCase(value)) {
+      throw new VeniceHttpException(
+          HttpStatus.SC_BAD_REQUEST,
+          fieldName + " must be a boolean, but value: " + value + " is invalid.",
+          ErrorType.BAD_REQUEST);
+    }
+    return Boolean.parseBoolean(value);
   }
 
   /**
@@ -327,6 +389,23 @@ public class Utils {
     } catch (IOException jsonException) {
       throw new VeniceException(fieldName + " must be a valid JSON object, but value: " + value);
     }
+  }
+
+  /**
+   * For Store Lifecycle Hooks value, we expect the command-line interface users to use JSON
+   * format to represent it. This method deserialize it to List<LifecycleHooksRecord>.
+   */
+  public static List<LifecycleHooksRecord> parseStoreLifecycleHooksListFromString(String value, String fieldName) {
+    try {
+      if (value != null) {
+        ObjectMapper objectMapper = ObjectMapperFactory.getInstance();
+        return objectMapper.readValue(value, new TypeReference<List<LifecycleHooksRecord>>() {
+        });
+      }
+    } catch (IOException e) {
+      throw new VeniceException(fieldName + " must be a valid JSON object, but value: " + value);
+    }
+    return Collections.emptyList();
   }
 
   public static String getHelixNodeIdentifier(String hostname, int port) {
@@ -356,13 +435,19 @@ public class Utils {
       }
       String schemaString = IOUtils.toString(inputStream);
       Schema schema = AvroCompatibilityHelper.parse(schemaString);
-      LOGGER.info("Loaded schema from resource path: {}", resourcePath);
+      LOGGER.debug("Loaded schema from resource path: {}", resourcePath);
       LOGGER.debug("Schema literal:\n{}", schema.toString(true));
       return schema;
     }
   }
 
   public static Map<Integer, Schema> getAllSchemasFromResources(AvroProtocolDefinition protocolDef) {
+    return getAllSchemasFromResources(protocolDef, protocolDef.getCurrentProtocolVersionSchema());
+  }
+
+  public static Map<Integer, Schema> getAllSchemasFromResources(
+      AvroProtocolDefinition protocolDef,
+      Schema compiledSchema) {
     final int SENTINEL_PROTOCOL_VERSION_USED_FOR_UNDETECTABLE_COMPILED_SCHEMA =
         InternalAvroSpecificSerializer.SENTINEL_PROTOCOL_VERSION_USED_FOR_UNDETECTABLE_COMPILED_SCHEMA;
     final int SENTINEL_PROTOCOL_VERSION_USED_FOR_UNVERSIONED_PROTOCOL =
@@ -382,7 +467,6 @@ public class Utils {
     }
 
     byte compiledProtocolVersion = SENTINEL_PROTOCOL_VERSION_USED_FOR_UNDETECTABLE_COMPILED_SCHEMA;
-    String className = protocolDef.getClassName();
     Map<Integer, Schema> protocolSchemaMap = new TreeMap<>();
     int initialVersion;
     if (currentProtocolVersion > 0) {
@@ -392,6 +476,7 @@ public class Utils {
     }
     final String sep = "/"; // TODO: Make sure that jar resources are always forward-slash delimited, even on Windows
     int version = initialVersion;
+    String className = protocolDef.getClassName();
     while (true) {
       String versionPath = "avro" + sep;
       if (currentProtocolVersion != SENTINEL_PROTOCOL_VERSION_USED_FOR_UNVERSIONED_PROTOCOL) {
@@ -401,7 +486,7 @@ public class Utils {
       try {
         Schema schema = Utils.getSchemaFromResource(versionPath);
         protocolSchemaMap.put(version, schema);
-        if (schema.equals(protocolDef.getCurrentProtocolVersionSchema())) {
+        if (schema.equals(compiledSchema)) {
           compiledProtocolVersion = (byte) version;
           break;
         }
@@ -444,7 +529,7 @@ public class Utils {
     if (intendedCurrentProtocol == null) {
       throw new VeniceException(
           "Failed to get schema for current version: " + currentProtocolVersion + " class: " + className);
-    } else if (!intendedCurrentProtocol.equals(protocolDef.getCurrentProtocolVersionSchema())) {
+    } else if (!intendedCurrentProtocol.equals(compiledSchema)) {
       throw new VeniceException(
           "The intended protocol version (" + currentProtocolVersion
               + ") does not match the compiled protocol version (" + compiledProtocolVersion + ").");
@@ -460,19 +545,18 @@ public class Utils {
     return Arrays.asList(allowed).contains(newStatus.getRootStatus());
   }
 
-  public static List<String> parseCommaSeparatedStringToList(String rawString) {
-    String[] strArray = rawString.split(",\\s*");
-    if (strArray.length < 1) {
-      throw new VeniceException("Invalid input: " + rawString);
-    }
-    return Arrays.asList(strArray);
-  }
-
   public static Set<String> parseCommaSeparatedStringToSet(String rawString) {
-    if (rawString == null || rawString.length() == 0) {
+    if (StringUtils.isEmpty(rawString)) {
       return Collections.emptySet();
     }
     return Utils.setOf(rawString.split(",\\s*"));
+  }
+
+  public static List<String> parseCommaSeparatedStringToList(String rawString) {
+    if (StringUtils.isEmpty(rawString)) {
+      return Collections.emptyList();
+    }
+    return Arrays.asList(rawString.split("\\s*,\\s*"));
   }
 
   /**
@@ -528,6 +612,137 @@ public class Utils {
     } catch (IOException e) {
       throw new VeniceException(e);
     }
+  }
+
+  /** This method should only be used for system stores.
+   * For other stores, use {@link Utils#getRealTimeTopicName(Store)}, {@link Utils#getRealTimeTopicName(StoreInfo)} or
+   * {@link Utils#getRealTimeTopicName(Version)} in source code.
+   * For tests, use {@link Utils#composeRealTimeTopic(String, int)}
+   */
+  public static String composeRealTimeTopic(String storeName) {
+    return storeName + REAL_TIME_TOPIC_SUFFIX;
+  }
+
+  public static String composeRealTimeTopic(String storeName, int versionNumber) {
+    return String.format(Version.REAL_TIME_TOPIC_TEMPLATE, storeName, versionNumber);
+  }
+
+  /**
+   * It follows the following order to search for real time topic name,
+   * i) current store-version config, ii) store config, iii) other store-version configs, iv) default name
+   */
+  public static String getRealTimeTopicName(Store store) {
+    return getRealTimeTopicName(
+        store.getName(),
+        store.getVersions(),
+        store.getCurrentVersion(),
+        store.getHybridStoreConfig());
+  }
+
+  public static String getRealTimeTopicName(StoreInfo storeInfo) {
+    return getRealTimeTopicName(
+        storeInfo.getName(),
+        storeInfo.getVersions(),
+        storeInfo.getCurrentVersion(),
+        storeInfo.getHybridStoreConfig());
+  }
+
+  public static boolean isRTVersioningApplicable(String storeName) {
+    return !(VeniceSystemStoreUtils.isSystemStore(storeName) || VeniceSystemStoreUtils.isUserSystemStore(storeName)
+        || VeniceSystemStoreUtils.isParticipantStore(storeName));
+  }
+
+  public static String getRealTimeTopicName(Version version) {
+    if (!isRTVersioningApplicable(version.getStoreName())) {
+      return composeRealTimeTopic(version.getStoreName());
+    }
+
+    if (version.isHybrid()) {
+      String realTimeTopicName = version.getHybridStoreConfig().getRealTimeTopicName();
+      return getRealTimeTopicNameIfEmpty(realTimeTopicName, version.getStoreName());
+    } else {
+      // if the version is not hybrid, caller should not ask for the real time topic,
+      // but unfortunately that happens, so instead of throwing exception, we just return a default name.
+      return composeRealTimeTopic(version.getStoreName());
+    }
+  }
+
+  public static Set<String> getAllRealTimeTopicNames(Store store) {
+    return store.getVersions().stream().map(Utils::getRealTimeTopicName).collect(Collectors.toSet());
+  }
+
+  static String getRealTimeTopicName(
+      String storeName,
+      List<Version> versions,
+      int currentVersionNumber,
+      HybridStoreConfig hybridStoreConfig) {
+    if (!isRTVersioningApplicable(storeName)) {
+      return composeRealTimeTopic(storeName);
+    }
+
+    Set<String> realTimeTopicNames = new HashSet<>();
+
+    for (Version version: versions) {
+      if (version.isHybrid()) {
+        String realTimeTopicName = version.getHybridStoreConfig().getRealTimeTopicName();
+        if (StringUtils.isNotBlank(realTimeTopicName)) {
+          if (version.getNumber() == currentVersionNumber) {
+            return realTimeTopicName;
+          } else {
+            realTimeTopicNames.add(realTimeTopicName);
+          }
+        }
+      }
+    }
+
+    if (realTimeTopicNames.size() > 1) {
+      LOGGER.warn(
+          "Current version({}) of store {} is not hybrid, yet {} older version(s) is/are using real "
+              + "time topic(s). Will return one of them.",
+          currentVersionNumber,
+          storeName,
+          realTimeTopicNames.size());
+    }
+
+    if (!realTimeTopicNames.isEmpty()) {
+      return realTimeTopicNames.iterator().next();
+    }
+
+    if (hybridStoreConfig != null) {
+      String realTimeTopicName = hybridStoreConfig.getRealTimeTopicName();
+      return getRealTimeTopicNameIfEmpty(realTimeTopicName, storeName);
+    }
+
+    return composeRealTimeTopic(storeName);
+  }
+
+  private static String getRealTimeTopicNameIfEmpty(String realTimeTopicName, String storeName) {
+    return StringUtils.isBlank(realTimeTopicName) ? composeRealTimeTopic(storeName) : realTimeTopicName;
+  }
+
+  public static String getRealTimeTopicNameFromSeparateRealTimeTopic(String separateRealTimeTopicName) {
+    return separateRealTimeTopicName.substring(0, separateRealTimeTopicName.indexOf(Utils.SEPARATE_TOPIC_SUFFIX));
+  }
+
+  public static String getSeparateRealTimeTopicName(String realTimeTopicName) {
+    return realTimeTopicName + Utils.SEPARATE_TOPIC_SUFFIX;
+  }
+
+  public static String getSeparateRealTimeTopicName(Version version) {
+    return getSeparateRealTimeTopicName(Utils.getRealTimeTopicName(version));
+  }
+
+  public static String getSeparateRealTimeTopicName(StoreInfo storeInfo) {
+    return getSeparateRealTimeTopicName(Utils.getRealTimeTopicName(storeInfo));
+  }
+
+  public static int calculateTopicHashCode(PubSubTopic topic) {
+    if (topic.isSeparateRealTimeTopic()) {
+      String realTimeTopicName = Utils.getRealTimeTopicNameFromSeparateRealTimeTopic(topic.getName());
+      PubSubTopic normalizedTopic = new PubSubTopicImpl(realTimeTopicName);
+      return normalizedTopic.hashCode();
+    }
+    return topic.hashCode();
   }
 
   private static class TimeUnitInfo {
@@ -736,16 +951,24 @@ public class Utils {
     return new HashSet<>(Arrays.asList(objs));
   }
 
-  public static long calculateDurationMs(Time time, long startTimeMs) {
-    return time.getMilliseconds() - startTimeMs;
-  }
-
-  public static void closeQuietlyWithErrorLogged(Closeable... closeables) {
+  public static void closeQuietlyWithErrorLogged(AutoCloseable... closeables) {
     if (closeables == null) {
       return;
     }
-    for (Closeable closeable: closeables) {
-      IOUtils.closeQuietly(closeable, LOGGER::error);
+    for (AutoCloseable closeable: closeables) {
+      closeQuietly(closeable, LOGGER::error);
+    }
+  }
+
+  public static void closeQuietly(final AutoCloseable closeable, final Consumer<Exception> consumer) {
+    if (closeable != null) {
+      try {
+        closeable.close();
+      } catch (final Exception e) {
+        if (consumer != null) {
+          consumer.accept(e);
+        }
+      }
     }
   }
 
@@ -813,6 +1036,35 @@ public class Utils {
   }
 
   /**
+   * Checks if the future version is ready to serve. A future version is considered ready to serve if the version status
+   * is either PUSHED or ONLINE
+   * @param resourceName
+   * @param metadataRepo
+   * @return
+   */
+  public static boolean isFutureVersionReady(String resourceName, ReadOnlyStoreRepository metadataRepo) {
+    try {
+      String storeName = Version.parseStoreFromKafkaTopicName(resourceName);
+      int versionNum = Version.parseVersionFromKafkaTopicName(resourceName);
+      Store store = metadataRepo.getStoreOrThrow(storeName);
+      if (store == null) {
+        LOGGER.warn("Store {} is not in store repository.", storeName);
+        return false;
+      }
+
+      Version futureVersion = store.getVersion(versionNum);
+      if (futureVersion == null) {
+        return false;
+      }
+
+      return store.getCurrentVersion() < versionNum && (futureVersion.getStatus().equals(VersionStatus.ONLINE)
+          || futureVersion.getStatus().equals(VersionStatus.PUSHED));
+    } catch (VeniceException e) {
+      return false;
+    }
+  }
+
+  /**
    * When Helix thinks some host is overloaded or a new host joins the cluster, it might move some replicas from
    * one host to another. The partition to be moved is usually in a healthy state, i.e. 3/3 running replicas.
    * We will now build an extra replica in the new host before dropping one replica in an old host.
@@ -855,17 +1107,17 @@ public class Utils {
     return params;
   }
 
-  public static Pair<Store, Version> waitStoreVersionOrThrow(
+  public static StoreVersionInfo waitStoreVersionOrThrow(
       String storeVersionName,
       ReadOnlyStoreRepository metadataRepo) {
     String storeName = Version.parseStoreFromKafkaTopicName(storeVersionName);
     int versionNumber = Version.parseVersionFromKafkaTopicName(storeVersionName);
 
-    Pair<Store, Version> storeVersionPair = metadataRepo.waitVersion(storeName, versionNumber, Duration.ofSeconds(30));
-    if (storeVersionPair.getFirst() == null) {
+    StoreVersionInfo storeVersionPair = metadataRepo.waitVersion(storeName, versionNumber, Duration.ofSeconds(30));
+    if (storeVersionPair.getStore() == null) {
       throw new VeniceException("Store " + storeName + " does not exist.");
     }
-    if (storeVersionPair.getSecond() == null) {
+    if (storeVersionPair.getVersion() == null) {
       throw new VeniceException("Store " + storeName + " version " + versionNumber + " does not exist.");
     }
     return storeVersionPair;
@@ -905,6 +1157,10 @@ public class Utils {
     return orig.replace('.', '_');
   }
 
+  public static String getReplicaId(String storeName, int version, int partition) {
+    return getReplicaId(Version.composeKafkaTopic(storeName, version), partition);
+  }
+
   /**
    * Standard logging format for TopicPartition
    */
@@ -927,5 +1183,90 @@ public class Utils {
    */
   public static String escapeFilePathComponent(final String component) {
     return component.replaceAll("[^a-zA-Z0-9-_/\\.]", "_");
+  }
+
+  /**
+   * Check whether the given kafka url has "_sep" or not.
+   * If it has, return the kafka url without "_sep". Otherwise, return the original kafka url.
+   * @param kafkaUrl
+   * @return
+   */
+  public static String resolveKafkaUrlForSepTopic(String kafkaUrl) {
+    if (kafkaUrl != null && kafkaUrl.endsWith(SEPARATE_TOPIC_SUFFIX)) {
+      return kafkaUrl.substring(0, kafkaUrl.length() - SEPARATE_TOPIC_SUFFIX.length());
+    }
+    return kafkaUrl;
+  }
+
+  /**
+   * Check whether input region is for separate RT topic.
+   */
+  public static boolean isSeparateTopicRegion(String region) {
+    return region.endsWith(SEPARATE_TOPIC_SUFFIX);
+  }
+
+  /**
+   * Resolve leader topic from input topic.
+   * If input topic is separate RT topic, return the corresponding RT topic.
+   * Otherwise, return the original input topic.
+   */
+  public static PubSubTopic resolveLeaderTopicFromPubSubTopic(
+      PubSubTopicRepository pubSubTopicRepository,
+      PubSubTopic pubSubTopic) {
+    if (pubSubTopic.getPubSubTopicType().equals(PubSubTopicType.REALTIME_TOPIC)
+        && pubSubTopic.getName().endsWith(SEPARATE_TOPIC_SUFFIX)) {
+      return pubSubTopicRepository.getTopic(getRealTimeTopicNameFromSeparateRealTimeTopic(pubSubTopic.getName()));
+    }
+    return pubSubTopic;
+  }
+
+  public static PubSubTopicPartition createPubSubTopicPartitionFromLeaderTopicPartition(
+      String pubSubAddress,
+      PubSubTopicPartition leaderTopicPartition) {
+    return pubSubAddress.endsWith(Utils.SEPARATE_TOPIC_SUFFIX)
+        ? new PubSubTopicPartitionImpl(
+            new PubSubTopicImpl(leaderTopicPartition.getTopicName() + Utils.SEPARATE_TOPIC_SUFFIX),
+            leaderTopicPartition.getPartitionNumber())
+        : leaderTopicPartition;
+  }
+
+  /**
+   * Parses a date-time string to epoch milliseconds using the default format and time zone.
+   *
+   * @param dateTime the date-time string in the format "yyyy-MM-dd hh:mm:ss"
+   * @return the epoch time in milliseconds
+   * @throws ParseException if the date-time string cannot be parsed
+   */
+  public static long parseDateTimeToEpoch(String dateTime, String dateTimeFormat, String timeZone)
+      throws ParseException {
+    SimpleDateFormat dateFormat = new SimpleDateFormat(dateTimeFormat);
+    dateFormat.setTimeZone(TimeZone.getTimeZone(timeZone));
+    return dateFormat.parse(dateTime).getTime();
+  }
+
+  public static long getOSMemorySize() {
+    OperatingSystemMXBean osBean = ManagementFactory.getOperatingSystemMXBean();
+
+    if (osBean instanceof com.sun.management.OperatingSystemMXBean) {
+      com.sun.management.OperatingSystemMXBean extendedOsBean = (com.sun.management.OperatingSystemMXBean) osBean;
+      return extendedOsBean.getTotalPhysicalMemorySize();
+    } else {
+      System.out.println("OS Bean not available.");
+    }
+    return -1;
+  }
+
+  /**
+   * Used for seeding purposes. e.g. consumer sequence id. Doesn't actual have nanosecond accuracy.
+   * @return the current time in nanoseconds.
+   */
+  public static long getCurrentTimeInNanosForSeeding() {
+    long max = Long.MAX_VALUE / Time.NS_PER_MS;
+    long currentMs = System.currentTimeMillis();
+    if (currentMs > max) {
+      throw new VeniceException(
+          "Can no longer generate nanoseconds for seeding purposes (why are you still on Venice)");
+    }
+    return currentMs * Time.NS_PER_MS;
   }
 }

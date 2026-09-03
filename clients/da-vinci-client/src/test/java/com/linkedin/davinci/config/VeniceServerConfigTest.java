@@ -1,24 +1,49 @@
 package com.linkedin.davinci.config;
 
-import static com.linkedin.davinci.ingestion.utils.IsolatedIngestionUtils.*;
-import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_PLAIN_TABLE_FORMAT_ENABLED;
-import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_TOTAL_MEMTABLE_USAGE_CAP_IN_BYTES;
+import static com.linkedin.venice.ConfigKeys.BLOB_TRANSFER_CLIENT_NETTY_WORKER_THREADS;
 import static com.linkedin.venice.ConfigKeys.CLUSTER_NAME;
-import static com.linkedin.venice.ConfigKeys.INGESTION_MEMORY_LIMIT;
+import static com.linkedin.venice.ConfigKeys.DATA_BASE_PATH;
 import static com.linkedin.venice.ConfigKeys.INGESTION_USE_DA_VINCI_CLIENT;
 import static com.linkedin.venice.ConfigKeys.KAFKA_BOOTSTRAP_SERVERS;
+import static com.linkedin.venice.ConfigKeys.KAFKA_FETCH_THROTTLER_FACTORS_PER_SECOND;
+import static com.linkedin.venice.ConfigKeys.LOCAL_REGION_NAME;
+import static com.linkedin.venice.ConfigKeys.PARTICIPANT_MESSAGE_STORE_ENABLED;
+import static com.linkedin.venice.ConfigKeys.SERVER_AA_DCR_BUG_INJECTION_STORE_TO_REGION_MAP;
+import static com.linkedin.venice.ConfigKeys.SERVER_CROSS_TP_PARALLEL_PROCESSING_CURRENT_VERSION_AA_WC_LEADER_ONLY;
+import static com.linkedin.venice.ConfigKeys.SERVER_CROSS_TP_PARALLEL_PROCESSING_ENABLED;
+import static com.linkedin.venice.ConfigKeys.SERVER_CROSS_TP_PARALLEL_PROCESSING_THREAD_POOL_SIZE;
+import static com.linkedin.venice.ConfigKeys.SERVER_DEAD_LEADER_READY_TO_SERVE_FALLBACK_THRESHOLD_MS;
 import static com.linkedin.venice.ConfigKeys.SERVER_FORKED_PROCESS_JVM_ARGUMENT_LIST;
-import static com.linkedin.venice.ConfigKeys.SERVER_INGESTION_MODE;
+import static com.linkedin.venice.ConfigKeys.SERVER_FUTURE_VERSION_STANDBY_LAG_CHECK_ENABLED;
+import static com.linkedin.venice.ConfigKeys.SERVER_FUTURE_VERSION_STANDBY_LAG_CHECK_POLL_INTERVAL_MINUTES;
+import static com.linkedin.venice.ConfigKeys.SERVER_FUTURE_VERSION_STANDBY_LAG_CHECK_TIMEOUT_MINUTES;
+import static com.linkedin.venice.ConfigKeys.SERVER_FUTURE_VERSION_STANDBY_LAG_THRESHOLD;
+import static com.linkedin.venice.ConfigKeys.SERVER_INGESTION_OTEL_STATS_ENABLED;
+import static com.linkedin.venice.ConfigKeys.SERVER_LEADER_COMPLETE_STATE_CHECK_IN_FOLLOWER_VALID_INTERVAL_MS;
+import static com.linkedin.venice.ConfigKeys.SERVER_LEADER_HANDOVER_USE_DOL_MECHANISM_FOR_SYSTEM_STORES;
+import static com.linkedin.venice.ConfigKeys.SERVER_LEADER_HANDOVER_USE_DOL_MECHANISM_FOR_USER_STORES;
+import static com.linkedin.venice.ConfigKeys.SERVER_PARALLEL_SHUTDOWN_THREAD_POOL_SIZE;
+import static com.linkedin.venice.ConfigKeys.SERVER_THROTTLER_FACTORS_FOR_CURRENT_VERSION_AA_WC_LEADER;
+import static com.linkedin.venice.ConfigKeys.SERVER_THROTTLER_FACTORS_FOR_CURRENT_VERSION_NON_AA_WC_LEADER;
+import static com.linkedin.venice.ConfigKeys.SERVER_THROTTLER_FACTORS_FOR_NON_CURRENT_VERSION_AA_WC_LEADER;
+import static com.linkedin.venice.ConfigKeys.SERVER_THROTTLER_FACTORS_FOR_NON_CURRENT_VERSION_NON_AA_WC_LEADER;
 import static com.linkedin.venice.ConfigKeys.ZOOKEEPER_ADDRESS;
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertThrows;
 import static org.testng.Assert.assertTrue;
-import static org.testng.Assert.expectThrows;
 
+import com.linkedin.davinci.blobtransfer.client.NettyFileTransferClient;
 import com.linkedin.venice.exceptions.VeniceException;
-import com.linkedin.venice.meta.IngestionMode;
 import com.linkedin.venice.utils.VeniceProperties;
+import java.util.Arrays;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Properties;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.stream.Collectors;
 import org.testng.annotations.Test;
 
 
@@ -47,64 +72,262 @@ public class VeniceServerConfigTest {
   }
 
   @Test
-  public void testMemoryLimitConfigWithoutIngestionIsolation() {
-    Properties propsForNonDaVinci = populatedBasicProperties();
-    propsForNonDaVinci.setProperty(INGESTION_USE_DA_VINCI_CLIENT, "false");
-    propsForNonDaVinci.setProperty(INGESTION_MEMORY_LIMIT, "100MB");
+  public void testFutureVersionStandbyLagCheckDefaults() {
+    Properties props = populatedBasicProperties();
+    VeniceServerConfig config = new VeniceServerConfig(new VeniceProperties(props));
 
-    VeniceException e =
-        expectThrows(VeniceException.class, () -> new VeniceServerConfig(new VeniceProperties(propsForNonDaVinci)));
-    assertTrue(e.getMessage().contains("only meaningful for DaVinci"));
-
-    Properties props1 = populatedBasicProperties();
-    props1.setProperty(INGESTION_MEMORY_LIMIT, "100MB");
-    e = expectThrows(VeniceException.class, () -> new VeniceServerConfig(new VeniceProperties(props1)));
-    assertTrue(e.getMessage().contains("meaningful when using RocksDB plaintable format"));
-
-    Properties props2 = populatedBasicProperties();
-    props2.setProperty(INGESTION_MEMORY_LIMIT, "100MB");
-    props2.setProperty(ROCKSDB_PLAIN_TABLE_FORMAT_ENABLED, "true");
-    e = expectThrows(VeniceException.class, () -> new VeniceServerConfig(new VeniceProperties(props2)));
-    assertTrue(e.getMessage().contains("should be bigger than total memtable usage cap"));
-
-    Properties props3 = populatedBasicProperties();
-    props3.setProperty(INGESTION_MEMORY_LIMIT, "100MB");
-    props3.setProperty(ROCKSDB_PLAIN_TABLE_FORMAT_ENABLED, "true");
-    props3.setProperty(ROCKSDB_TOTAL_MEMTABLE_USAGE_CAP_IN_BYTES, "32MB");
-    VeniceServerConfig config1 = new VeniceServerConfig(new VeniceProperties(props3));
-    assertEquals(config1.getIngestionMemoryLimit(), 68 * 1024 * 1024l);
+    assertFalse(config.isFutureVersionStandbyLagCheckEnabled());
+    assertEquals(config.getFutureVersionStandbyLagThreshold(), 1000L);
+    assertEquals(config.getFutureVersionStandbyLagCheckTimeoutMinutes(), 2 * 60);
+    assertEquals(config.getFutureVersionStandbyLagCheckPollIntervalMinutes(), 15);
   }
 
   @Test
-  public void testMemoryLimitConfigWithIngestionIsolation() {
-    Properties props1 = populatedBasicProperties();
-    props1.setProperty(INGESTION_MEMORY_LIMIT, "100MB");
-    props1.setProperty(SERVER_INGESTION_MODE, IngestionMode.ISOLATED.toString());
-    props1.setProperty(ROCKSDB_PLAIN_TABLE_FORMAT_ENABLED, "true");
+  public void testFutureVersionStandbyLagCheckOverrides() {
+    Properties props = populatedBasicProperties();
+    props.setProperty(SERVER_FUTURE_VERSION_STANDBY_LAG_CHECK_ENABLED, "true");
+    props.setProperty(SERVER_FUTURE_VERSION_STANDBY_LAG_THRESHOLD, "2000");
+    props.setProperty(SERVER_FUTURE_VERSION_STANDBY_LAG_CHECK_TIMEOUT_MINUTES, "60");
+    props.setProperty(SERVER_FUTURE_VERSION_STANDBY_LAG_CHECK_POLL_INTERVAL_MINUTES, "5");
+    VeniceServerConfig config = new VeniceServerConfig(new VeniceProperties(props));
 
-    VeniceException e = expectThrows(VeniceException.class, () -> new VeniceServerConfig(new VeniceProperties(props1)));
-    assertTrue(
-        e.getMessage()
-            .contains(
-                "The max heap size of isolated process needs to be configured explicitly when enabling memory limiter"));
+    assertTrue(config.isFutureVersionStandbyLagCheckEnabled());
+    assertEquals(config.getFutureVersionStandbyLagThreshold(), 2000L);
+    assertEquals(config.getFutureVersionStandbyLagCheckTimeoutMinutes(), 60);
+    assertEquals(config.getFutureVersionStandbyLagCheckPollIntervalMinutes(), 5);
+  }
 
-    Properties props2 = populatedBasicProperties();
-    props2.setProperty(INGESTION_MEMORY_LIMIT, "100MB");
-    props2.setProperty(SERVER_INGESTION_MODE, IngestionMode.ISOLATED.toString());
-    props2.put(SERVER_FORKED_PROCESS_JVM_ARGUMENT_LIST, "-Xms32MB;-Xmx32MB");
-    props2.setProperty(ROCKSDB_TOTAL_MEMTABLE_USAGE_CAP_IN_BYTES, "50MB");
-    props2.setProperty(ROCKSDB_PLAIN_TABLE_FORMAT_ENABLED, "true");
-    e = expectThrows(VeniceException.class, () -> new VeniceServerConfig(new VeniceProperties(props2)));
-    assertTrue(e.getMessage().contains("should be positive after subtracting the usage from other components"));
+  @Test
+  public void testAaDcrBugInjectionEnabledForStore() {
+    // Default: empty map, nothing is enabled.
+    Properties props = populatedBasicProperties();
+    props.put(LOCAL_REGION_NAME, "ei-ltx1");
+    VeniceServerConfig config = new VeniceServerConfig(new VeniceProperties(props));
+    assertFalse(config.isAaDcrBugInjectionEnabledForStore("store_a"));
 
-    Properties props3 = populatedBasicProperties();
-    props3.setProperty(INGESTION_MEMORY_LIMIT, "100MB");
-    props3.setProperty(SERVER_INGESTION_MODE, IngestionMode.ISOLATED.toString());
-    props3.put(SERVER_FORKED_PROCESS_JVM_ARGUMENT_LIST, "-Xms32MB;-Xmx32MB");
-    props3.setProperty(ROCKSDB_TOTAL_MEMTABLE_USAGE_CAP_IN_BYTES, "32MB");
-    props3.setProperty(ROCKSDB_PLAIN_TABLE_FORMAT_ENABLED, "true");
-    props3.setProperty(INGESTION_ISOLATION_CONFIG_PREFIX + "." + ROCKSDB_TOTAL_MEMTABLE_USAGE_CAP_IN_BYTES, "16MB");
-    VeniceServerConfig config1 = new VeniceServerConfig(new VeniceProperties(props3));
-    assertEquals(config1.getIngestionMemoryLimit(), 20 * 1024 * 1024l);
+    // store_a targets this server's region (ei-ltx1) -> enabled; store_b targets another allowed region -> disabled.
+    props.put(SERVER_AA_DCR_BUG_INJECTION_STORE_TO_REGION_MAP, "store_a:ei-ltx1,store_b:ei4");
+    config = new VeniceServerConfig(new VeniceProperties(props));
+    assertEquals(config.getRegionName(), "ei-ltx1");
+    assertTrue(config.isAaDcrBugInjectionEnabledForStore("store_a"));
+    assertFalse(config.isAaDcrBugInjectionEnabledForStore("store_b"));
+    // Store not present in the map -> disabled.
+    assertFalse(config.isAaDcrBugInjectionEnabledForStore("store_c"));
+
+    // Same map but on a server in a different region -> store_b becomes the enabled one, store_a disabled.
+    props.put(LOCAL_REGION_NAME, "ei4");
+    config = new VeniceServerConfig(new VeniceProperties(props));
+    assertFalse(config.isAaDcrBugInjectionEnabledForStore("store_a"));
+    assertTrue(config.isAaDcrBugInjectionEnabledForStore("store_b"));
+  }
+
+  @Test
+  public void testAaDcrBugInjectionNotEnabledForNonAllowlistedRegion() {
+    // A production (non-allowlisted) region must never enable injection, and the server must still boot normally.
+    Properties props = populatedBasicProperties();
+    props.put(LOCAL_REGION_NAME, "prod-ltx1");
+    props.put(SERVER_AA_DCR_BUG_INJECTION_STORE_TO_REGION_MAP, "store_a:prod-ltx1");
+    VeniceServerConfig config = new VeniceServerConfig(new VeniceProperties(props));
+    assertFalse(config.isAaDcrBugInjectionEnabledForStore("store_a"));
+  }
+
+  @Test
+  public void testConfig() {
+    Properties props = populatedBasicProperties();
+
+    Map<String, Function<VeniceServerConfig, List<Double>>> configMap = new HashMap<>();
+
+    configMap.put(KAFKA_FETCH_THROTTLER_FACTORS_PER_SECOND, VeniceServerConfig::getKafkaFetchThrottlerFactorsPerSecond);
+
+    configMap.put(
+        SERVER_THROTTLER_FACTORS_FOR_CURRENT_VERSION_AA_WC_LEADER,
+        VeniceServerConfig::getThrottlerFactorsForCurrentVersionAAWCLeader);
+    configMap.put(
+        SERVER_THROTTLER_FACTORS_FOR_CURRENT_VERSION_NON_AA_WC_LEADER,
+        VeniceServerConfig::getThrottlerFactorsForCurrentVersionNonAAWCLeader);
+    configMap.put(
+        SERVER_THROTTLER_FACTORS_FOR_NON_CURRENT_VERSION_AA_WC_LEADER,
+        VeniceServerConfig::getThrottlerFactorsForNonCurrentVersionAAWCLeader);
+    configMap.put(
+        SERVER_THROTTLER_FACTORS_FOR_NON_CURRENT_VERSION_NON_AA_WC_LEADER,
+        VeniceServerConfig::getThrottlerFactorsForNonCurrentVersionNonAAWCLeader);
+
+    // Looping through all the factors config keys and checking if the values are same as default values
+    for (Map.Entry<String, Function<VeniceServerConfig, List<Double>>> entry: configMap.entrySet()) {
+      VeniceServerConfig config = new VeniceServerConfig(new VeniceProperties(props));
+      List<Double> consumerPoolRecordsLimitFactors = entry.getValue().apply(config);
+      assertEquals(consumerPoolRecordsLimitFactors.size(), config.getDefaultConsumerPoolLimitFactorsList().size());
+      assertEquals(
+          consumerPoolRecordsLimitFactors.toArray(),
+          config.getDefaultConsumerPoolLimitFactorsList().toArray());
+      Double[] factors = new Double[] { 0.6D, 0.8D, 1.0D, 1.2D };
+      List<Double> factorsList = Arrays.asList(factors);
+      // Convert list of double to string with comma separated
+      String factorsListStr = factorsList.stream().map(String::valueOf).collect(Collectors.joining(", "));
+      props.put(entry.getKey(), factorsListStr);
+      config = new VeniceServerConfig(new VeniceProperties(props));
+      consumerPoolRecordsLimitFactors = entry.getValue().apply(config);
+      assertEquals(consumerPoolRecordsLimitFactors.size(), 4);
+      assertEquals(consumerPoolRecordsLimitFactors.toArray(), factors);
+    }
+  }
+
+  @Test
+  public void testBlobTransferClientNettyWorkerThreadCount() {
+    int availableProcessors = Runtime.getRuntime().availableProcessors();
+    // When unset, the client event-loop pool defaults to max(MIN_NETTY_WORKER_THREADS, 20% of available processors).
+    int expectedDefault = Math.max(NettyFileTransferClient.MIN_NETTY_WORKER_THREADS, availableProcessors / 5);
+
+    Properties props = populatedBasicProperties();
+    VeniceServerConfig defaultConfig = new VeniceServerConfig(new VeniceProperties(props));
+    assertEquals(defaultConfig.getBlobTransferClientNettyWorkerThreadCount(), expectedDefault);
+
+    // An explicitly configured value above the floor is read back verbatim.
+    int explicit = expectedDefault + 13;
+    props.setProperty(BLOB_TRANSFER_CLIENT_NETTY_WORKER_THREADS, String.valueOf(explicit));
+    VeniceServerConfig overriddenConfig = new VeniceServerConfig(new VeniceProperties(props));
+    assertEquals(overriddenConfig.getBlobTransferClientNettyWorkerThreadCount(), explicit);
+
+    // An explicitly configured value below the floor (including 0, which would otherwise make Netty fall back to its
+    // 2 * cores default) is clamped up to the minimum.
+    props.setProperty(
+        BLOB_TRANSFER_CLIENT_NETTY_WORKER_THREADS,
+        String.valueOf(NettyFileTransferClient.MIN_NETTY_WORKER_THREADS - 1));
+    VeniceServerConfig clampedConfig = new VeniceServerConfig(new VeniceProperties(props));
+    assertEquals(
+        clampedConfig.getBlobTransferClientNettyWorkerThreadCount(),
+        NettyFileTransferClient.MIN_NETTY_WORKER_THREADS);
+  }
+
+  @Test
+  public void testRocksDBPath() {
+    Properties props = populatedBasicProperties();
+    props.put(DATA_BASE_PATH, "db/path");
+
+    VeniceServerConfig config = new VeniceServerConfig(new VeniceProperties(props));
+
+    String path = config.getRocksDBPath();
+    assertEquals(path, "db/path/rocksdb");
+  }
+
+  @Test
+  public void testDeadLeaderReadyToServeFallbackThresholdMs() {
+    Properties props = populatedBasicProperties();
+    VeniceServerConfig defaultConfig = new VeniceServerConfig(new VeniceProperties(props));
+    assertEquals(defaultConfig.getDeadLeaderReadyToServeFallbackThresholdMs(), TimeUnit.HOURS.toMillis(3));
+
+    props.put(SERVER_DEAD_LEADER_READY_TO_SERVE_FALLBACK_THRESHOLD_MS, "7200000");
+    VeniceServerConfig overriddenConfig = new VeniceServerConfig(new VeniceProperties(props));
+    assertEquals(overriddenConfig.getDeadLeaderReadyToServeFallbackThresholdMs(), 7200000L);
+
+    props.put(SERVER_DEAD_LEADER_READY_TO_SERVE_FALLBACK_THRESHOLD_MS, "0");
+    VeniceServerConfig disabledConfig = new VeniceServerConfig(new VeniceProperties(props));
+    assertEquals(disabledConfig.getDeadLeaderReadyToServeFallbackThresholdMs(), 0L);
+
+    // A positive threshold that is not larger than the leader-complete freshness window is rejected at construction.
+    props.put(SERVER_LEADER_COMPLETE_STATE_CHECK_IN_FOLLOWER_VALID_INTERVAL_MS, "300000");
+    props.put(SERVER_DEAD_LEADER_READY_TO_SERVE_FALLBACK_THRESHOLD_MS, "300000");
+    assertThrows(VeniceException.class, () -> new VeniceServerConfig(new VeniceProperties(props)));
+  }
+
+  // TODO: Delete this test once we fully delete the HelixMessagingChannel.
+  @Test
+  public void testParticipantStoreConfigs() {
+    Properties props = populatedBasicProperties();
+    VeniceServerConfig config = new VeniceServerConfig(new VeniceProperties(props));
+    assertTrue(config.isParticipantMessageStoreEnabled());
+
+    props.put(PARTICIPANT_MESSAGE_STORE_ENABLED, "true");
+    config = new VeniceServerConfig(new VeniceProperties(props));
+    assertTrue(config.isParticipantMessageStoreEnabled());
+
+    props.put(PARTICIPANT_MESSAGE_STORE_ENABLED, "false");
+    config = new VeniceServerConfig(new VeniceProperties(props));
+    assertFalse(config.isParticipantMessageStoreEnabled());
+  }
+
+  @Test
+  public void testCrossTpParallelProcessingConfigs() {
+    // Test default values
+    Properties props = populatedBasicProperties();
+    VeniceServerConfig config = new VeniceServerConfig(new VeniceProperties(props));
+
+    assertFalse(config.isCrossTpParallelProcessingEnabled());
+    assertEquals(config.getCrossTpParallelProcessingThreadPoolSize(), 4);
+    assertFalse(config.isCrossTpParallelProcessingCurrentVersionAAWCLeaderOnly());
+
+    // Test enabling cross-TP parallel processing
+    props.put(SERVER_CROSS_TP_PARALLEL_PROCESSING_ENABLED, "true");
+    config = new VeniceServerConfig(new VeniceProperties(props));
+    assertTrue(config.isCrossTpParallelProcessingEnabled());
+
+    // Test custom thread pool size
+    props.put(SERVER_CROSS_TP_PARALLEL_PROCESSING_THREAD_POOL_SIZE, "8");
+    config = new VeniceServerConfig(new VeniceProperties(props));
+    assertEquals(config.getCrossTpParallelProcessingThreadPoolSize(), 8);
+
+    // Test enabling CURRENT_VERSION_AA_WC_LEADER_ONLY mode
+    props.put(SERVER_CROSS_TP_PARALLEL_PROCESSING_CURRENT_VERSION_AA_WC_LEADER_ONLY, "true");
+    config = new VeniceServerConfig(new VeniceProperties(props));
+    assertTrue(config.isCrossTpParallelProcessingCurrentVersionAAWCLeaderOnly());
+
+    // Test disabling CURRENT_VERSION_AA_WC_LEADER_ONLY mode explicitly
+    props.put(SERVER_CROSS_TP_PARALLEL_PROCESSING_CURRENT_VERSION_AA_WC_LEADER_ONLY, "false");
+    config = new VeniceServerConfig(new VeniceProperties(props));
+    assertFalse(config.isCrossTpParallelProcessingCurrentVersionAAWCLeaderOnly());
+  }
+
+  @Test
+  public void testLeaderHandoverDoLMechanismConfigs() {
+    Properties props = populatedBasicProperties();
+
+    // Test default values (both should be true by default)
+    VeniceServerConfig config = new VeniceServerConfig(new VeniceProperties(props));
+    assertTrue(config.isLeaderHandoverUseDoLMechanismEnabledForSystemStores());
+    assertTrue(config.isLeaderHandoverUseDoLMechanismEnabledForUserStores());
+
+    // Test disabling DoL for system stores only
+    props.put(SERVER_LEADER_HANDOVER_USE_DOL_MECHANISM_FOR_SYSTEM_STORES, "false");
+    config = new VeniceServerConfig(new VeniceProperties(props));
+    assertFalse(config.isLeaderHandoverUseDoLMechanismEnabledForSystemStores());
+    assertTrue(config.isLeaderHandoverUseDoLMechanismEnabledForUserStores());
+
+    // Test disabling DoL for user stores only
+    props.put(SERVER_LEADER_HANDOVER_USE_DOL_MECHANISM_FOR_SYSTEM_STORES, "true");
+    props.put(SERVER_LEADER_HANDOVER_USE_DOL_MECHANISM_FOR_USER_STORES, "false");
+    config = new VeniceServerConfig(new VeniceProperties(props));
+    assertTrue(config.isLeaderHandoverUseDoLMechanismEnabledForSystemStores());
+    assertFalse(config.isLeaderHandoverUseDoLMechanismEnabledForUserStores());
+
+    // Test disabling DoL for both system and user stores
+    props.put(SERVER_LEADER_HANDOVER_USE_DOL_MECHANISM_FOR_SYSTEM_STORES, "false");
+    props.put(SERVER_LEADER_HANDOVER_USE_DOL_MECHANISM_FOR_USER_STORES, "false");
+    config = new VeniceServerConfig(new VeniceProperties(props));
+    assertFalse(config.isLeaderHandoverUseDoLMechanismEnabledForSystemStores());
+    assertFalse(config.isLeaderHandoverUseDoLMechanismEnabledForUserStores());
+  }
+
+  @Test
+  public void testParallelShutdownThreadPoolSizeConfig() {
+    // Test default value
+    Properties props = populatedBasicProperties();
+    VeniceServerConfig config = new VeniceServerConfig(new VeniceProperties(props));
+    assertEquals(config.getParallelShutdownThreadPoolSize(), 16);
+
+    // Test custom value
+    props.put(SERVER_PARALLEL_SHUTDOWN_THREAD_POOL_SIZE, "4");
+    config = new VeniceServerConfig(new VeniceProperties(props));
+    assertEquals(config.getParallelShutdownThreadPoolSize(), 4);
+  }
+
+  @Test
+  public void testIngestionOtelStatsEnabledConfig() {
+    Properties props = populatedBasicProperties();
+    VeniceServerConfig config = new VeniceServerConfig(new VeniceProperties(props));
+    assertTrue(config.isIngestionOtelStatsEnabled());
+
+    props.put(SERVER_INGESTION_OTEL_STATS_ENABLED, "false");
+    config = new VeniceServerConfig(new VeniceProperties(props));
+    assertFalse(config.isIngestionOtelStatsEnabled());
   }
 }

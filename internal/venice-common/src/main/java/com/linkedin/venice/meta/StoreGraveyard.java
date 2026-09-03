@@ -12,10 +12,16 @@ import org.apache.zookeeper.data.Stat;
  */
 public interface StoreGraveyard {
   /**
-   * Retrieve the largest used version number by the given store name from graveyard. Return 0 if the store dose not
+   * Retrieve the largest used version number by the given store name from graveyard. Return 0 if the store does not
    * exist in the graveyard, which is the default value we used for the new store.
    */
   int getLargestUsedVersionNumber(String storeName);
+
+  /**
+   * Retrieve the largest used version number for the real time topic by the given store name from graveyard.
+   * Return 0 if the store does not exist in the graveyard, which is the default value we used for the new store.
+   */
+  int getLargestUsedRTVersionNumber(String storeName);
 
   /**
    * Put the given store into graveyard. If the store has already existed in the graveyard, update it by this given
@@ -37,4 +43,14 @@ public interface StoreGraveyard {
    * List store names from graveyard in the specified cluster.
    */
   List<String> listStoreNamesFromGraveyard(String clusterName);
+
+  /**
+   * Get the deletion time of a store in the graveyard.
+   * This returns the time when the store was last updated in the graveyard (via updateZNode).
+   *
+   * @param clusterName the cluster name
+   * @param storeName the store name
+   * @return the deletion time in milliseconds since epoch, or STORE_NOT_IN_GRAVEYARD if the store doesn't exist in graveyard
+   */
+  long getStoreDeletedTime(String clusterName, String storeName);
 }

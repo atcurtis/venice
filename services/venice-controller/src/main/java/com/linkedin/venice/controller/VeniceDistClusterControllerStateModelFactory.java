@@ -4,8 +4,10 @@ import com.linkedin.venice.acl.DynamicAccessController;
 import com.linkedin.venice.controller.init.ClusterLeaderInitializationRoutine;
 import com.linkedin.venice.helix.HelixAdapterSerializer;
 import com.linkedin.venice.ingestion.control.RealTimeTopicSwitcher;
+import com.linkedin.venice.meta.ValueSchemaCreatedListener;
 import io.tehuti.metrics.MetricsRepository;
 import java.util.Collection;
+import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -28,6 +30,8 @@ public class VeniceDistClusterControllerStateModelFactory extends StateModelFact
   private final RealTimeTopicSwitcher realTimeTopicSwitcher;
   private final Optional<DynamicAccessController> accessController;
   private final HelixAdminClient helixAdminClient;
+  private final Optional<List<VeniceVersionLifecycleEventListener>> versionLifecycleEventListeners;
+  private final Optional<List<ValueSchemaCreatedListener>> valueSchemaCreatedListeners;
 
   public VeniceDistClusterControllerStateModelFactory(
       ZkClient zkClient,
@@ -38,7 +42,9 @@ public class VeniceDistClusterControllerStateModelFactory extends StateModelFact
       ClusterLeaderInitializationRoutine controllerInitialization,
       RealTimeTopicSwitcher realTimeTopicSwitcher,
       Optional<DynamicAccessController> accessController,
-      HelixAdminClient helixAdminClient) {
+      HelixAdminClient helixAdminClient,
+      Optional<List<VeniceVersionLifecycleEventListener>> versionLifecycleEventListeners,
+      Optional<List<ValueSchemaCreatedListener>> valueSchemaCreatedListeners) {
     this.zkClient = zkClient;
     this.adapterSerializer = adapterSerializer;
     this.clusterConfigs = clusterConfigs;
@@ -48,6 +54,8 @@ public class VeniceDistClusterControllerStateModelFactory extends StateModelFact
     this.realTimeTopicSwitcher = realTimeTopicSwitcher;
     this.accessController = accessController;
     this.helixAdminClient = helixAdminClient;
+    this.versionLifecycleEventListeners = versionLifecycleEventListeners;
+    this.valueSchemaCreatedListeners = valueSchemaCreatedListeners;
   }
 
   /**
@@ -66,7 +74,9 @@ public class VeniceDistClusterControllerStateModelFactory extends StateModelFact
         controllerInitialization,
         realTimeTopicSwitcher,
         accessController,
-        helixAdminClient);
+        helixAdminClient,
+        versionLifecycleEventListeners,
+        valueSchemaCreatedListeners);
     clusterToStateModelsMap.put(veniceClusterName, model);
     return model;
   }
@@ -84,5 +94,14 @@ public class VeniceDistClusterControllerStateModelFactory extends StateModelFact
    */
   public Collection<VeniceControllerStateModel> getAllModels() {
     return clusterToStateModelsMap.values();
+  }
+
+  /**
+   * Close all {@code VeniceControllerStateModel} created by the factory.
+   */
+  public void close() {
+    for (VeniceControllerStateModel model: clusterToStateModelsMap.values()) {
+      model.close();
+    }
   }
 }

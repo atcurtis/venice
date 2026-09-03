@@ -3,7 +3,7 @@ package com.linkedin.venice;
 import com.linkedin.venice.pubsub.PubSubConstants;
 import com.linkedin.venice.pubsub.adapter.kafka.consumer.ApacheKafkaConsumerConfig;
 import com.linkedin.venice.pubsub.adapter.kafka.producer.ApacheKafkaProducerConfig;
-import com.linkedin.venice.pubsub.api.PubSubAdminAdapter;
+import com.linkedin.venice.server.VersionRole;
 
 
 public class ConfigKeys {
@@ -31,6 +31,132 @@ public class ConfigKeys {
   // store specific properties
   public static final String PERSISTENCE_TYPE = "persistence.type";
 
+  /**
+   * Prefix for all Pub/Sub client-specific configurations.
+   *
+   * <p>This prefix ensures that all Pub/Sub-related configurations are directed to the
+   * appropriate Pub/Sub client adapters. Each adapter extracts and processes the relevant
+   * properties based on its designated prefix.</p>
+   *
+   * <p>Configurations should follow this structure:</p>
+   * <pre>{@code
+   * PUBSUB_CLIENT_CONFIG_PREFIX + "<ClientSpecificPrefix>" + "actual.config.name"
+   * }</pre>
+   *
+   * <p>For instance, Kafka configurations would follow this pattern:</p>
+   * <pre>{@code
+   * "pubsub.kafka.bootstrap.servers"
+   * "pubsub.kafka.linger.ms"
+   * }</pre>
+   *
+   * <p>Similarly, configurations for other Pub/Sub clients include:</p>
+   * <ul>
+   *   <li>Pulsar: {@code "pubsub.pulsar.service.url"}</li>
+   *   <li>WarpStream: {@code "pubsub.warpstream.bucket.url"}</li>
+   * </ul>
+   */
+  public static final String PUBSUB_CLIENT_CONFIG_PREFIX = PubSubConstants.PUBSUB_CLIENT_CONFIG_PREFIX;
+
+  /**
+   * @deprecated Use {@link #PUBSUB_ADMIN_ADAPTER_FACTORY_CLASS} instead.
+   * This legacy config key uses the older "pub.sub" naming convention.
+   */
+  @Deprecated
+  public static final String PUB_SUB_ADMIN_ADAPTER_FACTORY_CLASS = "pub.sub.admin.adapter.factory.class";
+
+  /**
+   * Configuration key for specifying the fully qualified class name of the PubSub admin adapter factory.
+   * This factory is responsible for creating instances of the PubSub admin adapter for the selected system.
+   */
+  public static final String PUBSUB_ADMIN_ADAPTER_FACTORY_CLASS =
+      PUBSUB_CLIENT_CONFIG_PREFIX + "admin.adapter.factory.class";
+
+  /**
+   * @deprecated Use {@link #PUBSUB_PRODUCER_ADAPTER_FACTORY_CLASS} instead.
+   * This legacy config key uses the older "pub.sub" naming convention.
+   */
+  @Deprecated
+  public static final String PUB_SUB_PRODUCER_ADAPTER_FACTORY_CLASS = "pub.sub.producer.adapter.factory.class";
+
+  /**
+   * Configuration key for specifying the fully qualified class name of the PubSub producer adapter factory.
+   * This factory is responsible for creating instances of the PubSub producer adapter.
+   */
+  public static final String PUBSUB_PRODUCER_ADAPTER_FACTORY_CLASS =
+      PUBSUB_CLIENT_CONFIG_PREFIX + "producer.adapter.factory.class";
+
+  /**
+   * @deprecated Use {@link #PUBSUB_CONSUMER_ADAPTER_FACTORY_CLASS} instead.
+   * This legacy config key uses the older "pub.sub" naming convention.
+   */
+  @Deprecated
+  public static final String PUB_SUB_CONSUMER_ADAPTER_FACTORY_CLASS = "pub.sub.consumer.adapter.factory.class";
+
+  /**
+   * Configuration key for specifying the fully qualified class name of the PubSub consumer adapter factory.
+   * This factory is responsible for creating instances of the PubSub consumer adapter.
+   */
+  public static final String PUBSUB_CONSUMER_ADAPTER_FACTORY_CLASS =
+      PUBSUB_CLIENT_CONFIG_PREFIX + "consumer.adapter.factory.class";
+
+  /**
+   * @deprecated Use {@link #PUBSUB_SOURCE_OF_TRUTH_ADMIN_ADAPTER_FACTORY_CLASS} instead.
+   * This legacy config key uses the older "pub.sub" naming convention.
+   */
+  @Deprecated
+  public static final String PUB_SUB_SOURCE_OF_TRUTH_ADMIN_ADAPTER_FACTORY_CLASS =
+      "pub.sub.of.source.of.truth.admin.adapter.factory.class";
+
+  /**
+   * Configuration key for specifying the fully qualified class name of the source-of-truth PubSub admin adapter factory.
+   * <p>
+   * This adapter acts as the authoritative source to avoid discrepancies across multiple PubSub systems,
+   * particularly during operations like topic reconciliation and metadata resolution.
+   */
+  public static final String PUBSUB_SOURCE_OF_TRUTH_ADMIN_ADAPTER_FACTORY_CLASS =
+      PUBSUB_CLIENT_CONFIG_PREFIX + "source.of.truth.admin.adapter.factory.class";
+
+  /**
+   * Configuration key for specifying the address of the PubSub broker (e.g., Kafka, Pulsar).
+   * <p>
+   * This address is used by Venice components to connect to the underlying PubSub infrastructure
+   * for producing and consuming messages. The format and semantics of the address depend on the
+   * specific PubSub system being used.
+   * <p>
+   * Example values:
+   * <ul>
+   *   <li><code>localhost:9092</code> for Kafka</li>
+   *   <li><code>pulsar://broker1:6650</code> for Pulsar</li>
+   * </ul>
+   *
+   * <p><b>Note:</b> The broker address is expected to uniquely identify a PubSub cluster. If a PubSub client
+   * implementation requires additional information or a different interpretation of the broker address,
+   * it should provide and pass down a mapping from this configured address to the expected implementation-specific
+   * broker URL, address format, or connection details.
+   */
+  public static final String PUBSUB_BROKER_ADDRESS = PubSubConstants.PUBSUB_BROKER_ADDRESS;
+
+  /**
+   * Configuration key for the mapping between PubSub position type IDs and their corresponding
+   * fully qualified class names.
+   * <p>
+   * This mapping is used for serializing and deserializing {@code PubSubPosition} implementations.
+   * Each type ID should uniquely identify a position class, enabling the PubSub client to resolve
+   * the correct class when handling position data.
+   * <p>
+   * The expected value is a comma-separated list of mappings in the format:
+   * <pre>
+   *   typeId1:fully.qualified.ClassName1,typeId2:fully.qualified.ClassName2,...
+   * </pre>
+   * <p>
+   * Example:
+   * <pre>
+   *   pubsub.type.id.to.position.class.name.map=1:com.linkedin.venice.pubsub.adapter.kafka.common.ApacheKafkaOffsetPosition,2:com.linkedin.venice.pubsub.adapter.pulsar.PulsarPosition
+   * </pre>
+   */
+  public static final String PUBSUB_TYPE_ID_TO_POSITION_CLASS_NAME_MAP =
+      PubSubConstants.PUBSUB_CLIENT_CONFIG_PREFIX + "type.id.to.position.class.name.map";
+
   public static final String KAFKA_CONFIG_PREFIX = ApacheKafkaProducerConfig.KAFKA_CONFIG_PREFIX;
   public static final String KAFKA_BOOTSTRAP_SERVERS = ApacheKafkaProducerConfig.KAFKA_BOOTSTRAP_SERVERS;
   public static final String SSL_KAFKA_BOOTSTRAP_SERVERS = ApacheKafkaProducerConfig.SSL_KAFKA_BOOTSTRAP_SERVERS;
@@ -43,9 +169,6 @@ public class ConfigKeys {
 
   public static final String KAFKA_CLIENT_ID_CONFIG = ApacheKafkaConsumerConfig.KAFKA_CLIENT_ID_CONFIG;
   public static final String KAFKA_GROUP_ID_CONFIG = ApacheKafkaConsumerConfig.KAFKA_GROUP_ID_CONFIG;
-  public static final String KAFKA_AUTO_OFFSET_RESET_CONFIG = ApacheKafkaConsumerConfig.KAFKA_AUTO_OFFSET_RESET_CONFIG;
-  public static final String KAFKA_ENABLE_AUTO_COMMIT_CONFIG =
-      ApacheKafkaConsumerConfig.KAFKA_ENABLE_AUTO_COMMIT_CONFIG;
   public static final String KAFKA_FETCH_MIN_BYTES_CONFIG = ApacheKafkaConsumerConfig.KAFKA_FETCH_MIN_BYTES_CONFIG;
   public static final String KAFKA_FETCH_MAX_BYTES_CONFIG = ApacheKafkaConsumerConfig.KAFKA_FETCH_MAX_BYTES_CONFIG;
   public static final String KAFKA_MAX_POLL_RECORDS_CONFIG = ApacheKafkaConsumerConfig.KAFKA_MAX_POLL_RECORDS_CONFIG;
@@ -77,14 +200,56 @@ public class ConfigKeys {
   public static final String SERVER_KAFKA_FETCH_QUOTA_RECORDS_PER_SECOND =
       "server.kafka.fetch.quota.records.per.second";
 
+  /**
+   * Whether to speed up DaVinci current version bootstrapping or not.
+   */
+  public static final String DA_VINCI_CURRENT_VERSION_BOOTSTRAPPING_SPEEDUP_ENABLED =
+      "da.vinci.current.version.bootstrapping.speedup.enabled";
+
+  /**
+   * When {@link #DA_VINCI_CURRENT_VERSION_BOOTSTRAPPING_SPEEDUP_ENABLED} is true, the following throttler
+   * will be applied when any current version is bootstrapping.
+   */
+  public static final String DA_VINCI_CURRENT_VERSION_BOOTSTRAPPING_QUOTA_RECORDS_PER_SECOND =
+      "da.vinci.current.version.bootstrapping.quota.records.per.second";
+
+  /**
+   * When {@link #DA_VINCI_CURRENT_VERSION_BOOTSTRAPPING_SPEEDUP_ENABLED} is true, the following throttler
+   * will be applied when any current version is bootstrapping.
+   */
+  public static final String DA_VINCI_CURRENT_VERSION_BOOTSTRAPPING_QUOTA_BYTES_PER_SECOND =
+      "da.vinci.current.version.bootstrapping.quota.bytes.per.second";
+
   // Unordered throttlers aren't compatible with Shared Kafka Consumer and have no effect when Shared Consumer is used.
   public static final String KAFKA_FETCH_QUOTA_UNORDERED_BYTES_PER_SECOND =
       "kafka.fetch.quota.unordered.bytes.per.second";
   public static final String KAFKA_FETCH_QUOTA_UNORDERED_RECORDS_PER_SECOND =
       "kafka.fetch.quota.unordered.records.per.second";
 
-  // Kafka security protocol
-  public static final String KAFKA_SECURITY_PROTOCOL = "security.protocol";
+  /**
+   * @deprecated This legacy config key was used to specify the security protocol for PubSub clients.
+   * As part of an ongoing effort to namespace all PubSub client configs, this key is being replaced
+   * with a "pubsub."-prefixed version to reduce ambiguity with unrelated configurations.
+   * Use {@link #PUBSUB_SECURITY_PROTOCOL} instead.
+   */
+  @Deprecated
+  public static final String PUBSUB_SECURITY_PROTOCOL_LEGACY = "security.protocol";
+
+  /**
+   * New config key for specifying the PubSub client security protocol.
+   * This is part of a broader effort to namespace all PubSub configs under the "pubsub." prefix.
+   */
+  public static final String PUBSUB_SECURITY_PROTOCOL = PUBSUB_CLIENT_CONFIG_PREFIX + PUBSUB_SECURITY_PROTOCOL_LEGACY;
+
+  /**
+   * @deprecated This legacy config key was used to specify the Kafka security protocol using a "kafka." prefix.
+   * As part of the ongoing effort to unify and namespace all PubSub client configurations under the "pubsub." prefix,
+   * this key is being phased out in favor of {@link #PUBSUB_SECURITY_PROTOCOL}.
+   *
+   * Use {@code pubsub.security.protocol} instead to avoid ambiguity and ensure consistency across client configs.
+   */
+  @Deprecated
+  public static final String KAFKA_SECURITY_PROTOCOL_LEGACY = KAFKA_CONFIG_PREFIX + PUBSUB_SECURITY_PROTOCOL_LEGACY;
 
   /**
    * Number of PubSub consumer clients to be used per topic manager for fetching metadata.
@@ -98,6 +263,12 @@ public class ConfigKeys {
   public static final String PUBSUB_TOPIC_MANAGER_METADATA_FETCHER_THREAD_POOL_SIZE =
       "pubsub.topic.manager.metadata.fetcher.thread.pool.size";
 
+  /**
+   * During a state transition, it is unsafe to proceed without waiting for all inflight messages to be processed.
+   * This controls how long to wait for inflight messages after unsubscribing from a topic during a state transition.
+   */
+  public static final String SERVER_MAX_WAIT_AFTER_UNSUBSCRIBE_MS = "server.max.wait.after.unsubscribe.ms";
+
   // Cluster specific configs for controller
   public static final String CONTROLLER_NAME = "controller.name";
 
@@ -107,11 +278,6 @@ public class ConfigKeys {
    * Will take effect at topic creation time, and when the hybrid config for the store is turned on.
    */
   public static final String KAFKA_LOG_COMPACTION_FOR_HYBRID_STORES = "kafka.log.compaction.for.hybrid.stores";
-
-  /**
-   * For log compaction enabled topics, this config will define the minimum time a message will remain uncompacted in the log.
-   */
-  public static final String KAFKA_MIN_LOG_COMPACTION_LAG_MS = "kafka.min.log.compaction.lag.ms";
 
   /**
    * The minimum number of in sync replicas to set for store version topics.
@@ -135,6 +301,16 @@ public class ConfigKeys {
   public static final String KAFKA_MIN_IN_SYNC_REPLICAS_ADMIN_TOPICS = "kafka.min.in.sync.replicas.admin.topics";
 
   /**
+   * Whether to enable unclean leader election for real-time buffer topics.
+   * When set to false, only in-sync replicas can be elected as leader,
+   * preventing data loss at the cost of reduced availability.
+   *
+   * Will use the Kafka cluster's default if not set.
+   */
+  public static final String KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE_RT_TOPICS =
+      "kafka.unclean.leader.election.enable.rt.topics";
+
+  /**
    * The replication factor to set for store-version topics.
    */
   public static final String KAFKA_REPLICATION_FACTOR = "kafka.replication.factor";
@@ -145,43 +321,15 @@ public class ConfigKeys {
   public static final String KAFKA_REPLICATION_FACTOR_RT_TOPICS = "kafka.replication.factor.rt.topics";
 
   /**
-   * TODO: the following 3 configs will be deprecated after the native replication migration is changed to a two-step
-   *       process: 1. Turn on the cluster level config that takes care of newly created stores; 2. Run admin command
-   *       to convert existing stores to native replication.
-   */
-  /**
-   * Cluster-level config to enable native replication for all batch-only stores.
-   */
-  public static final String ENABLE_NATIVE_REPLICATION_FOR_BATCH_ONLY = "enable.native.replication.for.batch.only";
-
-  /**
-   * Cluster-level config to enable native replication for all hybrid stores.
-   */
-  public static final String ENABLE_NATIVE_REPLICATION_FOR_HYBRID = "enable.native.replication.for.hybrid";
-
-  /**
-   * Cluster-level config to enable native replication for new batch-only stores.
-   */
-  public static final String ENABLE_NATIVE_REPLICATION_AS_DEFAULT_FOR_BATCH_ONLY =
-      "enable.native.replication.as.default.for.batch.only";
-
-  /**
-   * Cluster-level config to enable native replication for new hybrid stores.
-   */
-  public static final String ENABLE_NATIVE_REPLICATION_AS_DEFAULT_FOR_HYBRID =
-      "enable.native.replication.as.default.for.hybrid";
-
-  /**
-   * Cluster-level config to enable active-active replication for new batch-only stores.
-   */
-  public static final String ENABLE_ACTIVE_ACTIVE_REPLICATION_AS_DEFAULT_FOR_BATCH_ONLY_STORE =
-      "enable.active.active.replication.as.default.for.batch.only.store";
-
-  /**
    * Cluster-level config to enable active-active replication for new hybrid stores.
    */
   public static final String ENABLE_ACTIVE_ACTIVE_REPLICATION_AS_DEFAULT_FOR_HYBRID_STORE =
       "enable.active.active.replication.as.default.for.hybrid.store";
+
+  /**
+   * Cluster-level config to indicate whether this is an encryption cluster.
+   */
+  public static final String CLUSTER_ENCRYPTION_ENABLED = "cluster.encryption.enabled";
 
   /**
    * Store-level config to enable blob transfers (feature flag)
@@ -189,9 +337,19 @@ public class ConfigKeys {
   public static final String ENABLE_BLOB_TRANSFER = "enable.blob.transfer";
 
   /**
-   * Sets the default for whether or not do schema validation for all stores
+   * Sets the default for whether to do schema validation or not for all stores
    */
   public static final String CONTROLLER_SCHEMA_VALIDATION_ENABLED = "controller.schema.validation.enabled";
+
+  /**
+   * When true, the controller persists newly added store versions as individual ZK znodes at
+   * {@code /<cluster>/Stores/<name>/versions/<n>} rather than appending them inside the store znode JSON. Existing
+   * embedded versions age out through normal version lifecycle removals, so the active version set gradually shifts to
+   * per-version znodes. The read path understands both layouts, so this flag must only flip after
+   * every reader in the deployment (router, server, da-vinci, fast-client) is running a build that contains the
+   * split-aware read path.
+   */
+  public static final String CONTROLLER_PER_VERSION_ZNODE_ENABLED = "controller.per.version.znode.enabled";
 
   /**
    * Fallback to remain compatible with the old config spelling.
@@ -200,6 +358,13 @@ public class ConfigKeys {
    */
   public static final String DEFAULT_READ_STRATEGY = "default.read.strategy";
   public static final String DEFAULT_OFFLINE_PUSH_STRATEGY = "default.offline.push.strategy";
+  public static final String CONCURRENT_PUSH_DETECTION_STRATEGY = "concurrent.push.detection.strategy";
+  /**
+   * Minimum interval between admitted user-store version-creation attempts in the leader parent controller. A value of
+   * 0 disables the process-local cooldown.
+   */
+  public static final String CONTROLLER_PUSH_RETRY_COOLDOWN_MS = "controller.push.retry.cooldown.ms";
+
   public static final String DEFAULT_ROUTING_STRATEGY = "default.routing.strategy";
   public static final String DEFAULT_REPLICA_FACTOR = "default.replica.factor";
   public static final String DEFAULT_NUMBER_OF_PARTITION = "default.partition.count";
@@ -216,7 +381,6 @@ public class ConfigKeys {
   public static final String PARTITION_COUNT_ROUND_UP_SIZE = "partition.count.round.up.size";
   public static final String OFFLINE_JOB_START_TIMEOUT_MS = "offline.job.start.timeout.ms";
   public static final String DELAY_TO_REBALANCE_MS = "delay.to.rebalance.ms";
-  public static final String MIN_ACTIVE_REPLICA = "min.active.replica";
   public static final String CLUSTER_TO_D2 = "cluster.to.d2";
   public static final String CLUSTER_TO_SERVER_D2 = "cluster.to.server.d2";
   public static final String HELIX_SEND_MESSAGE_TIMEOUT_MS = "helix.send.message.timeout.ms";
@@ -231,8 +395,33 @@ public class ConfigKeys {
 
   // Controller specific configs
   public static final String CONTROLLER_CLUSTER_ZK_ADDRESSS = "controller.cluster.zk.address";
-  /** Cluster name for all parent controllers */
+  // Name of the Helix cluster for controllers
   public static final String CONTROLLER_CLUSTER = "controller.cluster.name";
+  // What instance group tag to assign to a cluster resource
+  public static final String CONTROLLER_RESOURCE_INSTANCE_GROUP_TAG = "controller.resource.instance.group.tag";
+  // What tags to assign to a controller instance
+  public static final String CONTROLLER_INSTANCE_TAG_LIST = "controller.instance.tag.list";
+
+  /**
+   * Whether to enable gRPC server in controller or not.
+   */
+  public static final String CONTROLLER_GRPC_SERVER_ENABLED = "controller.grpc.server.enabled";
+
+  /**
+   * A port for the controller to listen on for incoming requests. On this port, the controller will
+   * server non-ssl requests.
+   */
+  public static final String CONTROLLER_ADMIN_GRPC_PORT = "controller.admin.grpc.port";
+  /**
+   * A port for the controller to listen on for incoming requests. On this port, the controller will
+   * only serve ssl requests.
+   */
+  public static final String CONTROLLER_ADMIN_SECURE_GRPC_PORT = "controller.admin.secure.grpc.port";
+
+  /**
+   * Number of threads to use for the gRPC server in controller.
+   */
+  public static final String CONTROLLER_GRPC_SERVER_THREAD_COUNT = "controller.grpc.server.thread.count";
 
   /** List of forbidden admin paths */
   public static final String CONTROLLER_DISABLED_ROUTES = "controller.cluster.disabled.routes";
@@ -242,8 +431,79 @@ public class ConfigKeys {
    */
   public static final String DEPRECATED_TOPIC_RETENTION_MS = "deprecated.topic.retention.ms";
 
+  /**
+   * Time interval to retry registering service discovery announcers that failed to register. By default, this is set to 30000L ms.
+   */
+  public static final String SERVICE_DISCOVERY_REGISTRATION_RETRY_MS = "service.discovery.registration.retry.ms";
+
   public static final String FATAL_DATA_VALIDATION_FAILURE_TOPIC_RETENTION_MS =
       "fatal.data.validation.failure.topic.retention.ms";
+
+  /**
+   * Class name of the implementation of interface {@link com.linkedin.venice.controller.repush.RepushOrchestrator} in {@link com.linkedin.venice.controller.logcompaction.CompactionManager}
+   */
+  public static final String REPUSH_ORCHESTRATOR_CLASS_NAME = "controller.repush.orchestrator.class.name";
+
+  /**
+   * Class names of the implementation of interface
+   * {@link com.linkedin.venice.controller.logcompaction.RepushCandidateFilter} used by
+   * {@link com.linkedin.venice.controller.logcompaction.CompactionManager}.
+   *
+   * <p>Filters are chained with AND logic: <b>all</b> filters must pass for a store to remain a candidate.
+   * They enforce exclusion criteria such as cluster config, store eligibility, and migration status.</p>
+   */
+  public static final String REPUSH_CANDIDATE_FILTER_CLASS_NAMES = "controller.repush.candidate.filter.class.names";
+
+  /**
+   * Class names of the implementation of interface
+   * {@link com.linkedin.venice.controller.logcompaction.RepushCandidateTrigger} used by
+   * {@link com.linkedin.venice.controller.logcompaction.CompactionManager}.
+   *
+   * <p>Triggers are chained with OR logic: at least <b>one</b> trigger must pass for a store to be scheduled.
+   * They represent conditions that independently justify compaction (e.g., version staleness,
+   * high duplicate key ratio). A store is scheduled when all filters pass AND any trigger passes.</p>
+   */
+  public static final String REPUSH_CANDIDATE_TRIGGER_CLASS_NAMES = "controller.repush.candidate.trigger.class.names";
+
+  /**
+   * Prefix of configs to configure RepushOrchestrator
+   */
+  public static final String CONTROLLER_REPUSH_PREFIX = "controller.repush.";
+
+  /**
+   * Whether log compaction is enabled for stores in this Venice controller
+   */
+  public static final String LOG_COMPACTION_ENABLED = "log.compaction.enabled";
+
+  /**
+   * Whether log compaction scheduling is enabled for stores in this Venice controller
+   */
+  public static final String LOG_COMPACTION_SCHEDULING_ENABLED = "log.compaction.scheduling.enabled";
+  /**
+   * Number of threads to use for log compaction
+   */
+  public static final String LOG_COMPACTION_THREAD_COUNT = "log.compaction.thread.count";
+
+  /**
+   * Time between each scheduled log compaction
+   */
+  public static final String LOG_COMPACTION_INTERVAL_MS = "log.compaction.interval.ms";
+
+  /**
+   * Time since last log compaction before a store is considered for log compaction
+   */
+  public static final String LOG_COMPACTION_THRESHOLD_MS = "log.compaction.threshold.ms";
+
+  /**
+   * Version staleness threshold to decide when a store should be nominated for compaction
+   */
+  public static final String LOG_COMPACTION_VERSION_STALENESS_THRESHOLD_MS =
+      "log.compaction.version.staleness.threshold.ms";
+
+  /**
+   * Duplicate key threshold to decide when a store should be nominated for compaction
+   */
+  public static final String LOG_COMPACTION_DUPLICATE_KEY_THRESHOLD = "log.compaction.duplicate.key.threshold";
 
   /**
    * This config is to indicate the max retention policy we have setup for deprecated jobs currently and in the past.
@@ -262,13 +522,6 @@ public class ConfigKeys {
   public static final String TOPIC_CLEANUP_SLEEP_INTERVAL_BETWEEN_TOPIC_LIST_FETCH_MS =
       "topic.cleanup.sleep.interval.between.topic.list.fetch.ms";
   public static final String TOPIC_CLEANUP_DELAY_FACTOR = "topic.cleanup.delay.factor";
-  public static final String TOPIC_CLEANUP_SEND_CONCURRENT_DELETES_REQUESTS =
-      "topic.cleanup.send.concurrent.delete.requests.enabled";
-
-  /**
-   * Sleep interval for polling topic deletion status from ZK.
-   */
-  public static final String TOPIC_DELETION_STATUS_POLL_INTERVAL_MS = "topic.deletion.status.poll.interval.ms";
 
   /**
    * The following config is to control the default retention time in milliseconds if it is not specified in store level.
@@ -278,6 +531,25 @@ public class ConfigKeys {
 
   public static final String CONTROLLER_BACKUP_VERSION_DELETION_SLEEP_MS =
       "controller.backup.version.deletion.sleep.ms";
+
+  /**
+   * The minimum delay in milliseconds before any backup version may be deleted after a new
+   * current version is promoted. Gives routers and servers time to switch versions before
+   * the old backup is removed. Defaults to 1 hour.
+   */
+  public static final String CONTROLLER_BACKUP_VERSION_MIN_CLEANUP_DELAY_MS =
+      "controller.backup.version.min.cleanup.delay.ms";
+
+  /**
+   * Retention time in milliseconds for rolled-back versions before they are eligible for deletion.
+   * Defaults to 24 hours. This is distinct from {@link #CONTROLLER_BACKUP_VERSION_MIN_CLEANUP_DELAY_MS}
+   * (which gates ALL backup version deletions to allow routers to switch versions) and
+   * {@link #CONTROLLER_BACKUP_VERSION_DEFAULT_RETENTION_MS} (which controls normal backup retention).
+   * Rolled-back versions need a separate, shorter retention because they represent intentional
+   * operational actions that operators may want to reverse within a reasonable window.
+   */
+  public static final String CONTROLLER_ROLLED_BACK_VERSION_RETENTION_MS =
+      "controller.rolled.back.version.retention.ms";
 
   /**
    * The following config is to control whether to enable backup version cleanup based on retention policy or not at cluster level.
@@ -304,9 +576,9 @@ public class ConfigKeys {
   public static final String CONTROLLER_ENFORCE_SSL = "controller.enforce.ssl";
 
   /**
-   * Whether child controllers will directly consume the source admin topic in the parent Kafka cluster.
+   * This config specifies if Venice is deployed in a multi-region mode
    */
-  public static final String ADMIN_TOPIC_REMOTE_CONSUMPTION_ENABLED = "admin.topic.remote.consumption.enabled";
+  public static final String MULTI_REGION = "multi.region";
 
   /**
    * This config defines the source region name of the admin topic
@@ -314,15 +586,45 @@ public class ConfigKeys {
   public static final String ADMIN_TOPIC_SOURCE_REGION = "admin.topic.source.region";
 
   /**
-   * This following config defines whether admin consumption should be enabled or not, and this config will only control the behavior in Child Controller.
+   * This following config defines whether admin consumption should be enabled or not, and this config will only control
+   * the behavior in Child Controller. This is used for store migration.
    */
   public static final String CHILD_CONTROLLER_ADMIN_TOPIC_CONSUMPTION_ENABLED =
       "child.controller.admin.topic.consumption.enabled";
 
   /**
+   * Whether to enable admin operation system store or not.
+   * If yes, controller will register admin operation system store and process admin operations in rollback cases.
+   */
+  public static final String CONTROLLER_ADMIN_OPERATION_SYSTEM_STORE_ENABLED =
+      "controller.admin.operation.system.store.enabled";
+
+  /**
    * This config defines the source region of aggregate hybrid store real-time data when native replication is enabled
    */
   public static final String AGGREGATE_REAL_TIME_SOURCE_REGION = "aggregate.real.time.source.region";
+
+  /**
+   * Whether degraded mode is enabled for a cluster, allowing batch pushes to succeed
+   * even when some DCs are marked as degraded. Default is false.
+   * The value for this config is read from cluster configs in Zk.
+   */
+  public static final String DEGRADED_MODE_ENABLED = "degraded.mode.enabled";
+
+  /**
+   * Whether auto-recovery is enabled when a degraded DC is unmarked.
+   * When true, the controller will automatically trigger data recovery for stores
+   * with PARTIALLY_ONLINE versions after a DC is unmarked as degraded.
+   */
+  public static final String DEGRADED_MODE_AUTO_RECOVERY_ENABLED = "degraded.mode.auto.recovery.enabled";
+
+  /**
+   * Thread pool size for the degraded mode recovery service.
+   * Controls how many store recoveries can run concurrently. Default is 5, which
+   * supports typical clusters with tens of stores. Increase for clusters with hundreds
+   * of stores to reduce total recovery wall-clock time.
+   */
+  public static final String DEGRADED_MODE_RECOVERY_THREAD_POOL_SIZE = "degraded.mode.recovery.thread.pool.size";
 
   /**
    * Whether stores are allowed to be migrated from/to a specific cluster.
@@ -336,9 +638,70 @@ public class ConfigKeys {
   public static final String ALLOW_CLUSTER_WIPE = "allow.cluster.wipe";
 
   /**
-   * Whether the controller is in Azure fabric. Default is false.
+   * Whether the controller cluster is in a cloud environment. Default is false.
    */
-  public static final String CONTROLLER_IN_AZURE_FABRIC = "controller.in.azure.fabric";
+  public static final String CONTROLLER_CLUSTER_HELIX_CLOUD_ENABLED = "controller.cluster.helix.cloud.enabled";
+
+  /**
+   * Whether the controller storage cluster is in a cloud environment. Default is false.
+   */
+  public static final String CONTROLLER_STORAGE_CLUSTER_HELIX_CLOUD_ENABLED =
+      "controller.storage.cluster.helix.cloud.enabled";
+
+  /**
+   * What cloud environment the controller is in. Maps to {@link org.apache.helix.cloud.constants.CloudProvider}. Default is empty string.
+   */
+  public static final String CONTROLLER_HELIX_CLOUD_PROVIDER = "controller.helix.cloud.provider";
+
+  /**
+   * Specific id in cloud environment that belongs to this cluster. Default is empty string.
+   */
+  public static final String CONTROLLER_HELIX_CLOUD_ID = "controller.helix.cloud.id";
+
+  /**
+   * Sources for retrieving the cloud information. Default is empty list.
+   */
+  public static final String CONTROLLER_HELIX_CLOUD_INFO_SOURCES = "controller.helix.cloud.info.sources";
+
+  /**
+   * Package name of the class that processes the fetching and parsing of cloud information. Default is empty string.
+   */
+  public static final String CONTROLLER_HELIX_CLOUD_INFO_PROCESSOR_PACKAGE =
+      "controller.helix.cloud.info.processor.package";
+
+  /**
+   * Name of the class that processes the fetching and parsing of cloud information. Default is empty string.
+   */
+  public static final String CONTROLLER_HELIX_CLOUD_INFO_PROCESSOR_NAME = "controller.helix.cloud.info.processor.name";
+
+  /**
+   * Controller Helix participant deregistration timeout in milliseconds.
+   */
+  public static final String CONTROLLER_HELIX_PARTICIPANT_DEREGISTRATION_TIMEOUT_MS =
+      "controller.helix.participant.deregistration.timeout.ms";
+
+  /**
+   * Base URL for customized health checks triggered by Helix. Default is empty string.
+   */
+  public static final String CONTROLLER_HELIX_REST_CUSTOMIZED_HEALTH_URL =
+      "controller.helix.rest.customized.health.url";
+
+  /**
+   * Config that controls whether server cluster in Helix is TOPOLOGY aware or not.
+   */
+  public static final String CONTROLLER_HELIX_SERVER_CLUSTER_TOPOLOGY_AWARE =
+      "controller.helix.server.cluster.topology.aware";
+
+  /**
+   * The TOPOLOGY string to use for the server cluster in Helix.
+   */
+  public static final String CONTROLLER_HELIX_SERVER_CLUSTER_TOPOLOGY = "controller.helix.server.cluster.topology";
+
+  /**
+   * The FAULT_ZONE_TYPE string to use for the server cluster in Helix.
+   */
+  public static final String CONTROLLER_HELIX_SERVER_CLUSTER_FAULT_ZONE_TYPE =
+      "controller.helix.server.cluster.fault.zone.type";
 
   /**
    * Whether to enable graveyard cleanup for batch-only store at cluster level. Default is false.
@@ -357,6 +720,13 @@ public class ConfigKeys {
    * */
   public static final String CONTROLLER_STORE_GRAVEYARD_CLEANUP_SLEEP_INTERVAL_BETWEEN_LIST_FETCH_MINUTES =
       "controller.store.graveyard.cleanup.sleep.interval.between.list.fetch.minutes";
+
+  /**
+   * Minimum time window in seconds that must pass after a store is deleted before it can be recreated.
+   * This prevents accidental recreation of recently deleted stores. Default is 21600 seconds (6 hours).
+   */
+  public static final String CONTROLLER_STORE_RECREATION_AFTER_DELETION_TIME_WINDOW_SECONDS =
+      "controller.store.recreation.after.deletion.time.window.seconds";
 
   /**
    * Whether the superset schema generation in Parent Controller should be done via passed callback or not.
@@ -378,17 +748,29 @@ public class ConfigKeys {
 
   /**
    * The wait time before validating system store heartbeat during system store health check in parent controller.
-   * Default is 1min.
+   * Default is 10 min.
    */
   public static final String CONTROLLER_PARENT_SYSTEM_STORE_HEARTBEAT_CHECK_WAIT_TIME_SECONDS =
       "controller.parent.system.store.heartbeat.check.wait.time.seconds";
 
+  public static final String CONTROLLER_PARENT_SYSTEM_STORE_VERSION_REFRESH_THRESHOLD_IN_DAYS =
+      "controller.parent.system.store.version.refresh.threshold.in.days";
+
   /**
-   * The maximum retry count for parent controller to fix a bad system store.
-   * Default is 1.
+   * Maximum number of system stores to repair in a single round per cluster. When there are more unhealthy stores
+   * than this limit, the excess stores will be deferred to the next round. A negative value (e.g. -1) means
+   * unlimited. A value of 0 disables repair entirely: health checking still runs and the bad-store metrics are
+   * still updated, but no store is repaired. Default is 50.
    */
-  public static final String CONTROLLER_PARENT_SYSTEM_STORE_REPAIR_RETRY_COUNT =
-      "controller.parent.system.store.repair.retry.count";
+  public static final String CONTROLLER_PARENT_SYSTEM_STORE_REPAIR_MAX_PER_ROUND =
+      "controller.parent.system.store.repair.max.per.round";
+
+  /**
+   * Fully qualified class name of an optional {@code SystemStoreHealthChecker} override. When set, this checker runs
+   * to check system store health. Default value is empty, will fall back to {@code HeartbeatBasedSystemStoreHealthChecker}.
+   */
+  public static final String CONTROLLER_PARENT_SYSTEM_STORE_HEALTH_CHECK_OVERRIDE_CLASS_NAME =
+      "controller.parent.system.store.health.check.override.class.name";
 
   /**
    * Whether to initialize system schemas when controller starts. Default is true.
@@ -396,8 +778,27 @@ public class ConfigKeys {
   public static final String SYSTEM_SCHEMA_INITIALIZATION_AT_START_TIME_ENABLED =
       "system.schema.initialization.at.start.time.enabled";
 
+  /**
+   * Whether to register PARTITION_STATE and STORE_VERSION_STATE schemas via
+   * ControllerClientBackedSystemSchemaInitializer at controller startup.
+   * Requires {@link #SYSTEM_SCHEMA_INITIALIZATION_AT_START_TIME_ENABLED} to also be true.
+   * Default: false.
+   */
+  public static final String CONTROLLER_STATE_PROTOCOL_SCHEMA_STARTUP_REGISTRATION_ENABLED =
+      "controller.state.protocol.schema.startup.registration.enabled";
+
   public static final String KME_REGISTRATION_FROM_MESSAGE_HEADER_ENABLED =
       "kme.registration.from.message.header.enabled";
+
+  /**
+   * Configuration flag to enable using the KME-based schema reader for schema evolution.
+   * <p>
+   * When set to {@code true}, and if all other prerequisites are satisfied
+   * (e.g., a valid client is available to fetch schemas from the router or controller),
+   * Venice will leverage the KME schema reader to handle schema evolution.
+   */
+  public static final String KME_SCHEMA_READER_FOR_SCHEMA_EVOLUTION_ENABLED =
+      "kme.schema.reader.for.schema.evolution.enabled";
 
   /**
    * The following config is to control whether to turn on disabled replica enabler service.
@@ -439,9 +840,95 @@ public class ConfigKeys {
   public static final String SERVER_MAX_REQUEST_SIZE = "server.max.request.size";
   public static final String SERVER_SOURCE_TOPIC_OFFSET_CHECK_INTERVAL_MS =
       "server.source.topic.offset.check.interval.ms";
+  /**
+   * Controls whether replica lag computation should use offsets/positions obtained
+   * from consumer metrics.
+   *
+   * Default: false, since we are moving away from metrics-based lag computation.
+   * Set this to true only as a fallback in cases where PubSub broker metadata
+   * queries cause performance issues or excessive load.
+   */
+  public static final String SERVER_USE_METRICS_BASED_POSITION_IN_LAG_COMPUTATION =
+      "server.use.metrics.based.position.in.lag.computation";
+
+  /**
+   * Controls whether to use upstreamPubSubPosition (with offset fallback) or upstreamOffset
+   * when deserializing positions from leader metadata during ingestion.
+   *
+   * Default: true (use upstreamPubSubPosition with fallback to upstreamOffset).
+   * When true, the server will attempt to deserialize the position from upstreamPubSubPosition
+   * and fall back to upstreamOffset if deserialization fails or the position is invalid.
+   * When false, the server will directly use upstreamOffset without attempting position deserialization.
+   *
+   * This provides a safety mechanism to revert to offset-only behavior if position deserialization
+   * causes issues in production.
+   */
+  public static final String SERVER_USE_UPSTREAM_PUBSUB_POSITIONS = "server.use.upstream.pubsub.positions";
+
+  /**
+   * Feature flag to control whether OffsetRecord should use PubSubPosition deserialization with offset fallback
+   * when reading checkpointed positions from PartitionState.
+   * When true (default), the server will attempt to deserialize PubSubPosition from wire format bytes
+   * and fall back to offset-based position if deserialization fails or the buffer is empty.
+   * When false, the server will directly use numeric offsets without attempting position deserialization.
+   *
+   * This provides a safety mechanism to revert to offset-only behavior if position deserialization
+   * causes issues in production when reading checkpointed state.
+   */
+  public static final String SERVER_USE_CHECKPOINTED_PUBSUB_POSITIONS = "server.use.checkpointed.pubsub.positions";
+
+  /**
+   * Controls whether to use the Declaration of Leadership (DoL) mechanism for leader handover
+   * of system stores (meta stores, push status stores, etc.).
+   *
+   * <p>When enabled, the new leader replica will:
+   * 1. Produce a Declaration of Leadership message to the local version topic (VT)
+   * 2. Wait until it consumes this message back from VT (loopback confirmation)
+   * 3. Only then switch to consuming from the leader source topic (remote VT during batch push,
+   *    or RT topic for hybrid stores post-EOP)
+   *
+   * <p>This provides a deterministic guarantee that the leader has successfully written to
+   * and consumed from the local VT before transitioning to the leader source topic, eliminating
+   * the need for time-based waits.
+   *
+   * <p>System stores typically benefit more from fast handover due to their critical role in
+   * cluster operations. Having a separate config allows independent rollout strategy.
+   *
+   * Default: true (DoL mechanism enabled for system stores)
+   */
+  public static final String SERVER_LEADER_HANDOVER_USE_DOL_MECHANISM_FOR_SYSTEM_STORES =
+      "server.leader.handover.use.dol.mechanism.for.system.stores";
+
+  /**
+   * Controls whether to use the Declaration of Leadership (DoL) mechanism for leader handover
+   * of user stores (regular application data stores).
+   *
+   * <p>When enabled, the new leader replica will:
+   * 1. Produce a Declaration of Leadership message to the local version topic (VT)
+   * 2. Wait until it consumes this message back from VT (loopback confirmation)
+   * 3. Only then switch to consuming from the leader source topic (remote VT during batch push,
+   *    or RT topic for hybrid stores post-EOP)
+   *
+   * <p>This provides a deterministic guarantee that the leader has successfully written to
+   * and consumed from the local VT before transitioning to the leader source topic, eliminating
+   * the need for time-based waits.
+   *
+   * <p>Having a separate config from system stores allows independent rollout - typically you
+   * would enable DoL for system stores first, validate it works correctly, then roll out to
+   * user stores.
+   *
+   * Default: true (DoL mechanism enabled for user stores)
+   */
+  public static final String SERVER_LEADER_HANDOVER_USE_DOL_MECHANISM_FOR_USER_STORES =
+      "server.leader.handover.use.dol.mechanism.for.user.stores";
+
   public static final String SERVER_NETTY_GRACEFUL_SHUTDOWN_PERIOD_SECONDS =
       "server.netty.graceful.shutdown.period.seconds";
   public static final String SERVER_NETTY_WORKER_THREADS = "server.netty.worker.threads";
+  /**
+   * Whether to join a Helix cluster in an UNKNOWN state
+   */
+  public static final String SERVER_HELIX_JOIN_AS_UNKNOWN = "server.helix.join.as.unknown";
 
   /**
    * This config key is a misspelling. It is now considered deprecated.
@@ -549,6 +1036,27 @@ public class ConfigKeys {
   public static final String SERVER_NODE_CAPACITY_RCU = "server.node.capacity.rcu.per.second";
 
   /**
+   * Rate limiter for store version level read quota enforcement.
+   */
+  public static final String SERVER_STORE_VERSION_QPS_RATE_LIMITER = "server.store.version.qps.rate.limiter";
+
+  /**
+   * Rate limiter for storage node level read quota enforcement.
+   */
+  public static final String SERVER_STORAGE_NODE_RATE_LIMITER = "server.storage.node.rate.limiter";
+
+  /**
+   * Server quota enforcement interval in milliseconds.
+   */
+  public static final String SERVER_QUOTA_ENFORCEMENT_INTERVAL_IN_MILLIS =
+      "server.quota.enforcement.interval.in.millis";
+
+  /**
+   * Server quota enforcement capacity multiple.
+   */
+  public static final String SERVER_QUOTA_ENFORCEMENT_CAPACITY_MULTIPLE = "server.quota.enforcement.capacity.multiple";
+
+  /**
    * This config is used to control the maximum records returned by every poll request.
    * So far, Store Ingestion is throttling per poll, so if the configured value is too big,
    * the throttling could be inaccurate and it may impact GC as well.
@@ -577,6 +1085,15 @@ public class ConfigKeys {
   public static final String SERVER_MAX_WAIT_FOR_VERSION_INFO_MS_CONFIG = "server.max.wait.for.version.info.ms";
 
   /**
+   * Maximum duration (in milliseconds) to wait for version metadata to become available in the store repository
+   * during Helix state transitions. Version metadata may not yet be propagated from ZK when the OFFLINE-to-STANDBY
+   * transition fires. This config controls how long to retry with exponential backoff before failing the state
+   * transition. Default: 300000 (5 minutes).
+   */
+  public static final String SERVER_STORE_VERSION_METADATA_WAIT_DURING_STATE_TRANSITION_TIME_MS =
+      "server.store.version.metadata.wait.during.state.transition.time.ms";
+
+  /**
    * This config decides the frequency of the disk health check; the disk health check service writes
    * 64KB data to a temporary file in the database directory and read from the file for each health check.
    */
@@ -601,6 +1118,17 @@ public class ConfigKeys {
    * Whether to enable fast-avro in compute request path.
    */
   public static final String SERVER_COMPUTE_FAST_AVRO_ENABLED = "server.compute.fast.avro.enabled";
+
+  /**
+   * Whether to replace an existing collection-merge (SET_UNION) array element with the incoming element on a conflict,
+   * instead of only advancing its replication-metadata timestamp. When two elements are considered equal by Avro's
+   * comparison (which excludes {@code order: ignore} fields), the legacy behavior keeps the stored element and drops the
+   * incoming element's content in the ignored fields. Enabling this flag applies the incoming element when it wins the
+   * conflict (newer timestamp, or equal timestamp with a deterministic full-content tie-break). Active/Active only.
+   * Defaults to false to preserve the legacy behavior for controlled rollout.
+   */
+  public static final String SERVER_AA_COLLECTION_FIELD_ELEMENT_REPLACEMENT_ENABLED =
+      "server.aa.collection.field.element.replacement.enabled";
 
   /**
    * Whether to enable parallel lookup for batch-get.
@@ -665,12 +1193,6 @@ public class ConfigKeys {
   public static final String SERVER_LEAKED_RESOURCE_CLEANUP_ENABLED = "server.leaked.resource.cleanup.enabled";
 
   /**
-   * Ingestion mode in target storage instance.
-   * This will be applied to Da Vinci and Storage Node.
-   */
-  public static final String SERVER_INGESTION_MODE = "server.ingestion.mode";
-
-  /**
    * Unsubscribe from kakfa topic once a batch-store push finishes
    */
   public static final String SERVER_UNSUB_AFTER_BATCHPUSH = "server.unsub.after.batch.push";
@@ -692,63 +1214,66 @@ public class ConfigKeys {
    */
   public static final String SERVER_STOP_CONSUMPTION_TIMEOUT_IN_SECONDS = "server.stop.consumption.timeout.in.seconds";
 
-  /**
-   * Service listening port number for main ingestion service.
-   */
-  public static final String SERVER_INGESTION_ISOLATION_SERVICE_PORT = "server.ingestion.isolation.service.port";
-
-  /**
-   * Service listening port number for forked ingestion process.
-   */
-  public static final String SERVER_INGESTION_ISOLATION_APPLICATION_PORT =
-      "server.ingestion.isolation.application.port";
-
   public static final String SERVER_DB_READ_ONLY_FOR_BATCH_ONLY_STORE_ENABLED =
       "server.db.read.only.for.batch.only.store.enabled";
+  public static final String SERVER_RESET_ERROR_REPLICA_ENABLED = "server.reset.error.replica.enabled";
+
   /**
-   * A list of fully-qualified class names of all stats classes that needs to be initialized in isolated ingestion process,
-   * separated by comma. This config will help isolated ingestion process to register extra stats needed for monitoring,
-   * for example: JVM GC/Memory stats. All the classes defined here will be extending {@link com.linkedin.venice.stats.AbstractVeniceStats},
-   * and will take {@link io.tehuti.metrics.MetricsRepository} as the only parameter in their constructor.
+   * Config for enable/disable adaptive throttler service feature
    */
-  public static final String SERVER_INGESTION_ISOLATION_STATS_CLASS_LIST =
-      "server.ingestion.isolation.stats.class.list";
+  public static final String SERVER_ADAPTIVE_THROTTLER_ENABLED = "server.adaptive.throttler.enabled";
 
-  public static final String SERVER_INGESTION_ISOLATION_SSL_ENABLED = "server.ingestion.isolation.ssl.enabled";
+  /**
+   * Config for enable/disable blob transfer adaptive throttler feature (when adaptive throttler service is enabled)
+   */
+  public static final String SERVER_BLOB_TRANSFER_ADAPTIVE_THROTTLER_ENABLED =
+      "server.blob.transfer.adaptive.throttler.enabled";
 
-  public static final String SERVER_INGESTION_ISOLATION_ACL_ENABLED = "server.ingestion.isolation.acl.enabled";
+  /**
+   * Config for update percentage for blob transfer adaptive throttler
+   */
+  public static final String SERVER_BLOB_TRANSFER_ADAPTIVE_THROTTLER_UPDATE_PERCENTAGE =
+      "server.blob.transfer.adaptive.throttler.update.percentage";
 
-  public static final String SERVER_INGESTION_ISOLATION_PRINCIPAL_NAME = "server.ingestion.isolation.principal.name";
+  public static final String SERVER_SKIP_CHECK_AFTER_UNSUB_ENABLED = "server.skip.check.after.unsub.enabled";
+  public static final String SERVER_ADAPTIVE_THROTTLER_SIGNAL_IDLE_THRESHOLD =
+      "server.adaptive.throttler.signal.idle.threshold";
+  public static final String SERVER_ADAPTIVE_THROTTLER_SINGLE_GET_LATENCY_THRESHOLD =
+      "server.adaptive.throttler.single.get.latency.threshold";
+  public static final String SERVER_ADAPTIVE_THROTTLER_MULTI_GET_LATENCY_THRESHOLD =
+      "server.adaptive.throttler.multi.get.latency.threshold";
+  public static final String SERVER_ADAPTIVE_THROTTLER_READ_COMPUTE_GET_LATENCY_THRESHOLD =
+      "server.adaptive.throttler.read.compute.latency.threshold";
+
+  /**
+   * Config to enable parallel resource shutdown operation to speed up overall ingestion task shutdown.
+   */
+  public static final String SERVER_PARALLEL_RESOURCE_SHUTDOWN_ENABLED = "server.parallel.resource.shutdown.enabled";
+
+  /**
+   * Config to control the thread pool size used for parallel ingestion task shutdown.
+   * Default is 16 to avoid creating too many threads.
+   */
+  public static final String SERVER_PARALLEL_SHUTDOWN_THREAD_POOL_SIZE = "server.parallel.shutdown.thread.pool.size";
+
+  /**
+   * Config for adaptive throttler signal refresh interval in seconds.
+   */
+  public static final String SERVER_ADAPTIVE_THROTTLER_SIGNAL_REFRESH_INTERVAL_IN_SECONDS =
+      "server.adaptive.throttler.signal.refresh.interval.in.seconds";
 
   /**
    * A list of JVM arguments for forked child process, separated by semicolon.
    */
   public static final String SERVER_FORKED_PROCESS_JVM_ARGUMENT_LIST = "server.forked.process.jvm.arg.list";
 
-  /**
-   * Timeout for connection between main process and forked ingestion process. If heartbeat is not refreshed within this
-   * timeout, both processes should act to reconstruct the state in order to restore connection and service.
-   */
-  public static final String SERVER_INGESTION_ISOLATION_CONNECTION_TIMEOUT_SECONDS =
-      "server.ingestion.isolation.connection.timeout.seconds";
+  public static final String SERVER_BATCH_REPORT_END_OF_INCREMENTAL_PUSH_STATUS_ENABLED =
+      "server.batch.report.end.of.incremental.push.status.enabled";
 
   /**
-   * Timeout for single ingestion command request sent from main process to forked ingestion process.
+   * This config dictates where the server should write the end of incremental push status.
    */
-  public static final String SERVER_INGESTION_ISOLATION_REQUEST_TIMEOUT_SECONDS =
-      "server.ingestion.isolation.request.timeout.seconds";
-
-  /**
-   * Timeout for single heartbeat request sent from main process to forked ingestion process.
-   */
-  public static final String SERVER_INGESTION_ISOLATION_HEARTBEAT_REQUEST_TIMEOUT_SECONDS =
-      "server.ingestion.isolation.heartbeat.request.timeout.seconds";
-
-  /**
-   * Timeout for single metric request sent from main process to forked ingestion process.
-   */
-  public static final String SERVER_INGESTION_ISOLATION_METRIC_REQUEST_TIMEOUT_SECONDS =
-      "server.ingestion.isolation.metric.request.timeout.seconds";
+  public static final String SERVER_INCREMENTAL_PUSH_STATUS_WRITE_MODE = "server.incremental.push.status.write.mode";
 
   /**
    * whether to enable checksum verification in the ingestion path from kafka to database persistency. If enabled it will
@@ -757,6 +1282,22 @@ public class ConfigKeys {
    */
   public static final String SERVER_DATABASE_CHECKSUM_VERIFICATION_ENABLED =
       "server.database.checksum.verification.enabled";
+
+  /**
+   * Whether to drop a data partition that fails to be restored at storage engine startup, rather than aborting the
+   * whole engine bootstrap. When enabled, the on-disk directory of the failed partition is deleted and the partition
+   * is re-bootstrapped from scratch via Helix/ingestion on the next startup.
+   *
+   * The drop is intentionally narrow: only failures that look like partition-local on-disk damage trigger it.
+   * For the RocksDB engine that means {@code Status.Code.Corruption}, or {@code Status.Code.IOError} whose status
+   * carries a "No such file or directory" message. Environmental failures - disk full, permission denied, lock
+   * contention from a concurrent open, generic IO errors - are NOT dropped; they re-throw and abort engine bootstrap
+   * so an operator can investigate. Failures while restoring the metadata partition always propagate, regardless
+   * of this flag.
+   *
+   * Default false to preserve fail-fast behavior.
+   */
+  public static final String SERVER_RESTORE_DROP_BAD_PARTITION_ENABLED = "server.restore.drop.bad.partition.enabled";
 
   /**
    * Any server config that start with "server.local.consumer.config.prefix" will be used as a customized consumer config
@@ -796,12 +1337,6 @@ public class ConfigKeys {
    */
   public static final String FREEZE_INGESTION_IF_READY_TO_SERVE_OR_LOCAL_DATA_EXISTS =
       "freeze.ingestion.if.ready.to.serve.or.local.data.exists";
-
-  /**
-   * a comma seperated list of kafka producer metrics that will be reported.
-   * For ex. "outgoing-byte-rate,record-send-rate,batch-size-max,batch-size-avg,buffer-available-bytes,buffer-exhausted-rate"
-   */
-  public static final String KAFKA_PRODUCER_METRICS = "list.of.producer.metrics.from.kafka";
 
   /**
    * Whether to print logs that are used for troubleshooting only.
@@ -913,6 +1448,7 @@ public class ConfigKeys {
    */
   public static final String ROUTER_MAX_KEY_COUNT_IN_MULTIGET_REQ = "router.max.key_count.in.multiget.req";
   public static final String ROUTER_CONNECTION_LIMIT = "router.connection.limit";
+  public static final String ROUTER_CONNECTION_HANDLE_MODE = "router.connection.handle.mode";
   /**
    * The http client pool size being used in one Router;
    */
@@ -946,12 +1482,6 @@ public class ConfigKeys {
    * Please check {@literal VeniceMultiKeyRoutingStrategy} to find available routing strategy.
    */
   public static final String ROUTER_MULTI_KEY_ROUTING_STRATEGY = "router.multi.key.routing.strategy";
-
-  /**
-   * The Helix virtual group field name in domain, and the allowed values: {@link com.linkedin.venice.helix.HelixInstanceConfigRepository#GROUP_FIELD_NAME_IN_DOMAIN}
-   * and {@link com.linkedin.venice.helix.HelixInstanceConfigRepository#ZONE_FIELD_NAME_IN_DOMAIN}.
-   */
-  public static final String ROUTER_HELIX_VIRTUAL_GROUP_FIELD_IN_DOMAIN = "router.helix.virtual.group.field.in.domain";
 
   /**
    * Helix group selection strategy when Helix assisted routing is enabled.
@@ -993,11 +1523,6 @@ public class ConfigKeys {
       "router.netty.graceful.shutdown.period.seconds";
 
   public static final String ROUTER_CLIENT_DECOMPRESSION_ENABLED = "router.client.decompression.enabled";
-
-  /**
-   * Whether to enable fast-avro in router;
-   */
-  public static final String ROUTER_COMPUTE_FAST_AVRO_ENABLED = "router.compute.fast.avro.enabled";
 
   /**
    * Socket timeout config for the connection manager from router to server
@@ -1088,15 +1613,6 @@ public class ConfigKeys {
   public static final String CONTROLLER_CLUSTER_REPLICA = "controller.cluster.replica";
 
   /**
-   * The time window in ms used to throttle the Kafka topic creation, during the time window, only 1 topic is allowed to
-   * be created.
-   */
-  public static final String TOPIC_CREATION_THROTTLING_TIME_WINDOW_MS = "topic.creation.throttling.time.window.ms";
-
-  /** Timeout for create topic and delete topic operations. */
-  public static final String TOPIC_MANAGER_KAFKA_OPERATION_TIMEOUT_MS = "topic.manager.kafka.operation.timeout.ms";
-
-  /**
    * This is the minimum number of Kafka topics that are guaranteed to be preserved by the leaky topic clean
    * up routine. The topics with the highest version numbers will be favored by this preservative behavior.
    * All other topics (i.e.: those with smaller version numbers) which Venice does not otherwise know about
@@ -1125,6 +1641,17 @@ public class ConfigKeys {
 
   /** Whether current controller is parent or not */
   public static final String CONTROLLER_PARENT_MODE = "controller.parent.mode";
+
+  /**
+   * This config specifies the state of the region of the parent controller.
+   *
+   * The region can be in one of the following states:
+   * ACTIVE: the parent controller in the region is serving requests.
+   * PASSIVE: the parent controller in the region is rejecting requests.
+   *
+   * By default, this is set to ACTIVE.
+   */
+  public static final String CONTROLLER_PARENT_REGION_STATE = "controller.parent.region.state";
 
   /**
    * This config is used to control how many errored topics we are going to keep in parent cluster.
@@ -1188,6 +1715,14 @@ public class ConfigKeys {
    */
   public static final String ENABLE_INCREMENTAL_PUSH_FOR_HYBRID_ACTIVE_ACTIVE_USER_STORES =
       "enable.incremental.push.for.hybrid.active.active.user.stores";
+
+  /**
+   * We will use this config to determine whether we should enable separate real-time topic for incremental push enabled stores.
+   * If this config is set to true, we will enable separate real-time topic for incremental push enabled stores.
+   */
+  public static final String ENABLE_SEPARATE_REAL_TIME_TOPIC_FOR_STORE_WITH_INCREMENTAL_PUSH =
+      "enable.separate.real.time.topic.for.store.with.incremental.push";
+
   /**
    * We will use this config to determine whether we should enable partial update for hybrid active-active user stores.
    * If this config is set to true, we will enable partial update for hybrid active-active user stores whose latest value
@@ -1255,15 +1790,9 @@ public class ConfigKeys {
   public static final String PARENT_KAFKA_CLUSTER_FABRIC_LIST = "parent.kafka.cluster.fabric.list";
 
   /**
-   * Whether A/A is enabled on the controller. When it is true, all A/A required config (e.g.
-   * {@link #ACTIVE_ACTIVE_REAL_TIME_SOURCE_FABRIC_LIST}) must be set.
-   */
-  public static final String ACTIVE_ACTIVE_ENABLED_ON_CONTROLLER = "active.active.enabled.on.controller";
-
-  /**
-   * A list of fabrics that are source(s) of the active active real time replication. When active-active replication
-   * is enabled on the controller {@link #ACTIVE_ACTIVE_ENABLED_ON_CONTROLLER} is true, this list should contain fabrics
-   * where the Venice server should consume from when it accepts the TS (TopicSwitch) message.
+   * A list of regions that are source(s) of the Active/Active real time replication. When running in a multi-region
+   * mode, this list should contain region names where the Venice server should consume from when it accepts the
+   * TS (TopicSwitch) message.
    * Example value of this config: "dc-0, dc-1, dc-2".
    */
   public static final String ACTIVE_ACTIVE_REAL_TIME_SOURCE_FABRIC_LIST = "active.active.real.time.source.fabric.list";
@@ -1275,12 +1804,6 @@ public class ConfigKeys {
    * */
   public static final String PARENT_CONTROLLER_WAITING_TIME_FOR_CONSUMPTION_MS =
       "parent.controller.waiting.time.for.consumption.ms";
-
-  /**
-   * If there is a failure in consuming from the admin topic, skip the message after retrying for this many minutes
-   * Default 5 days
-   */
-  public static final String ADMIN_CONSUMPTION_TIMEOUT_MINUTES = "admin.consumption.timeout.minute";
 
   /**
    * The maximum time allowed for worker threads to execute admin messages in one cycle. A cycle is the processing of
@@ -1348,11 +1871,28 @@ public class ConfigKeys {
   public static final String SERVER_DISK_FULL_THRESHOLD = "disk.full.threshold";
 
   /**
+   * The minimum ratio of future version disk size to current version disk size.
+   * If the future version's disk usage drops below this ratio of the current version's disk usage,
+   * an alert metric will be emitted. For example, a value of 0.5 means an alert fires when the
+   * future version is less than 50% of the current version's size.
+   * Default value is 0.5 (50%).
+   */
+  public static final String SERVER_VERSION_SWAP_DISK_SIZE_DROP_ALERT_THRESHOLD =
+      "server.version.swap.disk.size.drop.alert.threshold";
+
+  /**
    * If a request is slower than this, it will be reported as tardy in the router metrics
    */
   public static final String ROUTER_SINGLEGET_TARDY_LATENCY_MS = "router.singleget.tardy.latency.ms";
   public static final String ROUTER_MULTIGET_TARDY_LATENCY_MS = "router.multiget.tardy.latency.ms";
   public static final String ROUTER_COMPUTE_TARDY_LATENCY_MS = "router.compute.tardy.latency.ms";
+
+  /**
+   * Threshold in milliseconds for logging slow scatter requests.
+   * When a scatter request exceeds this threshold, detailed information will be logged
+   * to help debug high P99 latency issues.
+   */
+  public static final String ROUTER_SLOW_SCATTER_REQUEST_THRESHOLD_MS = "router.slow.scatter.request.threshold.ms";
 
   public static final String ROUTER_ENABLE_READ_THROTTLING = "router.enable.read.throttling";
 
@@ -1375,6 +1915,12 @@ public class ConfigKeys {
   public static final String PUSH_JOB_STATUS_STORE_CLUSTER_NAME = "controller.push.job.status.store.cluster.name";
 
   /**
+   * The name of the cluster that the internal store for storing controller parent metadata belongs to.
+   */
+  public static final String PARENT_CONTROLLER_METADATA_STORE_CLUSTER_NAME =
+      "parent.controller.metadata.store.cluster.name";
+
+  /**
    * The most-significant-bits of the producer GUID used by {@code VenicePushJob} encoded as a {@code long}.
    */
   public static final String PUSH_JOB_GUID_MOST_SIGNIFICANT_BITS = "push.job.guid.most.significant.bits";
@@ -1390,11 +1936,6 @@ public class ConfigKeys {
   public static final String CONTROLLER_ADD_VERSION_VIA_ADMIN_PROTOCOL = "controller.add.version.via.admin.protocol";
 
   public static final String CONTROLLER_EARLY_DELETE_BACKUP_ENABLED = "controller.early.delete.backup.enabled";
-
-  /**
-   * Flag to indicate which push monitor controller will pick up for an upcoming push
-   */
-  public static final String PUSH_MONITOR_TYPE = "push.monitor.type";
 
   /**
    * Flag to enable the participant message store setup and write operations to the store.
@@ -1418,6 +1959,7 @@ public class ConfigKeys {
    * Flag to enable the controller to send kill push job helix messages to the storage node upon consuming kill push job
    * admin messages.
    */
+  @Deprecated
   public static final String ADMIN_HELIX_MESSAGING_CHANNEL_ENABLED = "admin.helix.messaging.channel.enabled";
 
   /**
@@ -1427,6 +1969,18 @@ public class ConfigKeys {
   public static final String PARTICIPANT_MESSAGE_CONSUMPTION_DELAY_MS = "participant.message.consumption.delay.ms";
 
   public static final String ROUTER_STATEFUL_HEALTHCHECK_ENABLED = "router.stateful.healthcheck.enabled";
+
+  /**
+   * Enable latency-based routing for host selection.
+   * When enabled, uses average response latency as the criterion with a 1.5x spectrum
+   * threshold among the healthy host list. Ref AVG_LATENCY_SPECTRUM_FOR_HOST_SELECTION
+   *
+   * When disabled (default), uses pending request count to decide on the host selection
+   * among the healthy host list.
+   *
+   * Note: Healthy host list is based on VeniceHostHealth#isHostHealthy.
+   */
+  public static final String ROUTER_LATENCY_BASED_ROUTING_ENABLED = "router.latency.based.routing.enabled";
 
   /**
   * Maximum number of pending router request per storage node after which router concludes that host to be unhealthy
@@ -1562,20 +2116,8 @@ public class ConfigKeys {
   public static final String CONTROLLER_HAAS_SUPER_CLUSTER_NAME = "controller.haas.super.cluster.name";
 
   /**
-   * Whether to enable batch push (including GF job) from Admin in Child Controller.
-   * In theory, we should disable batch push in Child Controller no matter what, but the fact is that today there are
-   * many tests, which are doing batch pushes to an individual cluster setup (only Child Controller), so disabling batch push from Admin
-   * in Child Controller will require a lot of refactoring.
-   * So the current strategy is to enable it by default, but disable it in EI and PROD.
-   */
-  public static final String CONTROLLER_ENABLE_BATCH_PUSH_FROM_ADMIN_IN_CHILD =
-      "controller.enable.batch.push.from.admin.in.child";
-
-  /**
-   * A config that turns the key/value profiling stats on and off. This config can be placed in both Router and SNs and it
-   * is off by default. When switching it on, We will emit a fine grained histogram that reflects the distribution of
-   * key and value size. Since this will be run in the critical read path and it will emit additional ~20 stats, please
-   * be cautious when turning it on.
+   * Router-only config that controls request-key-size metrics. It is off by default because collecting per-key sizes
+   * adds work to the critical read path.
    */
   public static final String KEY_VALUE_PROFILING_ENABLED = "key.value.profiling.enabled";
 
@@ -1589,11 +2131,6 @@ public class ConfigKeys {
    * A config specifies which partitioning scheme should be used by VenicePushJob.
    */
   public static final String PARTITIONER_CLASS = "partitioner.class";
-  /**
-   * A configs of over-partitioning factor
-   * number of Kafka partitions in each partition
-   */
-  public static final String AMPLIFICATION_FACTOR = "amplification.factor";
 
   /**
    * A unique id that can represent this instance
@@ -1609,21 +2146,6 @@ public class ConfigKeys {
    * Number of threads that the Router will use to wait for dictionary to download from storage nodes and process it.
    */
   public static final String ROUTER_DICTIONARY_PROCESSING_THREADS = "router.dictionary.processing.threads";
-
-  /**
-   * The class name to use for the {@link PubSubAdminAdapter}.
-   */
-  public static final String KAFKA_ADMIN_CLASS = "kafka.admin.class";
-
-  /**
-   * Fully-qualified class name to use for Kafka write-only admin operations.
-   */
-  public static final String KAFKA_WRITE_ONLY_ADMIN_CLASS = "kafka.write.only.admin.class";
-
-  /**
-   * Fully-qualified class name to use for Kafka read-only admin operations.
-   */
-  public static final String KAFKA_READ_ONLY_ADMIN_CLASS = "kafka.read.only.admin.class";
 
   /**
    * A config that determines whether to use Helix customized view for hybrid store quota
@@ -1697,6 +2219,13 @@ public class ConfigKeys {
       "client.system.store.repository.refresh.interval.seconds";
 
   /**
+   * A config for Da-Vinci clients to use request based metadata repository. This will enable the client to retrieve metadata
+   * directly from the server zk-cache.
+   */
+  public static final String CLIENT_USE_REQUEST_BASED_METADATA_REPOSITORY =
+      "client.use.request.based.metadata.repository";
+
+  /**
    * Test only config used to disable parent topic truncation upon job completion. This is needed because kafka cluster
    * in test environment is shared between parent and child controllers. Truncating topic upon completion will confuse
    * child controllers in certain scenarios.
@@ -1740,6 +2269,106 @@ public class ConfigKeys {
   public static final String DAVINCI_PUSH_STATUS_SCAN_MAX_OFFLINE_INSTANCE_RATIO =
       "davinci.push.status.scan.max.offline.instance.ratio";
 
+  // this is a host-level config to decide whether bootstrap a blob transfer manager for the host
+  public static final String BLOB_TRANSFER_MANAGER_ENABLED = "blob.transfer.manager.enabled";
+
+  // this is a host-level config to decide if bootstrap from blob transfer for venice server
+  // the store level config is controlled by BLOB_TRANSFER_IN_SERVER_ENABLED.
+  public static final String BLOB_TRANSFER_RECEIVER_SERVER_POLICY = "blob.transfer.receiver.server.policy";
+
+  // this is a config to decide whether the snapshot is expired and need to be recreated.
+  public static final String BLOB_TRANSFER_SNAPSHOT_RETENTION_TIME_IN_MIN =
+      "blob.transfer.snapshot.retention.time.in.min";
+  // this is a config to decide the max allowed concurrent snapshot user per host level, it is used to limit how many
+  // requests can be concurrently served for a host globally.
+  public static final String BLOB_TRANSFER_MAX_CONCURRENT_SNAPSHOT_USER = "blob.transfer.max.concurrent.snapshot.user";
+  // this is a config to decide the upper bound of the per-chunk size (in bytes) used when streaming a snapshot file
+  // to a peer during blob transfer. The server picks min(this value, max(16KB, fileLength / 4)) as the actual chunk
+  // size, so this config only caps the ceiling; it does not change the 16KB floor. Tune this down to keep large
+  // chunks poolable by Netty's heap arena (see io.netty.allocator.maxOrder) at the cost of more, smaller writes.
+  public static final String BLOB_TRANSFER_MAX_CHUNK_SIZE_BYTES = "blob.transfer.max.chunk.size.bytes";
+  // this is a config to decide the max allowed concurrent blob receive replicas per host level, it is used to limit how
+  // many
+  // replicas can be concurrently receiving blobs for a host globally.
+  public static final String BLOB_TRANSFER_MAX_CONCURRENT_BLOB_RECEIVE_REPLICAS =
+      "blob.transfer.max.concurrent.blob.receive.replicas";
+  // this is a config to decide max file transfer timeout time in minutes in server side.
+  public static final String BLOB_TRANSFER_MAX_TIMEOUT_IN_MIN = "blob.transfer.max.timeout.in.min";
+  // this is a config to decide the max file receive timeout time in minutes in client side.
+  public static final String BLOB_RECEIVE_MAX_TIMEOUT_IN_MIN = "blob.receive.max.timeout.in.min";
+  // This is a config to set the reader idle timeout (in seconds) on the client side to handle scenarios where the
+  // server shuts down before transfer completes.
+  public static final String BLOB_RECEIVE_READER_IDLE_TIME_IN_SECONDS = "blob.receive.reader.idle.time.in.seconds";
+  // This is a config to decide the max allowed offset lag to use pubsub, even if the blob transfer is enable.
+  public static final String BLOB_TRANSFER_DISABLED_OFFSET_LAG_THRESHOLD =
+      "blob.transfer.disabled.offset.lag.threshold";
+  /**
+   * This is a config to decide the max allowed time lag to use pubsub, even if the blob transfer is enable.
+   * If the config is non-positive, this means the feature is disabled.
+   */
+  public static final String BLOB_TRANSFER_DISABLED_TIME_LAG_THRESHOLD_IN_MINUTES =
+      "blob.transfer.disabled.time.lag.threshold.in.minutes";
+  // This is a freshness in sec to measure the connectivity between the peers,
+  // if the connectivity is not fresh, then retry the connection.
+  public static final String BLOB_TRANSFER_PEERS_CONNECTIVITY_FRESHNESS_IN_SECONDS =
+      "blob.transfer.peers.connectivity.freshness.in.seconds";
+  // Number of Netty worker (event-loop) threads for the blob transfer client. Blob transfer is not latency sensitive,
+  // so when unset this defaults to max(4, 20% of available processors) rather than Netty's default of 2 * available
+  // processors. Any explicitly configured value of 4 or below is clamped up to 4; values above 4 are used as-is.
+  public static final String BLOB_TRANSFER_CLIENT_NETTY_WORKER_THREADS = "blob.transfer.client.netty.worker.threads";
+  // This is the maximum allowed read speed (in bytes per sec) for the Netty client when receiving data from the remote
+  // peer.
+  public static final String BLOB_TRANSFER_CLIENT_READ_LIMIT_BYTES_PER_SEC =
+      "blob.transfer.client.read.limit.bytes.per.sec";
+  // This is the maximum allowed write speed (in bytes per sec) for the file transfer service when sending out data to
+  // the remote peer.
+  public static final String BLOB_TRANSFER_SERVICE_WRITE_LIMIT_BYTES_PER_SEC =
+      "blob.transfer.service.write.limit.bytes.per.sec";
+
+  // This is the cleanup interval in mins for the blob transfer snapshot. Every interval, the snapshot will be cleaned
+  // up.
+  public static final String BLOB_TRANSFER_SNAPSHOT_CLEANUP_INTERVAL_IN_MINS =
+      "blob.transfer.snapshot.cleanup.interval.in.mins";
+
+  // Enable ssl for the blob transfer
+  public static final String BLOB_TRANSFER_SSL_ENABLED = "blob.transfer.ssl.enabled";
+
+  // Enable acl for the blob transfer between Da Vinci peers, or server peers
+  public static final String BLOB_TRANSFER_ACL_ENABLED = "blob.transfer.acl.enabled";
+
+  /**
+   * This is the server host-level flag -- when true and the blob transfer service is enabled, the Venice
+   * server accepts blob transfer requests from (Da Vinci /
+   * Stateful CDC) clients. Defaults to false.
+   */
+  public static final String SERVER_BLOB_TRANSFER_ACCEPT_CLIENT_REQUEST_ENABLED =
+      "server.blob.transfer.accept.client.request.enabled";
+
+  // Client-side flag: when true, after peer-to-peer (client) blob discovery finds no usable peer, the
+  // Stateful CDC / Da Vinci client falls back to requesting the blob from a Venice server. Defaults to false.
+  public static final String DAVINCI_BLOB_TRANSFER_SERVER_FALLBACK_ENABLED =
+      "davinci.blob.transfer.server.fallback.enabled";
+
+  // Server-side hard cap, as a percentage of the host blob-transfer budget
+  // (BLOB_TRANSFER_MAX_CONCURRENT_SNAPSHOT_USER), that client-origin transfers may occupy. Server-origin
+  // (server-to-server) transfers are not capped and may use the full budget. Defaults to 25.
+  public static final String SERVER_BLOB_TRANSFER_CLIENT_CAPACITY_PERCENT =
+      "server.blob.transfer.client.capacity.percent";
+
+  // Port used by peer-to-peer transfer service. It should be used by both server and client
+  public static final String DAVINCI_P2P_BLOB_TRANSFER_SERVER_PORT = "davinci.p2p.blob.transfer.server.port";
+  // Ideally this config should NOT be used but for testing purpose on a single host, we need to separate the ports.
+  public static final String DAVINCI_P2P_BLOB_TRANSFER_CLIENT_PORT = "davinci.p2p.blob.transfer.client.port";
+
+  /**
+   * When true, DVC clients in non-target regions subscribe to a future version immediately at version
+   * creation (paused after Start-Of-Push) and resume once targetRegionPromoted=true arrives, so VPJ
+   * naturally waits for all DVCs everywhere before completing. When false (default), non-target-region
+   * DVC clients use the legacy behavior: subscribe only when the version reaches VersionStatus.ONLINE.
+   * Only has an effect for stores with targetSwapRegion configured.
+   */
+  public static final String DAVINCI_PAUSED_SIT_ENABLED = "davinci.paused.sit.enabled";
+
   public static final String CONTROLLER_ZK_SHARED_DAVINCI_PUSH_STATUS_SYSTEM_SCHEMA_STORE_AUTO_CREATION_ENABLED =
       "controller.zk.shared.davinci.push.status.system.schema.store.auto.creation.enabled";
 
@@ -1770,21 +2399,39 @@ public class ConfigKeys {
       "use.da.vinci.specific.execution.status.for.error";
 
   /**
-   * The number of threads that will be used to perform SSL handshakes between clients and a router.
+   * When enabled, allows the use of the getProgressPercentage() method in TopicManager.
+   * This is disabled by default as it can be expensive to compute.
    */
-  public static final String ROUTER_CLIENT_SSL_HANDSHAKE_THREADS = "router.client.ssl.handshake.threads";
+  public static final String POSITIONAL_PROGRESS_LOGGING_ENABLED = "positional.progress.logging.enabled";
 
   /**
-   * Config to control if DNS resolution should be done before SSL handshake between clients and a router.
-   * If this is enabled, the above SSL handshake thread pool will be used to perform DNS resolution, because
-   * DNS resolution before SSL and separate SSL handshake thread pool are mutually exclusive features.
+   * If the config value is non-negative, da-vinci client will batch push statues among all partitions into one single
+   * update events; DaVinciPushStatusUpdateTask will check the push status across all partitions in the same DaVinci
+   * node, and decide whether to send a status update event. This config controls the interval between each check.
    */
-  public static final String ROUTER_RESOLVE_BEFORE_SSL = "router.resolve.before.ssl";
+  public static final String DAVINCI_PUSH_STATUS_CHECK_INTERVAL_IN_MS = "davinci.push.status.check.interval.in.ms";
+
+  /**
+   * Config to control the number of threads used for DNS resolution.
+   * If the value is positive, DNS resolution would be done before SSL handshake between clients and a router.
+   * 0 will disable the dns resolution but does not affect the SSL handshake.
+   */
+  public static final String ROUTER_RESOLVE_THREADS = "router.resolve.threads";
+
+  /**
+   * Config to control the queue capacity for the thread pool executor used for DNS resolution.
+   */
+  public static final String ROUTER_RESOLVE_QUEUE_CAPACITY = "router.resolve.queue.capacity";
 
   /**
    * Config to control the maximum number of concurrent DNS resolutions that can be done by the router.
    */
-  public static final String ROUTER_MAX_CONCURRENT_RESOLUTIONS = "router.max.concurrent.resolutions";
+  public static final String ROUTER_MAX_CONCURRENT_SSL_HANDSHAKES = "router.max.concurrent.ssl.handshakes";
+
+  /**
+   * Config to control whether Router will do ip spoofing check or not.
+   */
+  public static final String ROUTER_CLIENT_IP_SPOOFING_CHECK_ENABLED = "router.client.ip.spoofing.check.enabled";
 
   /**
    * Config to control the maximum number of attempts to resolve a client host name before giving up.
@@ -1827,17 +2474,18 @@ public class ConfigKeys {
   public static final String LEAKED_RESOURCE_ALLOWED_LINGER_TIME_MS = "leaked.resource.allowed.linger.time.ms";
 
   /**
-   * This config controls whether to use da-vinci based implementation of the system store repository when
-   * CLIENT_USE_SYSTEM_STORE_REPOSITORY is set to true. By default the thin-client based implementation will be used.
-   */
-  public static final String CLIENT_USE_DA_VINCI_BASED_SYSTEM_STORE_REPOSITORY =
-      "client.use.da.vinci.based.system.store.repository";
-
-  /**
    *
    */
   public static final String CONTROLLER_DISABLE_PARENT_REQUEST_TOPIC_FOR_STREAM_PUSHES =
       "controller.disable.parent.request.topic.for.stream.pushes";
+
+  /**
+   * Config to enable overriding PubSub bootstrap servers for stream push jobs based on source grid fabric.
+   * When enabled, if a source grid fabric is specified in the request, the controller will use the
+   * PubSub bootstrap servers for that fabric instead of the default local Kafka cluster.
+   */
+  public static final String CONTROLLER_ENABLE_STREAM_PUSH_SOURCE_GRID_FABRIC_OVERRIDE =
+      "controller.enable.stream.push.source.grid.fabric.override";
 
   public static final String CONTROLLER_DEFAULT_READ_QUOTA_PER_ROUTER = "controller.default.read.quota.per.router";
 
@@ -1859,6 +2507,61 @@ public class ConfigKeys {
   public static final String CONTROLLER_AUTO_MATERIALIZE_DAVINCI_PUSH_STATUS_SYSTEM_STORE =
       "controller.auto.materialize.davinci.push.status.system.store";
 
+  // --- Alternative PubSub backend configs (per-cluster, per-topic-type) ---
+  // Each per-topic flag falls back to the umbrella CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_ALL.
+  // This lets operators enable all topic types at once (all=true) and selectively disable
+  // individual ones, or ramp each type independently without touching the others.
+
+  /** Enable alternative pubsub backend for ALL topic types. Default: false */
+  public static final String CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_ALL = "controller.pubsub.alternative.backend.all";
+
+  /** Create meta system store version topics using alternative pubsub backend. Default: false */
+  public static final String CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_META_SYSTEM_STORE_VT =
+      "controller.pubsub.alternative.backend.meta.system.store.vt";
+
+  /** Create meta system store RT topics using alternative pubsub backend. Default: false */
+  public static final String CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_META_SYSTEM_STORE_RT =
+      "controller.pubsub.alternative.backend.meta.system.store.rt";
+
+  /** Create push status system store VTs using alternative pubsub backend. Default: false */
+  public static final String CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_PUSH_STATUS_SYSTEM_STORE_VT =
+      "controller.pubsub.alternative.backend.push.status.system.store.vt";
+
+  /** Create push status system store RTs using alternative pubsub backend. Default: false */
+  public static final String CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_PUSH_STATUS_SYSTEM_STORE_RT =
+      "controller.pubsub.alternative.backend.push.status.system.store.rt";
+
+  /** Create batch-only user store version topics using alternative pubsub backend. Default: false */
+  public static final String CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_BATCH_USER_STORE_VT =
+      "controller.pubsub.alternative.backend.batch.user.store.vt";
+
+  /** Create hybrid user store version topics using alternative pubsub backend. Default: false */
+  public static final String CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_HYBRID_USER_STORE_VT =
+      "controller.pubsub.alternative.backend.hybrid.user.store.vt";
+
+  /** Create hybrid user store RT topics using alternative pubsub backend. Default: false */
+  public static final String CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_HYBRID_USER_STORE_RT =
+      "controller.pubsub.alternative.backend.hybrid.user.store.rt";
+
+  /** Create batch job heartbeat system store version topics using alternative pubsub backend. Default: false */
+  public static final String CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_BATCH_JOB_HEARTBEAT_STORE_VT =
+      "controller.pubsub.alternative.backend.batch.job.heartbeat.store.vt";
+
+  /** Create batch job heartbeat system store RT topics using alternative pubsub backend. Default: false */
+  public static final String CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_BATCH_JOB_HEARTBEAT_STORE_RT =
+      "controller.pubsub.alternative.backend.batch.job.heartbeat.store.rt";
+
+  /** Comma-separated store names excluded from alternative pubsub backend. Default: empty */
+  public static final String CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_EXCLUSION_LIST =
+      "controller.pubsub.alternative.backend.exclusion.list";
+
+  /**
+   * Comma-separated store names always routed to the alternative pubsub backend, overriding the
+   * per-topic-type flags. The exclusion list takes precedence over this inclusion list. Default: empty
+   */
+  public static final String CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_INCLUSION_LIST =
+      "controller.pubsub.alternative.backend.inclusion.list";
+
   /**
    * This will indicate which ReplicationMetadataSchemaGenerator version to use to generate replication metadata schema.
    * This config should be set on a per-cluster level, meaning that each cluster can have its own RMD version ID.
@@ -1870,6 +2573,20 @@ public class ConfigKeys {
    */
   public static final String OFFSET_LAG_DELTA_RELAX_FACTOR_FOR_FAST_ONLINE_TRANSITION_IN_RESTART =
       "offset.lag.delta.relax.factor.for.fast.online.transition.in.restart";
+
+  /*
+   * This config will specify the time lag threshold to be used for time lag comparison in making partition
+   * online faster. Default value is -1 meaning disabled.
+   */
+  public static final String TIME_LAG_THRESHOLD_FOR_FAST_ONLINE_TRANSITION_IN_RESTART_MINUTES =
+      "time.lag.threshold.for.fast.online.transition.in.restart.minutes";
+
+  /**
+   * This config controls the behavior to enable/disable offset lag calculation and persistence during offset record
+   * sync action. The intention is to gradually deprecate this behavior until all the usage is removed from Server and
+   * Da Vinci clients. After they are fully deprecate, this config and the checkpoint logic will all be removed.
+   */
+  public static final String OFFSET_LAG_CHECKPOINT_DURING_SYNC_ENABLED = "offset.lag.checkpoint.during.sync.enabled";
 
   /**
    * Enable offset collection for kafka topic partition from kafka consumer metrics.
@@ -1918,6 +2635,43 @@ public class ConfigKeys {
    */
   public static final String SERVER_INGESTION_CHECKPOINT_DURING_GRACEFUL_SHUTDOWN_ENABLED =
       "server.ingestion.checkpoint.during.graceful.shutdown.enabled";
+
+  /**
+   * Maximum time in milliseconds to wait for the drainer to execute a sync offset command during graceful shutdown.
+   * The sync command itself is fast; the wait is for it to reach the front of the shared drainer queue.
+   */
+  public static final String SERVER_SHUTDOWN_SYNC_OFFSET_TIMEOUT_MS = "server.shutdown.sync.offset.timeout.ms";
+
+  /**
+   * Maximum time in milliseconds to wait for the drainer queue to fully drain for a partition.
+   * Used during graceful shutdown and also during state transitions (leader/follower resubscribe, topic switches)
+   * that wait for in-flight records to be processed after unsubscription. After unsubscription, very few records
+   * remain in the queue; records not drained in time will be re-consumed from the last checkpoint on restart.
+   */
+  public static final String SERVER_DRAIN_TIMEOUT_MS = "server.drain.timeout.ms";
+
+  /**
+   * Maximum time in milliseconds to wait for all per-partition shutdown futures to complete in
+   * {@code shutdownPartitionConsumptionStates}. This is the outer timeout that caps the total time spent on
+   * per-partition syncOffset + drain operations during SIT shutdown.
+   */
+  public static final String SERVER_SHUTDOWN_PARTITION_STATE_TIMEOUT_MS = "server.shutdown.partition.state.timeout.ms";
+
+  /**
+   * Maximum time in seconds for {@code shutdownAndWait} to wait for the StoreIngestionTask thread to complete
+   * its shutdown sequence (unsubscribe, checkpoint, internalClose). This is the outermost timeout that caps
+   * the total SIT shutdown time.
+   */
+  public static final String SERVER_SHUTDOWN_SIT_WAIT_TIME_SECONDS = "server.shutdown.sit.wait.time.seconds";
+
+  /**
+   * Whether to emit OTel metrics for ingestion stats. When enabled (and the global OTel flag is also enabled),
+   * per-store ingestion OTel metrics are recorded. Enabled by default so that turning on OTel for servers
+   * automatically includes ingestion stats. Can be set to {@code false} to disable ingestion OTel stats
+   * independently — useful because ingestion stats are high-frequency hot-path metrics and may need to be
+   * turned off separately without affecting other server/DaVinci OTel metrics.
+   */
+  public static final String SERVER_INGESTION_OTEL_STATS_ENABLED = "server.ingestion.otel.stats.enabled";
 
   /**
    * A config to control which status store to use for fetching incremental push job status from the controller. This config
@@ -2009,9 +2763,33 @@ public class ConfigKeys {
   public static final String SERVER_SSL_HANDSHAKE_QUEUE_CAPACITY = "server.ssl.handshake.queue.capacity";
 
   /**
-   * Number of threads for online Venice producer controlling the number of concurrent write operations.
+   * Number of partition workers for parallel processing.
+   * Each worker handles preprocessing + dispatch for assigned partitions.
+   * Default: 4.
+   * Set to 0 to DISABLE worker threads (execute inline on caller thread).
    */
-  public static final String CLIENT_PRODUCER_THREAD_NUM = "client.producer.thread.num";
+  public static final String CLIENT_PRODUCER_WORKER_COUNT = "client.producer.worker.count";
+
+  /**
+   * Queue capacity per worker for backpressure.
+   * When full, the caller thread blocks until space is available.
+   * Default: 100000. Ignored if worker count is 0.
+   */
+  public static final String CLIENT_PRODUCER_WORKER_QUEUE_CAPACITY = "client.producer.worker.queue.capacity";
+
+  /**
+   * Number of threads for callback executor (optional).
+   * Isolates user code from Kafka callback thread.
+   * Default: 0 (DISABLED - callbacks run on Kafka thread).
+   * Set to >0 to enable callback thread pool.
+   */
+  public static final String CLIENT_PRODUCER_CALLBACK_THREAD_COUNT = "client.producer.callback.thread.count";
+
+  /**
+   * Queue capacity for callback executor.
+   * Default: 100000. Ignored if callback thread count is 0.
+   */
+  public static final String CLIENT_PRODUCER_CALLBACK_QUEUE_CAPACITY = "client.producer.callback.queue.capacity";
 
   /**
    * The refresh interval for online producer to refresh value schemas and update schemas that rely on periodic polling.
@@ -2019,29 +2797,35 @@ public class ConfigKeys {
   public static final String CLIENT_PRODUCER_SCHEMA_REFRESH_INTERVAL_SECONDS =
       "client.producer.schema.refresh.interval.seconds";
 
-  /*
-   * The memory up-limit for the ingestion path while using RocksDB Plaintable format.
-   * Currently, this option is only meaningful for DaVinci use cases.
+  /**
+   * The max interval for Venice writer batching feature.
    */
-  public static final String INGESTION_MEMORY_LIMIT = "ingestion.memory.limit";
+  public static final String WRITER_BATCHING_MAX_INTERVAL_MS = "writer.batching.max.interval.ms";
 
   /**
-   * Whether the ingestion is using mlock or not.
-   * Currently, this option is only meaningful for DaVinci use cases.
-   *
-   * Actually, this config option is being actively used, and it is a placeholder for the future optimization.
-   * The memory limit logic implemented today is assuming mlock usage, and to make it backward compatible when
-   * we want to do more optimization for non-mlock usage, we will ask the mlock user to enable this flag.
+   * The max size of buffer in bytes for Venice writer batching feature.
    */
-  public static final String INGESTION_MLOCK_ENABLED = "ingestion.mlock.enabled";
+  public static final String WRITER_BATCHING_MAX_BUFFER_SIZE_IN_BYTES = "writer.batching.max.buffer.size.in.bytes";
 
   /**
-   * Only applies the memory limiter to the stores listed in this config.
-   * This is mainly used for testing purpose since ultimately, we want to enforce memory limiter against
-   * all the stores to avoid node crash.
-   * Empty config means ingestion memory limiter will apply to all the stores.
+   * Controls when {@link com.linkedin.venice.writer.VeniceWriter} attaches the
+   * {@link com.linkedin.venice.pubsub.api.PubSubMessageHeaders#VENICE_TRANSPORT_PROTOCOL_HEADER vtp}
+   * protocol-schema header to outbound messages. The pre-existing emission gate is
+   * {@code segmentNumber == 0 && messageSequenceNumber == 0} on the outgoing producer metadata.
+   * On the data path that gate matches only the first segment-start record produced on a
+   * partition (segment 0, sequence 0); subsequent data SOS records use non-zero
+   * {@code segmentNumber} and are unaffected. Heartbeats pin both coordinates to {@code 0}, so
+   * every heartbeat matches the gate. Accepts one of the
+   * {@link com.linkedin.venice.writer.VtpHeaderEmissionMode} names: {@code SOS_AND_HB} (default,
+   * preserves the pre-existing behavior — emit on both first data SOS and every heartbeat),
+   * {@code SOS_ONLY} (apply the same 0/0 gate but skip heartbeats — i.e., emit on the first
+   * data SOS per partition and on DoL stamps, which also carry 0/0 coordinates but are not
+   * heartbeats), or {@code NONE} (never emit). Use {@code SOS_ONLY} when heartbeat
+   * fan-out dominates the consumer-side per-record memory footprint and consumers can bootstrap
+   * the {@code KafkaMessageEnvelope} schema from the first data SOS or an out-of-band schema
+   * cache.
    */
-  public static final String INGESTION_MEMORY_LIMIT_STORE_LIST = "ingestion.memory.limit.store.list";
+  public static final String VENICE_WRITER_VTP_HEADER_EMISSION_MODE = "venice.writer.vtp.header.emission.mode";
 
   /**
    * The maximum age (in milliseconds) of producer state retained by Data Ingestion Validation. Tuning this
@@ -2058,18 +2842,6 @@ public class ConfigKeys {
    */
   public static final String DIV_PRODUCER_STATE_MAX_AGE_MS = "div.producer.state.max.age.ms";
 
-  public static final String PUB_SUB_ADMIN_ADAPTER_FACTORY_CLASS = "pub.sub.admin.adapter.factory.class";
-
-  public static final String PUB_SUB_PRODUCER_ADAPTER_FACTORY_CLASS = "pub.sub.producer.adapter.factory.class";
-
-  public static final String PUB_SUB_CONSUMER_ADAPTER_FACTORY_CLASS = "pub.sub.consumer.adapter.factory.class";
-
-  /**
-   * Source of truth admin adapter type, mainly for avoiding topic discrepancy between multiple pub sub systems.
-   */
-  public static final String PUB_SUB_SOURCE_OF_TRUTH_ADMIN_ADAPTER_FACTORY_CLASS =
-      "pub.sub.of.source.of.truth.admin.adapter.factory.class";
-
   /**
    * Venice router's principal name used for ssl. Default should contain "venice-router".
    */
@@ -2083,14 +2855,98 @@ public class ConfigKeys {
   public static final String SERVER_INGESTION_HEARTBEAT_INTERVAL_MS = "server.ingestion.heartbeat.interval.ms";
 
   /**
-   * Whether to check LeaderCompleteState in the follower replica and davinci replica before marking the follower
-   * completed. This is to avoid the case that the follower replica is marked completed before the leader replica
-   * and transitions to leader if the leader replicas goes down.
-   * <p>
-   * Default to false. Should be enabled only after Venice tag 0.4.154 is fully rolled out.
+   * When enabled, {@code PubSubMessageDeserializer} falls back to the Venice producer timestamp
+   * ({@code producerMetadata.messageTimestamp} from the KafkaMessageEnvelope) when the pub-sub
+   * system does not provide a reliable per-message timestamp (i.e. the broker timestamp is null
+   * or zero). This protects all downstream call sites of {@code getPubSubMessageTime()} —
+   * including DIV compaction checks, ingestion latency metrics, Beam watermarks, CDC event
+   * timestamps, and DaVinci record transformer metadata — from receiving a zero timestamp.
+   *
+   * <p>This also prevents downstream changelog consumer clients that durably checkpoint
+   * {@code getPubSubMessageTime()} as a seek watermark from persisting a zero timestamp and
+   * replaying all data on every restart.
+   *
+   * <p>Default: {@code true} (enabled). Disable only for debugging or rollback purposes.
    */
-  public static final String SERVER_LEADER_COMPLETE_STATE_CHECK_IN_FOLLOWER_ENABLED =
-      "server.leader.complete.state.check.in.follower.enabled";
+  public static final String PUBSUB_PRODUCER_TIMESTAMP_FALLBACK_ENABLED = "pubsub.producer.timestamp.fallback.enabled";
+
+  /**
+   * Enable record-level timestamp tracking in heartbeat monitoring service.
+   * When enabled, the monitoring service will track timestamps for all records processed during
+   * ingestion, not just heartbeat control messages. This provides more granular visibility into
+   * ingestion progress and lag at the expense of additional memory and CPU overhead.
+   */
+  public static final String SERVER_RECORD_LEVEL_TIMESTAMP_ENABLED = "server.record.level.timestamp.enabled";
+
+  /**
+   * Enable per-record OTel metrics emission for record-level delay tracking.
+   * When enabled, OTel metrics are emitted for every record processed during ingestion,
+   * providing real-time visibility into ingestion delays. When disabled (default), OTel metrics
+   * are only emitted periodically (every 60 seconds) with aggregated max/avg values.
+   * Requires SERVER_RECORD_LEVEL_TIMESTAMP_ENABLED to be true.
+   */
+  public static final String SERVER_PER_RECORD_OTEL_METRICS_ENABLED = "server.per.record.otel.metrics.enabled";
+
+  /**
+   * When enabled, per-record OTel metrics are emitted for batch pushes
+   * Requires SERVER_RECORD_LEVEL_TIMESTAMP_ENABLED and SERVER_PER_RECORD_OTEL_METRICS_ENABLED to be true.
+   */
+  public static final String SERVER_PER_RECORD_BATCH_OTEL_METRICS_ENABLED =
+      "server.per.record.batch.otel.metrics.enabled";
+
+  /**
+   * Sleep interval (in seconds) between heartbeat reporter cycles in {@code HeartbeatMonitoringService}.
+   * The reporter thread iterates the heartbeat-timestamp map and emits aggregate lag metrics on
+   * each cycle. Default: 60s in production. Tests typically override to 1s so SLO/heartbeat-delay
+   * metrics show up before the test method timeout.
+   */
+  public static final String SERVER_HEARTBEAT_REPORTER_INTERVAL_SECONDS = "server.heartbeat.reporter.interval.seconds";
+
+  /**
+   * Selects which timestamp the leader carries in
+   * {@code LeaderMetadata.upstreamMessageTimestamp} when producing a record to the version topic
+   * from a consumed upstream message. Valid values: {@code BROKER} (default) or {@code PRODUCER}.
+   *
+   * <ul>
+   *   <li>{@code BROKER}: the upstream pub-sub broker's append timestamp (falls back to the
+   *       upstream producer timestamp when the broker time is not available). Matches the
+   *       infra-only latency view used by the leader today.</li>
+   *   <li>{@code PRODUCER}: the upstream producer's wall clock embedded in the upstream
+   *       {@code KafkaMessageEnvelope.producerMetadata.messageTimestamp}. Includes upstream-client
+   *       enqueue-to-produce latency, giving the application-perceived end-to-end view.</li>
+   * </ul>
+   */
+  public static final String SERVER_NEARLINE_LATENCY_TIMESTAMP_SOURCE = "server.nearline.latency.timestamp.source";
+
+  /**
+   * Whether to enable HyperLogLog-based unique key count tracking during ingestion.
+   * When enabled, each partition maintains an HLL sketch (~8KB at lgK=13) that estimates
+   * the number of unique keys ever put or deleted. The count is monotonically increasing
+   * and resets on new version push. The sketch is persisted atomically with the offset checkpoint.
+   * Default: false (opt-in during rollout).
+   */
+  public static final String SERVER_UNIQUE_INGESTED_KEY_COUNT_HLL_ENABLED =
+      "server.unique.ingested.key.count.hll.enabled";
+
+  /**
+   * The log-base-2 of K for the HLL sketch used in unique key count tracking.
+   * Higher values use more memory but reduce error rate.
+   * Valid range: 4-21. Default: 13 (~8KB memory, ~1.15% error).
+   */
+  public static final String SERVER_UNIQUE_INGESTED_KEY_COUNT_HLL_LOG2K = "server.unique.ingested.key.count.hll.log2k";
+
+  /**
+   * Server-side strict mode for batch-push record-count verification at EOP. When {@code true}
+   * (default), a deficit detected by {@code verifyBatchPushRecordCount} fails ingestion via
+   * {@link com.linkedin.venice.exceptions.VeniceException}; the informational
+   * {@code batch_push_record_count_mismatch} + {@code record_count_mismatch_failure} OTel
+   * metrics fire alongside the throw. When {@code false}, only the informational
+   * {@code batch_push_record_count_mismatch} metric fires — no throw, ingestion continues. The
+   * throw is unconditionally suppressed on DaVinci replicas regardless of this flag (DaVinci
+   * failure is aggregated separately via the push status store).
+   */
+  public static final String SERVER_BATCH_PUSH_RECORD_COUNT_VERIFICATION_FAIL_ON_MISMATCH_ENABLED =
+      "server.batch.push.record.count.verification.fail.on.mismatch.enabled";
 
   /**
    * Follower replicas and DavinciClient will only consider heartbeats received within
@@ -2103,6 +2959,34 @@ public class ConfigKeys {
    */
   public static final String SERVER_LEADER_COMPLETE_STATE_CHECK_IN_FOLLOWER_VALID_INTERVAL_MS =
       "server.leader.complete.state.check.in.follower.valid.interval.ms";
+
+  /**
+   * Gate for the catch-up version-topic-offset RTS shortcut. When {@code true}, a hybrid follower
+   * that is caught up to the local version topic via {@code reportIfCatchUpVersionTopicOffset}
+   * (LeaderFollowerStoreIngestionTask) is only marked READY_TO_SERVE if the most recent leader-
+   * complete heartbeat header has been observed within
+   * {@link #SERVER_LEADER_COMPLETE_STATE_CHECK_IN_FOLLOWER_VALID_INTERVAL_MS}. This prevents the
+   * post-blob-transfer regression where a fresh follower that catches up to an idle local VT gets
+   * promoted to READY_TO_SERVE before any leader-complete signal arrives, causing the
+   * Replica.State dimension on the metric Venice.Server.Ingestion.Replication.Record.Delay to tag
+   * stale records as ready_to_serve. The default is {@code false} (pre-existing un-gated behavior
+   * preserved); operators who hit the post-blob-transfer regression should turn it on per cluster.
+   * The original Helix-rebalance edge case the relax-completion path was written for (no leader
+   * exists to send leader-complete heartbeats; cluster could end up with zero online replicas)
+   * remains covered by the default-off behavior.
+   */
+  public static final String SERVER_REQUIRE_LEADER_COMPLETE_FOR_CATCH_UP_VT_RTS =
+      "server.require.leader.complete.for.catch.up.vt.rts";
+
+  /**
+   * How long a hybrid follower or DaVinci replica waits without observing a fresh leader-complete heartbeat before
+   * presuming the leader dead and falling back to offset catch-up alone for the ready-to-serve check. The silence
+   * window is anchored on the later of the last observed signal and the consumption start time. Default is 3 hours;
+   * {@code 0} or less disables the fallback. When positive it must be larger than
+   * {@link #SERVER_LEADER_COMPLETE_STATE_CHECK_IN_FOLLOWER_VALID_INTERVAL_MS}, otherwise server startup fails.
+   */
+  public static final String SERVER_DEAD_LEADER_READY_TO_SERVE_FALLBACK_THRESHOLD_MS =
+      "server.dead.leader.ready.to.serve.fallback.threshold.ms";
 
   /**
    * Whether to enable stuck consumer repair in Server.
@@ -2133,14 +3017,60 @@ public class ConfigKeys {
       "server.non.existing.topic.check.retry.interval.second";
 
   /**
-   * Handling AA or WC stores is expensive because of RocksDB lookup, and this following
-   * feature will handle these writes in dedicated consumer pool, so that the full
-   * updates won't be affected by the heavy writes to these AA/WC stores.
+   * Consumer Pool allocation strategy to rely on pool size to prioritize specific traffic. There will be 3 different
+   * types strategy supported decided by #ConsumerPoolStrategyType.
    */
-  public static final String SERVER_DEDICATED_CONSUMER_POOL_FOR_AA_WC_LEADER_ENABLED =
-      "server.dedicated.consumer.pool.for.aa.wc.leader.enabled";
-  public static final String SERVER_DEDICATED_CONSUMER_POOL_SIZE_FOR_AA_WC_LEADER =
-      "server.dedicated.consumer.pool.size.for.aa.wc.leader";
+  public static final String SERVER_CONSUMER_POOL_ALLOCATION_STRATEGY = "server.consumer.pool.allocation.strategy";
+  /**
+   * Consumer Pool for active-active or write computer leader of current version, the traffic we need to isolate due to
+   * it is more costly than normal leader processing and current version should be allocated more resources to prioritize.
+   */
+  public static final String SERVER_CONSUMER_POOL_SIZE_FOR_CURRENT_VERSION_AA_WC_LEADER =
+      "server.consumer.pool.size.for.current.version.aa.wc.leader";
+
+  /**
+   * Consumer Pool for separate realtime leader of current version, the traffic we need to isolate due to
+   * it is more costly than normal leader processing and current version should be allocated more resources to prioritize.
+   */
+  public static final String SERVER_CONSUMER_POOL_SIZE_FOR_CURRENT_VERSION_SEPARATE_RT_LEADER =
+      "server.consumer.pool.size.for.current.version.separate.rt.leader";
+
+  /**
+   * Consumer Pool for active-active or write computer leader of future or backup version, the traffic we need to isolate
+   * due to it is still more costly than normal leader processing and it has less priority than current version.
+   */
+  public static final String SERVER_CONSUMER_POOL_SIZE_FOR_NON_CURRENT_VERSION_AA_WC_LEADER =
+      "server.consumer.pool.size.for.non.current.version.aa.wc.leader";
+  /**
+   * Consumer Pool for all followers, non-active-active and non-write compute leader of current version, the traffic
+   * is less costly and but it is current version with high priority.
+   */
+  public static final String SERVER_CONSUMER_POOL_SIZE_FOR_CURRENT_VERSION_NON_AA_WC_LEADER =
+      "server.consumer.pool.size.for.current.version.non.aa.wc.leader";
+  /**
+   * Consumer Pool for all followers, non-active-active leader and non-write compute leader of backup and future version,
+   * the traffic is less costly and with low priority.
+   */
+  public static final String SERVER_CONSUMER_POOL_SIZE_FOR_NON_CURRENT_VERSION_NON_AA_WC_LEADER =
+      "server.consumer.pool.size.for.non.current.version.non.aa.wc.leader";
+
+  /**
+   * A string of comma separated number to specify different factors multiplying basic throttling limit
+   * KAFKA_FETCH_QUOTA_RECORDS_PER_SECOND, the factors will be comma separated numbers with ascending order,
+   * but we should include 1.0 as basic setting. For example, a string as: "0.8, 1.0, 1.2" means the basic setting is
+   * 1.0, and the max setting is 1.2 * basic throttling limit.
+   */
+  public static final String KAFKA_FETCH_THROTTLER_FACTORS_PER_SECOND = "kafka.fetch.throttler.factors.per.second";
+  public static final String SERVER_THROTTLER_FACTORS_FOR_CURRENT_VERSION_AA_WC_LEADER =
+      "server.throttler.factors.for.current.version.aa.wc.leader";
+  public static final String SERVER_THROTTLER_FACTORS_FOR_CURRENT_VERSION_SEPARATE_RT_LEADER =
+      "server.throttler.factors.for.current.version.separate.rt.leader";
+  public static final String SERVER_THROTTLER_FACTORS_FOR_NON_CURRENT_VERSION_AA_WC_LEADER =
+      "server.throttler.factors.for.non.current.version.aa.wc.leader";
+  public static final String SERVER_THROTTLER_FACTORS_FOR_CURRENT_VERSION_NON_AA_WC_LEADER =
+      "server.throttler.factors.for.current.version.non.aa.wc.leader";
+  public static final String SERVER_THROTTLER_FACTORS_FOR_NON_CURRENT_VERSION_NON_AA_WC_LEADER =
+      "server.throttler.factors.for.non.current.version.non.aa.wc.leader";
 
   /**
    * Whether to enable record-level metrics when bootstrapping current version.
@@ -2161,4 +3091,591 @@ public class ConfigKeys {
    */
   public static final String CONTROLLER_DANGLING_TOPIC_OCCURRENCE_THRESHOLD_FOR_CLEANUP =
       "controller.dangling.topic.occurrence.threshold.for.cleanup";
+
+  /**
+   * Configure in controllers to provide a custom list of checkpoints to define user errors and to
+   * override the default checkpoint list {@link PushJobCheckpoints#DEFAULT_PUSH_JOB_USER_ERROR_CHECKPOINTS}.
+   * This is useful to emit the push job failure metrics due to user errors or not due
+   * to user errors based on the custom checkpoint list.
+   *
+   * Check {@link PushJobCheckpoints} for the list of supported checkpoints: Config should contain one or more
+   * of the checkpoints strings separated by comma. In case of invalid config, the default list of checkpoints
+   * will be used.
+   */
+  public static final String PUSH_JOB_FAILURE_CHECKPOINTS_TO_DEFINE_USER_ERROR =
+      "push.job.failure.checkpoints.to.define.user.error";
+
+  /**
+   * Config for the default value which is filled in when the store-level config
+   * {@link com.linkedin.venice.writer.VeniceWriter#maxRecordSizeBytes} is left unset. Used as a controller config for
+   * batch push jobs. Used as a server config for nearline jobs / partial updates.
+   */
+  public static final String DEFAULT_MAX_RECORD_SIZE_BYTES = "default.max.record.size.bytes";
+
+  /**
+   * Percentage of total single get requests that are allowed for retry in decimal. e.g. 0.1 would mean up to 10% of the
+   * total single get requests are allowed for long tail retry. This is to prevent retry storm and cascading failures.
+   */
+  public static final String ROUTER_SINGLE_KEY_LONG_TAIL_RETRY_BUDGET_PERCENT_DECIMAL =
+      "router.single.key.long.tail.retry.budget.percent.decimal";
+
+  /**
+   * Percentage of total multi get requests that are allowed for retry in decimal. e.g. 0.1 would mean up to 10% of the
+   * total multi get requests are allowed for long tail retry. This is to prevent retry storm and cascading failures.
+   */
+  public static final String ROUTER_MULTI_KEY_LONG_TAIL_RETRY_BUDGET_PERCENT_DECIMAL =
+      "router.multi.key.long.tail.retry.budget.percent.decimal";
+
+  /**
+   * Enforcement window for router long tail retry budget token bucket. This applies to both single get and multi get
+   * retry managers.
+   */
+  public static final String ROUTER_LONG_TAIL_RETRY_BUDGET_ENFORCEMENT_WINDOW_MS =
+      "router.long.tail.retry.budget.enforcement.window.ms";
+
+  /**
+   * The core pool size for the thread pool executor which contains threads responsible for measuring and updating all
+   * retry managers in router periodically to provide retry budget based on a percentage of the original requests.
+   */
+  public static final String ROUTER_RETRY_MANAGER_CORE_POOL_SIZE = "router.retry.manager.core.pool.size";
+
+  /**
+   * Whether to enable concurrent routing within one multi-key request in Router.
+   */
+  public static final String ROUTER_ROUTING_COMPUTATION_MODE = "router.routing.computation.mode";
+  public static final String ROUTER_PARALLEL_ROUTING_THREAD_POOL_SIZE = "router.parallel.routing.thread.pool.size";
+  /**
+   * Chunk size (number of partitions) for parallel routing within one multi-key request in Router.
+   */
+  public static final String ROUTER_PARALLEL_ROUTING_CHUNK_SIZE = "router.parallel.routing.chunk.size";
+  /**
+   * Thread pool size for response aggregation in Router. Response aggregation happens after scatter-gather
+   * completes and all sub-responses are collected. Previously this work ran on the Netty EventLoop
+   * (stageExecutor(ctx) in ScatterGatherRequestHandlerImpl); it now uses a dedicated thread pool to reduce
+   * contention and isolate aggregation load from I/O processing and other JVM components.
+   */
+  public static final String ROUTER_RESPONSE_AGGREGATION_THREAD_POOL_SIZE =
+      "router.response.aggregation.thread.pool.size";
+  /**
+   * Task queue capacity for response aggregation thread pool. Higher values allow more pending aggregation
+   * tasks but consume more memory. Lower values provide back-pressure during extreme load.
+   */
+  public static final String ROUTER_RESPONSE_AGGREGATION_QUEUE_CAPACITY = "router.response.aggregation.queue.capacity";
+
+  /**
+   * Server configs to enable the topic partition re-subscription during ingestion to let bottom ingestion service aware
+   * of store version's ingestion context changed (workload type {#@link PartitionReplicaIngestionContext.WorkloadType} or
+   * {@link VersionRole} version role changed).
+   */
+  public static final String SERVER_RESUBSCRIPTION_TRIGGERED_BY_VERSION_INGESTION_CONTEXT_CHANGE_ENABLED =
+      "server.resubscription.triggered.by.version.ingestion.context.change.enabled";
+
+  /**
+   * Server configs to configure the check interval of the topic partition re-subscription during ingestion.
+   */
+  public static final String SERVER_RESUBSCRIPTION_CHECK_INTERVAL_IN_SECONDS =
+      "server.resubscription.check.interval.in.seconds";
+
+  /**
+   * The following finer quota enforcement will be used when {@literal ConsumerPoolStrategyType.CURRENT_VERSION_PRIORITIZATION}
+   * is enabled.
+   */
+  public static final String SERVER_CURRENT_VERSION_AA_WC_LEADER_QUOTA_RECORDS_PER_SECOND =
+      "server.current.version.aa.wc.leader.quota.records.per.second";
+  public static final String SERVER_CURRENT_VERSION_SEPARATE_RT_LEADER_QUOTA_RECORDS_PER_SECOND =
+      "server.current.version.separate.rt.leader.quota.records.per.second";
+  public static final String SERVER_CURRENT_VERSION_NON_AA_WC_LEADER_QUOTA_RECORDS_PER_SECOND =
+      "server.current.version.non.aa.wc.leader.quota.records.per.second";
+  public static final String SERVER_NON_CURRENT_VERSION_AA_WC_LEADER_QUOTA_RECORDS_PER_SECOND =
+      "server.non.current.version.aa.wc.leader.quota.records.per.second";
+  public static final String SERVER_NON_CURRENT_VERSION_NON_AA_WC_LEADER_QUOTA_RECORDS_PER_SECOND =
+      "server.non.current.version.non.aa.wc.leader.quota.records.per.second";
+
+  public static final String SERVER_CHANNEL_OPTION_WRITE_BUFFER_WATERMARK_HIGH_BYTES =
+      "server.channel.option.write.buffer.watermark.high.bytes";
+
+  public static final String SERVER_AA_WC_WORKLOAD_PARALLEL_PROCESSING_ENABLED =
+      "server.aa.wc.workload.parallel.processing.enabled";
+
+  public static final String SERVER_AA_WC_WORKLOAD_PARALLEL_PROCESSING_THREAD_POOL_SIZE =
+      "server.aa.wc.workload.parallel.processing.thread.pool.size";
+  public static final String SERVER_GLOBAL_RT_DIV_ENABLED = "server.global.rt.div.enabled";
+
+  /**
+   * This config is used to control the RocksDB lookup concurrency when handling AA/WC workload with parallel processing enabled.
+   * Check {@link #SERVER_AA_WC_WORKLOAD_PARALLEL_PROCESSING_ENABLED} for more details.
+   */
+  public static final String SERVER_AA_WC_INGESTION_STORAGE_LOOKUP_THREAD_POOL_SIZE =
+      "server.aa.wc.ingestion.storage.lookup.thread.pool.size";
+
+  /**
+   * Enable cross-TP (topic-partition) parallel processing in the ConsumptionTask.
+   * When enabled, records from different topic-partitions in a single poll batch will be processed
+   * in parallel instead of sequentially. This can improve throughput when one slow TP would
+   * otherwise block all others in the same poll batch.
+   *
+   * Default: false (sequential processing, current behavior)
+   */
+  public static final String SERVER_CROSS_TP_PARALLEL_PROCESSING_ENABLED =
+      "server.cross.tp.parallel.processing.enabled";
+
+  /**
+   * Thread pool size for cross-TP parallel processing.
+   * This controls the maximum number of topic-partitions that can be processed concurrently
+   * within a single poll batch.
+   *
+   * Default: 4
+   */
+  public static final String SERVER_CROSS_TP_PARALLEL_PROCESSING_THREAD_POOL_SIZE =
+      "server.cross.tp.parallel.processing.thread.pool.size";
+
+  /**
+   * When enabled, cross-TP parallel processing will only be applied to the
+   * {@code ConsumerPoolType.CURRENT_VERSION_AA_WC_LEADER_POOL} consumer pool.
+   * This is useful for limiting parallel processing to the most critical pool type
+   * while keeping other pools using sequential processing.
+   *
+   * Default: false (when cross-TP parallel processing is enabled, it applies to all pools)
+   */
+  public static final String SERVER_CROSS_TP_PARALLEL_PROCESSING_CURRENT_VERSION_AA_WC_LEADER_ONLY =
+      "server.cross.tp.parallel.processing.current.version.aa.wc.leader.only";
+
+  /**
+   * Please find more details here: {@link com.linkedin.venice.reliability.LoadController}.
+   */
+  public static final String SERVER_LOAD_CONTROLLER_ENABLED = "server.load.controller.enabled";
+  public static final String SERVER_LOAD_CONTROLLER_WINDOW_SIZE_IN_SECONDS =
+      "server.load.controller.window.size.in.seconds";
+  public static final String SERVER_LOAD_CONTROLLER_ACCEPT_MULTIPLIER = "server.load.controller.accept.multiplier";
+  public static final String SERVER_LOAD_CONTROLLER_MAX_REJECTION_RATIO = "server.load.controller.max.rejection.ratio";
+  public static final String SERVER_LOAD_CONTROLLER_REJECTION_RATIO_UPDATE_INTERNAL_IN_SECONDS =
+      "server.load.controller.rejection.ratio.update.internal.in.seconds";
+  public static final String SERVER_LOAD_CONTROLLER_SINGLE_GET_LATENCY_ACCEPT_THRESHOLD_IN_MS =
+      "server.load.controller.single.get.latency.accept.threshold.in.ms";
+  public static final String SERVER_LOAD_CONTROLLER_MULTI_GET_LATENCY_ACCEPT_THRESHOLD_IN_MS =
+      "server.load.controller.multi.get.latency.accept.threshold.in.ms";
+  public static final String SERVER_LOAD_CONTROLLER_COMPUTE_LATENCY_ACCEPT_THRESHOLD_IN_MS =
+      "server.load.controller.compute.latency.accept.threshold.in.ms";
+
+  public static final String SERVER_INACTIVE_TOPIC_PARTITION_CHECKER_ENABLED =
+      "server.inactive.topic.partition.checker.enabled";
+
+  public static final String SERVER_INACTIVE_TOPIC_PARTITION_CHECKER_INTERNAL_IN_SECONDS =
+      "server.inactive.topic.partition.checker.internal.in.seconds";
+
+  public static final String SERVER_INACTIVE_TOPIC_PARTITION_CHECKER_THRESHOLD_IN_SECONDS =
+      "server.inactive.topic.partition.checker.threshold.in.seconds";
+
+  /**
+   * Config to enable/disable lag based replica auto-resubscribe feature.
+   * Default is false as we will plan to roll out step-by-step.
+   */
+  public static final String SERVER_LAG_BASED_REPLICA_AUTO_RESUBSCRIBE_ENABLED =
+      "server.lag.based.replica.auto.resubscribe.enabled";
+  /**
+   * Config to control the time lag threshold in seconds to trigger this auto-resubscribe feature.
+   * Default is 600s = 10 min.
+   */
+  public static final String SERVER_LAG_BASED_REPLICA_AUTO_RESUBSCRIBE_THRESHOLD_IN_SECONDS =
+      "server.lag.based.replica.auto.resubscribe.threshold.in.seconds";
+  /**
+   * Config to control the interval a replica is re-subscribed after previous attempt. This config intends to give replica
+   * sometime to auto-remediate the lag after re-subscription.
+   * Default is 300s = 5 min.
+   */
+  public static final String SERVER_LAG_BASED_REPLICA_AUTO_RESUBSCRIBE_INTERVAL_IN_SECONDS =
+      "server.lag.based.replica.auto.resubscribe.interval.in.seconds";
+  /**
+   * Config to control the maximum number of replicas can be resubscribed in one single store ingestion task check.
+   * This is to make sure in case resubscribe feature does not work as expected or encounter slowness during the process,
+   * the SIT thread will keep functioning and serve other requests.
+   * Default is 3.
+   */
+  public static final String SERVER_LAG_BASED_REPLICA_AUTO_RESUBSCRIBE_MAX_REPLICA_COUNT =
+      "server.lag.based.replica.auto.resubscribe.max.replica.count";
+
+  /**
+   * Config to enable/disable blocking the OFFLINE-&gt;STANDBY transition for future-version replicas whose push
+   * is still in progress (i.e. not yet PUSHED/ONLINE), until the replica's local version topic consumption lag
+   * drops to or below {@link #SERVER_FUTURE_VERSION_STANDBY_LAG_THRESHOLD}. This prevents Helix from electing a
+   * brand-new/lagging replica as leader immediately after it reaches STANDBY. Default is false.
+   */
+  public static final String SERVER_FUTURE_VERSION_STANDBY_LAG_CHECK_ENABLED =
+      "server.future.version.standby.lag.check.enabled";
+
+  /**
+   * Config to control the acceptable local version topic lag (number of records behind the end of the topic)
+   * for a future-version, in-progress-push replica to be allowed to complete the OFFLINE-&gt;STANDBY transition.
+   * Only used when {@link #SERVER_FUTURE_VERSION_STANDBY_LAG_CHECK_ENABLED} is true. Default is 1000 records,
+   * a small buffer to absorb normal producer/consumer jitter rather than requiring an exact catch-up.
+   */
+  public static final String SERVER_FUTURE_VERSION_STANDBY_LAG_THRESHOLD =
+      "server.future.version.standby.lag.threshold";
+
+  /**
+   * Config to control the maximum duration, in minutes, to block the OFFLINE-&gt;STANDBY transition while waiting
+   * for a future-version, in-progress-push replica's lag to become acceptable. This is a best-effort wait: once
+   * the timeout elapses, the transition proceeds regardless of the measured lag, to avoid liveness issues.
+   * Only used when {@link #SERVER_FUTURE_VERSION_STANDBY_LAG_CHECK_ENABLED} is true. Default is 120 min = 2 hours,
+   * to accommodate replicas that are still bootstrapping.
+   */
+  public static final String SERVER_FUTURE_VERSION_STANDBY_LAG_CHECK_TIMEOUT_MINUTES =
+      "server.future.version.standby.lag.check.timeout.minutes";
+
+  /**
+   * Config to control the interval, in minutes, between successive lag re-measurements while waiting for a
+   * future-version, in-progress-push replica's lag to become acceptable. Only used when
+   * {@link #SERVER_FUTURE_VERSION_STANDBY_LAG_CHECK_ENABLED} is true. Default is 15 min.
+   */
+  public static final String SERVER_FUTURE_VERSION_STANDBY_LAG_CHECK_POLL_INTERVAL_MINUTES =
+      "server.future.version.standby.lag.check.poll.interval.minutes";
+
+  /**
+   * Whether to enable producer throughput optimization for realtime workload or not.
+   * Two strategies:
+   * 1. Disable compression.
+   * 2. Utilizing multiple producers per write.
+   * These two options are controlled via store-level config.
+   */
+  public static final String SERVER_NEARLINE_WORKLOAD_PRODUCER_THROUGHPUT_OPTIMIZATION_ENABLED =
+      "server.nearline.workload.producer.throughput.optimization.enabled";
+  public static final String SERVER_ZSTD_DICT_COMPRESSION_LEVEL = "server.zstd.dict.compression.level";
+
+  public static final String SERVER_DELETE_UNASSIGNED_PARTITIONS_ON_STARTUP =
+      "server.delete.unassigned.partitions.on.startup";
+  public static final String CONTROLLER_ENABLE_REAL_TIME_TOPIC_VERSIONING =
+      "controller.enable.realtime.topic.versioning";
+
+  public static final boolean DEFAULT_CONTROLLER_ENABLE_REAL_TIME_TOPIC_VERSIONING = false;
+  public static final String CONTROLLER_ENABLE_HYBRID_STORE_PARTITION_COUNT_UPDATE =
+      "controller.enable.hybrid.store.partition.count.update";
+  public static final String PUSH_JOB_VIEW_CONFIGS = "push.job.view.configs";
+
+  /**
+   * The maximum number of entries (per type) to be cached in the {@link com.linkedin.venice.meta.NameRepository}.
+   *
+   * Default: {@value com.linkedin.venice.meta.NameRepository#DEFAULT_MAXIMUM_ENTRY_COUNT}
+   */
+  public static final String NAME_REPOSITORY_MAX_ENTRY_COUNT = "name.repository.max.entry.count";
+
+  /**
+   * Specifies the value to use for Helix's rebalance preference for evenness when using Waged.
+   * Must be used in conjunction with {@link ConfigKeys#CONTROLLER_HELIX_REBALANCE_PREFERENCE_LESS_MOVEMENT}.
+   * Accepted range: 0 - 1000
+   */
+  public static final String CONTROLLER_HELIX_REBALANCE_PREFERENCE_EVENNESS =
+      "controller.helix.rebalance.preference.evenness";
+
+  /**
+   * Specifies the value to use for Helix's rebalance preference for less movement when using Waged.
+   * Must be used in conjunction with {@link ConfigKeys#CONTROLLER_HELIX_REBALANCE_PREFERENCE_EVENNESS}.
+   * Accepted range: 0 - 1000
+   */
+  public static final String CONTROLLER_HELIX_REBALANCE_PREFERENCE_LESS_MOVEMENT =
+      "controller.helix.rebalance.preference.less.movement";
+
+  /**
+   * Specifies the value to use for Helix's rebalance preference for force baseline convergence when using Waged.
+   * This shouldn't be enabled, so it doesn't overpower other constraints.
+   * Accepted range: 0 - 1000
+   */
+  public static final String CONTROLLER_HELIX_REBALANCE_PREFERENCE_FORCE_BASELINE_CONVERGE =
+      "controller.helix.rebalance.preference.force.baseline.converge";
+
+  /**
+   * Specifies the capacity a controller instance can handle.
+   * The weight of each Helix resource is determined by {@link ConfigKeys#CONTROLLER_HELIX_RESOURCE_CAPACITY_WEIGHT}.
+   */
+  public static final String CONTROLLER_HELIX_INSTANCE_CAPACITY = "controller.helix.instance.capacity";
+
+  /**
+   * Specifies the weight of each Helix resource.
+   * The maximum weight per instance is determined by {@link ConfigKeys#CONTROLLER_HELIX_INSTANCE_CAPACITY}.
+   */
+  public static final String CONTROLLER_HELIX_RESOURCE_CAPACITY_WEIGHT = "controller.helix.default.instance.capacity";
+
+  /**
+   * Specifies how frequently the deferred version swap service runs. Default value is 1 minute
+   */
+  public static final String CONTROLLER_DEFERRED_VERSION_SWAP_SLEEP_MS = "controller.deferred.version.swap.sleep.ms";
+
+  /**
+   * Enables / disables the deferred version swap service. Default value is disabled
+   */
+  public static final String CONTROLLER_DEFERRED_VERSION_SWAP_SERVICE_ENABLED =
+      "controller.deferred.version.swap.service.enabled";
+
+  /**
+   * Specifies after how long the wait time has passed before emitting a stalled version swap metric. Default is value 1.1 where
+   * the buffer time is 10% of the store wait time;
+   */
+  public static final String DEFERRED_VERSION_SWAP_BUFFER_TIME = "deferred.version.swap.buffer.time";
+
+  /**
+   * Specifies the order in which the regions should roll forward in
+   */
+  public static final String DEFERRED_VERSION_SWAP_REGION_ROLL_FORWARD_ORDER =
+      "deferred.version.swap.region.roll.forward.order";
+
+  /**
+   * Specifies the number of threads for DeferredVersionSwapService
+   */
+  public static final String DEFERRED_VERSION_SWAP_THREAD_POOL_SIZE = "deferred.version.swap.thread.pool.size";
+
+  /**
+   * Specifies whether deferred version swap is enabled for empty pushes
+   */
+  public static final String DEFERRED_VERSION_SWAP_FOR_EMPTY_PUSH_ENABLED =
+      "deferred.version.swap.for.empty.push.enabled";
+
+  /**
+   * Enables / disables allowing dvc clients to perform a target region push with deferred swap. When enabled, dvc clients
+   * will be skipped and target regions will not be set and the deferred version swap service will skip checking stores with
+   * isDavinciHeartbeatReported set to true. This is a temporary config until delayed ingestion for dvc is complete. Default value is enabled
+   */
+  public static final String SKIP_DEFERRED_VERSION_SWAP_FOR_DVC_ENABLED = "skip.deferred.version.swap.for.dvc.enabled";
+
+  /*
+   * Both Router and Server will maintain an in-memory cache for connection-level ACLs and the following config
+   * controls the TTL of the cache per entry.
+   */
+  public static final String ACL_IN_MEMORY_CACHE_TTL_MS = "acl.in.memory.cache.ttl.ms";
+
+  /**
+   * Enables / disables protocol version auto-detection service in parent controller.
+   * This service is responsible for detecting the admin operation protocol version to serialize message
+   * Default value is enabled (true).
+   */
+  public static final String CONTROLLER_PROTOCOL_VERSION_AUTO_DETECTION_SERVICE_ENABLED =
+      "controller.protocol.version.auto.detection.service.enabled";
+
+  /**
+   * Specifies the sleep time for the protocol version auto-detection service between each detection attempt.
+   */
+  public static final String CONTROLLER_PROTOCOL_VERSION_AUTO_DETECTION_SLEEP_MS =
+      "controller.protocol.version.auto.detection.sleep.ms";
+
+  /**
+   * If enabled, the controller's get dead store endpoint will be enabled.
+   */
+  public static final String CONTROLLER_DEAD_STORE_ENDPOINT_ENABLED = "controller.dead.store.endpoint.enabled";
+
+  /**
+   * (Only matters if CONTROLLER_DEAD_STORE_ENDPOINT_ENABLED true). Class name of {@link com.linkedin.venice.controller.stats.DeadStoreStats} implementation
+   */
+  public static final String CONTROLLER_DEAD_STORE_STATS_CLASS_NAME = "controller.dead.store.stats.class.name";
+
+  /**
+   * (Only matters if CONTROLLER_DEAD_STORE_ENDPOINT_ENABLED true) Allow the controller to pre-fetch dead store stats before the endpoint is called
+   */
+  public static final String CONTROLLER_DEAD_STORE_STATS_PRE_FETCH_ENABLED =
+      "controller.dead.store.stats.pre.fetch.enabled";
+
+  /**
+   * (Only matters if CONTROLLER_DEAD_STORE_ENDPOINT_ENABLED and CONTROLLER_DEAD_STORE_STATS_PRE_FETCH_ENABLED are true) Amount of time in milliseconds to wait before refetching the dead store stats
+   */
+  public static final String CONTROLLER_DEAD_STORE_STATS_PRE_FETCH_INTERVAL_MS =
+      "controller.dead.store.stats.pre.fetch.interval.ms";
+
+  /**
+   * (Only matters if CONTROLLER_DEAD_STORE_ENDPOINT_ENABLED true) Prefix of configs to configure the DeadStoreStats implementation
+   */
+  public static final String CONTROLLER_DEAD_STORE_STATS_PREFIX = "controller.dead.store.stats.";
+
+  /**
+   * Enables / disables the Global RT DIV feature. Default value is disabled. The DIV will be centralized in the
+   * ConsumptionTask, and leaders will periodically replicate the RT DIV to followers via VT.
+   */
+  public static final String GLOBAL_RT_DIV_ENABLED = "global.rt.div.enabled";
+
+  /**
+   * The interval for cleaning up the idle store ingestion tasks in a centralized way inside KafkaStoreIngestionService.
+   * If config value is non-positive, it means the new clean up service is disabled and the old mechanism is still in place.
+   * If config value is positive, it means the new clean up service is enabled and the value is the clean up
+   * schedule interval in seconds.
+   *
+   * Once enabled, Store ingestion tasks will not try to close themselves when they are idle; instead, a service
+   * is started inside KafkaStoreIngestionService to clean up idle tasks. This is completely eliminate the race
+   * conditions between store ingestion task thread and Helix state transition threads when managing the life cycle
+   * of a store ingestion task.
+   * TODO: Deprecate this config after new clean up service is fully rolled out and stable.
+   */
+  public static final String SERVER_IDLE_INGESTION_TASK_CLEANUP_INTERVAL_IN_SECONDS =
+      "server.idle.ingestion.task.cleanup.interval.in.seconds";
+  public static final String PASS_THROUGH_CONFIG_PREFIXES_LIST_KEY = "pass.through.config.prefixes.list";
+  /**
+   * The threshold in ms to consider a subscribed topic partition problematic without a new message polled since it was
+   * subscribed.
+   */
+  public static final String SERVER_CONSUMER_POLL_TRACKER_STALE_THRESHOLD_IN_SECONDS =
+      "server.consumer.poll.tracker.stale.threshold.in.seconds";
+  /**
+   * Use heartbeat lag instead of offset lag for ready-to-serve check.
+   */
+  public static final String SERVER_USE_HEARTBEAT_LAG_FOR_READY_TO_SERVE_CHECK_ENABLED =
+      "server.use.heartbeat.lag.for.ready.to.serve.check.enabled";
+
+  /**
+   * The amount of threads to perform recovery in the DaVinciRecordTransformer, such as scanning local RocksDB.
+   */
+  public static final String DAVINCI_RECORD_TRANSFORMER_ON_RECOVERY_THREAD_POOL_SIZE =
+      "davinci.record.transformer.on.recovery.thread.pool.size";
+
+  /**
+   * If enabled, the parent-controller's multitask scheduler service would be enabled
+   */
+  public static final String MULTITASK_SCHEDULER_SERVICE_ENABLED = "multitask.scheduler.service.enabled";
+
+  /**
+   * (Only matters if MULTITASK_SCHEDULER_SERVICE_ENABLED true). Class name of {@link com.linkedin.venice.controller.multitaskscheduler.MultiTaskSchedulerService} implementation
+   */
+  public static final String STORE_MIGRATION_THREAD_POOL_SIZE = "store.migration.thread.pool.size";
+
+  /**
+   * (Only matters if MULTITASK_SCHEDULER_SERVICE_ENABLED true). Class name of {@link com.linkedin.venice.controller.multitaskscheduler.MultiTaskSchedulerService} implementation
+   */
+  public static final String STORE_MIGRATION_MAX_RETRY_ATTEMPTS = "store.migration.max.retry.attempts";
+
+  /**
+   * (Only matters if MULTITASK_SCHEDULER_SERVICE_ENABLED true). Class name of {@link com.linkedin.venice.controller.multitaskscheduler.MultiTaskSchedulerService} implementation
+   */
+  public static final String STORE_MIGRATION_FABRIC_LIST = "store.migration.fabric.list";
+
+  /**
+   * (Only matters if MULTITASK_SCHEDULER_SERVICE_ENABLED true). Class name of {@link com.linkedin.venice.controller.multitaskscheduler.MultiTaskSchedulerService} implementation
+   */
+  public static final String STORE_MIGRATION_TASK_SCHEDULING_INTERVAL_SECONDS =
+      "store.migration.task.scheduling.interval.seconds";
+
+  /**
+   * The strategy for how to share memory-heavy objects used in the ingestion hot path.
+   */
+  public static final String SERVER_INGESTION_TASK_REUSABLE_OBJECTS_STRATEGY =
+      "server.ingestion.task.reusable.objects.strategy";
+
+  public static final String CONTROLLER_BACKUP_VERSION_REPLICA_REDUCTION_ENABLED =
+      "controller.backup.version.replica.reduction.enabled";
+
+  public static final String DAVINCI_VALIDATE_SPECIFIC_SCHEMA_ENABLED = "davinci.validate.specific.schema.enabled";
+
+  /**
+   * List of stores to be treated as dark cluster target stores. If a store is in this list, all
+   * writes to this store will be replicated to dark clusters. If empty, no store will be treated as a dark cluster target store.
+   */
+  public static final String STORES_TO_REPLICATE = "stores.to.replicate";
+
+  /**
+   * Whether the cluster is a dark cluster.
+   * Default is false (i.e. not a dark cluster).
+   */
+  public static final String IS_DARK_CLUSTER = "is.dark.cluster";
+
+  /**
+   * When dumping topic partition info for each consumer, there will be one line for each partition. This limit will
+   * prevent generating log lines for this consumer, if this consumer taking higher partition number than this limit.
+   */
+  public static final String SERVER_INGESTION_INFO_LOG_LINE_LIMIT = "server.ingestion.info.log.line.limit";
+
+  /**
+   * Experiment config to skip the compaction policy update for hybrid store real-time topic during update store operation
+   */
+  public static final String SKIP_HYBRID_STORE_RT_TOPIC_COMPACTION_POLICY_UPDATE_ENABLED =
+      "skip.hybrid.store.rt.topic.compaction.policy.update.enabled";
+  /**
+   * Whether the child controller in each data center will use the MultiRegionRealTimeTopicSwitcher to send version swap
+   * messages to the RT topics in remote data centers.
+   * Default is false (i.e. use the RealTimeTopicSwitcher to only write to local RT topic).
+   */
+  public static final String CONTROLLER_USE_MULTI_REGION_REAL_TIME_TOPIC_SWITCHER_ENABLED =
+      "controller.use.multi.region.real.time.topic.switcher.enabled";
+
+  /**
+   * Number of consecutive cycles to wait before removing a replica that does not have a corresponding entry in local
+   * customized view cache before removing it from lag monitor. e.g. if this config is set to 10, and we are using the
+   * default sleep interval of 60 seconds then we will only remove the replica from lag monitor after at least 600
+   * seconds without having any corresponding entry in customized view.
+   */
+  public static final String SERVER_LAG_MONITOR_CLEANUP_CYCLE = "server.lag.monitor.cleanup.cycle";
+
+  /**
+   * Thread pool size for the async store change notifier service that handles store metadata change events.
+   * Default is 1.
+   */
+  public static final String STORE_CHANGE_NOTIFIER_THREAD_POOL_SIZE = "store.change.notifier.thread.pool.size";
+
+  /**
+   * User store version number to retain in Parent Controller to limit 'Store' ZNode size.
+   */
+  public static final String USER_STORE_VERSION_RETENTION_COUNT = "store.version.retention.count.user.store";
+  public static final int DEFAULT_USER_STORE_VERSION_RETENTION_COUNT = 5;
+
+  /**
+   * System store version number to retain in Parent Controller to limit 'Store' ZNode size.
+   */
+  public static final String SYSTEM_STORE_VERSION_RETENTION_COUNT = "store.version.retention.count.system.store";
+  public static final int DEFAULT_SYSTEM_STORE_VERSION_RETENTION_COUNT = 5;
+
+  /**
+   * Whether storage node read quota will fail-open if CV is unavailable during initialization or it will try to use
+   * cluster's instance count to calculate a placeholder/fallback value until CV is available.
+   */
+  public static final String SERVER_READ_QUOTA_INITIALIZATION_FALLBACK_ENABLED =
+      "server.read.quota.initialization.fallback.enabled";
+
+  /**
+   * Configures the component name used in {@link com.linkedin.venice.utils.LogContext} for structured logging.
+   * Defaults to "SERVER" if not set. DaVinci clients and CDC consumers can override this to use their own
+   * component names (e.g., "DAVINCI_CLIENT", "DVRT_STATEFUL_CDC", "DVRT_STATELESS_CDC").
+   */
+  public static final String VENICE_LOG_CONTEXT_COMPONENT = "venice.log.context.component";
+
+  /**
+   * Writes ts=0 RMD with every batch PUT for hybrid A/A stores (SOP→EOP), so DCR can
+   * distinguish batch keys from truly new keys without reading the value CF on first RT write.
+   * Batch DELETEs intentionally skip RMD so rmd==null correctly identifies them as dead keys.
+   * Only effective when the store is hybrid and A/A enabled (gated by isHybridMode()).
+   * Server-only — DaVinci clients are excluded at flag initialization.
+   */
+  public static final String SERVER_ADD_RMD_TO_BATCH_PUSH_FOR_HYBRID_STORES =
+      "server.add.rmd.to.batch.push.for.hybrid.stores";
+
+  /**
+   * Counts logical PUTs during batch ingestion (SOP→EOP), deduplicating speculative execution
+   * via key-order comparison. Persisted atomically with the consumption offset. Temporary —
+   * replaced by VPJ per-partition count via EOP headers (PR #2642).
+   */
+  public static final String SERVER_ACTIVE_KEY_COUNT_FOR_ALL_BATCH_PUSH_ENABLED =
+      "server.active.key.count.for.all.batch.push.enabled";
+
+  /**
+   * Tracks exact active key count for A/A hybrid stores. Leader computes +1/-1/0 (invalidate)
+   * signals from old/new value existence during DCR, propagated to followers via VT headers.
+   * Count persisted atomically with the consumption offset.
+   */
+  public static final String SERVER_ACTIVE_KEY_COUNT_FOR_HYBRID_STORE_ENABLED =
+      "server.active.key.count.for.hybrid.store.enabled";
+
+  /**
+   * Partial-update results larger than this threshold (in bytes) are tracked in the per-partition heavy-key map
+   * for amplification detection. Default: 100 KB.
+   */
+  public static final String PARTIAL_UPDATE_LARGE_RESULT_LOG_THRESHOLD_BYTES =
+      "partial.update.large.result.log.threshold.bytes";
+
+  /**
+   * How often (in ms) to emit a per-partition summary report of partial-update amplification.
+   * Only partitions with large results are reported. Default: -1 (disabled).
+   * Set to a positive value (e.g., 60000 for 1 minute) to enable. Set to -1 to disable entirely
+   * (no per-record overhead).
+   */
+  public static final String PARTIAL_UPDATE_AMPLIFICATION_REPORT_INTERVAL_MS =
+      "partial.update.amplification.report.interval.ms";
+
+  /**
+   * TEST-ONLY. Regions allowed for A/A DCR bug injection: EI (ei4, ei-ltx1). Map of store->region used to inject a
+   * bug into A/A DCR for testing in EI. MUST NEVER be enabled in prod. Injection is refused (and logged) for regions
+   * not in the server's EI allowlist.
+   */
+  public static final String SERVER_AA_DCR_BUG_INJECTION_STORE_TO_REGION_MAP =
+      "server.aa.dcr.bug.injection.store.to.region.map";
 }

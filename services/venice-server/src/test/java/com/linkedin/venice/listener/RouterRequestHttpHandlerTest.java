@@ -12,11 +12,13 @@ import com.linkedin.venice.listener.grpc.handlers.GrpcRouterRequestHandler;
 import com.linkedin.venice.listener.grpc.handlers.VeniceServerGrpcHandler;
 import com.linkedin.venice.listener.request.GetRouterRequest;
 import com.linkedin.venice.listener.request.HealthCheckRequest;
+import com.linkedin.venice.listener.request.KeyPartitionProfilerRequest;
 import com.linkedin.venice.listener.request.MultiGetRouterRequestWrapper;
 import com.linkedin.venice.listener.response.HttpShortcutResponse;
 import com.linkedin.venice.meta.QueryAction;
 import com.linkedin.venice.protocols.VeniceClientRequest;
 import com.linkedin.venice.protocols.VeniceServerResponse;
+import com.linkedin.venice.request.RequestHelper;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.http.DefaultFullHttpRequest;
 import io.netty.handler.codec.http.DefaultHttpHeaders;
@@ -25,6 +27,7 @@ import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpVersion;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.Collections;
@@ -80,7 +83,8 @@ public class RouterRequestHttpHandlerTest {
     Assert.assertEquals(requestObject.getKeyBytes(), expectedKey, "Key from path: " + path + " was parsed incorrectly");
 
     // Test parse method
-    GetRouterRequest getRouterRequest = GetRouterRequest.parseGetHttpRequest(msg);
+    GetRouterRequest getRouterRequest =
+        GetRouterRequest.parseGetHttpRequest(msg, RequestHelper.getRequestParts(URI.create(msg.uri())));
     Assert.assertEquals(
         getRouterRequest.getResourceName(),
         expectedStore,
@@ -145,7 +149,8 @@ public class RouterRequestHttpHandlerTest {
 
   public void doActionTest(String urlString, HttpMethod method, QueryAction expectedAction) {
     HttpRequest request = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, method, urlString);
-    QueryAction parsedAction = RouterRequestHttpHandler.getQueryActionFromRequest(request);
+    QueryAction parsedAction = RouterRequestHttpHandler
+        .getQueryActionFromRequest(request, RequestHelper.getRequestParts(URI.create(request.uri())));
     Assert.assertEquals(parsedAction, expectedAction, "parsed wrong query action from string: " + urlString);
   }
 
@@ -163,6 +168,59 @@ public class RouterRequestHttpHandlerTest {
 
     headers.add(HttpConstants.VENICE_API_VERSION, "1");
     GetRouterRequest.verifyApiVersion(headers, "1");
+  }
+
+  @Test
+  public void parsesKeyPartitionProfilerStartRequest() throws Exception {
+    RouterRequestHttpHandler handler = new RouterRequestHttpHandler(mock(StatsHandler.class), Collections.emptyMap());
+    ChannelHandlerContext ctx = mock(ChannelHandlerContext.class);
+    ArgumentCaptor<KeyPartitionProfilerRequest> captor = ArgumentCaptor.forClass(KeyPartitionProfilerRequest.class);
+
+    HttpRequest req = new DefaultFullHttpRequest(
+        HttpVersion.HTTP_1_1,
+        HttpMethod.POST,
+        "/key_partition_profiler/myStore_v3/start?duration=60&topK=10");
+    handler.channelRead(ctx, req);
+
+    verify(ctx).fireChannelRead(captor.capture());
+    KeyPartitionProfilerRequest parsed = captor.getValue();
+    Assert.assertEquals(parsed.getStoreVersion(), "myStore_v3");
+    Assert.assertEquals(parsed.getStoreName(), "myStore");
+    Assert.assertEquals(parsed.getAction(), KeyPartitionProfilerRequest.Action.START);
+    Assert.assertEquals(parsed.getDurationMs(), Long.valueOf(60_000L));
+    Assert.assertEquals(parsed.getTopK(), Integer.valueOf(10));
+  }
+
+  @Test
+  public void keyPartitionProfilerStopHasNoParams() throws Exception {
+    RouterRequestHttpHandler handler = new RouterRequestHttpHandler(mock(StatsHandler.class), Collections.emptyMap());
+    ChannelHandlerContext ctx = mock(ChannelHandlerContext.class);
+    ArgumentCaptor<KeyPartitionProfilerRequest> captor = ArgumentCaptor.forClass(KeyPartitionProfilerRequest.class);
+
+    HttpRequest req =
+        new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.POST, "/key_partition_profiler/myStore_v3/stop");
+    handler.channelRead(ctx, req);
+
+    verify(ctx).fireChannelRead(captor.capture());
+    KeyPartitionProfilerRequest parsed = captor.getValue();
+    Assert.assertEquals(parsed.getAction(), KeyPartitionProfilerRequest.Action.STOP);
+    Assert.assertNull(parsed.getDurationMs());
+    Assert.assertNull(parsed.getTopK());
+  }
+
+  @Test
+  public void malformedKeyPartitionProfilerUrlReturnsBadRequest() throws Exception {
+    RouterRequestHttpHandler handler = new RouterRequestHttpHandler(mock(StatsHandler.class), Collections.emptyMap());
+    ChannelHandlerContext ctx = mock(ChannelHandlerContext.class);
+    ArgumentCaptor<HttpShortcutResponse> captor = ArgumentCaptor.forClass(HttpShortcutResponse.class);
+
+    // Unknown sub-action — neither "start" nor "stop".
+    HttpRequest req =
+        new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.POST, "/key_partition_profiler/myStore_v3/bogus");
+    handler.channelRead(ctx, req);
+
+    verify(ctx).writeAndFlush(captor.capture());
+    Assert.assertEquals(captor.getValue().getStatus(), HttpResponseStatus.BAD_REQUEST);
   }
 
   @Test

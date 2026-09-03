@@ -1,24 +1,38 @@
 package com.linkedin.venice.server;
 
 import com.linkedin.avro.fastserde.FastDeserializerGeneratorAccessor;
+import com.linkedin.d2.balancer.D2Client;
+import com.linkedin.davinci.blobtransfer.BlobTransferManager;
+import com.linkedin.davinci.blobtransfer.BlobTransferManagerBuilder;
+import com.linkedin.davinci.blobtransfer.BlobTransferUtils;
+import com.linkedin.davinci.blobtransfer.BlobTransferUtils.BlobTransferTableFormat;
+import com.linkedin.davinci.blobtransfer.P2PBlobTransferConfig;
+import com.linkedin.davinci.blobtransfer.VeniceAdaptiveBlobTransferTrafficThrottler;
 import com.linkedin.davinci.compression.StorageEngineBackedCompressorFactory;
 import com.linkedin.davinci.config.VeniceClusterConfig;
 import com.linkedin.davinci.config.VeniceConfigLoader;
 import com.linkedin.davinci.config.VeniceServerConfig;
 import com.linkedin.davinci.helix.HelixParticipationService;
+import com.linkedin.davinci.kafka.consumer.AdaptiveThrottlerSignalService;
 import com.linkedin.davinci.kafka.consumer.KafkaStoreIngestionService;
 import com.linkedin.davinci.kafka.consumer.RemoteIngestionRepairService;
 import com.linkedin.davinci.repository.VeniceMetadataRepositoryBuilder;
+import com.linkedin.davinci.stats.AggBlobTransferStats;
+import com.linkedin.davinci.stats.AggVersionedBlobTransferStats;
 import com.linkedin.davinci.stats.AggVersionedStorageEngineStats;
+import com.linkedin.davinci.stats.HeartbeatMonitoringServiceStats;
 import com.linkedin.davinci.stats.RocksDBMemoryStats;
+import com.linkedin.davinci.stats.StoreVersionOtelStats;
 import com.linkedin.davinci.stats.ingestion.heartbeat.HeartbeatMonitoringService;
 import com.linkedin.davinci.storage.DiskHealthCheckService;
 import com.linkedin.davinci.storage.IngestionMetadataRetriever;
+import com.linkedin.davinci.storage.IngestionMetadataRetrieverDelegator;
 import com.linkedin.davinci.storage.ReadMetadataRetriever;
 import com.linkedin.davinci.storage.StorageEngineMetadataService;
 import com.linkedin.davinci.storage.StorageEngineRepository;
 import com.linkedin.davinci.storage.StorageMetadataService;
 import com.linkedin.davinci.storage.StorageService;
+import com.linkedin.venice.ConfigKeys;
 import com.linkedin.venice.acl.DynamicAccessController;
 import com.linkedin.venice.acl.StaticAccessController;
 import com.linkedin.venice.cleaner.BackupVersionOptimizationService;
@@ -27,6 +41,7 @@ import com.linkedin.venice.cleaner.ResourceReadUsageTracker;
 import com.linkedin.venice.client.store.ClientConfig;
 import com.linkedin.venice.client.store.ClientFactory;
 import com.linkedin.venice.common.VeniceSystemStoreUtils;
+import com.linkedin.venice.d2.D2ConfigUtils;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.helix.AllowlistAccessor;
 import com.linkedin.venice.helix.HelixCustomizedViewOfflinePushRepository;
@@ -60,6 +75,7 @@ import com.linkedin.venice.stats.VeniceJVMStats;
 import com.linkedin.venice.system.store.ControllerClientBackedSystemSchemaInitializer;
 import com.linkedin.venice.utils.CollectionUtils;
 import com.linkedin.venice.utils.Utils;
+import com.linkedin.venice.utils.VeniceProperties;
 import com.linkedin.venice.utils.lazy.Lazy;
 import io.tehuti.metrics.MetricsRepository;
 import java.util.ArrayList;
@@ -69,6 +85,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import org.apache.helix.manager.zk.ZKHelixAdmin;
 import org.apache.helix.zookeeper.impl.client.ZkClient;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -112,8 +129,16 @@ public class VeniceServer {
   private VeniceJVMStats jvmStats;
   private ICProvider icProvider;
   StorageEngineBackedCompressorFactory compressorFactory;
+  private StoreVersionOtelStats storeVersionOtelStats;
   private HeartbeatMonitoringService heartbeatMonitoringService;
+  private AdaptiveThrottlerSignalService adaptiveThrottlerSignalService;
   private ServerReadMetadataRepository serverReadMetadataRepository;
+  private BlobTransferManager<Void> blobTransferManager;
+  private AggVersionedBlobTransferStats aggVersionedBlobTransferStats;
+  private AggBlobTransferStats aggBlobTransferStats;
+  private Lazy<ZKHelixAdmin> zkHelixAdmin;
+
+  private final Optional<D2Client> d2Client;
 
   /**
    * @deprecated Use {@link VeniceServer#VeniceServer(VeniceServerContext)} instead.
@@ -180,6 +205,7 @@ public class VeniceServer {
     this.routerAccessController = Optional.ofNullable(ctx.getRouterAccessController());
     this.storeAccessController = Optional.ofNullable(ctx.getStoreAccessController());
     this.clientConfigForConsumer = Optional.ofNullable(ctx.getClientConfigForConsumer());
+    this.d2Client = Optional.ofNullable(ctx.getD2Client());
   }
 
   /**
@@ -219,6 +245,7 @@ public class VeniceServer {
               sslFactory,
               localControllerUrl,
               d2ServiceName,
+              d2Client,
               d2ZkHost,
               false);
       ControllerClientBackedSystemSchemaInitializer kmeSchemaInitializer =
@@ -231,6 +258,7 @@ public class VeniceServer {
               sslFactory,
               localControllerUrl,
               d2ServiceName,
+              d2Client,
               d2ZkHost,
               false);
       metaSystemStoreSchemaInitializer.execute();
@@ -287,8 +315,7 @@ public class VeniceServer {
         veniceConfigLoader,
         clientConfigForConsumer.orElse(null),
         metricsRepository,
-        icProvider,
-        false);
+        icProvider);
     zkClient = veniceMetadataRepositoryBuilder.getZkClient();
     metadataRepo = veniceMetadataRepositoryBuilder.getStoreRepo();
     schemaRepo = veniceMetadataRepositoryBuilder.getSchemaRepo();
@@ -300,11 +327,22 @@ public class VeniceServer {
     AggVersionedStorageEngineStats storageEngineStats = new AggVersionedStorageEngineStats(
         metricsRepository,
         metadataRepo,
-        serverConfig.isUnregisterMetricForDeletedStoreEnabled());
+        serverConfig.isUnregisterMetricForDeletedStoreEnabled(),
+        serverConfig.getVersionSwapDiskSizeDropAlertThreshold(),
+        clusterConfig.getClusterName());
+
+    // OTel per-store version gauge
+    storeVersionOtelStats =
+        StoreVersionOtelStats.create(metricsRepository, clusterConfig.getClusterName(), metadataRepo);
+
     boolean plainTableEnabled =
         veniceConfigLoader.getVeniceServerConfig().getRocksDBServerConfig().isRocksDBPlainTableFormatEnabled();
     RocksDBMemoryStats rocksDBMemoryStats = veniceConfigLoader.getVeniceServerConfig().isDatabaseMemoryStatsEnabled()
-        ? new RocksDBMemoryStats(metricsRepository, "RocksDBMemoryStats", plainTableEnabled)
+        ? new RocksDBMemoryStats(
+            metricsRepository,
+            "RocksDBMemoryStats",
+            plainTableEnabled,
+            clusterConfig.getClusterName())
         : null;
 
     // Create and add StorageService. storeRepository will be populated by StorageService
@@ -322,7 +360,8 @@ public class VeniceServer {
     services.add(storageService);
 
     // Create stats for RocksDB
-    storageService.getRocksDBAggregatedStatistics().ifPresent(stat -> new AggRocksDBStats(metricsRepository, stat));
+    storageService.getRocksDBAggregatedStatistics()
+        .ifPresent(stat -> new AggRocksDBStats(serverConfig.getClusterName(), metricsRepository, stat));
 
     compressorFactory = new StorageEngineBackedCompressorFactory(storageMetadataService);
 
@@ -347,21 +386,37 @@ public class VeniceServer {
         });
 
     CompletableFuture<HelixInstanceConfigRepository> helixInstanceFuture = managerFuture.thenApply(manager -> {
-      HelixInstanceConfigRepository helixData = new HelixInstanceConfigRepository(manager, false);
+      HelixInstanceConfigRepository helixData = new HelixInstanceConfigRepository(manager);
       helixData.refresh();
       return helixData;
     });
 
+    managerFuture.thenApply(manager -> {
+      storageService.checkWhetherStoragePartitionsShouldBeKeptOrNot(manager);
+      return true;
+    });
+
+    String clusterName = clusterConfig.getClusterName();
+    HeartbeatMonitoringServiceStats heartbeatMonitoringServiceStats =
+        new HeartbeatMonitoringServiceStats(metricsRepository, clusterName, clusterName);
+
     heartbeatMonitoringService = new HeartbeatMonitoringService(
         metricsRepository,
         metadataRepo,
-        serverConfig.getRegionNames(),
-        serverConfig.getRegionName());
-    services.add(heartbeatMonitoringService);
+        serverConfig,
+        heartbeatMonitoringServiceStats,
+        customizedViewFuture);
 
+    this.zkHelixAdmin = Lazy.of(() -> new ZKHelixAdmin(serverConfig.getZookeeperAddress()));
+    this.adaptiveThrottlerSignalService = null;
+    if (serverConfig.isAdaptiveThrottlerEnabled()) {
+      adaptiveThrottlerSignalService =
+          new AdaptiveThrottlerSignalService(serverConfig, metricsRepository, heartbeatMonitoringService);
+      services.add(adaptiveThrottlerSignalService);
+    }
     // create and add KafkaSimpleConsumerService
     this.kafkaStoreIngestionService = new KafkaStoreIngestionService(
-        storageService.getStorageEngineRepository(),
+        storageService,
         veniceConfigLoader,
         storageMetadataService,
         new StaticClusterInfoProvider(Collections.singleton(clusterConfig.getClusterName())),
@@ -374,25 +429,31 @@ public class VeniceServer {
         partitionStateSerializer,
         readOnlyZKSharedSchemaRepository,
         icProvider,
-        false,
         compressorFactory,
         Optional.empty(),
-        null,
         false,
         remoteIngestionRepairService,
         pubSubClientsFactory,
         sslFactory,
-        heartbeatMonitoringService);
+        heartbeatMonitoringService,
+        zkHelixAdmin,
+        adaptiveThrottlerSignalService,
+        d2Client);
 
     this.diskHealthCheckService = new DiskHealthCheckService(
         serverConfig.isDiskHealthCheckServiceEnabled(),
         serverConfig.getDiskHealthCheckIntervalInMS(),
         serverConfig.getDiskHealthCheckTimeoutInMs(),
         serverConfig.getDataBasePath(),
-        serverConfig.getSsdHealthCheckShutdownTimeMs());
+        serverConfig.getSsdHealthCheckShutdownTimeMs(),
+        serverConfig.getLogContext());
     services.add(diskHealthCheckService);
     // create stats for disk health check service
-    new DiskHealthStats(metricsRepository, diskHealthCheckService, "disk_health_check_service");
+    new DiskHealthStats(
+        metricsRepository,
+        diskHealthCheckService,
+        "disk_health_check_service",
+        clusterConfig.getClusterName());
 
     final Optional<ResourceReadUsageTracker> resourceReadUsageTracker;
     if (serverConfig.isOptimizeDatabaseForBackupVersionEnabled()) {
@@ -401,7 +462,11 @@ public class VeniceServer {
           storageService.getStorageEngineRepository(),
           serverConfig.getOptimizeDatabaseForBackupVersionNoReadThresholdMS(),
           serverConfig.getOptimizeDatabaseServiceScheduleIntervalSeconds(),
-          new BackupVersionOptimizationServiceStats(metricsRepository, "BackupVersionOptimizationService"));
+          new BackupVersionOptimizationServiceStats(
+              metricsRepository,
+              "BackupVersionOptimizationService",
+              serverConfig.getClusterName()),
+          serverConfig.getLogContext());
       services.add(backupVersionOptimizationService);
       resourceReadUsageTracker = Optional.of(backupVersionOptimizationService);
     } else {
@@ -411,15 +476,18 @@ public class VeniceServer {
      * Fast schema lookup implementation for read compute path.
      */
     StoreValueSchemasCacheService storeValueSchemasCacheService =
-        new StoreValueSchemasCacheService(metadataRepo, schemaRepo);
+        new StoreValueSchemasCacheService(metadataRepo, schemaRepo, serverConfig.getLogContext());
     services.add(storeValueSchemasCacheService);
 
     serverReadMetadataRepository = new ServerReadMetadataRepository(
+        clusterConfig.getClusterName(),
         metricsRepository,
         metadataRepo,
         schemaRepo,
+        veniceMetadataRepositoryBuilder.getStoreConfigRepo(),
         Optional.of(customizedViewFuture),
-        Optional.of(helixInstanceFuture));
+        Optional.of(helixInstanceFuture),
+        sslFactory.isPresent());
 
     // create and add ListenerServer for handling GET requests
     ListenerService listenerService = createListenerService(
@@ -427,7 +495,7 @@ public class VeniceServer {
         metadataRepo,
         storeValueSchemasCacheService,
         customizedViewFuture,
-        kafkaStoreIngestionService,
+        new IngestionMetadataRetrieverDelegator(kafkaStoreIngestionService, heartbeatMonitoringService),
         serverReadMetadataRepository,
         serverConfig,
         metricsRepository,
@@ -436,8 +504,88 @@ public class VeniceServer {
         storeAccessController,
         diskHealthCheckService,
         compressorFactory,
-        resourceReadUsageTracker);
+        resourceReadUsageTracker,
+        Optional.of(kafkaStoreIngestionService));
     services.add(listenerService);
+
+    /**
+     * Initialize Blob transfer manager for Service
+     */
+    if (BlobTransferUtils.isBlobTransferManagerEnabled(serverConfig)) {
+      aggVersionedBlobTransferStats = new AggVersionedBlobTransferStats(metricsRepository, metadataRepo, serverConfig);
+      aggBlobTransferStats = new AggBlobTransferStats(
+          aggVersionedBlobTransferStats,
+          kafkaStoreIngestionService.getHostLevelIngestionStats());
+      P2PBlobTransferConfig p2PBlobTransferConfig = new P2PBlobTransferConfig(
+          serverConfig.getDvcP2pBlobTransferServerPort(),
+          serverConfig.getDvcP2pBlobTransferClientPort(),
+          serverConfig.getRocksDBPath(),
+          serverConfig.getMaxConcurrentSnapshotUser(),
+          serverConfig.getBlobTransferMaxChunkSizeBytes(),
+          serverConfig.getSnapshotRetentionTimeInMin(),
+          serverConfig.getBlobTransferMaxTimeoutInMin(),
+          serverConfig.getBlobReceiveMaxTimeoutInMin(),
+          serverConfig.getBlobReceiveReaderIdleTimeInSeconds(),
+          serverConfig.getRocksDBServerConfig().isRocksDBPlainTableFormatEnabled()
+              ? BlobTransferTableFormat.PLAIN_TABLE
+              : BlobTransferTableFormat.BLOCK_BASED_TABLE,
+          serverConfig.getBlobTransferPeersConnectivityFreshnessInSeconds(),
+          serverConfig.getBlobTransferClientReadLimitBytesPerSec(),
+          serverConfig.getBlobTransferServiceWriteLimitBytesPerSec(),
+          serverConfig.getSnapshotCleanupIntervalInMins(),
+          serverConfig.getMaxConcurrentBlobReceiveReplicas(),
+          serverConfig.getBlobTransferClientNettyWorkerThreadCount(),
+          serverConfig.getBlobTransferClientCapacityPercent(),
+          serverConfig.isServerAcceptClientBlobRequestEnabled());
+      VeniceAdaptiveBlobTransferTrafficThrottler writeThrottler = null;
+      VeniceAdaptiveBlobTransferTrafficThrottler readThrottler = null;
+      if (serverConfig.isAdaptiveThrottlerEnabled() && serverConfig.isBlobTransferAdaptiveThrottlerEnabled()) {
+        writeThrottler = new VeniceAdaptiveBlobTransferTrafficThrottler(
+            serverConfig.getAdaptiveThrottlerSignalIdleThreshold(),
+            serverConfig.getBlobTransferServiceWriteLimitBytesPerSec(),
+            serverConfig.getBlobTransferAdaptiveThrottlerUpdatePercentage(),
+            true);
+        readThrottler = new VeniceAdaptiveBlobTransferTrafficThrottler(
+            serverConfig.getAdaptiveThrottlerSignalIdleThreshold(),
+            serverConfig.getBlobTransferClientReadLimitBytesPerSec(),
+            serverConfig.getBlobTransferAdaptiveThrottlerUpdatePercentage(),
+            false);
+        // Setup Limiter Signal for Read
+        readThrottler.registerLimiterSignal(adaptiveThrottlerSignalService::isReadLatencySignalActive);
+        readThrottler
+            .registerLimiterSignal(adaptiveThrottlerSignalService::isCurrentFollowerMaxHeartbeatLagSignalActive);
+        readThrottler.registerLimiterSignal(adaptiveThrottlerSignalService::isCurrentLeaderMaxHeartbeatLagSignalActive);
+        // Setup Limiter Signal for Write
+        writeThrottler.registerLimiterSignal(adaptiveThrottlerSignalService::isReadLatencySignalActive);
+        writeThrottler
+            .registerLimiterSignal(adaptiveThrottlerSignalService::isCurrentFollowerMaxHeartbeatLagSignalActive);
+        writeThrottler
+            .registerLimiterSignal(adaptiveThrottlerSignalService::isCurrentLeaderMaxHeartbeatLagSignalActive);
+        adaptiveThrottlerSignalService.registerThrottler(writeThrottler);
+        adaptiveThrottlerSignalService.registerThrottler(readThrottler);
+      }
+      blobTransferManager = new BlobTransferManagerBuilder().setBlobTransferConfig(p2PBlobTransferConfig)
+          .setCustomizedViewFuture(customizedViewFuture)
+          .setStorageMetadataService(storageMetadataService)
+          .setReadOnlyStoreRepository(metadataRepo)
+          .setStorageEngineRepository(storageService.getStorageEngineRepository())
+          .setAggBlobTransferStats(aggBlobTransferStats)
+          .setBlobTransferSSLFactory(sslFactory)
+          .setBlobTransferAclHandler(
+              BlobTransferUtils.createAclHandler(
+                  veniceConfigLoader,
+                  storeAccessController,
+                  serverConfig.isServerAcceptClientBlobRequestEnabled()))
+          .setAdaptiveBlobTransferWriteTrafficThrottler(writeThrottler)
+          .setAdaptiveBlobTransferReadTrafficThrottler(readThrottler)
+          .setPushStatusNotifierSupplier(
+              () -> helixParticipationService != null ? helixParticipationService.getPushStatusNotifier() : null)
+          .setLogContext(serverConfig.getLogContext())
+          .build();
+    } else {
+      aggVersionedBlobTransferStats = null;
+      blobTransferManager = null;
+    }
 
     /**
      * Helix participator service should start last since we need to make sure current Storage Node is ready to take
@@ -456,12 +604,15 @@ public class VeniceServer {
         veniceConfigLoader.getVeniceServerConfig().getListenerPort(),
         veniceConfigLoader.getVeniceServerConfig().getListenerHostname(),
         managerFuture,
-        heartbeatMonitoringService);
+        heartbeatMonitoringService,
+        blobTransferManager);
     services.add(helixParticipationService);
 
     // Add kafka consumer service last so when shutdown the server, it will be stopped first to avoid the case
     // that helix is disconnected but consumption service try to send message by helix.
     services.add(kafkaStoreIngestionService);
+    // Add HB monitoring service after Kafka consumer service so that it will be started after Kafka consumer service
+    services.add(heartbeatMonitoringService);
 
     /**
      * Resource cleanup service
@@ -473,7 +624,8 @@ public class VeniceServer {
           metadataRepo,
           kafkaStoreIngestionService,
           storageService,
-          metricsRepository);
+          metricsRepository,
+          serverConfig.getLogContext());
       services.add(leakedResourceCleaner);
     }
 
@@ -521,6 +673,14 @@ public class VeniceServer {
       return this.helixParticipationService;
     }
     throw new VeniceException("Cannot get helix participation service if server is not started");
+  }
+
+  public HeartbeatMonitoringService getHeartbeatMonitoringService() {
+    if (isStarted()) {
+      return heartbeatMonitoringService;
+    } else {
+      throw new VeniceException("Cannot get heartbeat monitoring service if server is not started");
+    }
   }
 
   /**
@@ -614,6 +774,15 @@ public class VeniceServer {
       LOGGER.info("All services have been stopped");
       compressorFactory.close();
 
+      if (storeVersionOtelStats != null) {
+        try {
+          storeVersionOtelStats.close();
+        } catch (Exception e) {
+          exceptions.add(e);
+          LOGGER.error("Exception while closing StoreVersionOtelStats", e);
+        }
+      }
+
       try {
         metricsRepository.close();
       } catch (Exception e) {
@@ -691,7 +860,8 @@ public class VeniceServer {
       Optional<DynamicAccessController> storeAccessController,
       DiskHealthCheckService diskHealthService,
       StorageEngineBackedCompressorFactory compressorFactory,
-      Optional<ResourceReadUsageTracker> resourceReadUsageTracker) {
+      Optional<ResourceReadUsageTracker> resourceReadUsageTracker,
+      Optional<KafkaStoreIngestionService> kafkaStoreIngestionService) {
     return new ListenerService(
         storageEngineRepository,
         storeMetadataRepository,
@@ -706,7 +876,8 @@ public class VeniceServer {
         storeAccessController,
         diskHealthService,
         compressorFactory,
-        resourceReadUsageTracker);
+        resourceReadUsageTracker,
+        kafkaStoreIngestionService);
   }
 
   public static void main(String args[]) throws Exception {
@@ -733,8 +904,25 @@ public class VeniceServer {
   }
 
   public static void run(VeniceConfigLoader veniceConfigService, boolean joinThread) throws Exception {
-    VeniceServerContext serverContext =
-        new VeniceServerContext.Builder().setVeniceConfigLoader(veniceConfigService).build();
+    List<ServiceDiscoveryAnnouncer> d2Servers = new ArrayList<>();
+    VeniceProperties props = veniceConfigService.getCombinedProperties();
+
+    if (props.getBoolean("server.d2.announce.enabled", false)) {
+      String zkAddress = props.getString(ConfigKeys.ZOOKEEPER_ADDRESS);
+      int port = props.getInt(ConfigKeys.LISTENER_PORT);
+      String announceHost = props.getString("server.d2.announce.host", "localhost");
+      String localUri = "http://" + announceHost + ":" + port;
+
+      String d2ServiceName = props.getString("server.d2.service.name", "venice-server-d2");
+      String d2ClusterName = d2ServiceName + "_d2_cluster";
+      D2ConfigUtils.setupD2Config(zkAddress, false, d2ClusterName, d2ServiceName);
+      d2Servers.addAll(D2ConfigUtils.getD2Servers(zkAddress, d2ClusterName, localUri));
+      LOGGER.info("Server D2 announcement enabled for service {} at URI: {}", d2ServiceName, localUri);
+    }
+
+    VeniceServerContext serverContext = new VeniceServerContext.Builder().setVeniceConfigLoader(veniceConfigService)
+        .setServiceDiscoveryAnnouncers(d2Servers)
+        .build();
     final VeniceServer server = new VeniceServer(serverContext);
     if (!server.isStarted()) {
       server.start();

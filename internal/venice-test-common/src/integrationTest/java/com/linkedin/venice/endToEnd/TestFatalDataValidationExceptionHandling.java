@@ -1,14 +1,17 @@
 package com.linkedin.venice.endToEnd;
 
 import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_PLAIN_TABLE_FORMAT_ENABLED;
-import static com.linkedin.venice.ConfigKeys.CONTROLLER_DISABLE_PARENT_TOPIC_TRUNCATION_UPON_COMPLETION;
+import static com.linkedin.venice.ConfigKeys.ADMIN_HELIX_MESSAGING_CHANNEL_ENABLED;
 import static com.linkedin.venice.ConfigKeys.DEFAULT_MAX_NUMBER_OF_PARTITIONS;
+import static com.linkedin.venice.ConfigKeys.DEFAULT_OFFLINE_PUSH_STRATEGY;
 import static com.linkedin.venice.ConfigKeys.DEPRECATED_TOPIC_MAX_RETENTION_MS;
+import static com.linkedin.venice.ConfigKeys.ERROR_PARTITION_AUTO_RESET_LIMIT;
 import static com.linkedin.venice.ConfigKeys.FATAL_DATA_VALIDATION_FAILURE_TOPIC_RETENTION_MS;
 import static com.linkedin.venice.ConfigKeys.INSTANCE_ID;
 import static com.linkedin.venice.ConfigKeys.KAFKA_BOOTSTRAP_SERVERS;
 import static com.linkedin.venice.ConfigKeys.MIN_CONSUMER_IN_CONSUMER_POOL_PER_KAFKA_CLUSTER;
 import static com.linkedin.venice.ConfigKeys.MIN_NUMBER_OF_UNUSED_KAFKA_TOPICS_TO_PRESERVE;
+import static com.linkedin.venice.ConfigKeys.PARTICIPANT_MESSAGE_STORE_ENABLED;
 import static com.linkedin.venice.ConfigKeys.PERSISTENCE_TYPE;
 import static com.linkedin.venice.ConfigKeys.PUSH_JOB_GUID_LEAST_SIGNIFICANT_BITS;
 import static com.linkedin.venice.ConfigKeys.PUSH_JOB_GUID_MOST_SIGNIFICANT_BITS;
@@ -16,11 +19,11 @@ import static com.linkedin.venice.ConfigKeys.SERVER_CONSUMER_POOL_SIZE_PER_KAFKA
 import static com.linkedin.venice.ConfigKeys.SERVER_DATABASE_CHECKSUM_VERIFICATION_ENABLED;
 import static com.linkedin.venice.ConfigKeys.SERVER_DATABASE_SYNC_BYTES_INTERNAL_FOR_DEFERRED_WRITE_MODE;
 import static com.linkedin.venice.ConfigKeys.SERVER_DEDICATED_DRAINER_FOR_SORTED_INPUT_ENABLED;
-import static com.linkedin.venice.ConfigKeys.SERVER_PROMOTION_TO_LEADER_REPLICA_DELAY_SECONDS;
 import static com.linkedin.venice.ConfigKeys.SERVER_SHARED_CONSUMER_ASSIGNMENT_STRATEGY;
 import static com.linkedin.venice.ConfigKeys.SSL_TO_KAFKA_LEGACY;
 import static com.linkedin.venice.status.BatchJobHeartbeatConfigs.HEARTBEAT_ENABLED_CONFIG;
 import static com.linkedin.venice.utils.TestWriteUtils.STRING_SCHEMA;
+import static com.linkedin.venice.writer.VeniceWriter.DEFAULT_TERM_ID;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -28,6 +31,7 @@ import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 
 import com.linkedin.davinci.kafka.consumer.KafkaConsumerService;
+import com.linkedin.venice.PushJobCheckpoints;
 import com.linkedin.venice.client.store.AvroSpecificStoreClient;
 import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.controller.VeniceHelixAdmin;
@@ -35,17 +39,18 @@ import com.linkedin.venice.controllerapi.ControllerClient;
 import com.linkedin.venice.controllerapi.JobStatusQueryResponse;
 import com.linkedin.venice.controllerapi.VersionResponse;
 import com.linkedin.venice.guid.GuidUtils;
-import com.linkedin.venice.hadoop.VenicePushJob;
 import com.linkedin.venice.integration.utils.PubSubBrokerWrapper;
 import com.linkedin.venice.integration.utils.ServiceFactory;
+import com.linkedin.venice.integration.utils.VeniceClusterCreateOptions;
 import com.linkedin.venice.integration.utils.VeniceClusterWrapper;
-import com.linkedin.venice.integration.utils.VeniceControllerCreateOptions;
-import com.linkedin.venice.integration.utils.VeniceControllerWrapper;
-import com.linkedin.venice.integration.utils.ZkServerWrapper;
+import com.linkedin.venice.meta.OfflinePushStrategy;
 import com.linkedin.venice.meta.PersistenceType;
 import com.linkedin.venice.meta.Version;
+import com.linkedin.venice.pubsub.PubSubPositionTypeRegistry;
 import com.linkedin.venice.pubsub.PubSubProducerAdapterFactory;
 import com.linkedin.venice.pubsub.PubSubTopicRepository;
+import com.linkedin.venice.pubsub.adapter.kafka.common.ApacheKafkaOffsetPosition;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
 import com.linkedin.venice.pubsub.manager.TopicManager;
 import com.linkedin.venice.serializer.AvroSerializer;
 import com.linkedin.venice.status.PushJobDetailsStatus;
@@ -73,20 +78,18 @@ public class TestFatalDataValidationExceptionHandling {
   public static final int NUMBER_OF_SERVERS = 1;
 
   private VeniceClusterWrapper veniceCluster;
-  ZkServerWrapper parentZk = null;
-  VeniceControllerWrapper parentController = null;
 
   protected final PubSubTopicRepository pubSubTopicRepository = new PubSubTopicRepository();
+  private PubSubPositionTypeRegistry pubSubPositionTypeRegistry;
 
   @BeforeClass(alwaysRun = true)
   public void setUp() {
     veniceCluster = setUpCluster();
+    pubSubPositionTypeRegistry = veniceCluster.getPubSubBrokerWrapper().getPubSubPositionTypeRegistry();
   }
 
   @AfterClass(alwaysRun = true)
   public void cleanUp() {
-    parentController.close();
-    parentZk.close();
     Utils.closeQuietlyWithErrorLogged(veniceCluster);
   }
 
@@ -101,8 +104,21 @@ public class TestFatalDataValidationExceptionHandling {
     extraProperties.setProperty(DEPRECATED_TOPIC_MAX_RETENTION_MS, Long.toString(TimeUnit.SECONDS.toMillis(20)));
     extraProperties
         .setProperty(FATAL_DATA_VALIDATION_FAILURE_TOPIC_RETENTION_MS, Long.toString(TimeUnit.SECONDS.toMillis(30)));
+    extraProperties.setProperty(ERROR_PARTITION_AUTO_RESET_LIMIT, "0");
+    extraProperties.setProperty(DEFAULT_OFFLINE_PUSH_STRATEGY, OfflinePushStrategy.WAIT_ALL_REPLICAS.name());
+    extraProperties.setProperty(ADMIN_HELIX_MESSAGING_CHANNEL_ENABLED, "true");
     extraProperties.setProperty(MIN_NUMBER_OF_UNUSED_KAFKA_TOPICS_TO_PRESERVE, "0");
-    VeniceClusterWrapper cluster = ServiceFactory.getVeniceCluster(1, 0, 1, 1, 1000000, false, false, extraProperties);
+    extraProperties.setProperty(PARTICIPANT_MESSAGE_STORE_ENABLED, "false");
+    VeniceClusterCreateOptions options = new VeniceClusterCreateOptions.Builder().numberOfControllers(1)
+        .numberOfServers(0)
+        .numberOfRouters(1)
+        .replicationFactor(1)
+        .partitionSize(1000000)
+        .sslToStorageNodes(false)
+        .sslToKafka(false)
+        .extraProperties(extraProperties)
+        .build();
+    VeniceClusterWrapper cluster = ServiceFactory.getVeniceCluster(options);
 
     // Add Venice Router
     Properties routerProperties = new Properties();
@@ -111,7 +127,6 @@ public class TestFatalDataValidationExceptionHandling {
     // Add Venice Server
     Properties serverProperties = new Properties();
     serverProperties.setProperty(PERSISTENCE_TYPE, PersistenceType.ROCKS_DB.name());
-    serverProperties.setProperty(SERVER_PROMOTION_TO_LEADER_REPLICA_DELAY_SECONDS, Long.toString(1L));
     serverProperties.setProperty(ROCKSDB_PLAIN_TABLE_FORMAT_ENABLED, "false");
     serverProperties.setProperty(SERVER_DATABASE_CHECKSUM_VERIFICATION_ENABLED, "true");
     serverProperties.setProperty(SERVER_DATABASE_SYNC_BYTES_INTERNAL_FOR_DEFERRED_WRITE_MODE, "300");
@@ -152,25 +167,12 @@ public class TestFatalDataValidationExceptionHandling {
    */
   @Test(timeOut = 2 * 60 * Time.MS_PER_SECOND)
   public void testFatalDataValidationHandling() {
-    Properties controllerConfig = new Properties();
-    controllerConfig.setProperty(CONTROLLER_DISABLE_PARENT_TOPIC_TRUNCATION_UPON_COMPLETION, "true");
-    controllerConfig.setProperty(DEPRECATED_TOPIC_MAX_RETENTION_MS, Long.toString(TimeUnit.SECONDS.toMillis(20)));
-    parentZk = ServiceFactory.getZkServer();
-    parentController = ServiceFactory.getVeniceController(
-        new VeniceControllerCreateOptions.Builder(
-            veniceCluster.getClusterName(),
-            parentZk,
-            veniceCluster.getPubSubBrokerWrapper())
-                .childControllers(new VeniceControllerWrapper[] { veniceCluster.getLeaderVeniceController() })
-                .extraProperties(controllerConfig)
-                .build());
-
     final String storeName = Utils.getUniqueString("batch-store-test");
     final String[] storeNames = new String[] { storeName };
 
     try (
         ControllerClient controllerClient =
-            new ControllerClient(veniceCluster.getClusterName(), parentController.getControllerUrl());
+            new ControllerClient(veniceCluster.getClusterName(), veniceCluster.getAllControllersURLs());
         TopicManager topicManager = veniceCluster.getLeaderVeniceController().getVeniceAdmin().getTopicManager()) {
       createStoresAndVersions(controllerClient, storeNames);
       String versionTopicName = Version.composeKafkaTopic(storeName, 1);
@@ -197,15 +199,15 @@ public class TestFatalDataValidationExceptionHandling {
       PubSubProducerAdapterFactory pubSubProducerAdapterFactory =
           veniceCluster.getPubSubBrokerWrapper().getPubSubClientsFactory().getProducerAdapterFactory();
       try (
-          VeniceWriter<byte[], byte[], byte[]> veniceWriter1 =
-              TestUtils.getVeniceWriterFactory(veniceWriterProperties1, pubSubProducerAdapterFactory)
-                  .createVeniceWriter(new VeniceWriterOptions.Builder(versionTopicName).build());
-          VeniceWriter<byte[], byte[], byte[]> veniceWriter2 =
-              TestUtils.getVeniceWriterFactory(veniceWriterProperties2, pubSubProducerAdapterFactory)
-                  .createVeniceWriter(new VeniceWriterOptions.Builder(versionTopicName).build());
-          VeniceWriter<byte[], byte[], byte[]> veniceWriter3 =
-              TestUtils.getVeniceWriterFactory(veniceWriterProperties3, pubSubProducerAdapterFactory)
-                  .createVeniceWriter(new VeniceWriterOptions.Builder(versionTopicName).build())) {
+          VeniceWriter<byte[], byte[], byte[]> veniceWriter1 = TestUtils
+              .getVeniceWriterFactory(veniceWriterProperties1, pubSubProducerAdapterFactory, pubSubPositionTypeRegistry)
+              .createVeniceWriter(new VeniceWriterOptions.Builder(versionTopicName).build());
+          VeniceWriter<byte[], byte[], byte[]> veniceWriter2 = TestUtils
+              .getVeniceWriterFactory(veniceWriterProperties2, pubSubProducerAdapterFactory, pubSubPositionTypeRegistry)
+              .createVeniceWriter(new VeniceWriterOptions.Builder(versionTopicName).build());
+          VeniceWriter<byte[], byte[], byte[]> veniceWriter3 = TestUtils
+              .getVeniceWriterFactory(veniceWriterProperties3, pubSubProducerAdapterFactory, pubSubPositionTypeRegistry)
+              .createVeniceWriter(new VeniceWriterOptions.Builder(versionTopicName).build())) {
         createCorruptDIVScenario(veniceWriter1, veniceWriter2, veniceWriter3, stringSerializer);
       }
 
@@ -267,7 +269,7 @@ public class TestFatalDataValidationExceptionHandling {
     pushJobDetails.totalRawValueBytes = -1;
     pushJobDetails.totalCompressedValueBytes = -1;
     pushJobDetails.failureDetails = "";
-    pushJobDetails.pushJobLatestCheckpoint = VenicePushJob.PushJobCheckpoints.INITIALIZE_PUSH_JOB.getValue();
+    pushJobDetails.pushJobLatestCheckpoint = PushJobCheckpoints.INITIALIZE_PUSH_JOB.getValue();
     pushJobDetails.pushJobConfigs =
         Collections.singletonMap(HEARTBEAT_ENABLED_CONFIG.getConfigName(), String.valueOf(true));
   }
@@ -304,34 +306,39 @@ public class TestFatalDataValidationExceptionHandling {
     vw3.broadcastStartOfPush(false, Collections.emptyMap());
     vw3.flush();
 
+    PubSubPosition pubSubPosition0 = new ApacheKafkaOffsetPosition(0);
     vw1.put(
         stringSerializer.serialize("key_writer_1"),
         stringSerializer.serialize("value_writer_1"),
         1,
         null,
-        new LeaderMetadataWrapper(0, 0));
+        new LeaderMetadataWrapper(pubSubPosition0, 0, DEFAULT_TERM_ID));
     vw1.flush();
 
+    PubSubPosition pubSubPosition1 = new ApacheKafkaOffsetPosition(1);
     vw2.put(
         stringSerializer.serialize("key_writer_2"),
         stringSerializer.serialize("value_writer_2"),
         1,
         null,
-        new LeaderMetadataWrapper(1, 0));
+        new LeaderMetadataWrapper(pubSubPosition1, 0, DEFAULT_TERM_ID));
+
+    PubSubPosition pubSubPosition2 = new ApacheKafkaOffsetPosition(2);
     vw2.put(
         stringSerializer.serialize("key_writer_3"),
         stringSerializer.serialize("value_writer_3"),
         1,
         null,
-        new LeaderMetadataWrapper(2, 0));
+        new LeaderMetadataWrapper(pubSubPosition2, 0, DEFAULT_TERM_ID));
     vw2.flush();
 
+    PubSubPosition pubSubPosition3 = new ApacheKafkaOffsetPosition(3);
     vw1.put(
         stringSerializer.serialize("key_writer_4"),
         stringSerializer.serialize("value_writer_4"),
         1,
         null,
-        new LeaderMetadataWrapper(3, 0));
+        new LeaderMetadataWrapper(pubSubPosition3, 0, DEFAULT_TERM_ID));
     vw1.flush();
     vw1.closePartition(0);
     vw1.flush();

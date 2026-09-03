@@ -8,12 +8,18 @@ import com.linkedin.venice.controllerapi.MultiSchemaResponse;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.schema.AvroSchemaParseUtils;
 import com.linkedin.venice.schema.SchemaData;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.stream.Collectors;
 import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericData;
+import org.apache.avro.generic.IndexedRecord;
 import org.apache.commons.lang.StringUtils;
 
 
@@ -26,7 +32,7 @@ public class AvroSupersetSchemaUtils {
    * @return True if {@param s1} is {@param s2}'s superset schema and false otherwise.
    */
   public static boolean isSupersetSchema(Schema s1, Schema s2) {
-    final Schema supersetSchema = generateSuperSetSchema(s1, s2);
+    final Schema supersetSchema = generateSupersetSchema(s1, s2);
     return AvroSchemaUtils.compareSchemaIgnoreFieldOrder(s1, supersetSchema);
   }
 
@@ -34,12 +40,21 @@ public class AvroSupersetSchemaUtils {
    * Generate super-set schema of two Schemas. If we have {A,B,C} and {A,B,D} it will generate {A,B,C,D}, where
    * C/D could be nested record change as well eg, array/map of records, or record of records.
    * Prerequisite: The top-level schema are of type RECORD only and each field have default values. ie they are compatible
-   * schemas and the generated schema will pick the default value from s1.
-   * @param existingSchema schema existing in the repo
-   * @param newSchema schema to be added.
-   * @return super-set schema of existingSchema abd newSchema
+   * schemas and the generated schema will pick the default value from new value schema.
+   * @param rawExistingSchema schema existing in the repo
+   * @param rawNewSchema schema to be added.
+   * @return super-set schema of rawExistingSchema and rawNewSchema
    */
-  public static Schema generateSuperSetSchema(Schema existingSchema, Schema newSchema) {
+  public static Schema generateSupersetSchema(Schema rawExistingSchema, Schema rawNewSchema) {
+    // Normalize single-element unions [T] to their inner type T so that [T] and T
+    // are treated equivalently. Skip normalization when both inputs are unions —
+    // the multi-element union case is handled by unionSchema() below and must not
+    // be disrupted (e.g. [T] vs ["null", T] must remain a UNION-vs-UNION merge).
+    final boolean bothUnions =
+        rawExistingSchema.getType() == Schema.Type.UNION && rawNewSchema.getType() == Schema.Type.UNION;
+    final Schema existingSchema = bothUnions ? rawExistingSchema : unwrapSingleElementUnion(rawExistingSchema);
+    final Schema newSchema = bothUnions ? rawNewSchema : unwrapSingleElementUnion(rawNewSchema);
+
     if (existingSchema.getType() != newSchema.getType()) {
       throw new VeniceException("Incompatible schema");
     }
@@ -79,32 +94,138 @@ public class AvroSupersetSchemaUtils {
         superSetSchema.setFields(mergeFieldSchemas(existingSchema, newSchema));
         return superSetSchema;
       case ARRAY:
-        return Schema.createArray(generateSuperSetSchema(existingSchema.getElementType(), newSchema.getElementType()));
+        return Schema.createArray(generateSupersetSchema(existingSchema.getElementType(), newSchema.getElementType()));
       case MAP:
-        return Schema.createMap(generateSuperSetSchema(existingSchema.getValueType(), newSchema.getValueType()));
+        return Schema.createMap(generateSupersetSchema(existingSchema.getValueType(), newSchema.getValueType()));
       case UNION:
         return unionSchema(existingSchema, newSchema);
+      case ENUM: {
+        // Build a superset symbol list: all symbols from existingSchema (preserving their order),
+        // followed by any symbols present only in newSchema. This ensures no symbol is lost when
+        // the two schemas have diverged (e.g. existing has ["A","B","C"], new has ["A","B","D"]).
+        LinkedHashSet<String> supersetSymbols = new LinkedHashSet<>(existingSchema.getEnumSymbols());
+        supersetSymbols.addAll(newSchema.getEnumSymbols());
+        // Always construct a new enum schema so that properties from both schemas are merged
+        // consistently, regardless of whether symbols grew or diverged. (Truly-equal schemas are
+        // already short-circuited by the Objects.equals check at the top of this method.)
+        // newSchema takes priority on conflicts. Avro 1.10+ forbids overwriting an already-set
+        // property, so each prop is written exactly once: existingSchema-only props first, then
+        // all newSchema props.
+        Schema supersetEnum = Schema.createEnum(
+            newSchema.getName(),
+            newSchema.getDoc(),
+            newSchema.getNamespace(),
+            new ArrayList<>(supersetSymbols),
+            newSchema.getEnumDefault());
+        Set<String> newSchemaPropNames = getSchemaPropNames(newSchema);
+        getSchemaPropNames(existingSchema).stream()
+            .filter(prop -> !newSchemaPropNames.contains(prop))
+            .forEach(
+                prop -> AvroCompatibilityHelper.setSchemaPropFromJsonString(
+                    supersetEnum,
+                    prop,
+                    AvroCompatibilityHelper.getSchemaPropAsJsonString(existingSchema, prop),
+                    false));
+        getSchemaPropNames(newSchema).forEach(
+            prop -> AvroCompatibilityHelper.setSchemaPropFromJsonString(
+                supersetEnum,
+                prop,
+                AvroCompatibilityHelper.getSchemaPropAsJsonString(newSchema, prop),
+                false));
+        return supersetEnum;
+      }
+      case FIXED: {
+        // FIXED schemas are structurally compatible only when their size attributes are identical.
+        // A size mismatch is an irreconcilable schema incompatibility — unlike custom properties,
+        // the size is part of the binary encoding and cannot be silently promoted.
+        if (existingSchema.getFixedSize() != newSchema.getFixedSize()) {
+          throw new VeniceException(
+              String.format(
+                  "Incompatible FIXED schemas for '%s': existing size %d does not match new size %d",
+                  existingSchema.getFullName(),
+                  existingSchema.getFixedSize(),
+                  newSchema.getFixedSize()));
+        }
+        // Sizes match — merge properties from both schemas, same convention as ENUM:
+        // existingSchema-only props first, then all newSchema props (newSchema wins on conflicts).
+        Schema supersetFixed = Schema
+            .createFixed(newSchema.getName(), newSchema.getDoc(), newSchema.getNamespace(), newSchema.getFixedSize());
+        Set<String> newFixedPropNames = getSchemaPropNames(newSchema);
+        getSchemaPropNames(existingSchema).stream()
+            .filter(prop -> !newFixedPropNames.contains(prop))
+            .forEach(
+                prop -> AvroCompatibilityHelper.setSchemaPropFromJsonString(
+                    supersetFixed,
+                    prop,
+                    AvroCompatibilityHelper.getSchemaPropAsJsonString(existingSchema, prop),
+                    false));
+        getSchemaPropNames(newSchema).forEach(
+            prop -> AvroCompatibilityHelper.setSchemaPropFromJsonString(
+                supersetFixed,
+                prop,
+                AvroCompatibilityHelper.getSchemaPropAsJsonString(newSchema, prop),
+                false));
+        return supersetFixed;
+      }
+      case INT:
+      case LONG:
+      case FLOAT:
+      case DOUBLE:
+      case BOOLEAN:
+      case BYTES:
+      case NULL:
+        // Primitive types cannot differ structurally; schemas are equal in type but differ only in
+        // custom properties (e.g. "li.data.proto.numberFieldType"). Return newSchema so its
+        // properties take priority, consistent with the convention used elsewhere in this method.
+        return newSchema;
       default:
         throw new VeniceException("Super set schema not supported");
     }
   }
 
-  private static Schema unionSchema(Schema s1, Schema s2) {
+  /**
+   * Merge union schema from two schema object. The rule is: If a field exist in both new schema and old schema, we should
+   * generate the superset schema of these two versions of the same field, with new schema's information taking higher
+   * priority.
+   */
+  private static Schema unionSchema(Schema existingSchema, Schema newSchema) {
     List<Schema> combinedSchema = new ArrayList<>();
-    Map<String, Schema> s2Schema = s2.getTypes().stream().collect(Collectors.toMap(s -> s.getName(), s -> s));
-    for (Schema subSchemaInS1: s1.getTypes()) {
-      final String fieldName = subSchemaInS1.getName();
-      final Schema subSchemaWithSameNameInS2 = s2Schema.get(fieldName);
-      if (subSchemaWithSameNameInS2 == null) {
-        combinedSchema.add(subSchemaInS1);
+    Map<String, Schema> existingSchemaTypeMap =
+        existingSchema.getTypes().stream().collect(Collectors.toMap(Schema::getName, s -> s));
+    for (Schema subSchemaInNewSchema: newSchema.getTypes()) {
+      final String fieldName = subSchemaInNewSchema.getName();
+      final Schema subSchemaInExistingSchema = existingSchemaTypeMap.get(fieldName);
+      if (subSchemaInExistingSchema == null) {
+        combinedSchema.add(subSchemaInNewSchema);
       } else {
-        combinedSchema.add(generateSuperSetSchema(subSchemaInS1, subSchemaWithSameNameInS2));
-        s2Schema.remove(fieldName);
+        combinedSchema.add(generateSupersetSchema(subSchemaInExistingSchema, subSchemaInNewSchema));
+        existingSchemaTypeMap.remove(fieldName);
       }
     }
-    s2Schema.forEach((k, v) -> combinedSchema.add(v));
-
+    existingSchemaTypeMap.forEach((k, v) -> combinedSchema.add(v));
     return Schema.createUnion(combinedSchema);
+  }
+
+  /**
+   * If the schema is a UNION with exactly one member type, return that inner type.
+   * A single-element union {@code [T]} is semantically equivalent to {@code T} in Avro,
+   * but {@link Schema#getType()} returns {@link Schema.Type#UNION} for the wrapper form.
+   * Unwrapping normalizes both representations so they compare as the same type.
+   */
+  private static Schema unwrapSingleElementUnion(Schema schema) {
+    if (schema.getType() == Schema.Type.UNION && schema.getTypes().size() == 1) {
+      return schema.getTypes().get(0);
+    }
+    return schema;
+  }
+
+  /**
+   * Returns all custom property names for a {@link Schema} using {@link Schema#getObjectProps()} (available since
+   * Avro 1.8) instead of {@link AvroCompatibilityHelper#getAllPropNames(Schema)}.  The latter routes through
+   * {@code Avro16Adapter.getAllPropNames} which calls the removed {@code Schema.getProps()} and breaks on Avro 1.11+.
+   */
+  private static Set<String> getSchemaPropNames(Schema schema) {
+    return schema.getObjectProps().keySet();
   }
 
   private static void copyFieldProperties(FieldBuilder fieldBuilder, Schema.Field field) {
@@ -116,41 +237,89 @@ public class AvroSupersetSchemaUtils {
     });
   }
 
-  private static FieldBuilder deepCopySchemaField(Schema.Field field) {
+  private static FieldBuilder deepCopySchemaFieldWithoutFieldProps(Schema.Field field) {
     FieldBuilder fieldBuilder = AvroCompatibilityHelper.newField(null)
         .setName(field.name())
         .setSchema(field.schema())
         .setDoc(field.doc())
         .setOrder(field.order());
-    copyFieldProperties(fieldBuilder, field);
-
     // set default as AvroCompatibilityHelper builder might drop defaults if there is type mismatch
     if (field.hasDefaultValue()) {
-      fieldBuilder.setDefault(getFieldDefault(field));
+      fieldBuilder.setDefault(normalizeFieldDefault(getFieldDefault(field)));
     }
-
     return fieldBuilder;
   }
 
-  private static List<Schema.Field> mergeFieldSchemas(Schema s1, Schema s2) {
+  /**
+   * FieldBuilder does not make ByteBuffer defaults Avro-friendly. Normalize them recursively without mutating the
+   * source buffers or exposing their backing arrays.
+   */
+  private static Object normalizeFieldDefault(Object defaultValue) {
+    if (defaultValue instanceof ByteBuffer) {
+      ByteBuffer buffer = ((ByteBuffer) defaultValue).duplicate();
+      byte[] bytes = new byte[buffer.remaining()];
+      buffer.get(bytes);
+      return bytes;
+    }
+    if (defaultValue instanceof List) {
+      List<?> defaultList = (List<?>) defaultValue;
+      List<Object> normalizedList = new ArrayList<>(defaultList.size());
+      defaultList.forEach(value -> normalizedList.add(normalizeFieldDefault(value)));
+      return normalizedList;
+    }
+    if (defaultValue instanceof Map) {
+      Map<?, ?> defaultMap = (Map<?, ?>) defaultValue;
+      Map<Object, Object> normalizedMap = new LinkedHashMap<>(defaultMap.size());
+      defaultMap.forEach((key, value) -> normalizedMap.put(key, normalizeFieldDefault(value)));
+      return normalizedMap;
+    }
+    if (defaultValue instanceof IndexedRecord) {
+      IndexedRecord defaultRecord = (IndexedRecord) defaultValue;
+      GenericData.Record normalizedRecord = new GenericData.Record(defaultRecord.getSchema());
+      for (Schema.Field field: defaultRecord.getSchema().getFields()) {
+        normalizedRecord.put(field.pos(), normalizeFieldDefault(defaultRecord.get(field.pos())));
+      }
+      return normalizedRecord;
+    }
+    return defaultValue;
+  }
+
+  private static FieldBuilder deepCopySchemaField(Schema.Field field) {
+    FieldBuilder fieldBuilder = deepCopySchemaFieldWithoutFieldProps(field);
+    copyFieldProperties(fieldBuilder, field);
+    return fieldBuilder;
+  }
+
+  /**
+   * Merge field schema from two schema object.
+   * The rule is: If a field exist in both new schema and old schema, we should generate the superset schema of these
+   * two versions of the same field, with new schema's information taking higher priority.
+   * For default value, if new schema does not have default value, we will still preserve the old default value.
+   * @param newSchema new schema
+   * @param existingSchema old schema
+   * @return merged schema field
+   */
+  private static List<Schema.Field> mergeFieldSchemas(Schema existingSchema, Schema newSchema) {
     List<Schema.Field> fields = new ArrayList<>();
 
-    for (Schema.Field f1: s1.getFields()) {
-      Schema.Field f2 = s2.getField(f1.name());
+    for (Schema.Field fieldInNewSchema: newSchema.getFields()) {
+      Schema.Field fieldInExistingSchema = existingSchema.getField(fieldInNewSchema.name());
 
-      FieldBuilder fieldBuilder = deepCopySchemaField(f1);
-      if (f2 != null) {
-        fieldBuilder.setSchema(generateSuperSetSchema(f1.schema(), f2.schema()))
-            .setDoc(f1.doc() != null ? f1.doc() : f2.doc());
-        // merge props from f2
-        copyFieldProperties(fieldBuilder, f2);
+      FieldBuilder fieldBuilder = deepCopySchemaField(fieldInNewSchema);
+      if (fieldInExistingSchema != null) {
+        fieldBuilder.setSchema(generateSupersetSchema(fieldInExistingSchema.schema(), fieldInNewSchema.schema()))
+            .setDoc(fieldInNewSchema.doc() != null ? fieldInNewSchema.doc() : fieldInExistingSchema.doc());
+        if (!fieldInNewSchema.hasDefaultValue() && fieldInExistingSchema.hasDefaultValue()) {
+          fieldBuilder.setDefault(normalizeFieldDefault(getFieldDefault(fieldInExistingSchema)));
+        }
       }
-      fields.add(fieldBuilder.build());
+      Schema.Field generatedField = fieldBuilder.build();
+      fields.add(generatedField);
     }
 
-    for (Schema.Field f2: s2.getFields()) {
-      if (s1.getField(f2.name()) == null) {
-        fields.add(deepCopySchemaField(f2).build());
+    for (Schema.Field fieldInExistingSchema: existingSchema.getFields()) {
+      if (newSchema.getField(fieldInExistingSchema.name()) == null) {
+        fields.add(deepCopySchemaField(fieldInExistingSchema).build());
       }
     }
     return fields;
@@ -192,6 +361,10 @@ public class AvroSupersetSchemaUtils {
     return updateSchema;
   }
 
+  /**
+   * * Validate if the Subset Value Schema is a subset of the Superset Value Schema, here the field props are not used to
+   * check if the field is same or not.
+   */
   public static boolean validateSubsetValueSchema(Schema subsetValueSchema, String supersetSchemaStr) {
     Schema supersetSchema = AvroSchemaParseUtils.parseSchemaFromJSONLooseValidation(supersetSchemaStr);
     for (Schema.Field field: subsetValueSchema.getFields()) {
@@ -199,11 +372,98 @@ public class AvroSupersetSchemaUtils {
       if (fieldInSupersetSchema == null) {
         return false;
       }
-      if (!field.equals(fieldInSupersetSchema)) {
+      Schema.Field subsetValueSchemaWithoutFieldProps = deepCopySchemaFieldWithoutFieldProps(field).build();
+      Schema.Field fieldInSupersetSchemaWithoutFieldProps =
+          deepCopySchemaFieldWithoutFieldProps(fieldInSupersetSchema).build();
+      if (!subsetValueSchemaWithoutFieldProps.equals(fieldInSupersetSchemaWithoutFieldProps)) {
         return false;
       }
     }
     return true;
   }
 
+  /**
+   * Relaxed variant of {@link #validateSubsetValueSchema} used to decide whether the input (superset) value schema can
+   * be projected down to {@param writerValueSchema}. On top of the strict subset rule, and recursively at every nesting
+   * level (records, array elements, map values), this tolerates the two artifacts of OpenHouse (OH) schema evolution:
+   * <ul>
+   *   <li>nullable wrapping on the input side -- an input field typed {@code [null, X]} (a null-first 2-branch union,
+   *   the shape OH produces so a field can default to null) matches a non-union writer field typed {@code X}; and</li>
+   *   <li>extra fields present in an input record but absent from the corresponding writer record (OH never removes
+   *   columns, so the superset accumulates them at every level).</li>
+   * </ul>
+   * The guardrails of the strict check still hold recursively: a writer field missing from the input, a type mismatch,
+   * reverse nullability drift ({@code [null, X]} writer vs {@code X} input), and null-last/complex unions all fail.
+   */
+  public static boolean validateSubsetValueSchemaForProjection(Schema writerValueSchema, String inputSchemaStr) {
+    Schema inputSchema = AvroSchemaParseUtils.parseSchemaFromJSONLooseValidation(inputSchemaStr);
+    return isProjectionSubset(writerValueSchema, inputSchema);
+  }
+
+  private static boolean isProjectionSubset(Schema writerSchema, Schema inputSchema) {
+    // Normalize single-element unions [X] to X (semantically equivalent) so they project like the bare type.
+    writerSchema = unwrapSingleElementUnion(writerSchema);
+    inputSchema = unwrapSingleElementUnion(inputSchema);
+    rejectComplexUnion(writerSchema);
+    rejectComplexUnion(inputSchema);
+    // A nullable-union writer [null, X] requires a nullable-union input [null, X']; unwrap both to the non-null branch.
+    if (AvroSchemaUtils.isNullableUnionPair(writerSchema)
+        && writerSchema.getTypes().get(0).getType() == Schema.Type.NULL) {
+      return AvroSchemaUtils.isNullableUnionPair(inputSchema)
+          && inputSchema.getTypes().get(0).getType() == Schema.Type.NULL
+          && isProjectionSubset(writerSchema.getTypes().get(1), inputSchema.getTypes().get(1));
+    }
+    // Unwrap nullable wrapping on the input side only: an input null-first [null, X] against a non-union writer matches
+    // writer vs X. Null-last ([X, null]) is not OH-produced, so it is left to fail the type check below.
+    if (writerSchema.getType() != Schema.Type.UNION && AvroSchemaUtils.isNullableUnionPair(inputSchema)
+        && inputSchema.getTypes().get(0).getType() == Schema.Type.NULL) {
+      return isProjectionSubset(writerSchema, inputSchema.getTypes().get(1));
+    }
+    if (writerSchema.getType() != inputSchema.getType()) {
+      return false;
+    }
+    switch (writerSchema.getType()) {
+      case RECORD:
+        for (Schema.Field writerField: writerSchema.getFields()) {
+          Schema.Field inputField = inputSchema.getField(writerField.name());
+          // A writer field absent from the input means the writer is not a (projection) subset of the input. Extra
+          // input fields (absent from the writer) are tolerated -- they are simply never iterated here.
+          if (inputField == null) {
+            return false;
+          }
+          if (!isProjectionSubset(writerField.schema(), inputField.schema())) {
+            return false;
+          }
+        }
+        return true;
+      case ARRAY:
+        return isProjectionSubset(writerSchema.getElementType(), inputSchema.getElementType());
+      case MAP:
+        return isProjectionSubset(writerSchema.getValueType(), inputSchema.getValueType());
+      default:
+        // Primitives, enums, and fixed must match exactly.
+        return writerSchema.equals(inputSchema);
+    }
+  }
+
+  /**
+   * Complex unions (more than one non-null branch, e.g. {@code [X, Y]} or {@code [null, X, Y]}) are not supported for
+   * value schema projection. Only nullable wrapping ({@code [null, X]}) is allowed. Throws if {@param schema} is a
+   * complex union.
+   */
+  private static void rejectComplexUnion(Schema schema) {
+    if (schema.getType() != Schema.Type.UNION) {
+      return;
+    }
+    int nonNullBranchCount = 0;
+    for (Schema branch: schema.getTypes()) {
+      if (branch.getType() != Schema.Type.NULL) {
+        nonNullBranchCount++;
+      }
+    }
+    if (nonNullBranchCount > 1) {
+      throw new VeniceException(
+          "Complex unions (more than one non-null branch) are not supported for value schema projection: " + schema);
+    }
+  }
 }

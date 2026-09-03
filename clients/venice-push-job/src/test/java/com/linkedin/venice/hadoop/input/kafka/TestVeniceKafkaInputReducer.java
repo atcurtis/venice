@@ -1,18 +1,18 @@
 package com.linkedin.venice.hadoop.input.kafka;
 
-import static com.linkedin.venice.ConfigKeys.KAFKA_BOOTSTRAP_SERVERS;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.COMPRESSION_STRATEGY;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.KAFKA_INPUT_BROKER_URL;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.KAFKA_INPUT_SOURCE_COMPRESSION_STRATEGY;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.KAFKA_INPUT_TOPIC;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.REPUSH_TTL_ENABLE;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.REPUSH_TTL_POLICY;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.REPUSH_TTL_START_TIMESTAMP;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.RMD_SCHEMA_DIR;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.TOPIC_PROP;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.VALUE_SCHEMA_DIR;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.VALUE_SCHEMA_ID_PROP;
 import static com.linkedin.venice.hadoop.mapreduce.datawriter.reduce.VeniceReducer.MAP_REDUCE_JOB_ID_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.COMPRESSION_STRATEGY;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.KAFKA_INPUT_SOURCE_COMPRESSION_STRATEGY;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.KAFKA_INPUT_TOPIC;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.REPUSH_TTL_ENABLE;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.REPUSH_TTL_POLICY;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.REPUSH_TTL_START_TIMESTAMP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.RMD_SCHEMA_DIR;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.TOPIC_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VALUE_SCHEMA_DIR;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VALUE_SCHEMA_ID_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_PUSH_DESTINATION_PUBSUB_BROKER;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_REPUSH_SOURCE_PUBSUB_BROKER;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
@@ -79,7 +79,8 @@ public class TestVeniceKafkaInputReducer {
     /**
      * Construct a list of values, which contain only 'PUT'.
      */
-    List<byte[]> values = getValues(
+    List<AbstractPartitionWriter.VeniceRecordWithMetadata> values = getValues(
+        keyBytes,
         Arrays.asList(MapperValueType.PUT, MapperValueType.PUT, MapperValueType.PUT),
         valueContainsRmdPayload);
 
@@ -97,6 +98,7 @@ public class TestVeniceKafkaInputReducer {
      * Construct a list of values, which contains both 'PUT' and 'DELETE', but 'DELETE' is the last one.
      */
     values = getValues(
+        keyBytes,
         Arrays.asList(MapperValueType.PUT, MapperValueType.PUT, MapperValueType.DELETE),
         valueContainsRmdPayload);
 
@@ -115,6 +117,7 @@ public class TestVeniceKafkaInputReducer {
      * Construct a list of values, which contains both 'PUT' and 'DELETE', but 'DELETE' is in the middle.
      */
     values = getValues(
+        keyBytes,
         Arrays.asList(MapperValueType.PUT, MapperValueType.DELETE, MapperValueType.PUT),
         valueContainsRmdPayload);
 
@@ -151,7 +154,8 @@ public class TestVeniceKafkaInputReducer {
     /**
      * Construct a list of values, which contain only 'PUT'.
      */
-    List<byte[]> values = getValues(Arrays.asList(MapperValueType.PUT, MapperValueType.PUT, MapperValueType.PUT), true);
+    List<AbstractPartitionWriter.VeniceRecordWithMetadata> values =
+        getValues(keyBytes, Arrays.asList(MapperValueType.PUT, MapperValueType.PUT, MapperValueType.PUT), true);
 
     AbstractPartitionWriter.VeniceWriterMessage message = reducer.extract(
         serializedMapperKey,
@@ -167,8 +171,11 @@ public class TestVeniceKafkaInputReducer {
     }
   }
 
-  public List<byte[]> getValues(List<MapperValueType> valueTypes, boolean hasRmdPayload) {
-    List<byte[]> values = new ArrayList<>();
+  public List<AbstractPartitionWriter.VeniceRecordWithMetadata> getValues(
+      byte[] keyBytes,
+      List<MapperValueType> valueTypes,
+      boolean hasRmdPayload) {
+    List<AbstractPartitionWriter.VeniceRecordWithMetadata> values = new ArrayList<>();
     long offset = 0;
     for (MapperValueType valueType: valueTypes) {
       KafkaInputMapperValue value = new KafkaInputMapperValue();
@@ -184,7 +191,10 @@ public class TestVeniceKafkaInputReducer {
         value.value = ByteBuffer.wrap((VALUE_PREFIX + value.offset).getBytes());
       }
       byte[] serializedValue = KAFKA_INPUT_MAPPER_VALUE_SERIALIZER.serialize(value);
-      values.add(serializedValue);
+      values.add(
+          new AbstractPartitionWriter.VeniceRecordWithMetadata(
+              serializedValue,
+              value.replicationMetadataPayload.array()));
     }
     Collections.reverse(values);
     return values;
@@ -201,9 +211,9 @@ public class TestVeniceKafkaInputReducer {
     props.put(REPUSH_TTL_START_TIMESTAMP, 10000000L - 10L * Time.MS_PER_SECOND);
     props.put(RMD_SCHEMA_DIR, "tmp");
     props.put(VALUE_SCHEMA_DIR, "tmp2");
-    props.put(KAFKA_BOOTSTRAP_SERVERS, "localhost:8090"); // Destination Kafka cluster
+    props.put(VENICE_PUSH_DESTINATION_PUBSUB_BROKER, "localhost:8090"); /* Destination Kafka cluster */
     props.put(TOPIC_PROP, "test_store_v2"); // Destination topic
-    props.put(KAFKA_INPUT_BROKER_URL, "localhost:9092"); // Source Kafka cluster
+    props.put(VENICE_REPUSH_SOURCE_PUBSUB_BROKER, "localhost:9092"); /* Source Kafka cluster */
     props.put(KAFKA_INPUT_TOPIC, "test_store_v1"); // Source topic
     return new VeniceProperties(props);
   }

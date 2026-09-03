@@ -11,6 +11,7 @@ import com.linkedin.davinci.config.VeniceStoreVersionConfig;
 import com.linkedin.davinci.stats.AggVersionedStorageEngineStats;
 import com.linkedin.davinci.storage.StorageService;
 import com.linkedin.davinci.store.AbstractStorageEngineTest;
+import com.linkedin.davinci.store.StorageEngineAccessor;
 import com.linkedin.davinci.store.StoragePartitionConfig;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.kafka.validation.checksum.CheckSum;
@@ -47,7 +48,7 @@ import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
 
-public class ReplicationMetadataRocksDBStoragePartitionTest extends AbstractStorageEngineTest {
+public class ReplicationMetadataRocksDBStoragePartitionTest extends AbstractStorageEngineTest<RocksDBStorageEngine> {
   private static final int PARTITION_ID = 0;
 
   private static final String storeName = Version.composeKafkaTopic(Utils.getUniqueString("rocksdb_store_test"), 1);
@@ -123,7 +124,8 @@ public class ReplicationMetadataRocksDBStoragePartitionTest extends AbstractStor
         AvroProtocolDefinition.PARTITION_STATE.getSerializer(),
         mockReadOnlyStoreRepository);
     storeConfig = new VeniceStoreVersionConfig(topicName, serverProps, PersistenceType.ROCKS_DB);
-    testStoreEngine = storageService.openStoreForNewPartition(storeConfig, PARTITION_ID, () -> null);
+    testStoreEngine = StorageEngineAccessor
+        .getInnerStorageEngine(storageService.openStoreForNewPartition(storeConfig, PARTITION_ID, () -> null));
     createStoreForTest();
     String stringSchema = "\"string\"";
     Schema aaSchema = RmdSchemaGenerator.generateMetadataSchema(stringSchema, 1);
@@ -172,15 +174,13 @@ public class ReplicationMetadataRocksDBStoragePartitionTest extends AbstractStor
     RocksDBServerConfig rocksDBServerConfig = new RocksDBServerConfig(veniceServerProperties);
     VeniceServerConfig serverConfig = new VeniceServerConfig(veniceServerProperties);
     RocksDBStorageEngineFactory factory = new RocksDBStorageEngineFactory(serverConfig);
-    VeniceStoreVersionConfig storeConfig = new VeniceStoreVersionConfig(storeName, veniceServerProperties);
     ReplicationMetadataRocksDBStoragePartition storagePartition = new ReplicationMetadataRocksDBStoragePartition(
         partitionConfig,
         factory,
         DATA_BASE_DIR,
         null,
         ROCKSDB_THROTTLER,
-        rocksDBServerConfig,
-        storeConfig);
+        rocksDBServerConfig);
 
     Map<String, Pair<String, String>> inputRecords = generateInputWithMetadata(100);
     for (Map.Entry<String, Pair<String, String>> entry: inputRecords.entrySet()) {
@@ -202,7 +202,7 @@ public class ReplicationMetadataRocksDBStoragePartitionTest extends AbstractStor
       byte[] key = entry.getKey().getBytes();
       byte[] value = storagePartition.get(key);
       Assert.assertEquals(value, entry.getValue().getFirst().getBytes());
-      byte[] metadata = storagePartition.getReplicationMetadata(key);
+      byte[] metadata = storagePartition.getReplicationMetadata(ByteBuffer.wrap(key));
       ByteBuffer replicationMetadataWithValueSchema = ByteBuffer.wrap(metadata);
       int replicationMetadataWithValueSchemaInt = replicationMetadataWithValueSchema.getInt();
 
@@ -222,7 +222,7 @@ public class ReplicationMetadataRocksDBStoragePartitionTest extends AbstractStor
       byte[] value = storagePartition.get(key);
       Assert.assertNull(value);
 
-      byte[] metadata = storagePartition.getReplicationMetadata(key);
+      byte[] metadata = storagePartition.getReplicationMetadata(ByteBuffer.wrap(key));
       ByteBuffer replicationMetadataWithValueSchema = ByteBuffer.wrap(metadata);
       int replicationMetadataWithValueSchemaInt = replicationMetadataWithValueSchema.getInt();
 
@@ -248,7 +248,7 @@ public class ReplicationMetadataRocksDBStoragePartitionTest extends AbstractStor
       byte[] key = entry.getKey().getBytes();
       byte[] value = storagePartition.get(key);
       Assert.assertEquals(value, entry.getValue().getFirst().getBytes());
-      Assert.assertNull(storagePartition.getReplicationMetadata(key));
+      Assert.assertNull(storagePartition.getReplicationMetadata(ByteBuffer.wrap(key)));
     }
 
     for (Map.Entry<String, Pair<String, String>> entry: inputRecordsBatch.entrySet()) {
@@ -263,7 +263,7 @@ public class ReplicationMetadataRocksDBStoragePartitionTest extends AbstractStor
       byte[] value = storagePartition.get(key);
       Assert.assertNull(value);
 
-      byte[] metadata = storagePartition.getReplicationMetadata(key);
+      byte[] metadata = storagePartition.getReplicationMetadata(ByteBuffer.wrap(key));
       ByteBuffer replicationMetadataWithValueSchema = ByteBuffer.wrap(metadata);
       int replicationMetadataWithValueSchemaInt = replicationMetadataWithValueSchema.getInt();
 
@@ -305,15 +305,13 @@ public class ReplicationMetadataRocksDBStoragePartitionTest extends AbstractStor
 
     VeniceServerConfig serverConfig = new VeniceServerConfig(veniceServerProperties);
     RocksDBStorageEngineFactory factory = new RocksDBStorageEngineFactory(serverConfig);
-    VeniceStoreVersionConfig storeConfig = new VeniceStoreVersionConfig(storeName, veniceServerProperties);
     ReplicationMetadataRocksDBStoragePartition storagePartition = new ReplicationMetadataRocksDBStoragePartition(
         partitionConfig,
         factory,
         DATA_BASE_DIR,
         null,
         ROCKSDB_THROTTLER,
-        rocksDBServerConfig,
-        storeConfig);
+        rocksDBServerConfig);
 
     final int syncPerRecords = 100;
     final int interruptedRecord = 345;
@@ -371,8 +369,7 @@ public class ReplicationMetadataRocksDBStoragePartitionTest extends AbstractStor
                 DATA_BASE_DIR,
                 null,
                 ROCKSDB_THROTTLER,
-                rocksDBServerConfig,
-                storeConfig);
+                rocksDBServerConfig);
             Options storeOptions = storagePartition.getOptions();
             Assert.assertEquals(storeOptions.level0FileNumCompactionTrigger(), 100);
           }
@@ -426,7 +423,7 @@ public class ReplicationMetadataRocksDBStoragePartitionTest extends AbstractStor
       Assert.assertEquals(storagePartition.get(entry.getKey().getBytes()), bytes);
       if (sorted) {
         Assert.assertEquals(
-            storagePartition.getReplicationMetadata(entry.getKey().getBytes()),
+            storagePartition.getReplicationMetadata(ByteBuffer.wrap(entry.getKey().getBytes())),
             entry.getValue().getSecond().getBytes());
       }
     }
@@ -444,8 +441,7 @@ public class ReplicationMetadataRocksDBStoragePartitionTest extends AbstractStor
         DATA_BASE_DIR,
         null,
         ROCKSDB_THROTTLER,
-        rocksDBServerConfig,
-        storeConfig);
+        rocksDBServerConfig);
     // Test deletion
     String toBeDeletedKey = KEY_PREFIX + 10;
     Assert.assertNotNull(storagePartition.get(toBeDeletedKey.getBytes()));
@@ -456,6 +452,48 @@ public class ReplicationMetadataRocksDBStoragePartitionTest extends AbstractStor
     Assert.assertEquals(storeOptions.level0FileNumCompactionTrigger(), 40);
     storagePartition.drop();
     options.close();
+    removeDir(storeDir);
+  }
+
+  /**
+   * Verifies that all RMD-specific methods throw VeniceException after close, not SIGSEGV.
+   * Complements {@code RocksDBStoragePartitionTest.testAllMethodsThrowAfterClose} which covers
+   * the base class methods.
+   */
+  @Test
+  public void testRmdMethodsThrowAfterClose() {
+    String storeName = Version.composeKafkaTopic(Utils.getUniqueString("test_rmd_lifecycle"), 1);
+    String storeDir = getTempDatabaseDir(storeName);
+    StoragePartitionConfig partitionConfig = new StoragePartitionConfig(storeName, 0);
+    VeniceProperties veniceServerProperties = AbstractStorageEngineTest.getServerProperties(PersistenceType.ROCKS_DB);
+    RocksDBServerConfig rocksDBServerConfig = new RocksDBServerConfig(veniceServerProperties);
+    VeniceServerConfig serverConfig = new VeniceServerConfig(veniceServerProperties);
+    RocksDBStorageEngineFactory factory = new RocksDBStorageEngineFactory(serverConfig);
+    ReplicationMetadataRocksDBStoragePartition partition = new ReplicationMetadataRocksDBStoragePartition(
+        partitionConfig,
+        factory,
+        DATA_BASE_DIR,
+        null,
+        ROCKSDB_THROTTLER,
+        rocksDBServerConfig);
+
+    // Write some data so the partition is non-empty
+    partition.putWithReplicationMetadata("key1".getBytes(), "val1".getBytes(), "rmd1".getBytes());
+    partition.putReplicationMetadata("key2".getBytes(), "rmd2".getBytes());
+    partition.close();
+
+    // Every RMD-specific method must throw VeniceException, not crash the JVM
+    Assert.assertThrows(
+        VeniceException.class,
+        () -> partition.putWithReplicationMetadata("k".getBytes(), "v".getBytes(), "m".getBytes()));
+    Assert.assertThrows(VeniceException.class, () -> partition.putReplicationMetadata("k".getBytes(), "m".getBytes()));
+    Assert.assertThrows(
+        VeniceException.class,
+        () -> partition.deleteWithReplicationMetadata("k".getBytes(), "m".getBytes()));
+    Assert.assertThrows(VeniceException.class, () -> partition.getReplicationMetadata(ByteBuffer.wrap("k".getBytes())));
+    Assert.assertThrows(VeniceException.class, partition::getRmdByteUsage);
+
+    partition.drop();
     removeDir(storeDir);
   }
 

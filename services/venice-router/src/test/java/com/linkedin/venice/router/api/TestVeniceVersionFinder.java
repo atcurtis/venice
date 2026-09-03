@@ -5,6 +5,9 @@ import static org.mockito.Mockito.anyInt;
 import static org.mockito.Mockito.anyString;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 
 import com.linkedin.alpini.netty4.misc.BasicFullHttpRequest;
 import com.linkedin.venice.HttpConstants;
@@ -28,11 +31,12 @@ import com.linkedin.venice.meta.VersionImpl;
 import com.linkedin.venice.meta.VersionStatus;
 import com.linkedin.venice.meta.ZKStore;
 import com.linkedin.venice.router.stats.StaleVersionStats;
+import com.linkedin.venice.stats.VeniceMetricsConfig;
+import com.linkedin.venice.stats.VeniceMetricsRepository;
 import com.linkedin.venice.utils.TestUtils;
 import com.linkedin.venice.utils.Utils;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpVersion;
-import io.tehuti.metrics.MetricsRepository;
 import io.tehuti.metrics.Sensor;
 import java.nio.ByteBuffer;
 import java.util.HashMap;
@@ -75,7 +79,7 @@ public class TestVeniceVersionFinder {
         clusterToD2Map,
         CLUSTER,
         compressorFactory,
-        mock(MetricsRepository.class));
+        mock(VeniceMetricsRepository.class));
     try {
       versionFinder.getVersion("", request);
       Assert.fail(
@@ -88,8 +92,9 @@ public class TestVeniceVersionFinder {
   @Test
   public void throws301onMigratedStore() {
     ReadOnlyStoreRepository mockRepo = Mockito.mock(ReadOnlyStoreRepository.class);
+    String storeName = "store";
     Store store = new ZKStore(
-        "store",
+        storeName,
         "owner",
         System.currentTimeMillis(),
         PersistenceType.IN_MEMORY,
@@ -100,6 +105,7 @@ public class TestVeniceVersionFinder {
     store.setMigrating(true);
     int currentVersion = 10;
     store.setCurrentVersion(currentVersion);
+    store.addVersion(new VersionImpl(storeName, currentVersion));
     doReturn(store).when(mockRepo).getStore(anyString());
     StaleVersionStats stats = mock(StaleVersionStats.class);
     HelixReadOnlyStoreConfigRepository storeConfigRepo = mock(HelixReadOnlyStoreConfigRepository.class);
@@ -107,15 +113,19 @@ public class TestVeniceVersionFinder {
     storeConfig.setCluster(DEST_CLUSTER);
     doReturn(Optional.of(storeConfig)).when(storeConfigRepo).getStoreConfig("store");
     CompressorFactory compressorFactory = mock(CompressorFactory.class);
-    VeniceVersionFinder versionFinder = new VeniceVersionFinder(
-        mockRepo,
-        getCVBasedMockedRoutingRepo(),
-        stats,
-        storeConfigRepo,
-        clusterToD2Map,
-        CLUSTER,
-        compressorFactory,
-        mock(MetricsRepository.class));
+    VeniceVersionFinder versionFinder = spy(
+        new VeniceVersionFinder(
+            mockRepo,
+            getCVBasedMockedRoutingRepo(),
+            stats,
+            storeConfigRepo,
+            clusterToD2Map,
+            CLUSTER,
+            compressorFactory,
+            mock(VeniceMetricsRepository.class)));
+    String kafkaTopicName = Version.composeKafkaTopic(storeName, currentVersion);
+    doReturn(true).when(versionFinder).isPartitionResourcesReady(kafkaTopicName);
+    doReturn(true).when(versionFinder).isDecompressorReady(store.getVersion(currentVersion), kafkaTopicName);
     try {
       request.headers().add(HttpConstants.VENICE_ALLOW_REDIRECT, "1");
       versionFinder.getVersion("store", request);
@@ -136,21 +146,27 @@ public class TestVeniceVersionFinder {
     int currentVersion = 10;
     Store store = TestUtils.createTestStore(storeName, "unittest", System.currentTimeMillis());
     store.setCurrentVersion(currentVersion);
+    store.addVersion(new VersionImpl(storeName, currentVersion));
     // disable store, should return the number indicates that none of version is avaiable to read.
     store.setEnableReads(false);
     doReturn(store).when(mockRepo).getStore(storeName);
     StaleVersionStats stats = mock(StaleVersionStats.class);
     HelixReadOnlyStoreConfigRepository storeConfigRepo = mock(HelixReadOnlyStoreConfigRepository.class);
     CompressorFactory compressorFactory = mock(CompressorFactory.class);
-    VeniceVersionFinder versionFinder = new VeniceVersionFinder(
-        mockRepo,
-        getCVBasedMockedRoutingRepo(),
-        stats,
-        storeConfigRepo,
-        clusterToD2Map,
-        CLUSTER,
-        compressorFactory,
-        mock(MetricsRepository.class));
+    VeniceVersionFinder versionFinder = spy(
+        new VeniceVersionFinder(
+            mockRepo,
+            getCVBasedMockedRoutingRepo(),
+            stats,
+            storeConfigRepo,
+            clusterToD2Map,
+            CLUSTER,
+            compressorFactory,
+            mock(VeniceMetricsRepository.class)));
+    String kafkaTopicName = Version.composeKafkaTopic(storeName, currentVersion);
+    doReturn(true).when(versionFinder).isPartitionResourcesReady(kafkaTopicName);
+    doReturn(true).when(versionFinder).isDecompressorReady(store.getVersion(currentVersion), kafkaTopicName);
+
     try {
       versionFinder.getVersion(storeName, request);
       Assert.fail("Store should be disabled and forbidden to read.");
@@ -190,9 +206,12 @@ public class TestVeniceVersionFinder {
     HelixReadOnlyStoreConfigRepository storeConfigRepo = mock(HelixReadOnlyStoreConfigRepository.class);
 
     CompressorFactory compressorFactory = mock(CompressorFactory.class);
-    MetricsRepository mockMetricsRepository = mock(MetricsRepository.class);
+    VeniceMetricsRepository mockMetricsRepository = mock(VeniceMetricsRepository.class);
     final Sensor mockSensor = mock(Sensor.class);
     doReturn(mockSensor).when(mockMetricsRepository).sensor(anyString(), any());
+    VeniceMetricsConfig mocksMetricsConfig = mock(VeniceMetricsConfig.class);
+    doReturn(mocksMetricsConfig).when(mockMetricsRepository).getVeniceMetricsConfig();
+    doReturn(true).when(mocksMetricsConfig).emitTehutiMetrics();
 
     // Object under test
     VeniceVersionFinder versionFinder = new VeniceVersionFinder(
@@ -205,27 +224,28 @@ public class TestVeniceVersionFinder {
         compressorFactory,
         mockMetricsRepository);
 
-    // for a new store, the versionFinder returns the current version, no matter the online replicas
-    Assert.assertEquals(versionFinder.getVersion(storeName, request), firstVersion);
+    // for a new store, the versionFinder returns no version
+    Assert.assertEquals(versionFinder.getVersion(storeName, request), Store.NON_EXISTING_VERSION);
 
-    // When the current version changes, without any online replicas the versionFinder returns the old version number
+    // When the current version changes, without any online replicas for either version,
+    // the versionFinder returns NON_EXISTING_VERSION (existing version's resources aren't ready either)
     store.addVersion(new VersionImpl(storeName, secondVersion));
     store.updateVersionStatus(secondVersion, VersionStatus.ONLINE);
     store.setCurrentVersion(secondVersion);
-    Assert.assertEquals(versionFinder.getVersion(storeName, request), firstVersion);
+    Assert.assertEquals(versionFinder.getVersion(storeName, request), Store.NON_EXISTING_VERSION);
 
-    // When we retire an old version, we update to the new version anyways
+    // When we retire an old version, still no online replicas -> NON_EXISTING_VERSION
     store.addVersion(new VersionImpl(storeName, thirdVersion));
     store.updateVersionStatus(thirdVersion, VersionStatus.ONLINE);
     store.setCurrentVersion(thirdVersion);
     store.updateVersionStatus(1, VersionStatus.NOT_CREATED);
-    Assert.assertEquals(versionFinder.getVersion(storeName, request), thirdVersion);
+    Assert.assertEquals(versionFinder.getVersion(storeName, request), Store.NON_EXISTING_VERSION);
 
-    // Next new version with no online instances still serves old ONLINE version
+    // Next new version with no online instances -> still NON_EXISTING_VERSION
     store.addVersion(new VersionImpl(storeName, fourthVersion));
     store.updateVersionStatus(fourthVersion, VersionStatus.ONLINE);
     store.setCurrentVersion(fourthVersion);
-    Assert.assertEquals(versionFinder.getVersion(storeName, request), thirdVersion);
+    Assert.assertEquals(versionFinder.getVersion(storeName, request), Store.NON_EXISTING_VERSION);
 
     // Once we have online replicas, the versionFinder reflects the new version
     instances.add(new Instance("id1", "host", 1234));
@@ -269,17 +289,19 @@ public class TestVeniceVersionFinder {
           Version.composeKafkaTopic(storeName, firstVersion),
           firstVersionDictionary.array());
       // Object under test
-      VeniceVersionFinder versionFinder = new VeniceVersionFinder(
-          storeRepository,
-          routingDataRepo,
-          stats,
-          storeConfigRepo,
-          clusterToD2Map,
-          CLUSTER,
-          compressorFactory,
-          mock(MetricsRepository.class));
+      VeniceVersionFinder versionFinder = spy(
+          new VeniceVersionFinder(
+              storeRepository,
+              routingDataRepo,
+              stats,
+              storeConfigRepo,
+              clusterToD2Map,
+              CLUSTER,
+              compressorFactory,
+              mock(VeniceMetricsRepository.class)));
 
       String firstVersionKafkaTopic = Version.composeKafkaTopic(storeName, firstVersion);
+      doReturn(true).when(versionFinder).isPartitionResourcesReady(firstVersionKafkaTopic);
 
       Assert.assertEquals(versionFinder.getVersion(storeName, request), firstVersion);
       Assert.assertNotNull(compressorFactory.getVersionSpecificCompressor(firstVersionKafkaTopic));
@@ -287,11 +309,9 @@ public class TestVeniceVersionFinder {
   }
 
   @Test
-  public void returnsCurrentVersionWhenItIsTheOnlyOption() {
-    // When the router doesn't know of any other versions, it will return that version even if dictionary is not
-    // downloaded.
-    // If the dictionary is not downloaded by the time the records needs to be decompressed, then the router will return
-    // an error response.
+  public void returnsNoVersionWhenNewStoreNewVersionNotReadyToServe() {
+    // When the router doesn't know of any other versions and the dictionary of the existing version is not downloaded,
+    // it will return no version.
     ReadOnlyStoreRepository storeRepository = mock(ReadOnlyStoreRepository.class);
     String storeName = Utils.getUniqueString("version-finder-test-store");
     int firstVersion = 1;
@@ -318,20 +338,25 @@ public class TestVeniceVersionFinder {
     CompressorFactory compressorFactory = mock(CompressorFactory.class);
 
     // Object under test
-    VeniceVersionFinder versionFinder = new VeniceVersionFinder(
-        storeRepository,
-        routingDataRepo,
-        stats,
-        storeConfigRepo,
-        clusterToD2Map,
-        CLUSTER,
-        compressorFactory,
-        mock(MetricsRepository.class));
+    VeniceVersionFinder versionFinder = spy(
+        new VeniceVersionFinder(
+            storeRepository,
+            routingDataRepo,
+            stats,
+            storeConfigRepo,
+            clusterToD2Map,
+            CLUSTER,
+            compressorFactory,
+            mock(VeniceMetricsRepository.class)));
 
     String firstVersionKafkaTopic = Version.composeKafkaTopic(storeName, firstVersion);
+    doReturn(true).when(versionFinder).isPartitionResourcesReady(firstVersionKafkaTopic);
 
-    Assert.assertEquals(versionFinder.getVersion(storeName, request), firstVersion);
+    Assert.assertEquals(versionFinder.getVersion(storeName, request), Store.NON_EXISTING_VERSION);
     Assert.assertNull(compressorFactory.getVersionSpecificCompressor(firstVersionKafkaTopic));
+
+    doReturn(true).when(compressorFactory).versionSpecificCompressorExists(firstVersionKafkaTopic);
+    Assert.assertEquals(versionFinder.getVersion(storeName, request), firstVersion);
   }
 
   @Test
@@ -346,6 +371,8 @@ public class TestVeniceVersionFinder {
     store.addVersion(new VersionImpl(storeName, firstVersion));
     store.setCurrentVersion(firstVersion);
     store.updateVersionStatus(firstVersion, VersionStatus.ONLINE);
+    // note: first version's compression strategy is NO_OP by default
+    // -> VeniceVersionFinder::isDecompressorReady() for first version will return true
 
     doReturn(store).when(storeRepository).getStore(storeName);
 
@@ -361,7 +388,7 @@ public class TestVeniceVersionFinder {
     doReturn(true).when(routingDataRepo).containsKafkaTopic(anyString());
 
     CompressorFactory compressorFactory = mock(CompressorFactory.class);
-    MetricsRepository mockMetricsRepository = mock(MetricsRepository.class);
+    VeniceMetricsRepository mockMetricsRepository = mock(VeniceMetricsRepository.class);
     final Sensor mockSensor = mock(Sensor.class);
     doReturn(mockSensor).when(mockMetricsRepository).sensor(anyString(), any());
 
@@ -419,9 +446,12 @@ public class TestVeniceVersionFinder {
     doReturn(3).when(routingDataRepo).getNumberOfPartitions(anyString());
     doReturn(instances).when(routingDataRepo).getReadyToServeInstances(anyString(), anyInt());
     doReturn(true).when(routingDataRepo).containsKafkaTopic(anyString());
-    MetricsRepository mockMetricsRepository = mock(MetricsRepository.class);
+    VeniceMetricsRepository mockMetricsRepository = mock(VeniceMetricsRepository.class);
     final Sensor mockSensor = mock(Sensor.class);
     doReturn(mockSensor).when(mockMetricsRepository).sensor(anyString(), any());
+    VeniceMetricsConfig mocksMetricsConfig = mock(VeniceMetricsConfig.class);
+    doReturn(mocksMetricsConfig).when(mockMetricsRepository).getVeniceMetricsConfig();
+    doReturn(true).when(mocksMetricsConfig).emitTehutiMetrics();
 
     try (CompressorFactory compressorFactory = new CompressorFactory()) {
       // Object under test
@@ -457,6 +487,250 @@ public class TestVeniceVersionFinder {
     }
   }
 
+  /** Since refreshOneStore() is an expensive operation, this test ensures that refreshOneStore() is only called once per store when getVersion() is called on the same store */
+  @Test
+  public void testRefreshOneStoreCalledOnce() {
+    String storeName = Utils.getUniqueString("version-finder-test-store");
+    int firstVersion = 1;
+    Store store = TestUtils.createTestStore(storeName, "unittest", System.currentTimeMillis());
+    store.setCurrentVersion(Store.NON_EXISTING_VERSION);
+
+    ReadOnlyStoreRepository storeRepository = mock(ReadOnlyStoreRepository.class);
+    HelixCustomizedViewOfflinePushRepository routingDataRepo = mock(HelixCustomizedViewOfflinePushRepository.class);
+    StaleVersionStats stats = mock(StaleVersionStats.class);
+    HelixReadOnlyStoreConfigRepository storeConfigRepo = mock(HelixReadOnlyStoreConfigRepository.class);
+    CompressorFactory compressorFactory = mock(CompressorFactory.class);
+    VeniceMetricsRepository mockMetricsRepository = mock(VeniceMetricsRepository.class);
+    final Sensor mockSensor = mock(Sensor.class);
+    doReturn(mockSensor).when(mockMetricsRepository).sensor(anyString(), any());
+    VeniceMetricsConfig mocksMetricsConfig = mock(VeniceMetricsConfig.class);
+    doReturn(mocksMetricsConfig).when(mockMetricsRepository).getVeniceMetricsConfig();
+    doReturn(true).when(mocksMetricsConfig).emitTehutiMetrics();
+
+    VeniceVersionFinder versionFinder = spy(
+        new VeniceVersionFinder(
+            storeRepository,
+            routingDataRepo,
+            stats,
+            storeConfigRepo,
+            clusterToD2Map,
+            CLUSTER,
+            compressorFactory,
+            mockMetricsRepository));
+
+    doReturn(store).when(storeRepository).getStore(storeName);
+    doReturn(store).when(storeRepository).refreshOneStore(storeName);
+
+    // Call getVersion() multiple times while version is NON_EXISTING_VERSION
+    Assert.assertEquals(versionFinder.getVersion(storeName, request), Store.NON_EXISTING_VERSION);
+    Assert.assertEquals(versionFinder.getVersion(storeName, request), Store.NON_EXISTING_VERSION);
+
+    // Verify refreshOneStore is called only once
+    verify(storeRepository, times(1)).refreshOneStore(storeName);
+
+    // Update the store's version to 1
+    store.setCurrentVersion(firstVersion);
+    doReturn(true).when(versionFinder).isDecompressorReady(any(), anyString());
+    doReturn(true).when(versionFinder).isPartitionResourcesReady(anyString());
+
+    // Call getVersion() again and verify it returns the updated version
+    Assert.assertEquals(versionFinder.getVersion(storeName, request), firstVersion);
+  }
+
+  @Test
+  public void testReturnsNonExistingVersionWhenExistingVersionRetired() {
+    // Bug 1: When the existing version's Helix resource has been deleted (by a subsequent push retiring it),
+    // the router should return NON_EXISTING_VERSION instead of the retired version.
+    ReadOnlyStoreRepository storeRepository = mock(ReadOnlyStoreRepository.class);
+    String storeName = Utils.getUniqueString("version-finder-test-store");
+    int firstVersion = 1;
+    int secondVersion = 2;
+
+    Store store = TestUtils.createTestStore(storeName, "unittest", System.currentTimeMillis());
+    store.setPartitionCount(3);
+    store.addVersion(new VersionImpl(storeName, firstVersion));
+    store.setCurrentVersion(firstVersion);
+    store.updateVersionStatus(firstVersion, VersionStatus.ONLINE);
+    doReturn(store).when(storeRepository).getStore(storeName);
+
+    List<Instance> instances = new LinkedList<>();
+    instances.add(new Instance("id1", "host", 1234));
+
+    StaleVersionStats stats = mock(StaleVersionStats.class);
+    HelixReadOnlyStoreConfigRepository storeConfigRepo = mock(HelixReadOnlyStoreConfigRepository.class);
+    HelixCustomizedViewOfflinePushRepository routingDataRepo = mock(HelixCustomizedViewOfflinePushRepository.class);
+    doReturn(instances).when(routingDataRepo).getReadyToServeInstances(anyString(), anyInt());
+    doReturn(3).when(routingDataRepo).getNumberOfPartitions(anyString());
+    doReturn(true).when(routingDataRepo).containsKafkaTopic(anyString());
+
+    VeniceMetricsRepository mockMetricsRepository = mock(VeniceMetricsRepository.class);
+    final Sensor mockSensor = mock(Sensor.class);
+    doReturn(mockSensor).when(mockMetricsRepository).sensor(anyString(), any());
+    VeniceMetricsConfig mocksMetricsConfig = mock(VeniceMetricsConfig.class);
+    doReturn(mocksMetricsConfig).when(mockMetricsRepository).getVeniceMetricsConfig();
+    doReturn(true).when(mocksMetricsConfig).emitTehutiMetrics();
+
+    CompressorFactory compressorFactory = mock(CompressorFactory.class);
+    VeniceVersionFinder versionFinder = new VeniceVersionFinder(
+        storeRepository,
+        routingDataRepo,
+        stats,
+        storeConfigRepo,
+        clusterToD2Map,
+        CLUSTER,
+        compressorFactory,
+        mockMetricsRepository);
+
+    // First request: establish v1 as current
+    Assert.assertEquals(versionFinder.getVersion(storeName, request), firstVersion);
+
+    // New version v2 arrives with ZSTD_WITH_DICT but decompressor not ready
+    store.setCompressionStrategy(CompressionStrategy.ZSTD_WITH_DICT);
+    store.addVersion(new VersionImpl(storeName, secondVersion));
+    store.setCurrentVersion(secondVersion);
+    store.updateVersionStatus(secondVersion, VersionStatus.ONLINE);
+
+    // v2 decompressor not ready -> falls back to v1
+    // v1 Helix resources still exist -> should return v1
+    Assert.assertEquals(versionFinder.getVersion(storeName, request), firstVersion);
+
+    // Now simulate v1's Helix resource being deleted (retired by a v3 push)
+    String v1KafkaTopic = Version.composeKafkaTopic(storeName, firstVersion);
+    doReturn(false).when(routingDataRepo).containsKafkaTopic(v1KafkaTopic);
+
+    // v2 decompressor still not ready, AND v1 Helix resource is gone
+    // Should return NON_EXISTING_VERSION instead of the retired v1
+    Assert.assertEquals(versionFinder.getVersion(storeName, request), Store.NON_EXISTING_VERSION);
+  }
+
+  @Test
+  public void testReturnExistingVersionWhenItIsStillHealthy() {
+    // When the existing version's Helix resources are still available, continue serving it
+    ReadOnlyStoreRepository storeRepository = mock(ReadOnlyStoreRepository.class);
+    String storeName = Utils.getUniqueString("version-finder-test-store");
+    int firstVersion = 1;
+    int secondVersion = 2;
+
+    Store store = TestUtils.createTestStore(storeName, "unittest", System.currentTimeMillis());
+    store.setPartitionCount(3);
+    store.addVersion(new VersionImpl(storeName, firstVersion));
+    store.setCurrentVersion(firstVersion);
+    store.updateVersionStatus(firstVersion, VersionStatus.ONLINE);
+    doReturn(store).when(storeRepository).getStore(storeName);
+
+    List<Instance> instances = new LinkedList<>();
+    instances.add(new Instance("id1", "host", 1234));
+
+    StaleVersionStats stats = mock(StaleVersionStats.class);
+    HelixReadOnlyStoreConfigRepository storeConfigRepo = mock(HelixReadOnlyStoreConfigRepository.class);
+    HelixCustomizedViewOfflinePushRepository routingDataRepo = mock(HelixCustomizedViewOfflinePushRepository.class);
+    doReturn(instances).when(routingDataRepo).getReadyToServeInstances(anyString(), anyInt());
+    doReturn(3).when(routingDataRepo).getNumberOfPartitions(anyString());
+    doReturn(true).when(routingDataRepo).containsKafkaTopic(anyString());
+
+    VeniceMetricsRepository mockMetricsRepository = mock(VeniceMetricsRepository.class);
+    final Sensor mockSensor = mock(Sensor.class);
+    doReturn(mockSensor).when(mockMetricsRepository).sensor(anyString(), any());
+    VeniceMetricsConfig mocksMetricsConfig = mock(VeniceMetricsConfig.class);
+    doReturn(mocksMetricsConfig).when(mockMetricsRepository).getVeniceMetricsConfig();
+    doReturn(true).when(mocksMetricsConfig).emitTehutiMetrics();
+
+    CompressorFactory compressorFactory = mock(CompressorFactory.class);
+    VeniceVersionFinder versionFinder = new VeniceVersionFinder(
+        storeRepository,
+        routingDataRepo,
+        stats,
+        storeConfigRepo,
+        clusterToD2Map,
+        CLUSTER,
+        compressorFactory,
+        mockMetricsRepository);
+
+    // Establish v1 as current
+    Assert.assertEquals(versionFinder.getVersion(storeName, request), firstVersion);
+
+    // New version v2 with ZSTD_WITH_DICT, decompressor not ready
+    store.setCompressionStrategy(CompressionStrategy.ZSTD_WITH_DICT);
+    store.addVersion(new VersionImpl(storeName, secondVersion));
+    store.setCurrentVersion(secondVersion);
+    store.updateVersionStatus(secondVersion, VersionStatus.ONLINE);
+
+    // v1 Helix resources still exist -> should return v1 (existing behavior preserved)
+    Assert.assertEquals(versionFinder.getVersion(storeName, request), firstVersion);
+  }
+
+  @Test
+  public void testRecoversAfterReturningNonExistingVersion() {
+    // After returning NON_EXISTING_VERSION for a retired existing version,
+    // the next call should re-evaluate and pick up the new version if it becomes ready.
+    ReadOnlyStoreRepository storeRepository = mock(ReadOnlyStoreRepository.class);
+    String storeName = Utils.getUniqueString("version-finder-test-store");
+    int firstVersion = 1;
+    int secondVersion = 2;
+
+    Store store = TestUtils.createTestStore(storeName, "unittest", System.currentTimeMillis());
+    store.setPartitionCount(3);
+    store.addVersion(new VersionImpl(storeName, firstVersion));
+    store.setCurrentVersion(firstVersion);
+    store.updateVersionStatus(firstVersion, VersionStatus.ONLINE);
+    doReturn(store).when(storeRepository).getStore(storeName);
+
+    List<Instance> instances = new LinkedList<>();
+    instances.add(new Instance("id1", "host", 1234));
+
+    StaleVersionStats stats = mock(StaleVersionStats.class);
+    HelixReadOnlyStoreConfigRepository storeConfigRepo = mock(HelixReadOnlyStoreConfigRepository.class);
+    HelixCustomizedViewOfflinePushRepository routingDataRepo = mock(HelixCustomizedViewOfflinePushRepository.class);
+    doReturn(instances).when(routingDataRepo).getReadyToServeInstances(anyString(), anyInt());
+    doReturn(3).when(routingDataRepo).getNumberOfPartitions(anyString());
+    doReturn(true).when(routingDataRepo).containsKafkaTopic(anyString());
+
+    VeniceMetricsRepository mockMetricsRepository = mock(VeniceMetricsRepository.class);
+    final Sensor mockSensor = mock(Sensor.class);
+    doReturn(mockSensor).when(mockMetricsRepository).sensor(anyString(), any());
+    VeniceMetricsConfig mocksMetricsConfig = mock(VeniceMetricsConfig.class);
+    doReturn(mocksMetricsConfig).when(mockMetricsRepository).getVeniceMetricsConfig();
+    doReturn(true).when(mocksMetricsConfig).emitTehutiMetrics();
+
+    try (CompressorFactory compressorFactory = new CompressorFactory()) {
+      VeniceVersionFinder versionFinder = new VeniceVersionFinder(
+          storeRepository,
+          routingDataRepo,
+          stats,
+          storeConfigRepo,
+          clusterToD2Map,
+          CLUSTER,
+          compressorFactory,
+          mockMetricsRepository);
+
+      // Establish v1
+      Assert.assertEquals(versionFinder.getVersion(storeName, request), firstVersion);
+
+      // Push v2 with ZSTD_WITH_DICT, decompressor not ready yet
+      store.setCompressionStrategy(CompressionStrategy.ZSTD_WITH_DICT);
+      store.addVersion(new VersionImpl(storeName, secondVersion));
+      store.setCurrentVersion(secondVersion);
+      store.updateVersionStatus(secondVersion, VersionStatus.ONLINE);
+
+      // Retire v1 Helix resource
+      String v1KafkaTopic = Version.composeKafkaTopic(storeName, firstVersion);
+      doReturn(false).when(routingDataRepo).containsKafkaTopic(v1KafkaTopic);
+
+      // Should return NON_EXISTING_VERSION
+      Assert.assertEquals(versionFinder.getVersion(storeName, request), Store.NON_EXISTING_VERSION);
+
+      // Now dictionary arrives for v2
+      String v2KafkaTopic = Version.composeKafkaTopic(storeName, secondVersion);
+      compressorFactory.createVersionSpecificCompressorIfNotExist(
+          CompressionStrategy.ZSTD_WITH_DICT,
+          v2KafkaTopic,
+          ByteBuffer.allocate(1).array());
+
+      // Next call should pick up v2 since lastCurrentVersionMap was reset to NON_EXISTING_VERSION
+      Assert.assertEquals(versionFinder.getVersion(storeName, request), secondVersion);
+    }
+  }
+
   public static HelixCustomizedViewOfflinePushRepository getCVBasedMockedRoutingRepo() {
     List<Instance> instances = new LinkedList<>();
     instances.add(new Instance("id1", "host", 1234));
@@ -467,5 +741,4 @@ public class TestVeniceVersionFinder {
 
     return routingData;
   }
-
 }

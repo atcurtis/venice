@@ -1,7 +1,8 @@
 package com.linkedin.davinci.consumer;
 
-import com.linkedin.venice.pubsub.adapter.kafka.ApacheKafkaOffsetPosition;
+import com.linkedin.venice.kafka.protocol.ControlMessage;
 import com.linkedin.venice.pubsub.api.PubSubMessage;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
 import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
 import java.util.Objects;
 
@@ -10,29 +11,120 @@ public class ImmutableChangeCapturePubSubMessage<K, V> implements PubSubMessage<
   private final K key;
   private final V value;
   private final PubSubTopicPartition topicPartition;
-  private final VeniceChangeCoordinate offset;
+  private final VeniceChangeCoordinate changeCoordinate;
   private final long timestamp;
   private final int payloadSize;
   private final boolean isEndOfBootstrap;
+  private final int writerSchemaId;
+  private final java.nio.ByteBuffer replicationMetadataPayload;
+  private final ControlMessage controlMessage;
+  private final long producerTimestamp;
 
   public ImmutableChangeCapturePubSubMessage(
       K key,
       V value,
       PubSubTopicPartition topicPartition,
-      long offset,
+      PubSubPosition pubSubPosition,
       long timestamp,
       int payloadSize,
-      boolean isEndOfBootstrap) {
+      boolean isEndOfBootstrap,
+      long consumerSequenceId) {
+    this(
+        key,
+        value,
+        topicPartition,
+        pubSubPosition,
+        timestamp,
+        payloadSize,
+        isEndOfBootstrap,
+        consumerSequenceId,
+        -1,
+        null,
+        null,
+        0L);
+  }
+
+  public ImmutableChangeCapturePubSubMessage(
+      K key,
+      V value,
+      PubSubTopicPartition topicPartition,
+      PubSubPosition pubSubPosition,
+      long timestamp,
+      int payloadSize,
+      boolean isEndOfBootstrap,
+      long consumerSequenceId,
+      int writerSchemaId,
+      java.nio.ByteBuffer replicationMetadataPayload) {
+    this(
+        key,
+        value,
+        topicPartition,
+        pubSubPosition,
+        timestamp,
+        payloadSize,
+        isEndOfBootstrap,
+        consumerSequenceId,
+        writerSchemaId,
+        replicationMetadataPayload,
+        null,
+        0L);
+  }
+
+  public ImmutableChangeCapturePubSubMessage(
+      K key,
+      V value,
+      PubSubTopicPartition topicPartition,
+      PubSubPosition pubSubPosition,
+      long timestamp,
+      int payloadSize,
+      boolean isEndOfBootstrap,
+      long consumerSequenceId,
+      int writerSchemaId,
+      java.nio.ByteBuffer replicationMetadataPayload,
+      ControlMessage controlMessage) {
+    this(
+        key,
+        value,
+        topicPartition,
+        pubSubPosition,
+        timestamp,
+        payloadSize,
+        isEndOfBootstrap,
+        consumerSequenceId,
+        writerSchemaId,
+        replicationMetadataPayload,
+        controlMessage,
+        0L);
+  }
+
+  public ImmutableChangeCapturePubSubMessage(
+      K key,
+      V value,
+      PubSubTopicPartition topicPartition,
+      PubSubPosition pubSubPosition,
+      long timestamp,
+      int payloadSize,
+      boolean isEndOfBootstrap,
+      long consumerSequenceId,
+      int writerSchemaId,
+      java.nio.ByteBuffer replicationMetadataPayload,
+      ControlMessage controlMessage,
+      long producerTimestamp) {
     this.key = key;
     this.value = value;
     this.topicPartition = Objects.requireNonNull(topicPartition);
     this.timestamp = timestamp;
     this.payloadSize = payloadSize;
-    this.offset = new VeniceChangeCoordinate(
+    this.changeCoordinate = new VeniceChangeCoordinate(
         this.topicPartition.getPubSubTopic().getName(),
-        new ApacheKafkaOffsetPosition(offset),
-        this.topicPartition.getPartitionNumber());
+        pubSubPosition,
+        this.topicPartition.getPartitionNumber(),
+        consumerSequenceId);
     this.isEndOfBootstrap = isEndOfBootstrap;
+    this.writerSchemaId = writerSchemaId;
+    this.replicationMetadataPayload = replicationMetadataPayload;
+    this.controlMessage = controlMessage;
+    this.producerTimestamp = producerTimestamp;
   }
 
   @Override
@@ -51,8 +143,8 @@ public class ImmutableChangeCapturePubSubMessage<K, V> implements PubSubMessage<
   }
 
   @Override
-  public VeniceChangeCoordinate getOffset() {
-    return offset;
+  public VeniceChangeCoordinate getPosition() {
+    return changeCoordinate;
   }
 
   @Override
@@ -70,9 +162,30 @@ public class ImmutableChangeCapturePubSubMessage<K, V> implements PubSubMessage<
     return isEndOfBootstrap;
   }
 
+  public int getWriterSchemaId() {
+    return writerSchemaId;
+  }
+
+  public java.nio.ByteBuffer getReplicationMetadataPayload() {
+    return replicationMetadataPayload;
+  }
+
+  public ControlMessage getControlMessage() {
+    return controlMessage;
+  }
+
+  public long getProducerTimestamp() {
+    return producerTimestamp;
+  }
+
   @Override
   public String toString() {
-    return "PubSubMessage{" + topicPartition + ", offset=" + offset + ", timestamp=" + timestamp + ", isEndOfBootstrap="
-        + isEndOfBootstrap + '}';
+    return "PubSubMessage{" + topicPartition + ", changeCoordinate=" + changeCoordinate + ", timestamp=" + timestamp
+        + ", isEndOfBootstrap=" + isEndOfBootstrap + '}';
+  }
+
+  @Override
+  public int getHeapSize() {
+    throw new UnsupportedOperationException("getHeapSize is not supported on " + this.getClass().getSimpleName());
   }
 }

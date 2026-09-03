@@ -7,9 +7,11 @@ import com.linkedin.venice.exceptions.SchemaIncompatibilityException;
 import com.linkedin.venice.exceptions.StoreKeySchemaExistException;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.exceptions.VeniceNoStoreException;
+import com.linkedin.venice.meta.ReadOnlyStore;
 import com.linkedin.venice.meta.ReadWriteSchemaRepository;
 import com.linkedin.venice.meta.ReadWriteStoreRepository;
 import com.linkedin.venice.meta.Store;
+import com.linkedin.venice.meta.ValueSchemaCreatedListener;
 import com.linkedin.venice.schema.GeneratedSchemaID;
 import com.linkedin.venice.schema.SchemaData;
 import com.linkedin.venice.schema.SchemaEntry;
@@ -25,6 +27,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArraySet;
 import org.apache.avro.Schema;
 import org.apache.helix.zookeeper.impl.client.ZkClient;
 import org.apache.logging.log4j.LogManager;
@@ -75,6 +79,8 @@ public class HelixReadWriteSchemaRepository implements ReadWriteSchemaRepository
 
   private final Optional<MetaStoreWriter> metaStoreWriter;
 
+  private final Set<ValueSchemaCreatedListener> valueSchemaCreatedListeners = new CopyOnWriteArraySet<>();
+
   public HelixReadWriteSchemaRepository(
       ReadWriteStoreRepository storeRepository,
       Optional<MetaStoreWriter> metaStoreWriter,
@@ -89,9 +95,10 @@ public class HelixReadWriteSchemaRepository implements ReadWriteSchemaRepository
       ZkClient zkClient,
       HelixAdapterSerializer adapter,
       String clusterName,
-      Optional<MetaStoreWriter> metaStoreWriter) {
+      Optional<MetaStoreWriter> metaStoreWriter,
+      int refreshAttemptsForZkReconnect) {
     this.storeRepository = storeRepository;
-    this.accessor = new HelixSchemaAccessor(zkClient, adapter, clusterName);
+    this.accessor = new HelixSchemaAccessor(zkClient, adapter, clusterName, refreshAttemptsForZkReconnect);
     this.metaStoreWriter = metaStoreWriter;
   }
 
@@ -158,35 +165,7 @@ public class HelixReadWriteSchemaRepository implements ReadWriteSchemaRepository
     Collection<SchemaEntry> valueSchemas = getValueSchemas(storeName);
     SchemaEntry valueSchemaEntry = new SchemaEntry(SchemaData.INVALID_VALUE_SCHEMA_ID, valueSchemaStr);
 
-    return getValueSchemaIdCanonicalMatch(valueSchemas, valueSchemaEntry);
-  }
-
-  private int getValueSchemaIdCanonicalMatch(Collection<SchemaEntry> valueSchemas, SchemaEntry valueSchemaEntry) {
-    List<SchemaEntry> canonicalizedMatches = AvroSchemaUtils.filterCanonicalizedSchemas(valueSchemaEntry, valueSchemas);
-    int schemaId = SchemaData.INVALID_VALUE_SCHEMA_ID;
-    if (!canonicalizedMatches.isEmpty()) {
-      if (canonicalizedMatches.size() == 1) {
-        schemaId = canonicalizedMatches.iterator().next().getId();
-      } else {
-        List<SchemaEntry> exactMatches = AvroSchemaUtils.filterSchemas(valueSchemaEntry, canonicalizedMatches);
-        if (exactMatches.isEmpty()) {
-          schemaId = getSchemaEntryWithLargestId(canonicalizedMatches).getId();
-        } else {
-          schemaId = getSchemaEntryWithLargestId(exactMatches).getId();
-        }
-      }
-    }
-    return schemaId;
-  }
-
-  private SchemaEntry getSchemaEntryWithLargestId(Collection<SchemaEntry> schemas) {
-    SchemaEntry largestIdSchema = schemas.iterator().next();
-    for (SchemaEntry schema: schemas) {
-      if (schema.getId() > largestIdSchema.getId()) {
-        largestIdSchema = schema;
-      }
-    }
-    return largestIdSchema;
+    return AvroSchemaUtils.getSchemaIdCanonicalMatch(valueSchemas, valueSchemaEntry);
   }
 
   /**
@@ -303,18 +282,36 @@ public class HelixReadWriteSchemaRepository implements ReadWriteSchemaRepository
       String storeName,
       String schemaStr,
       DirectionalSchemaCompatibilityType expectedCompatibilityType) {
-    return addValueSchema(
-        storeName,
-        schemaStr,
-        preCheckValueSchemaAndGetNextAvailableId(storeName, schemaStr, expectedCompatibilityType));
+    int schemaId = preCheckValueSchemaAndGetNextAvailableId(storeName, schemaStr, expectedCompatibilityType);
+    SchemaEntry result = addValueSchemaLocked(storeName, schemaStr, schemaId);
+    Store storeAfterWrite = storeRepository.getStore(storeName);
+    maybeNotifyValueSchemaCreated(storeName, storeAfterWrite, result);
+    return result;
   }
 
   @Override
   public synchronized SchemaEntry addValueSchema(String storeName, String schemaStr, int schemaId) {
+    SchemaEntry result = addValueSchemaLocked(storeName, schemaStr, schemaId);
+    Store storeAfterWrite = storeRepository.getStore(storeName);
+    maybeNotifyValueSchemaCreated(storeName, storeAfterWrite, result);
+    return result;
+  }
+
+  /**
+   * Pre-condition: caller holds {@code this} monitor.
+   *
+   * <p>Returns the schema entry the caller should propagate. A returned entry whose id equals
+   * {@link SchemaData#DUPLICATE_VALUE_SCHEMA_CODE} signals "true duplicate, nothing was persisted"
+   * — listeners must NOT be notified in that case. Any other id means a new entry was written to
+   * ZK; the caller fires listeners while still holding the lock so persist order matches dispatch
+   * order.
+   */
+  private SchemaEntry addValueSchemaLocked(String storeName, String schemaStr, int schemaId) {
     SchemaEntry newValueSchemaEntry = new SchemaEntry(schemaId, schemaStr);
 
     if (schemaId == SchemaData.DUPLICATE_VALUE_SCHEMA_CODE) {
       int dupSchemaId = getNextAvailableSchemaId(
+          storeName,
           getValueSchemas(storeName),
           newValueSchemaEntry,
           DirectionalSchemaCompatibilityType.FULL);
@@ -335,6 +332,68 @@ public class HelixReadWriteSchemaRepository implements ReadWriteSchemaRepository
       metaStoreWriter.get().writeStoreValueSchemas(storeName, valueSchemas);
     }
     return newValueSchemaEntry;
+  }
+
+  @Override
+  public void registerValueSchemaCreatedListener(ValueSchemaCreatedListener listener) {
+    valueSchemaCreatedListeners.add(listener);
+  }
+
+  @Override
+  public void unregisterValueSchemaCreatedListener(ValueSchemaCreatedListener listener) {
+    valueSchemaCreatedListeners.remove(listener);
+  }
+
+  /**
+   * Fires {@link ValueSchemaCreatedListener}s for an {@code addValueSchema} result. Invoked from
+   * inside the {@code synchronized (this)} write block so the persisted order matches the
+   * listener-dispatch order; this means a slow listener will extend the lock window.
+   *
+   * <p>No-ops in two cases:
+   * <ul>
+   *   <li>{@code result.getId()} is {@link SchemaData#DUPLICATE_VALUE_SCHEMA_CODE} — the schema was
+   *       already registered, so nothing was newly persisted.
+   *   <li>{@code store} is {@code null} — the store was deleted concurrently between the schema
+   *       write and this dispatch. A warn-level log records {@code storeName} and the schema id.
+   * </ul>
+   *
+   * <p>The {@code store} snapshot is wrapped in {@link ReadOnlyStore} before being handed to
+   * listeners so they cannot mutate the controller's in-memory state.
+   *
+   * <p>Listeners are invoked sequentially in registration order. {@link Exception}s thrown by a
+   * listener are logged (with the listener's class, store, and schema id) and swallowed so that
+   * subsequent listeners still run; fatal {@link Error}s propagate.
+   *
+   * @param storeName the store the schema was added to; used in logs even when {@code store} is null
+   * @param store     the store snapshot taken right after the persist; nullable on concurrent delete
+   * @param result    the schema entry returned by {@link #addValueSchemaLocked}
+   */
+  private void maybeNotifyValueSchemaCreated(String storeName, Store store, SchemaEntry result) {
+    if (result.getId() == SchemaData.DUPLICATE_VALUE_SCHEMA_CODE) {
+      return;
+    }
+    if (store == null) {
+      logger.warn(
+          "Skipping value schema created event for store: {}, schema id: {}: store snapshot is null, "
+              + "likely deleted concurrently between the schema write and the listener dispatch.",
+          storeName,
+          result.getId());
+      return;
+    }
+    ReadOnlyStore readOnlyStore = new ReadOnlyStore(store);
+    for (ValueSchemaCreatedListener listener: valueSchemaCreatedListeners) {
+      try {
+        listener.handleValueSchemaCreated(readOnlyStore, result);
+      } catch (Exception e) {
+        logger.error(
+            "Listener {} threw while handling value schema created event for store: {}, schema id: {}. "
+                + "Continuing to dispatch to remaining listeners.",
+            listener.getClass().getName(),
+            storeName,
+            result.getId(),
+            e);
+      }
+    }
   }
 
   /**
@@ -365,7 +424,7 @@ public class HelixReadWriteSchemaRepository implements ReadWriteSchemaRepository
               + " please don't use it in the value schema");
     }
 
-    return getNextAvailableSchemaId(getValueSchemas(storeName), valueSchemaEntry, expectedCompatibilityType);
+    return getNextAvailableSchemaId(storeName, getValueSchemas(storeName), valueSchemaEntry, expectedCompatibilityType);
   }
 
   @Override
@@ -376,6 +435,7 @@ public class HelixReadWriteSchemaRepository implements ReadWriteSchemaRepository
         new DerivedSchemaEntry(valueSchemaId, SchemaData.UNKNOWN_SCHEMA_ID, derivedSchemaStr);
 
     return getNextAvailableSchemaId(
+        storeName,
         getDerivedSchemaMap(storeName).get(valueSchemaId),
         derivedSchemaEntry,
         DirectionalSchemaCompatibilityType.BACKWARD);
@@ -392,6 +452,7 @@ public class HelixReadWriteSchemaRepository implements ReadWriteSchemaRepository
         schemaStr,
         valueSchemaId,
         getNextAvailableSchemaId(
+            storeName,
             getDerivedSchemaMap(storeName).get(valueSchemaId),
             newDerivedSchemaEntry,
             DirectionalSchemaCompatibilityType.NONE));
@@ -432,6 +493,7 @@ public class HelixReadWriteSchemaRepository implements ReadWriteSchemaRepository
   }
 
   private int getNextAvailableSchemaId(
+      String storeName,
       Collection<? extends SchemaEntry> schemaEntries,
       SchemaEntry newSchemaEntry,
       DirectionalSchemaCompatibilityType expectedCompatibilityType) {
@@ -440,12 +502,15 @@ public class HelixReadWriteSchemaRepository implements ReadWriteSchemaRepository
       if (schemaEntries == null || schemaEntries.isEmpty()) {
         newValueSchemaId = HelixSchemaAccessor.VALUE_SCHEMA_STARTING_ID;
       } else {
+        Store store = storeRepository.getStoreOrThrow(storeName);
+        boolean enumSchemaEvolutionAllowed = store.isEnumSchemaEvolutionAllowed();
         newValueSchemaId = schemaEntries.stream().map(schemaEntry -> {
           if (schemaEntry.equals(newSchemaEntry)
               && !AvroSchemaUtils.hasDocFieldChange(newSchemaEntry.getSchema(), schemaEntry.getSchema())) {
             throw new SchemaDuplicateException(schemaEntry, newSchemaEntry);
           }
-          if (!schemaEntry.isNewSchemaCompatible(newSchemaEntry, expectedCompatibilityType)) {
+          if (!schemaEntry
+              .isNewSchemaCompatible(newSchemaEntry, expectedCompatibilityType, enumSchemaEvolutionAllowed)) {
             throw new SchemaIncompatibilityException(schemaEntry, newSchemaEntry);
           }
 
@@ -453,7 +518,10 @@ public class HelixReadWriteSchemaRepository implements ReadWriteSchemaRepository
         }).max(Integer::compare).get() + 1;
       }
     } catch (SchemaDuplicateException e) {
-      logger.warn("Exception occurred while fetching next available schemaId. Msg: {}", e.getMessage());
+      logger.warn(
+          "Exception occurred while fetching next available schemaId for store: {}. Msg: {}",
+          storeName,
+          e.getMessage());
       newValueSchemaId = SchemaData.DUPLICATE_VALUE_SCHEMA_CODE;
     }
 

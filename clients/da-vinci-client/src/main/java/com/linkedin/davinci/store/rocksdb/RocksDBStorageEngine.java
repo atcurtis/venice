@@ -6,7 +6,9 @@ import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_PLA
 import com.linkedin.davinci.config.VeniceStoreVersionConfig;
 import com.linkedin.davinci.stats.RocksDBMemoryStats;
 import com.linkedin.davinci.store.AbstractStorageEngine;
+import com.linkedin.davinci.store.AbstractStorageIterator;
 import com.linkedin.davinci.store.AbstractStoragePartition;
+import com.linkedin.davinci.store.StorageEngineStats;
 import com.linkedin.davinci.store.StoragePartitionConfig;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.kafka.protocol.state.PartitionState;
@@ -21,10 +23,12 @@ import java.io.IOException;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
+import java.util.function.ToLongFunction;
 import org.apache.commons.io.FileUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.rocksdb.SstFileManager;
+import org.rocksdb.RocksDBException;
+import org.rocksdb.Status;
 
 
 public class RocksDBStorageEngine extends AbstractStorageEngine<RocksDBStoragePartition> {
@@ -41,15 +45,7 @@ public class RocksDBStorageEngine extends AbstractStorageEngine<RocksDBStoragePa
   private final RocksDBStorageEngineFactory factory;
   private final VeniceStoreVersionConfig storeConfig;
   private final boolean replicationMetadataEnabled;
-
-  /**
-   * The cached value will be refreshed by {@link #getStoreSizeInBytes()}.
-   */
-  private long cachedDiskUsage = 0;
-  /**
-   * The cached value will be refreshed by {@link #getRMDSizeInBytes()}.
-   */
-  private long cachedRMDDiskUsage = 0;
+  private final StorageEngineStats stats;
 
   public RocksDBStorageEngine(
       VeniceStoreVersionConfig storeConfig,
@@ -91,8 +87,13 @@ public class RocksDBStorageEngine extends AbstractStorageEngine<RocksDBStoragePa
       }
     }
 
+    this.stats = new RocksDBStorageEngineStats(storeDbPath, this::getRMDSizeInBytes, this::getKeyCountEstimate);
+
     // restoreStoragePartitions will create metadata partition if not exist.
-    restoreStoragePartitions(storeConfig.isRestoreMetadataPartition(), storeConfig.isRestoreDataPartitions());
+    restoreStoragePartitions(
+        storeConfig.isRestoreMetadataPartition(),
+        storeConfig.isRestoreDataPartitions(),
+        storeConfig.isRestoreDropBadPartitionEnabled());
 
     if (storeConfig.isRestoreMetadataPartition()) {
       // Persist RocksDB table format option used in building the storage engine.
@@ -100,11 +101,26 @@ public class RocksDBStorageEngine extends AbstractStorageEngine<RocksDBStoragePa
     }
   }
 
+  // For testing purpose only.
+  protected AbstractStoragePartition getMetadataPartition() {
+    return super.getMetadataPartition();
+  }
+
   @Override
   public PersistenceType getType() {
     return PersistenceType.ROCKS_DB;
   }
 
+  /**
+   * Retrieves the IDs of persisted partitions for the store.
+   * This method scans the existing store directory to identify the partition IDs that are retained and need to be persisted.
+   *
+   * Note:
+   * For stores with blob transfer enabled, temporary partition directories may exist if the instance previously fails during a transfer.
+   * In such cases, temporary directories should be excluded from the returned partition IDs.
+   *
+   * @return A set of IDs representing the persisted partitions.
+   */
   @Override
   public Set<Integer> getPersistedPartitionIds() {
     File storeDbDir = new File(storeDbPath);
@@ -119,6 +135,10 @@ public class RocksDBStorageEngine extends AbstractStorageEngine<RocksDBStoragePa
     HashSet<Integer> partitionIdSet = new HashSet<>();
     if (partitionDbNames != null) {
       for (String partitionDbName: partitionDbNames) {
+        if (RocksDBUtils.isTempPartitionDir(partitionDbName)) {
+          continue;
+        }
+
         partitionIdSet.add(RocksDBUtils.parsePartitionIdFromPartitionDbName(partitionDbName));
       }
     }
@@ -135,8 +155,7 @@ public class RocksDBStorageEngine extends AbstractStorageEngine<RocksDBStoragePa
           rocksDbPath,
           memoryStats,
           rocksDbThrottler,
-          rocksDBServerConfig,
-          storeConfig);
+          rocksDBServerConfig);
     } else {
       return new ReplicationMetadataRocksDBStoragePartition(
           storagePartitionConfig,
@@ -144,9 +163,106 @@ public class RocksDBStorageEngine extends AbstractStorageEngine<RocksDBStoragePa
           rocksDbPath,
           memoryStats,
           rocksDbThrottler,
-          rocksDBServerConfig,
-          storeConfig);
+          rocksDBServerConfig);
     }
+  }
+
+  private long getRMDSizeInBytes() {
+    return getStatSumAcrossPartitions(RocksDBStoragePartition::getRmdByteUsage);
+  }
+
+  private long getKeyCountEstimate() {
+    return getStatSumAcrossPartitions(RocksDBStoragePartition::getKeyCountEstimate);
+  }
+
+  private long getStatSumAcrossPartitions(ToLongFunction<RocksDBStoragePartition> statGetter) {
+    long sum = 0;
+    for (RocksDBStoragePartition partition: getPartitions()) {
+      try {
+        sum += executeWithSafeGuard(partition.getPartitionId(), () -> statGetter.applyAsLong(partition));
+      } catch (VeniceException e) {
+        // Skip closed/removed partitions gracefully instead of killing entire aggregation.
+        // This prevents VeniceException from blocking drainer threads.
+        LOGGER.debug(
+            "Failed to get stat for replica: {}, skipping",
+            Utils.getReplicaId(getStoreVersionName(), partition.getPartitionId()),
+            e);
+      }
+    }
+    return sum;
+  }
+
+  @Override
+  protected void dropPartitionDirectory(int partitionId) {
+    String partitionDbPath = RocksDBUtils.composePartitionDbDir(rocksDbPath, getStoreVersionName(), partitionId);
+    File partitionDbDir = new File(partitionDbPath);
+    if (!partitionDbDir.exists()) {
+      return;
+    }
+    try {
+      FileUtils.deleteDirectory(partitionDbDir);
+      LOGGER.info("Dropped on-disk directory for replica: {}", Utils.getReplicaId(getStoreVersionName(), partitionId));
+    } catch (IOException e) {
+      throw new VeniceException(
+          "Failed to delete partition directory: " + partitionDbPath + " for replica: "
+              + Utils.getReplicaId(getStoreVersionName(), partitionId),
+          e);
+    }
+  }
+
+  /**
+   * Only drop a partition for failures that are clearly local to its on-disk state. Environmental failures
+   * (disk full, permission denied, lock contention) must not trigger a drop — re-bootstrapping would amplify the
+   * problem or mask infra issues that need human attention.
+   *
+   * The drop-eligible cases are:
+   * <ul>
+   *   <li>{@link Status.Code#Corruption}: RocksDB has detected on-disk state it cannot read.</li>
+   *   <li>{@link Status.Code#IOError} whose status state or exception message contains
+   *       "No such file or directory": a partition file went missing. rocksdbjni 8.x does not expose a dedicated
+   *       SubCode for path-not-found, so we fall back to a substring match on the human-readable status text.
+   *       The substring match is gated by {@code Code.IOError} so we never drop on message text alone.
+   *       Other IOError flavors (NoSpace, generic EIO, permission denied) are intentionally excluded because their
+   *       status messages do not contain this substring.</li>
+   * </ul>
+   */
+  @Override
+  protected boolean shouldDropPartitionOnRestoreFailure(int partitionId, Throwable cause) {
+    RocksDBException rocksDBException = findRocksDBException(cause);
+    if (rocksDBException == null) {
+      return false;
+    }
+    Status status = rocksDBException.getStatus();
+    if (status == null) {
+      return false;
+    }
+    Status.Code code = status.getCode();
+    if (code == Status.Code.Corruption) {
+      return true;
+    }
+    if (code == Status.Code.IOError && isNoSuchFileOrDirectory(rocksDBException, status)) {
+      return true;
+    }
+    return false;
+  }
+
+  private static boolean isNoSuchFileOrDirectory(RocksDBException rocksDBException, Status status) {
+    String state = status.getState();
+    if (state != null && state.contains("No such file or directory")) {
+      return true;
+    }
+    String message = rocksDBException.getMessage();
+    return message != null && message.contains("No such file or directory");
+  }
+
+  private static RocksDBException findRocksDBException(Throwable t) {
+    while (t != null) {
+      if (t instanceof RocksDBException) {
+        return (RocksDBException) t;
+      }
+      t = t.getCause();
+    }
+    return null;
   }
 
   @Override
@@ -168,48 +284,6 @@ public class RocksDBStorageEngine extends AbstractStorageEngine<RocksDBStoragePa
     }
   }
 
-  @Override
-  public long getRMDSizeInBytes() {
-    Set<Integer> partitionIds = super.getPartitionIds();
-    long diskUsage = 0;
-    for (int i: partitionIds) {
-      AbstractStoragePartition partition;
-      try {
-        partition = super.getPartitionOrThrow(i);
-      } catch (VeniceException e) {
-        LOGGER.warn("Could not find partition {} for store {}", i, super.getStoreVersionName());
-        continue;
-      }
-      diskUsage += partition.getRmdByteUsage();
-    }
-    cachedRMDDiskUsage = diskUsage;
-
-    return diskUsage;
-  }
-
-  public long getCachedRMDSizeInBytes() {
-    return cachedRMDDiskUsage;
-  }
-
-  @Override
-  public long getStoreSizeInBytes() {
-    File storeDbDir = new File(storeDbPath);
-    if (storeDbDir.exists()) {
-      /**
-       * {@link FileUtils#sizeOf(File)} will throw {@link IllegalArgumentException} if the file/dir doesn't exist.
-       */
-      cachedDiskUsage = FileUtils.sizeOf(storeDbDir);
-    } else {
-      cachedDiskUsage = 0;
-    }
-    return cachedDiskUsage;
-  }
-
-  @Override
-  public long getCachedStoreSizeInBytes() {
-    return cachedDiskUsage;
-  }
-
   // package-private for testing purposes
   boolean hasConflictPersistedStoreEngineConfig() {
     String configPath = getRocksDbEngineConfigPath();
@@ -220,9 +294,7 @@ public class RocksDBStorageEngine extends AbstractStorageEngine<RocksDBStoragePa
         VeniceProperties persistedStorageEngineConfig = Utils.parseProperties(storeEngineConfig);
         LOGGER.info("Found storage engine configs: {}", persistedStorageEngineConfig.toString(true));
         boolean usePlainTableFormat = persistedStorageEngineConfig.getBoolean(ROCKSDB_PLAIN_TABLE_FORMAT_ENABLED, true);
-        String transformerValueSchema = persistedStorageEngineConfig.containsKey(RECORD_TRANSFORMER_VALUE_SCHEMA)
-            ? persistedStorageEngineConfig.getString(RECORD_TRANSFORMER_VALUE_SCHEMA)
-            : "null";
+        String transformerValueSchema = persistedStorageEngineConfig.getString(RECORD_TRANSFORMER_VALUE_SCHEMA, "null");
         if (usePlainTableFormat != rocksDBServerConfig.isRocksDBPlainTableFormatEnabled()) {
           String existingTableFormat = usePlainTableFormat ? "PlainTable" : "BlockBasedTable";
           String newTableFormat =
@@ -271,25 +343,21 @@ public class RocksDBStorageEngine extends AbstractStorageEngine<RocksDBStoragePa
         + SERVER_CONFIG_FILE_NAME;
   }
 
-  @Override
-  public boolean hasMemorySpaceLeft() {
-    SstFileManager sstFileManager = factory.getSstFileManagerForMemoryLimiter();
-    if (sstFileManager == null) {
-      // Memory limiter is disabled.
-      return true;
-    }
-    if (sstFileManager.isMaxAllowedSpaceReached() || sstFileManager.isMaxAllowedSpaceReachedIncludingCompactions()) {
-      return false;
-    }
-    long currentUsage = sstFileManager.getTotalSize();
-    if (factory.getMemoryLimit() - currentUsage >= 2 * factory.getMemtableSize()) {
-      return true;
-    }
-    return false;
-  }
-
   // Only used for testing purposes
   public void setRocksDBServerConfig(RocksDBServerConfig rocksDBServerConfig) {
     this.rocksDBServerConfig = rocksDBServerConfig;
+  }
+
+  @Override
+  public AbstractStorageIterator getIterator(int partitionId) {
+    return executeWithSafeGuard(partitionId, () -> {
+      AbstractStoragePartition partition = getPartitionOrThrow(partitionId);
+      return partition.getIterator();
+    });
+  }
+
+  @Override
+  public StorageEngineStats getStats() {
+    return this.stats;
   }
 }

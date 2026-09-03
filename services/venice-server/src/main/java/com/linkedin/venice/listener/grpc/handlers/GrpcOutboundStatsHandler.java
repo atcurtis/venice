@@ -1,7 +1,5 @@
 package com.linkedin.venice.listener.grpc.handlers;
 
-import static io.netty.handler.codec.http.HttpResponseStatus.*;
-
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.listener.ServerStatsContext;
 import com.linkedin.venice.listener.grpc.GrpcRequestContext;
@@ -32,15 +30,16 @@ public class GrpcOutboundStatsHandler extends VeniceServerGrpcHandler {
       throw new VeniceException("store name could not be null");
     }
 
-    ServerHttpRequestStats serverHttpRequestStats = statsContext.getStoreName() == null
-        ? null
-        : statsContext.getCurrentStats().getStoreStats(statsContext.getStoreName());
+    // storeName is guaranteed non-null here (null check above throws)
+    ServerHttpRequestStats serverHttpRequestStats =
+        statsContext.getCurrentStats().getStoreStats(statsContext.getStoreName());
 
     statsContext.recordBasicMetrics(serverHttpRequestStats);
 
     double elapsedTime = LatencyUtils.getElapsedTimeFromNSToMS(statsContext.getRequestStartTimeInNS());
 
-    if (!ctx.hasError() && !responseStatus.equals(OK) || responseStatus.equals(NOT_FOUND)) {
+    if (!ctx.hasError() && !responseStatus.equals(HttpResponseStatus.OK)
+        || responseStatus.equals(HttpResponseStatus.NOT_FOUND)) {
       statsContext.successRequest(serverHttpRequestStats, elapsedTime);
     } else {
       statsContext.errorRequest(serverHttpRequestStats, elapsedTime);

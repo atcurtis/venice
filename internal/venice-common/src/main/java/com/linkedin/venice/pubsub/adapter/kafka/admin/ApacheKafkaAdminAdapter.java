@@ -44,6 +44,7 @@ import org.apache.kafka.common.errors.RetriableException;
 import org.apache.kafka.common.errors.TimeoutException;
 import org.apache.kafka.common.errors.TopicExistsException;
 import org.apache.kafka.common.errors.UnknownTopicOrPartitionException;
+import org.apache.kafka.common.record.TimestampType;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -57,26 +58,20 @@ public class ApacheKafkaAdminAdapter implements PubSubAdminAdapter {
   private final ApacheKafkaAdminConfig apacheKafkaAdminConfig;
   private final PubSubTopicRepository pubSubTopicRepository;
 
-  public ApacheKafkaAdminAdapter(
-      ApacheKafkaAdminConfig apacheKafkaAdminConfig,
-      PubSubTopicRepository pubSubTopicRepository) {
+  public ApacheKafkaAdminAdapter(ApacheKafkaAdminConfig apacheKafkaAdminConfig) {
     this(
         AdminClient.create(
             Objects.requireNonNull(
                 apacheKafkaAdminConfig.getAdminProperties(),
                 "Properties for kafka admin construction cannot be null!")),
-        apacheKafkaAdminConfig,
-        pubSubTopicRepository);
+        apacheKafkaAdminConfig);
   }
 
-  ApacheKafkaAdminAdapter(
-      AdminClient internalKafkaAdminClient,
-      ApacheKafkaAdminConfig apacheKafkaAdminConfig,
-      PubSubTopicRepository pubSubTopicRepository) {
+  ApacheKafkaAdminAdapter(AdminClient internalKafkaAdminClient, ApacheKafkaAdminConfig apacheKafkaAdminConfig) {
     this.apacheKafkaAdminConfig = Objects.requireNonNull(apacheKafkaAdminConfig, "Kafka admin config cannot be null!");
     this.internalKafkaAdminClient =
         Objects.requireNonNull(internalKafkaAdminClient, "Kafka admin client cannot be null!");
-    this.pubSubTopicRepository = pubSubTopicRepository;
+    this.pubSubTopicRepository = apacheKafkaAdminConfig.getPubSubTopicRepository();
     LOGGER.info("Created ApacheKafkaAdminAdapter with config: {}", apacheKafkaAdminConfig);
   }
 
@@ -406,12 +401,17 @@ public class ApacheKafkaAdminAdapter implements PubSubAdminAdapter {
     Optional<Long> maxLogCompactionLagMs = properties.containsKey(TopicConfig.MAX_COMPACTION_LAG_MS_CONFIG)
         ? Optional.of(Long.parseLong(properties.getProperty(TopicConfig.MAX_COMPACTION_LAG_MS_CONFIG)))
         : Optional.empty();
+    Optional<Boolean> uncleanLeaderElectionEnable =
+        Optional.ofNullable(properties.getProperty(TopicConfig.UNCLEAN_LEADER_ELECTION_ENABLE_CONFIG))
+            .map(Boolean::parseBoolean);
     return new PubSubTopicConfiguration(
         retentionMs,
         isLogCompacted,
         minInSyncReplicas,
         minLogCompactionLagMs,
-        maxLogCompactionLagMs);
+        maxLogCompactionLagMs,
+        false,
+        uncleanLeaderElectionEnable);
   }
 
   private Properties unmarshallProperties(PubSubTopicConfiguration pubSubTopicConfiguration) {
@@ -438,8 +438,16 @@ public class ApacheKafkaAdminAdapter implements PubSubAdminAdapter {
         .ifPresent(
             minIsrConfig -> topicProperties
                 .put(TopicConfig.MIN_IN_SYNC_REPLICAS_CONFIG, Integer.toString(minIsrConfig)));
-    // Just in case the Kafka cluster isn't configured as expected.
-    topicProperties.put(TopicConfig.MESSAGE_TIMESTAMP_TYPE_CONFIG, "LogAppendTime");
+    // If not set, Kafka cluster defaults will apply
+    pubSubTopicConfiguration.getUncleanLeaderElectionEnable()
+        .ifPresent(
+            enabled -> topicProperties
+                .put(TopicConfig.UNCLEAN_LEADER_ELECTION_ENABLE_CONFIG, Boolean.toString(enabled)));
+    // Default to CreateTime so Venice does not depend on pub-sub system broker timestamps.
+    // Venice's PubSubMessageDeserializer falls back to the producer timestamp embedded in
+    // KafkaMessageEnvelope when the pub-sub system timestamp is unavailable, making CreateTime
+    // the safer default across all pub-sub backends.
+    topicProperties.put(TopicConfig.MESSAGE_TIMESTAMP_TYPE_CONFIG, TimestampType.CREATE_TIME.toString());
     return topicProperties;
   }
 

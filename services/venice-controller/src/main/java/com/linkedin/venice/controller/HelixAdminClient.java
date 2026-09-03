@@ -2,6 +2,11 @@ package com.linkedin.venice.controller;
 
 import java.util.List;
 import java.util.Map;
+import org.apache.helix.HelixAdmin;
+import org.apache.helix.constants.InstanceConstants;
+import org.apache.helix.model.ClusterConfig;
+import org.apache.helix.model.IdealState;
+import org.apache.helix.model.RESTConfig;
 
 
 /**
@@ -23,20 +28,38 @@ public interface HelixAdminClient {
 
   /**
    * Create and configure the Venice controller cluster.
-   * @param isControllerInAzureFabric whether the controller is in Azure fabric.
    */
-  void createVeniceControllerCluster(boolean isControllerInAzureFabric);
+  void createVeniceControllerCluster();
 
   /**
    * Create and configure the Venice storage cluster.
    * @param clusterName of the Venice storage cluster.
-   * @param helixClusterProperties to be applied to the new cluster.
-   * @param isControllerInAzureFabric whether the controller is in Azure fabric.
+   * @param clusterConfig {@link ClusterConfig} for the new cluster.
+   * @param restConfig {@link RESTConfig} for the new cluster.
    */
-  void createVeniceStorageCluster(
-      String clusterName,
-      Map<String, String> helixClusterProperties,
-      boolean isControllerInAzureFabric);
+  void createVeniceStorageCluster(String clusterName, ClusterConfig clusterConfig, RESTConfig restConfig);
+
+  /**
+   * Legacy (non-HAAS) creation of a Venice storage cluster: creates the storage Helix cluster and
+   * registers it as a resource in the Venice controller cluster. No-op if the cluster already exists.
+   * @param clusterName of the Venice storage cluster.
+   */
+  void createVeniceStorageClusterLegacy(String clusterName);
+
+  /**
+   * Enable the customized state config on the given storage cluster. The customized state config may get
+   * wiped or may never have been written to the ZK cluster config before, so it needs to be (re)enabled.
+   * @param clusterName of the Venice storage cluster.
+   */
+  void setupCustomizedStateConfig(String clusterName);
+
+  /**
+   * Returns the underlying {@link HelixAdmin} used for storage-cluster operations. This is a low-level
+   * escape hatch for raw Helix operations not otherwise exposed by this interface (e.g. used by tests
+   * and maintenance tooling). Prefer the dedicated methods on this interface for normal operations.
+   * @return the storage-cluster {@link HelixAdmin}.
+   */
+  HelixAdmin getHelixAdmin();
 
   /**
    * Check if the given Venice storage cluster's cluster resource is in the Venice controller cluster.
@@ -67,9 +90,16 @@ public interface HelixAdminClient {
   /**
    * Update some Helix cluster properties for the given cluster.
    * @param clusterName of the cluster to be updated.
-   * @param helixClusterProperties to be applied to the given cluster.
+   * @param clusterConfig {@link ClusterConfig} for the new cluster.
    */
-  void updateClusterConfigs(String clusterName, Map<String, String> helixClusterProperties);
+  void updateClusterConfigs(String clusterName, ClusterConfig clusterConfig);
+
+  /**
+   * Update some Helix cluster properties for the given cluster.
+   * @param clusterName of the cluster to be updated.
+   * @param restConfig {@link RESTConfig} for the new cluster.
+   */
+  void updateRESTConfigs(String clusterName, RESTConfig restConfig);
 
   /**
    * Disable or enable a list of partitions on an instance.
@@ -128,4 +158,32 @@ public interface HelixAdminClient {
    * Release resources.
    */
   void close();
+
+  /**
+   * Manually enable maintenance mode. To be called by the REST client that accepts KV mappings as
+   * the payload.
+   */
+  void manuallyEnableMaintenanceMode(
+      String clusterName,
+      boolean enabled,
+      String reason,
+      Map<String, String> customFields);
+
+  /**
+   * Set the instanceOperation of and instance with {@link InstanceConstants.InstanceOperation}.
+   *
+   * @param clusterName       The cluster name
+   * @param instanceName      The instance name
+   * @param instanceOperation The instance operation type
+   * @param reason            The reason for the operation
+   */
+  void setInstanceOperation(
+      String clusterName,
+      String instanceName,
+      InstanceConstants.InstanceOperation instanceOperation,
+      String reason);
+
+  IdealState getResourceIdealState(String clusterName, String resourceName);
+
+  void updateIdealState(String clusterName, String resourceName, IdealState idealState);
 }

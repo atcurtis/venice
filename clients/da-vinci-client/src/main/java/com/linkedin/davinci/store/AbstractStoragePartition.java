@@ -4,8 +4,6 @@ import com.linkedin.davinci.callback.BytesStreamingCallback;
 import com.linkedin.davinci.store.rocksdb.ReplicationMetadataRocksDBStoragePartition;
 import com.linkedin.venice.exceptions.VeniceUnsupportedOperationException;
 import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.function.Supplier;
@@ -46,15 +44,21 @@ public abstract class AbstractStoragePartition {
    */
   public abstract byte[] get(byte[] key);
 
+  /**
+   * Check if a key exists in the partition without reading the full value.
+   * Default implementation falls back to {@link #get(byte[])}. Storage engines that support
+   * a more efficient existence check should override this.
+   *
+   * @see com.linkedin.davinci.store.rocksdb.RocksDBStoragePartition#keyExists(byte[])
+   *      for current limitations and pending upstream RocksDB improvements
+   */
+  public boolean keyExists(byte[] key) {
+    return get(key) != null;
+  }
+
   public ByteBuffer get(byte[] key, ByteBuffer valueToBePopulated) {
     // Naive default impl is not optimized... only storage engines that support the optimization implement it.
     return ByteBuffer.wrap(get(key));
-  }
-
-  public List<byte[]> multiGet(List<byte[]> keys) {
-    List<byte[]> values = new ArrayList<>(keys.size());
-    keys.forEach(key -> values.add(get(key)));
-    return values;
   }
 
   /**
@@ -117,6 +121,11 @@ public abstract class AbstractStoragePartition {
   public abstract void createSnapshot();
 
   /**
+   * Cleans up the snapshot
+   */
+  public abstract void cleanupSnapshot();
+
+  /**
    * checks whether the current state of the database is valid
    * during the start of ingestion.
    */
@@ -167,12 +176,8 @@ public abstract class AbstractStoragePartition {
    * Only {@link ReplicationMetadataRocksDBStoragePartition} will execute this method,
    * other storage partition implementation will VeniceUnsupportedOperationException.
    */
-  public byte[] getReplicationMetadata(byte[] key) {
+  public byte[] getReplicationMetadata(ByteBuffer key) {
     throw new VeniceUnsupportedOperationException("getReplicationMetadata");
-  }
-
-  public List<byte[]> multiGetReplicationMetadata(List<byte[]> keys) {
-    throw new VeniceUnsupportedOperationException("multiGetReplicationMetadata");
   }
 
   /**
@@ -186,5 +191,9 @@ public abstract class AbstractStoragePartition {
 
   public long getRmdByteUsage() {
     throw new VeniceUnsupportedOperationException("getRmdByteUsage");
+  }
+
+  public AbstractStorageIterator getIterator() {
+    throw new UnsupportedOperationException("Method not supported for storage engine");
   }
 }

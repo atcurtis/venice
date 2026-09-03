@@ -2,6 +2,7 @@ package com.linkedin.venice.hadoop.mapreduce.datawriter.task;
 
 import com.linkedin.venice.hadoop.mapreduce.counter.MRJobCounterHelper;
 import com.linkedin.venice.hadoop.task.datawriter.DataWriterTaskTracker;
+import java.util.Set;
 import org.apache.hadoop.mapred.Counters;
 
 
@@ -51,6 +52,11 @@ public class CounterBackedMapReduceDataWriterTaskTracker implements DataWriterTa
   }
 
   @Override
+  public long getUncompressedRecordTooLargeFailureCount() {
+    return MRJobCounterHelper.getUncompressedRecordTooLargeFailureCount(counters);
+  }
+
+  @Override
   public long getWriteAclAuthorizationFailureCount() {
     return MRJobCounterHelper.getWriteAclAuthorizationFailureCount(counters);
   }
@@ -78,5 +84,25 @@ public class CounterBackedMapReduceDataWriterTaskTracker implements DataWriterTa
   @Override
   public long getTotalPutOrDeleteRecordsCount() {
     return MRJobCounterHelper.getTotalPutOrDeleteRecordsCount(counters);
+  }
+
+  @Override
+  public long getIncrementalPushThrottledTimeMs() {
+    return MRJobCounterHelper.getIncrementalPushThrottleTimeMs(counters);
+  }
+
+  @Override
+  public Set<String> getFailedExternalStorageRegions() {
+    return MRJobCounterHelper.getFailedExternalStorageRegions(counters);
+  }
+
+  @Override
+  public long getExternalStorageWriteTimeMs() {
+    return MRJobCounterHelper.getExternalStorageWriteTimeMs(counters);
+  }
+
+  @Override
+  public long getVeniceWriteTimeMs() {
+    return MRJobCounterHelper.getVeniceWriteTimeMs(counters);
   }
 }

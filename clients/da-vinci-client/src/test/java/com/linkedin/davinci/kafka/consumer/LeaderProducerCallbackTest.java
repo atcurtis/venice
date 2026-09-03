@@ -11,18 +11,24 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertTrue;
+import static org.testng.Assert.fail;
 
 import com.linkedin.davinci.stats.AggVersionedDIVStats;
+import com.linkedin.davinci.stats.AggVersionedIngestionStats;
 import com.linkedin.venice.exceptions.VeniceException;
-import com.linkedin.venice.kafka.protocol.KafkaMessageEnvelope;
+import com.linkedin.venice.kafka.protocol.Put;
 import com.linkedin.venice.message.KafkaKey;
-import com.linkedin.venice.pubsub.api.PubSubMessage;
+import com.linkedin.venice.pubsub.api.DefaultPubSubMessage;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
 import com.linkedin.venice.storage.protocol.ChunkedValueManifest;
 import com.linkedin.venice.utils.InMemoryLogAppender;
 import com.linkedin.venice.utils.Utils;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.core.LoggerContext;
@@ -35,7 +41,7 @@ public class LeaderProducerCallbackTest {
   @Test
   public void testOnCompletionWithNonNullException() {
     LeaderFollowerStoreIngestionTask ingestionTaskMock = mock(LeaderFollowerStoreIngestionTask.class);
-    PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> sourceConsumerRecordMock = mock(PubSubMessage.class);
+    DefaultPubSubMessage sourceConsumerRecordMock = mock(DefaultPubSubMessage.class);
     PartitionConsumptionState partitionConsumptionStateMock = mock(PartitionConsumptionState.class);
     LeaderProducedRecordContext leaderProducedRecordContextMock = mock(LeaderProducedRecordContext.class);
     AggVersionedDIVStats statsMock = mock(AggVersionedDIVStats.class);
@@ -56,14 +62,14 @@ public class LeaderProducerCallbackTest {
     inMemoryLogAppender.start();
     LoggerContext ctx = ((LoggerContext) LogManager.getContext(false));
     Configuration config = ctx.getConfiguration();
-    doReturn(true).when(ingestionTaskMock).isTransientRecordBufferUsed();
+    doReturn(true).when(ingestionTaskMock).isTransientRecordBufferUsed(any());
     doReturn(null).when(partitionConsumptionStateMock).getTransientRecord(any());
     doReturn(true).when(partitionConsumptionStateMock).isEndOfPushReceived();
     doReturn(mock(KafkaKey.class)).when(sourceConsumerRecordMock).getKey();
 
     try {
       config.addLoggerAppender(
-          (org.apache.logging.log4j.core.Logger) LogManager.getLogger(LeaderFollowerStoreIngestionTask.class),
+          (org.apache.logging.log4j.core.Logger) LogManager.getLogger(LeaderProducerCallback.class),
           inMemoryLogAppender);
 
       LeaderProducerCallback leaderProducerCallback = new LeaderProducerCallback(
@@ -104,9 +110,35 @@ public class LeaderProducerCallbackTest {
   }
 
   @Test
+  public void testSetChunkingInfoSkipsTransientRecordLookupForGlobalRtDivMessages() {
+    LeaderFollowerStoreIngestionTask ingestionTaskMock = mock(LeaderFollowerStoreIngestionTask.class);
+    DefaultPubSubMessage sourceConsumerRecordMock = mock(DefaultPubSubMessage.class);
+    PartitionConsumptionState partitionConsumptionStateMock = mock(PartitionConsumptionState.class);
+
+    KafkaKey globalRtDivKey = mock(KafkaKey.class);
+    doReturn(true).when(globalRtDivKey).isGlobalRtDiv();
+    doReturn(globalRtDivKey).when(sourceConsumerRecordMock).getKey();
+    doReturn(true).when(ingestionTaskMock).isTransientRecordBufferUsed(any());
+
+    LeaderProducerCallback callback = new LeaderProducerCallback(
+        ingestionTaskMock,
+        sourceConsumerRecordMock,
+        partitionConsumptionStateMock,
+        mock(LeaderProducedRecordContext.class),
+        5,
+        "dc-0.kafka.venice.org",
+        0);
+
+    callback.setChunkingInfo(new byte[0], null, null, null, null, null, null);
+
+    // Global RT DIV messages skip the transient record lookup entirely
+    verify(partitionConsumptionStateMock, times(0)).getTransientRecord(any());
+  }
+
+  @Test
   public void testLeaderProducerCallbackProduceDeprecatedChunkDeletion() throws InterruptedException {
     LeaderFollowerStoreIngestionTask storeIngestionTask = mock(LeaderFollowerStoreIngestionTask.class);
-    PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> sourceConsumerRecord = mock(PubSubMessage.class);
+    DefaultPubSubMessage sourceConsumerRecord = mock(DefaultPubSubMessage.class);
     PartitionConsumptionState partitionConsumptionState = mock(PartitionConsumptionState.class);
     LeaderProducedRecordContext leaderProducedRecordContext = mock(LeaderProducedRecordContext.class);
     LeaderProducerCallback leaderProducerCallback = new LeaderProducerCallback(
@@ -127,5 +159,127 @@ public class LeaderProducerCallbackTest {
     verify(storeIngestionTask, times(10))
         .produceToStoreBufferService(any(), any(), anyInt(), anyString(), anyLong(), anyLong());
 
+  }
+
+  @Test
+  public void testHighProducerCompletionLatencyWarning() throws Exception {
+    LeaderFollowerStoreIngestionTask ingestionTaskMock = mock(LeaderFollowerStoreIngestionTask.class);
+    DefaultPubSubMessage sourceConsumerRecordMock = mock(DefaultPubSubMessage.class);
+    PartitionConsumptionState partitionConsumptionStateMock = mock(PartitionConsumptionState.class);
+    LeaderProducedRecordContext leaderProducedRecordContextMock = mock(LeaderProducedRecordContext.class);
+    AggVersionedIngestionStats versionedIngestionStatsMock = mock(AggVersionedIngestionStats.class);
+    com.linkedin.venice.pubsub.api.PubSubProduceResult produceResultMock =
+        mock(com.linkedin.venice.pubsub.api.PubSubProduceResult.class);
+    com.linkedin.venice.pubsub.api.PubSubTopicPartition topicPartitionMock =
+        mock(com.linkedin.venice.pubsub.api.PubSubTopicPartition.class);
+    com.linkedin.venice.pubsub.api.PubSubTopic pubSubTopicMock = mock(com.linkedin.venice.pubsub.api.PubSubTopic.class);
+    String storeName = Utils.getUniqueString("test-store");
+    String replicaId = "test_store_v1_0";
+
+    when(ingestionTaskMock.getStoreName()).thenReturn(storeName);
+    when(ingestionTaskMock.isUserSystemStore()).thenReturn(false);
+    when(ingestionTaskMock.getVersionIngestionStats()).thenReturn(versionedIngestionStatsMock);
+    when(partitionConsumptionStateMock.getReplicaId()).thenReturn(replicaId);
+    when(partitionConsumptionStateMock.isEndOfPushReceived()).thenReturn(false);
+    when(sourceConsumerRecordMock.getTopicPartition()).thenReturn(topicPartitionMock);
+    when(topicPartitionMock.getPubSubTopic()).thenReturn(pubSubTopicMock);
+    when(pubSubTopicMock.isRealTime()).thenReturn(false);
+    when(produceResultMock.getSerializedSize()).thenReturn(100);
+    when(produceResultMock.getPubSubPosition()).thenReturn(mock(com.linkedin.venice.pubsub.api.PubSubPosition.class));
+    doReturn(mock(com.linkedin.venice.pubsub.api.PubSubPosition.class)).when(leaderProducedRecordContextMock)
+        .getConsumedPosition();
+
+    InMemoryLogAppender inMemoryLogAppender = new InMemoryLogAppender.Builder().build();
+    inMemoryLogAppender.start();
+    LoggerContext ctx = ((LoggerContext) LogManager.getContext(false));
+    Configuration config = ctx.getConfiguration();
+
+    try {
+      config.addLoggerAppender(
+          (org.apache.logging.log4j.core.Logger) LogManager.getLogger(LeaderProducerCallback.class),
+          inMemoryLogAppender);
+
+      LeaderProducerCallback leaderProducerCallback = new LeaderProducerCallback(
+          ingestionTaskMock,
+          sourceConsumerRecordMock,
+          partitionConsumptionStateMock,
+          leaderProducedRecordContextMock,
+          0,
+          "kafka-url",
+          0);
+
+      // Use reflection to set produceTimeNs to simulate high latency (>30 seconds ago)
+      java.lang.reflect.Field produceTimeField = LeaderProducerCallback.class.getDeclaredField("produceTimeNs");
+      produceTimeField.setAccessible(true);
+      long thirtyFiveSecondsAgoInNs = System.nanoTime() - (35_000L * 1_000_000L); // 35 seconds in nanoseconds
+      produceTimeField.set(leaderProducerCallback, thirtyFiveSecondsAgoInNs);
+
+      // Call onCompletion with success (null exception)
+      leaderProducerCallback.onCompletion(produceResultMock, null);
+
+      // Verify warning log was generated
+      List<String> logs = inMemoryLogAppender.getLogs();
+      long matchedLogs = logs.stream()
+          .filter(log -> log.contains("High leader producer completion latency detected"))
+          .filter(log -> log.contains(replicaId))
+          .filter(log -> log.contains("threshold: 30000.0 ms"))
+          .count();
+      assertEquals(matchedLogs, 1L, "Expected exactly one warning log for high producer latency");
+    } finally {
+      LoggerConfig loggerConfig = config.getLoggerConfig(LeaderProducerCallback.class.getName());
+      if (loggerConfig.getName().equals(LeaderProducerCallback.class.getCanonicalName())) {
+        loggerConfig.removeAppender(inMemoryLogAppender.getName());
+      }
+      ctx.updateLoggers();
+      inMemoryLogAppender.stop();
+    }
+  }
+
+  /**
+   * On a produce failure, onCompletion(produceResult, e) with a non-null exception must complete the
+   * persistedToDBFuture exceptionally. Otherwise waiters block forever: the leader topic-switch's
+   * getLastLeaderPersistFuture().get() and the graceful-shutdown Global RT DIV sync relay both key their fail-fast off
+   * this future, and would hang until the shutdown timeout.
+   */
+  @Test
+  public void testOnCompletionCompletesPersistedToDBFutureExceptionallyOnProduceFailure() {
+    LeaderFollowerStoreIngestionTask ingestionTaskMock = mock(LeaderFollowerStoreIngestionTask.class);
+    DefaultPubSubMessage sourceConsumerRecordMock = mock(DefaultPubSubMessage.class);
+    PartitionConsumptionState partitionConsumptionStateMock = mock(PartitionConsumptionState.class);
+    AggVersionedDIVStats statsMock = mock(AggVersionedDIVStats.class);
+    String storeName = Utils.getUniqueString("test-store");
+
+    when(ingestionTaskMock.getStoreName()).thenReturn(storeName);
+    when(ingestionTaskMock.getVersionedDIVStats()).thenReturn(statsMock);
+    when(sourceConsumerRecordMock.getTopicName()).thenReturn("test_topic_v1");
+    when(sourceConsumerRecordMock.getPartition()).thenReturn(1);
+
+    // Real context backed by a real future so we can observe how onCompletion completes it on produce failure.
+    CompletableFuture<Void> persistedToDBFuture = new CompletableFuture<>();
+    LeaderProducedRecordContext leaderProducedRecordContext = LeaderProducedRecordContext
+        .newPutRecordWithFuture(0, mock(PubSubPosition.class), "key".getBytes(), mock(Put.class), persistedToDBFuture);
+
+    LeaderProducerCallback leaderProducerCallback = new LeaderProducerCallback(
+        ingestionTaskMock,
+        sourceConsumerRecordMock,
+        partitionConsumptionStateMock,
+        leaderProducedRecordContext,
+        5,
+        "dc-0.kafka.venice.org",
+        0);
+
+    VeniceException produceFailure = new VeniceException("Producer is closed forcefully");
+    leaderProducerCallback.onCompletion(null, produceFailure);
+
+    assertTrue(persistedToDBFuture.isCompletedExceptionally(), "persistedToDBFuture must fail fast on produce failure");
+    try {
+      persistedToDBFuture.get();
+      fail("Expected persistedToDBFuture to complete exceptionally");
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      fail("Unexpected InterruptedException");
+    } catch (ExecutionException e) {
+      assertEquals(e.getCause(), produceFailure, "The original produce failure must propagate to waiters");
+    }
   }
 }

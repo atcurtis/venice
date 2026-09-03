@@ -1,0 +1,464 @@
+package com.linkedin.venice.endToEnd;
+
+import static com.linkedin.venice.utils.TestUtils.assertCommand;
+import static com.linkedin.venice.utils.TestWriteUtils.DEFAULT_USER_DATA_RECORD_COUNT;
+import static com.linkedin.venice.utils.TestWriteUtils.DEFAULT_USER_DATA_VALUE_PREFIX;
+import static com.linkedin.venice.utils.TestWriteUtils.writeSimpleAvroFileWithStringToStringSchema;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.DATA_WRITER_COMPUTE_JOB_CLASS;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.PUSH_JOB_EXTERNAL_STORAGE_BATCHPUT_RETRIES;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.PUSH_JOB_EXTERNAL_STORAGE_BATCHPUT_RETRY_BACKOFF_MS;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.PUSH_JOB_EXTERNAL_STORAGE_BATCH_SIZE;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.PUSH_JOB_EXTERNAL_STORAGE_FAIL_OPEN_ON_REGION_FAILURE;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.PUSH_JOB_EXTERNAL_STORAGE_WRITER_CLASS;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.PUSH_JOB_EXTERNAL_STORAGE_WRITE_QUOTA_BYTES_PER_REGION_PER_SECOND;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.PUSH_JOB_EXTERNAL_STORAGE_WRITE_QUOTA_RECORDS_PER_REGION_PER_SECOND;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.SPARK_NATIVE_INPUT_FORMAT_ENABLED;
+import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertNotNull;
+import static org.testng.Assert.assertTrue;
+
+import com.linkedin.venice.client.store.AvroGenericStoreClient;
+import com.linkedin.venice.client.store.ClientConfig;
+import com.linkedin.venice.client.store.ClientFactory;
+import com.linkedin.venice.controllerapi.ControllerClient;
+import com.linkedin.venice.controllerapi.UpdateStoreQueryParams;
+import com.linkedin.venice.hadoop.mapreduce.datawriter.jobs.DataWriterMRJob;
+import com.linkedin.venice.hadoop.task.datawriter.ExternalStorageRecord;
+import com.linkedin.venice.helix.HelixReadOnlySchemaRepository;
+import com.linkedin.venice.integration.utils.VeniceClusterWrapper;
+import com.linkedin.venice.integration.utils.VeniceControllerWrapper;
+import com.linkedin.venice.integration.utils.VeniceMultiClusterWrapper;
+import com.linkedin.venice.meta.StorageMode;
+import com.linkedin.venice.meta.Store;
+import com.linkedin.venice.meta.StoreInfo;
+import com.linkedin.venice.meta.Version;
+import com.linkedin.venice.meta.VersionStorageModeUpdateReason;
+import com.linkedin.venice.serializer.AvroGenericDeserializer;
+import com.linkedin.venice.serializer.AvroSerializer;
+import com.linkedin.venice.spark.datawriter.jobs.DataWriterSparkJob;
+import com.linkedin.venice.stats.VeniceMetricsRepository;
+import com.linkedin.venice.utils.ByteUtils;
+import com.linkedin.venice.utils.IntegrationTestPushUtils;
+import com.linkedin.venice.utils.TestUtils;
+import com.linkedin.venice.utils.Time;
+import com.linkedin.venice.utils.Utils;
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.sdk.metrics.data.LongPointData;
+import io.opentelemetry.sdk.metrics.data.MetricData;
+import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
+import io.tehuti.metrics.MetricsRepository;
+import java.io.File;
+import java.nio.ByteBuffer;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import org.apache.avro.Schema;
+import org.testng.annotations.AfterMethod;
+import org.testng.annotations.DataProvider;
+import org.testng.annotations.Test;
+
+
+/**
+ * End-to-end test for the VPJ external-storage dual-write path, exercised across two regions. One region
+ * (dc0) has its store-level {@code storageMode} set to {@code DUAL_WRITE} via a region-scoped
+ * {@code UpdateStore}, while the other (dc1) stays {@code INTERNAL}. A single VPJ batch push resolves each
+ * region's storage mode through the parent controller and fans out external writes only to the
+ * {@code DUAL_WRITE} regions.
+ *
+ * <p>This single multi-region test covers the full cross-product of the dual-write contract (consolidating
+ * what used to be a separate single-region test):
+ * <ul>
+ *   <li><b>Per-region routing / gating:</b> only dc0's region-keyed sink is populated; dc1's stays empty —
+ *       i.e. the {@code DUAL_WRITE} region writes and the {@code INTERNAL} region does not.</li>
+ *   <li><b>On-disk format:</b> each sink value is bit-for-bit {@code [4-byte BE schemaId][Avro value]}.</li>
+ *   <li><b>Config forwarding:</b> an arbitrary {@code push.job.external.storage.*} key set on the driver
+ *       reaches {@code configure()} on the executor.</li>
+ *   <li><b>Batching:</b> {@code batchSize=1} flushes one record per {@code batchPut}; {@code batchSize=25}
+ *       flushes a full 25-record batch (the store is pinned to a single partition for determinism).</li>
+ *   <li><b>Throttling:</b> a generous per-region record/byte write quota is configured so the dual-write
+ *       throttler is constructed and exercised on the write path end-to-end, without slowing the push or
+ *       dropping records.</li>
+ *   <li><b>Ingestion unaffected:</b> Venice still serves every record in the {@code DUAL_WRITE} region.</li>
+ * </ul>
+ *
+ * <p>{@link #dualWritePushSucceedsWhenOneRegionExhaustsExternalWriteRetries} additionally covers the fail-open
+ * path over both data writer engines (Spark and MapReduce): one region's external writes exhaust their retries,
+ * the push still succeeds, only that region's version is downgraded to {@code INTERNAL}, and the affected
+ * region's controller emits {@code push_job.external_storage_write_failure.count} exactly once with that region
+ * as its dimension while the healthy region emits nothing.
+ */
+public class TestVPJDualWriteExternalStorageMultiRegion extends AbstractMultiRegionTest {
+  private static final int READ_VERIFICATION_TIMEOUT_SEC = 60;
+  /** Matches {@code PushJobStatusStats.PushJobOtelMetricEntity.PUSH_JOB_EXTERNAL_STORAGE_WRITE_FAILURE_COUNT}. */
+  private static final String EXTERNAL_STORAGE_WRITE_FAILURE_METRIC_NAME =
+      "push_job.external_storage_write_failure.count";
+
+  @AfterMethod(alwaysRun = true)
+  public void resetSink() {
+    InMemoryExternalStorageWriter.clearAll();
+  }
+
+  @DataProvider(name = "batchSize")
+  public Object[][] batchSize() {
+    return new Object[][] { { 1 }, { 25 } };
+  }
+
+  @DataProvider(name = "dataWriterComputeJobClass")
+  public Object[][] dataWriterComputeJobClass() {
+    return new Object[][] { { DataWriterSparkJob.class }, { DataWriterMRJob.class } };
+  }
+
+  @Test(timeOut = 240 * Time.MS_PER_SECOND, dataProvider = "batchSize")
+  public void dualWriteFansOutOnlyToDualWriteRegions(int batchSize) throws Exception {
+    String storeName = Utils.getUniqueString("dual_write_multi_region_b" + batchSize);
+    String dc0Region = multiRegionMultiClusterWrapper.getChildRegionNames().get(0);
+    String dc1Region = multiRegionMultiClusterWrapper.getChildRegionNames().get(1);
+
+    File inputDir = Utils.getTempDataDirectory();
+    writeSimpleAvroFileWithStringToStringSchema(inputDir);
+    Schema stringSchema = Schema.parse("\"string\"");
+
+    Properties props = IntegrationTestPushUtils
+        .defaultVPJProps(multiRegionMultiClusterWrapper, "file://" + inputDir.getAbsolutePath(), storeName);
+    props.setProperty(DATA_WRITER_COMPUTE_JOB_CLASS, DataWriterSparkJob.class.getCanonicalName());
+    props.setProperty(SPARK_NATIVE_INPUT_FORMAT_ENABLED, "true");
+    props.setProperty(PUSH_JOB_EXTERNAL_STORAGE_WRITER_CLASS, InMemoryExternalStorageWriter.class.getName());
+    props.setProperty(PUSH_JOB_EXTERNAL_STORAGE_BATCH_SIZE, String.valueOf(batchSize));
+    // Enable per-region external-write throttling end-to-end. The store is pinned to a single partition, so the
+    // per-task rate equals the global rate; both quotas are deliberately generous so the throttler is built and
+    // exercised on the write path without measurably slowing the push or ever dropping a record.
+    props.setProperty(PUSH_JOB_EXTERNAL_STORAGE_WRITE_QUOTA_RECORDS_PER_REGION_PER_SECOND, "100000");
+    props.setProperty(PUSH_JOB_EXTERNAL_STORAGE_WRITE_QUOTA_BYTES_PER_REGION_PER_SECOND, "100000000");
+    // Probe an arbitrary push.job.external.storage.* key to verify driver->executor prefix forwarding reaches
+    // configure(). Read back via forwardedConfigObservedFor().
+    String expectedProbeValue = "probe-value-for-b" + batchSize;
+    props.setProperty(InMemoryExternalStorageWriter.FORWARDED_CONFIG_PROBE_KEY, expectedProbeValue);
+
+    try (ControllerClient parentClient = new ControllerClient(CLUSTER_NAME, parentController.getControllerUrl());
+        ControllerClient dc0Client =
+            new ControllerClient(CLUSTER_NAME, childDatacenters.get(0).getControllerConnectString());
+        ControllerClient dc1Client =
+            new ControllerClient(CLUSTER_NAME, childDatacenters.get(1).getControllerConnectString())) {
+      assertCommand(parentClient.createNewStore(storeName, "owner", stringSchema.toString(), stringSchema.toString()));
+      // Pin to a single partition so all records land in one partition writer, making the batching assertions
+      // below deterministic.
+      assertCommand(
+          parentClient.updateStore(
+              storeName,
+              new UpdateStoreQueryParams().setStorageQuotaInByte(Store.UNLIMITED_STORAGE_QUOTA).setPartitionCount(1)));
+
+      // Enable dual-write in dc0 only; dc1's region-filter early-return leaves it at INTERNAL. The VPJ driver
+      // reads each region's store-level value through the parent, so this must settle before the push runs.
+      assertCommand(
+          parentClient.updateStore(
+              storeName,
+              new UpdateStoreQueryParams().setStorageMode(StorageMode.DUAL_WRITE).setRegionsFilter(dc0Region)));
+      TestUtils.waitForNonDeterministicAssertion(60, TimeUnit.SECONDS, () -> {
+        StoreInfo dc0Store = assertCommand(dc0Client.getStore(storeName)).getStore();
+        StoreInfo dc1Store = assertCommand(dc1Client.getStore(storeName)).getStore();
+        assertEquals(
+            dc0Store.getStorageMode(),
+            StorageMode.DUAL_WRITE,
+            "dc0 store-level storageMode should be DUAL_WRITE");
+        assertEquals(
+            dc1Store.getStorageMode(),
+            StorageMode.INTERNAL,
+            "dc1 store-level storageMode should stay INTERNAL");
+      });
+
+      IntegrationTestPushUtils.runVPJ(props);
+
+      String topic = Version.composeKafkaTopic(storeName, 1);
+
+      // Build the bit-for-bit expected blob set: AvroSerializer over the value schema, then prepend the
+      // BE schema-id prefix — identical to what the partition writer emits (NO_OP compression by default).
+      AvroSerializer<CharSequence> valueSerializer = new AvroSerializer<>(stringSchema);
+      Set<ByteBuffer> expectedFormattedValues = new HashSet<>();
+      for (int i = 1; i <= DEFAULT_USER_DATA_RECORD_COUNT; i++) {
+        byte[] avroPayload = valueSerializer.serialize(DEFAULT_USER_DATA_VALUE_PREFIX + i);
+        byte[] formatted = new byte[ExternalStorageRecord.SCHEMA_ID_PREFIX_LENGTH + avroPayload.length];
+        ByteUtils.writeInt(formatted, HelixReadOnlySchemaRepository.VALUE_SCHEMA_STARTING_ID, 0);
+        System.arraycopy(avroPayload, 0, formatted, ExternalStorageRecord.SCHEMA_ID_PREFIX_LENGTH, avroPayload.length);
+        expectedFormattedValues.add(ByteBuffer.wrap(formatted));
+      }
+
+      // Per-region dual-write: dc0's sink received every record; dc1's sink was never written.
+      assertEquals(
+          InMemoryExternalStorageWriter.regionsWithDataForTopic(topic),
+          Collections.singleton(dc0Region),
+          "Only the DUAL_WRITE region (dc0) should have an external sink populated");
+
+      Map<ByteBuffer, byte[]> dc0Sink = InMemoryExternalStorageWriter.snapshotForRegionAndTopic(dc0Region, topic);
+      assertEquals(
+          dc0Sink.size(),
+          DEFAULT_USER_DATA_RECORD_COUNT,
+          "dc0 external sink did not receive every pushed record");
+      Set<ByteBuffer> actualFormattedValues = new HashSet<>();
+      for (byte[] formattedValue: dc0Sink.values()) {
+        actualFormattedValues.add(ByteBuffer.wrap(formattedValue));
+      }
+      assertEquals(
+          actualFormattedValues,
+          expectedFormattedValues,
+          "dc0 sink blobs must be bit-for-bit [4-byte BE schemaId][Avro-encoded value] for every input record");
+
+      // Per-key cross-check: for each input key, look up its blob in the external sink (keyed by the serialized
+      // key, exactly as the partition writer emitted it), strip the 4-byte BE schema-id prefix, and Avro-decode
+      // the value. Confirm the decoded value matches the expected input value for that specific key. This ties
+      // each external-storage entry to a key (the set assertion above is key-agnostic) and the decoded map is
+      // cross-checked against what Venice serves in the read-verification block below.
+      AvroSerializer<CharSequence> keySerializer = new AvroSerializer<>(stringSchema);
+      AvroGenericDeserializer<Object> valueDeserializer = new AvroGenericDeserializer<>(stringSchema, stringSchema);
+      Map<String, String> externalDecodedByKey = new HashMap<>();
+      for (int i = 1; i <= DEFAULT_USER_DATA_RECORD_COUNT; i++) {
+        String key = Integer.toString(i);
+        byte[] blob = dc0Sink.get(ByteBuffer.wrap(keySerializer.serialize(key)));
+        assertNotNull(blob, "dc0 external sink has no entry for key " + key);
+        ByteBuffer view = ByteBuffer.wrap(blob);
+        assertEquals(
+            view.getInt(),
+            HelixReadOnlySchemaRepository.VALUE_SCHEMA_STARTING_ID,
+            "External value for key " + key + " must be prefixed with the value schema id");
+        byte[] valuePayload = new byte[view.remaining()];
+        view.get(valuePayload);
+        String decoded = valueDeserializer.deserialize(valuePayload).toString();
+        assertEquals(
+            decoded,
+            DEFAULT_USER_DATA_VALUE_PREFIX + i,
+            "External-stored value for key " + key + " does not match the expected input value");
+        externalDecodedByKey.put(key, decoded);
+      }
+
+      assertTrue(
+          InMemoryExternalStorageWriter.snapshotForRegionAndTopic(dc1Region, topic).isEmpty(),
+          "dc1 is INTERNAL; its external sink must stay empty");
+
+      // Config forwarding: the arbitrary push.job.external.storage.* probe set on the driver reached
+      // configure() on the executor.
+      assertEquals(
+          InMemoryExternalStorageWriter.forwardedConfigObservedFor(topic),
+          expectedProbeValue,
+          "Custom push.job.external.storage.* property did not propagate from driver to executor's configure()");
+
+      // Batching contract: batchSize=1 never batches; batchSize>1 flushes at least one full-size batch (the
+      // store is pinned to a single partition above so this is deterministic).
+      int observedMaxBatch = InMemoryExternalStorageWriter.maxBatchSizeFor(topic);
+      assertTrue(InMemoryExternalStorageWriter.batchPutInvocationsFor(topic) > 0, "Expected at least one batchPut");
+      if (batchSize == 1) {
+        assertEquals(observedMaxBatch, 1, "With batchSize=1 the wrapper must never batch");
+      } else {
+        assertEquals(observedMaxBatch, batchSize, "With batchSize=" + batchSize + " a full batch should flush");
+      }
+
+      // Venice still serves every record in the DUAL_WRITE region — dual-write must not break ingestion.
+      VeniceClusterWrapper dc0Cluster = getCluster(0);
+      try (AvroGenericStoreClient<String, Object> client = ClientFactory.getAndStartGenericAvroClient(
+          ClientConfig.defaultGenericClientConfig(storeName).setVeniceURL(dc0Cluster.getRandomRouterURL()))) {
+        TestUtils.waitForNonDeterministicAssertion(READ_VERIFICATION_TIMEOUT_SEC, TimeUnit.SECONDS, true, true, () -> {
+          dc0Cluster.refreshAllRouterMetaData();
+          for (int i = 1; i <= DEFAULT_USER_DATA_RECORD_COUNT; i++) {
+            Object veniceValue = client.get(Integer.toString(i)).get();
+            assertNotNull(veniceValue, "Thin client returned null for key " + i);
+            assertEquals(
+                veniceValue.toString(),
+                DEFAULT_USER_DATA_VALUE_PREFIX + i,
+                "Venice value mismatch for key " + i);
+            // Direct external == Venice per key: the value an external reader decodes from dc0's sink equals
+            // what Venice serves for the same key (non-chunked case).
+            assertEquals(
+                externalDecodedByKey.get(Integer.toString(i)),
+                veniceValue.toString(),
+                "External-storage value and Venice value diverge for key " + i);
+          }
+        });
+      }
+    }
+  }
+
+  @Test(timeOut = 240 * Time.MS_PER_SECOND, dataProvider = "dataWriterComputeJobClass")
+  public void dualWritePushSucceedsWhenOneRegionExhaustsExternalWriteRetries(Class<?> dataWriterComputeJobClass)
+      throws Exception {
+    String storeName =
+        Utils.getUniqueString("dual_write_fail_open_multi_region_" + dataWriterComputeJobClass.getSimpleName());
+    String healthyRegion = multiRegionMultiClusterWrapper.getChildRegionNames().get(0);
+    String failedRegion = multiRegionMultiClusterWrapper.getChildRegionNames().get(1);
+
+    File inputDir = Utils.getTempDataDirectory();
+    writeSimpleAvroFileWithStringToStringSchema(inputDir);
+    Schema stringSchema = Schema.parse("\"string\"");
+
+    Properties props = IntegrationTestPushUtils
+        .defaultVPJProps(multiRegionMultiClusterWrapper, "file://" + inputDir.getAbsolutePath(), storeName);
+    props.setProperty(DATA_WRITER_COMPUTE_JOB_CLASS, dataWriterComputeJobClass.getCanonicalName());
+    if (dataWriterComputeJobClass == DataWriterSparkJob.class) {
+      props.setProperty(SPARK_NATIVE_INPUT_FORMAT_ENABLED, "true");
+    }
+    props.setProperty(PUSH_JOB_EXTERNAL_STORAGE_WRITER_CLASS, InMemoryExternalStorageWriter.class.getName());
+    props.setProperty(PUSH_JOB_EXTERNAL_STORAGE_BATCH_SIZE, "1");
+    props.setProperty(PUSH_JOB_EXTERNAL_STORAGE_BATCHPUT_RETRIES, "2");
+    props.setProperty(PUSH_JOB_EXTERNAL_STORAGE_BATCHPUT_RETRY_BACKOFF_MS, "0");
+    props.setProperty(PUSH_JOB_EXTERNAL_STORAGE_FAIL_OPEN_ON_REGION_FAILURE, "true");
+    props.setProperty(InMemoryExternalStorageWriter.FAIL_ALWAYS_IN_REGION_KEY, failedRegion);
+
+    try (ControllerClient parentClient = new ControllerClient(CLUSTER_NAME, parentController.getControllerUrl());
+        ControllerClient healthyRegionControllerClient =
+            new ControllerClient(CLUSTER_NAME, childDatacenters.get(0).getControllerConnectString());
+        ControllerClient failedRegionControllerClient =
+            new ControllerClient(CLUSTER_NAME, childDatacenters.get(1).getControllerConnectString())) {
+      assertCommand(parentClient.createNewStore(storeName, "owner", stringSchema.toString(), stringSchema.toString()));
+      assertCommand(
+          parentClient.updateStore(
+              storeName,
+              new UpdateStoreQueryParams().setStorageQuotaInByte(Store.UNLIMITED_STORAGE_QUOTA)
+                  .setPartitionCount(1)
+                  .setStorageMode(StorageMode.DUAL_WRITE)));
+      TestUtils.waitForNonDeterministicAssertion(60, TimeUnit.SECONDS, () -> {
+        assertEquals(
+            assertCommand(healthyRegionControllerClient.getStore(storeName)).getStore().getStorageMode(),
+            StorageMode.DUAL_WRITE);
+        assertEquals(
+            assertCommand(failedRegionControllerClient.getStore(storeName)).getStore().getStorageMode(),
+            StorageMode.DUAL_WRITE);
+      });
+
+      IntegrationTestPushUtils.runVPJ(props);
+
+      String topic = Version.composeKafkaTopic(storeName, 1);
+      assertEquals(
+          InMemoryExternalStorageWriter.batchPutAttemptsForRegionAndTopic(failedRegion, topic),
+          3,
+          "Failed region should exhaust the configured initial attempt plus 2 retries exactly once");
+      assertEquals(
+          InMemoryExternalStorageWriter.regionsWithDataForTopic(topic),
+          Collections.singleton(healthyRegion),
+          "Only the healthy region should retain external-storage data after fail-open disables the failed region");
+      assertEquals(
+          InMemoryExternalStorageWriter.snapshotForRegionAndTopic(healthyRegion, topic).size(),
+          DEFAULT_USER_DATA_RECORD_COUNT);
+      assertTrue(
+          InMemoryExternalStorageWriter.snapshotForRegionAndTopic(failedRegion, topic).isEmpty(),
+          "The failed region should never persist external-storage records after every batchPut throws");
+
+      TestUtils.waitForNonDeterministicAssertion(60, TimeUnit.SECONDS, true, true, () -> {
+        StoreInfo healthyRegionStoreInfo = assertCommand(healthyRegionControllerClient.getStore(storeName)).getStore();
+        StoreInfo failedRegionStoreInfo = assertCommand(failedRegionControllerClient.getStore(storeName)).getStore();
+
+        assertEquals(healthyRegionStoreInfo.getCurrentVersion(), 1);
+        assertEquals(failedRegionStoreInfo.getCurrentVersion(), 1);
+        assertEquals(healthyRegionStoreInfo.getStorageMode(), StorageMode.DUAL_WRITE);
+        assertEquals(failedRegionStoreInfo.getStorageMode(), StorageMode.DUAL_WRITE);
+        assertEquals(
+            healthyRegionStoreInfo.getVersion(1).get().getStorageMode(),
+            StorageMode.DUAL_WRITE,
+            "Healthy region should keep the version in DUAL_WRITE mode");
+        assertEquals(
+            failedRegionStoreInfo.getVersion(1).get().getStorageMode(),
+            StorageMode.INTERNAL,
+            "Failed region should downgrade only that version to INTERNAL before the swap");
+      });
+
+      // The fail-open is otherwise silent — the push succeeded — so the alertable counter is the only signal
+      // that this fabric's copy of v1 exists in Venice alone. It must be attributed to the region that actually
+      // lost its external-storage copy, and the healthy region must stay clean.
+      TestUtils.waitForNonDeterministicAssertion(60, TimeUnit.SECONDS, true, true, () -> {
+        assertEquals(
+            externalStorageWriteFailureCount(1, storeName, failedRegion),
+            1L,
+            "The failed region's controller must count exactly one external-storage write failure");
+        assertEquals(
+            externalStorageWriteFailureCount(0, storeName, healthyRegion),
+            0L,
+            "The healthy region never failed open and must not contribute to the alert");
+      });
+      // Cross-region attribution: the failed region's controller must not attribute the failure to any region
+      // other than its own, which is what makes a per-fabric alert meaningful.
+      assertEquals(
+          externalStorageWriteFailureCount(1, storeName, healthyRegion),
+          0L,
+          "The failed region's controller must not attribute its failure to the healthy region");
+
+      // Idempotent replay through the parent: the push job retries this request, so the same downgrade can be
+      // delivered more than once. The version is already INTERNAL, so nothing transitions and the counter must
+      // not move. This also re-exercises parent -> child reason propagation on its own, outside the push.
+      assertCommand(
+          parentClient.updateStoreVersionStorageMode(
+              storeName,
+              1,
+              StorageMode.INTERNAL,
+              failedRegion,
+              VersionStorageModeUpdateReason.EXTERNAL_WRITE_FAILURE));
+      assertEquals(
+          assertCommand(failedRegionControllerClient.getStore(storeName)).getStore()
+              .getVersion(1)
+              .get()
+              .getStorageMode(),
+          StorageMode.INTERNAL,
+          "The replayed downgrade must leave the version INTERNAL");
+      // Give the child controller room to have (incorrectly) re-emitted before asserting the count held.
+      TestUtils.waitForNonDeterministicAssertion(15, TimeUnit.SECONDS, true, true, () -> {
+        assertEquals(
+            externalStorageWriteFailureCount(1, storeName, failedRegion),
+            1L,
+            "An idempotent replay of the same downgrade must not double count the alert");
+      });
+
+      VeniceClusterWrapper failedCluster = getCluster(1);
+      try (AvroGenericStoreClient<String, Object> client = ClientFactory.getAndStartGenericAvroClient(
+          ClientConfig.defaultGenericClientConfig(storeName).setVeniceURL(failedCluster.getRandomRouterURL()))) {
+        TestUtils.waitForNonDeterministicAssertion(READ_VERIFICATION_TIMEOUT_SEC, TimeUnit.SECONDS, true, true, () -> {
+          failedCluster.refreshAllRouterMetaData();
+          Object value = client.get("1").get();
+          assertNotNull(value, "Failed region should still serve the new current version");
+          assertEquals(value.toString(), DEFAULT_USER_DATA_VALUE_PREFIX + 1);
+        });
+      }
+    }
+  }
+
+  /**
+   * Sum {@code push_job.external_storage_write_failure.count} across the controllers of one child region,
+   * for the given store and {@code venice.region.name} dimension.
+   *
+   * <p>Reads the controllers' own {@link InMemoryMetricReader}s, so this asserts on what the affected region's
+   * controller actually emitted rather than on anything the test computed. Returns 0 when the counter has never
+   * been recorded, since an OTel instrument that was never observed does not materialize at all.
+   */
+  private long externalStorageWriteFailureCount(int dcIndex, String storeName, String regionName) {
+    AttributeKey<String> clusterKey = AttributeKey.stringKey("venice.cluster.name");
+    AttributeKey<String> storeKey = AttributeKey.stringKey("venice.store.name");
+    AttributeKey<String> regionKey = AttributeKey.stringKey("venice.region.name");
+    VeniceMultiClusterWrapper childDatacenter = childDatacenters.get(dcIndex);
+    long total = 0L;
+    for (VeniceControllerWrapper controller: childDatacenter.getControllers().values()) {
+      MetricsRepository repository = controller.getMetricRepository();
+      if (!(repository instanceof VeniceMetricsRepository)) {
+        continue;
+      }
+      InMemoryMetricReader reader =
+          (InMemoryMetricReader) ((VeniceMetricsRepository) repository).getVeniceMetricsConfig()
+              .getOtelAdditionalMetricsReader();
+      if (reader == null) {
+        continue;
+      }
+      for (MetricData metricData: reader.collectAllMetrics()) {
+        if (!metricData.getName().endsWith(EXTERNAL_STORAGE_WRITE_FAILURE_METRIC_NAME)) {
+          continue;
+        }
+        total += metricData.getLongSumData()
+            .getPoints()
+            .stream()
+            .filter(
+                point -> CLUSTER_NAME.equals(point.getAttributes().get(clusterKey))
+                    && storeName.equals(point.getAttributes().get(storeKey))
+                    && regionName.equals(point.getAttributes().get(regionKey)))
+            .mapToLong(LongPointData::getValue)
+            .sum();
+      }
+    }
+    return total;
+  }
+}

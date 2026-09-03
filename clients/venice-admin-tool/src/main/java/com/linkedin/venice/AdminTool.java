@@ -1,12 +1,9 @@
 package com.linkedin.venice;
 
 import static com.linkedin.venice.CommonConfigKeys.SSL_FACTORY_CLASS_NAME;
-import static com.linkedin.venice.ConfigKeys.KAFKA_BOOTSTRAP_SERVERS;
 import static com.linkedin.venice.VeniceConstants.DEFAULT_SSL_FACTORY_CLASS_NAME;
 import static com.linkedin.venice.schema.AvroSchemaParseUtils.parseSchemaFromJSONLooseValidation;
 import static com.linkedin.venice.serialization.avro.AvroProtocolDefinition.SERVER_ADMIN_RESPONSE;
-import static org.apache.kafka.clients.consumer.ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG;
-import static org.apache.kafka.clients.consumer.ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -15,8 +12,10 @@ import com.fasterxml.jackson.databind.ObjectWriter;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.linkedin.davinci.listener.response.TopicPartitionIngestionContextResponse;
+import com.linkedin.davinci.listener.response.ReplicaIngestionResponse;
+import com.linkedin.venice.acl.VeniceComponent;
 import com.linkedin.venice.admin.protocol.response.AdminResponseRecord;
+import com.linkedin.venice.annotation.VisibleForTesting;
 import com.linkedin.venice.client.exceptions.VeniceClientException;
 import com.linkedin.venice.client.store.ClientConfig;
 import com.linkedin.venice.client.store.ClientFactory;
@@ -31,10 +30,10 @@ import com.linkedin.venice.controllerapi.AclResponse;
 import com.linkedin.venice.controllerapi.AdminTopicMetadataResponse;
 import com.linkedin.venice.controllerapi.ChildAwareResponse;
 import com.linkedin.venice.controllerapi.ClusterStaleDataAuditResponse;
+import com.linkedin.venice.controllerapi.ControllerApiConstants;
 import com.linkedin.venice.controllerapi.ControllerClient;
 import com.linkedin.venice.controllerapi.ControllerClientFactory;
 import com.linkedin.venice.controllerapi.ControllerResponse;
-import com.linkedin.venice.controllerapi.D2ControllerClient;
 import com.linkedin.venice.controllerapi.D2ServiceDiscoveryResponse;
 import com.linkedin.venice.controllerapi.JobStatusQueryResponse;
 import com.linkedin.venice.controllerapi.MigrationPushStrategyResponse;
@@ -43,6 +42,7 @@ import com.linkedin.venice.controllerapi.MultiNodesStatusResponse;
 import com.linkedin.venice.controllerapi.MultiReplicaResponse;
 import com.linkedin.venice.controllerapi.MultiSchemaResponse;
 import com.linkedin.venice.controllerapi.MultiStoragePersonaResponse;
+import com.linkedin.venice.controllerapi.MultiStoreInfoResponse;
 import com.linkedin.venice.controllerapi.MultiStoreResponse;
 import com.linkedin.venice.controllerapi.MultiStoreStatusResponse;
 import com.linkedin.venice.controllerapi.MultiStoreTopicsResponse;
@@ -53,8 +53,10 @@ import com.linkedin.venice.controllerapi.NodeReplicasReadinessResponse;
 import com.linkedin.venice.controllerapi.NodeStatusResponse;
 import com.linkedin.venice.controllerapi.OwnerResponse;
 import com.linkedin.venice.controllerapi.PartitionResponse;
+import com.linkedin.venice.controllerapi.PubSubPositionJsonWireFormat;
 import com.linkedin.venice.controllerapi.PubSubTopicConfigResponse;
 import com.linkedin.venice.controllerapi.ReadyForDataRecoveryResponse;
+import com.linkedin.venice.controllerapi.RepushJobResponse;
 import com.linkedin.venice.controllerapi.RoutersClusterConfigResponse;
 import com.linkedin.venice.controllerapi.SchemaResponse;
 import com.linkedin.venice.controllerapi.StoragePersonaResponse;
@@ -64,6 +66,7 @@ import com.linkedin.venice.controllerapi.StoreMigrationResponse;
 import com.linkedin.venice.controllerapi.StoreResponse;
 import com.linkedin.venice.controllerapi.TrackableControllerResponse;
 import com.linkedin.venice.controllerapi.UpdateClusterConfigQueryParams;
+import com.linkedin.venice.controllerapi.UpdateDarkClusterConfigQueryParams;
 import com.linkedin.venice.controllerapi.UpdateStoragePersonaQueryParams;
 import com.linkedin.venice.controllerapi.UpdateStoreQueryParams;
 import com.linkedin.venice.controllerapi.VersionCreationResponse;
@@ -78,20 +81,33 @@ import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.helix.HelixAdapterSerializer;
 import com.linkedin.venice.helix.HelixSchemaAccessor;
 import com.linkedin.venice.helix.ZkClientFactory;
-import com.linkedin.venice.kafka.protocol.KafkaMessageEnvelope;
 import com.linkedin.venice.meta.BackupStrategy;
 import com.linkedin.venice.meta.BufferReplayPolicy;
 import com.linkedin.venice.meta.DataReplicationPolicy;
+import com.linkedin.venice.meta.ExternalStorageReadMode;
+import com.linkedin.venice.meta.IngestionPauseMode;
+import com.linkedin.venice.meta.LifecycleHooksRecord;
 import com.linkedin.venice.meta.QueryAction;
 import com.linkedin.venice.meta.ServerAdminAction;
+import com.linkedin.venice.meta.StorageMode;
 import com.linkedin.venice.meta.StoreInfo;
+import com.linkedin.venice.meta.VeniceETLStrategy;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.meta.VersionStatus;
+import com.linkedin.venice.metadata.payload.StorePropertiesPayloadRecord;
 import com.linkedin.venice.metadata.response.MetadataResponseRecord;
 import com.linkedin.venice.pubsub.PubSubClientsFactory;
+import com.linkedin.venice.pubsub.PubSubConsumerAdapterContext;
+import com.linkedin.venice.pubsub.PubSubPositionDeserializer;
+import com.linkedin.venice.pubsub.PubSubPositionTypeRegistry;
+import com.linkedin.venice.pubsub.PubSubTopicPartitionImpl;
 import com.linkedin.venice.pubsub.PubSubTopicRepository;
+import com.linkedin.venice.pubsub.PubSubUtil;
 import com.linkedin.venice.pubsub.api.PubSubConsumerAdapter;
 import com.linkedin.venice.pubsub.api.PubSubMessageDeserializer;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
+import com.linkedin.venice.pubsub.api.PubSubSymbolicPosition;
+import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
 import com.linkedin.venice.pubsub.api.exceptions.PubSubOpTimeoutException;
 import com.linkedin.venice.pubsub.manager.TopicManager;
 import com.linkedin.venice.pubsub.manager.TopicManagerContext;
@@ -101,20 +117,20 @@ import com.linkedin.venice.schema.SchemaEntry;
 import com.linkedin.venice.schema.avro.SchemaCompatibility;
 import com.linkedin.venice.schema.vson.VsonAvroSchemaAdapter;
 import com.linkedin.venice.security.SSLFactory;
-import com.linkedin.venice.serialization.KafkaKeySerializer;
 import com.linkedin.venice.serialization.avro.AvroProtocolDefinition;
 import com.linkedin.venice.serialization.avro.InternalAvroSpecificSerializer;
-import com.linkedin.venice.serialization.avro.KafkaValueSerializer;
-import com.linkedin.venice.serialization.avro.OptimizedKafkaValueSerializer;
 import com.linkedin.venice.serializer.FastSerializerDeserializerFactory;
 import com.linkedin.venice.serializer.RecordDeserializer;
+import com.linkedin.venice.utils.ConfigCommonUtils;
+import com.linkedin.venice.utils.DaemonThreadFactory;
+import com.linkedin.venice.utils.LogContext;
 import com.linkedin.venice.utils.ObjectMapperFactory;
 import com.linkedin.venice.utils.RetryUtils;
 import com.linkedin.venice.utils.SslUtils;
 import com.linkedin.venice.utils.Time;
 import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.VeniceProperties;
-import com.linkedin.venice.utils.pools.LandFillObjectPool;
+import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import java.io.BufferedReader;
 import java.io.Console;
 import java.io.FileInputStream;
@@ -122,8 +138,8 @@ import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
-import java.text.SimpleDateFormat;
 import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
@@ -141,7 +157,10 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.StringJoiner;
-import java.util.TimeZone;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -160,16 +179,22 @@ import org.apache.commons.cli.Options;
 import org.apache.commons.cli.ParseException;
 import org.apache.commons.lang.StringUtils;
 import org.apache.helix.zookeeper.impl.client.ZkClient;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 
 public class AdminTool {
+  private static final Logger LOGGER = LogManager.getLogger(AdminTool.class);
   private static ObjectWriter jsonWriter = ObjectMapperFactory.getInstance().writerWithDefaultPrettyPrinter();
   private static final String STATUS = "status";
   private static final String ERROR = "error";
   private static final String SUCCESS = "success";
 
-  private static final PubSubTopicRepository PUB_SUB_TOPIC_REPOSITORY = new PubSubTopicRepository();
-
+  /**
+   * Value an operator passes to a nullable store config's flag to clear it back to null, for example
+   * {@code --workload-type null}. Omitting the flag leaves the config unchanged instead.
+   */
+  private static final String CLEAR_CONFIG_TOKEN = "null";
   private static final ObjectMapper OBJECT_MAPPER = ObjectMapperFactory.getInstance();
 
   private static ControllerClient controllerClient;
@@ -185,10 +210,12 @@ public class AdminTool {
       "zookeeper.ssl.trustStore.location",
       "zookeeper.ssl.trustStore.password",
       "zookeeper.ssl.trustStore.type");
+  private static final String DEFAULT_DATE_FORMAT = "yyyy-MM-dd hh:mm:ss";
+  private static final String PST_TIME_ZONE = "America/Los_Angeles";
+
+  static final PubSubTopicRepository TOPIC_REPOSITORY = new PubSubTopicRepository();
 
   public static void main(String[] args) throws Exception {
-    // Generate PubSubClientsFactory from java system properties, apache kafka adapter is the default one.
-    PubSubClientsFactory pubSubClientsFactory = new PubSubClientsFactory(new VeniceProperties(System.getProperties()));
     CommandLine cmd = getCommandLine(args);
     try {
       Command foundCommand = ensureOnlyOneCommand(cmd);
@@ -212,6 +239,10 @@ public class AdminTool {
        * Initialize SSL config if provided.
        */
       buildSslFactory(cmd);
+
+      // Generate PubSubClientsFactory from java system properties, apache kafka adapter is the default one.
+      PubSubClientsFactory pubSubClientsFactory =
+          new PubSubClientsFactory(new VeniceProperties(System.getProperties()));
 
       boolean hasUrlArg = Arrays.asList(foundCommand.getRequiredArgs()).contains(Arg.URL);
       if (hasUrlArg) {
@@ -249,6 +280,11 @@ public class AdminTool {
           storeResponse = queryStoreList(cmd);
           printObject(storeResponse);
           break;
+        case CLEAN_EXECUTION_IDS:
+          String cluster = getRequiredArgument(cmd, Arg.CLUSTER);
+          response = controllerClient.cleanExecutionIds(cluster);
+          printObject(response);
+          break;
         case DESCRIBE_STORE:
           storeName = getRequiredArgument(cmd, Arg.STORE, Command.DESCRIBE_STORE);
           for (String store: storeName.split(",")) {
@@ -260,6 +296,9 @@ public class AdminTool {
           for (String store: storeResponse.getStores()) {
             printStoreDescription(store);
           }
+          break;
+        case DISCOVER_CLUSTER:
+          discoverCluster(cmd);
           break;
         case JOB_STATUS:
           storeName = getRequiredArgument(cmd, Arg.STORE, Command.JOB_STATUS);
@@ -282,10 +321,21 @@ public class AdminTool {
           response = controllerClient.killOfflinePushJob(topicName);
           printObject(response);
           break;
-        case SKIP_ADMIN:
-          String offset = getRequiredArgument(cmd, Arg.OFFSET, Command.SKIP_ADMIN);
+        case SKIP_ADMIN_MESSAGE:
+          if (!cmd.hasOption(Arg.POSITION.first()) && !cmd.hasOption(Arg.EXECUTION_ID.first())) {
+            printErrAndExit(
+                "At least one of " + Arg.POSITION.getArgName() + " or " + Arg.EXECUTION_ID.getArgName()
+                    + " is required.");
+          }
+          if (cmd.hasOption(Arg.POSITION.first()) && cmd.hasOption(Arg.EXECUTION_ID.first())) {
+            printErrAndExit(
+                "Only one of " + Arg.POSITION.getArgName() + " or " + Arg.EXECUTION_ID.getArgName() + " is allowed.");
+          }
+          String typeIdAndBase64PositionBytes = getOptionalArgument(cmd, Arg.POSITION);
+
+          String executionId = getOptionalArgument(cmd, Arg.EXECUTION_ID);
           boolean skipDIV = Boolean.parseBoolean(getOptionalArgument(cmd, Arg.SKIP_DIV, "false"));
-          response = controllerClient.skipAdminMessage(offset, skipDIV);
+          response = controllerClient.skipAdminMessage(typeIdAndBase64PositionBytes, skipDIV, executionId);
           printObject(response);
           break;
         case NEW_STORE:
@@ -330,6 +380,9 @@ public class AdminTool {
         case SET_OWNER:
           setStoreOwner(cmd);
           break;
+        case GET_PARTITION_ID:
+          getPartitionIdForKey(cmd);
+          break;
         case SET_PARTITION_COUNT:
           setStorePartition(cmd);
           break;
@@ -338,6 +391,9 @@ public class AdminTool {
           break;
         case UPDATE_CLUSTER_CONFIG:
           updateClusterConfig(cmd);
+          break;
+        case UPDATE_DARK_CLUSTER_CONFIG:
+          updateDarkClusterConfig(cmd);
           break;
         case ADD_SCHEMA:
           applyValueSchemaToStore(cmd);
@@ -435,6 +491,9 @@ public class AdminTool {
         case QUERY_KAFKA_TOPIC:
           queryKafkaTopic(cmd, pubSubClientsFactory);
           break;
+        case AUTO_MIGRATE_STORE:
+          autoMigrateStore(cmd);
+          break;
         case MIGRATE_STORE:
           migrateStore(cmd);
           break;
@@ -471,18 +530,6 @@ public class AdminTool {
         case REMOVE_FROM_STORE_ACL:
           removeFromStoreAcl(cmd);
           break;
-        case ENABLE_NATIVE_REPLICATION_FOR_CLUSTER:
-          enableNativeReplicationForCluster(cmd);
-          break;
-        case DISABLE_NATIVE_REPLICATION_FOR_CLUSTER:
-          disableNativeReplicationForCluster(cmd);
-          break;
-        case ENABLE_ACTIVE_ACTIVE_REPLICATION_FOR_CLUSTER:
-          enableActiveActiveReplicationForCluster(cmd);
-          break;
-        case DISABLE_ACTIVE_ACTIVE_REPLICATION_FOR_CLUSTER:
-          disableActiveActiveReplicationForCluster(cmd);
-          break;
         case GET_DELETABLE_STORE_TOPICS:
           getDeletableStoreTopics(cmd);
           break;
@@ -494,6 +541,12 @@ public class AdminTool {
           break;
         case LIST_CLUSTER_STALE_STORES:
           listClusterStaleStores(cmd);
+          break;
+        case REPUSH_STORE:
+          repushStore(cmd);
+          break;
+        case GET_DEAD_STORES:
+          getDeadStores(cmd);
           break;
         case COMPARE_STORE:
           compareStore(cmd);
@@ -515,6 +568,9 @@ public class AdminTool {
           break;
         case UPDATE_KAFKA_TOPIC_MIN_IN_SYNC_REPLICA:
           updateKafkaTopicMinInSyncReplica(cmd);
+          break;
+        case UPDATE_KAFKA_TOPIC_UNCLEAN_LEADER_ELECTION:
+          updateKafkaTopicUncleanLeaderElection(cmd);
           break;
         case START_FABRIC_BUILDOUT:
           startFabricBuildout(cmd);
@@ -558,6 +614,9 @@ public class AdminTool {
         case REQUEST_BASED_METADATA:
           getRequestBasedMetadata(cmd);
           break;
+        case REQUEST_BASED_STORE_PROPERTIES:
+          getRequestBasedStoreProperties(cmd);
+          break;
         case DUMP_INGESTION_STATE:
           dumpIngestionState(cmd);
           break;
@@ -572,6 +631,27 @@ public class AdminTool {
           break;
         case DUMP_TOPIC_PARTITION_INGESTION_CONTEXT:
           dumpTopicPartitionIngestionContext(cmd);
+          break;
+        case MIGRATE_VENICE_ZK_PATHS:
+          migrateVeniceZKPaths(cmd);
+          break;
+        case EXTRACT_VENICE_ZK_PATHS:
+          extractVeniceZKPaths(cmd);
+          break;
+        case AGGREGATED_HEALTH_STATUS:
+          getAggregatedHealthStatus(cmd);
+          break;
+        case DUMP_HOST_HEARTBEAT:
+          dumpHostHeartbeat(cmd);
+          break;
+        case CLUSTER_BATCH_TASK:
+          clusterBatchTask(cmd);
+          break;
+        case UPDATE_ADMIN_OPERATION_PROTOCOL_VERSION:
+          updateAdminOperationProtocolVersion(cmd);
+          break;
+        case MONITOR_INGESTION:
+          monitorIngestion(cmd);
           break;
         default:
           StringJoiner availableCommands = new StringJoiner(", ");
@@ -601,14 +681,33 @@ public class AdminTool {
      * Gather all the options we have in "options"
      */
     Options options = new Options();
+
+    // Create mutually exclusive option group for starting position arguments
+    OptionGroup startingPositionGroup = new OptionGroup();
+    startingPositionGroup.setRequired(false); // Not required by default, specific commands will validate
+
+    // Add all options except the mutually exclusive ones
     for (Arg arg: Arg.values()) {
-      createOpt(arg, arg.isParameterized(), arg.getHelpText(), options);
+      if (arg == Arg.STARTING_OFFSET || arg == Arg.STARTING_POSITION) {
+        // Add mutually exclusive starting position options to the group
+        Option option = new Option(arg.first(), arg.toString(), arg.isParameterized(), arg.getHelpText());
+        startingPositionGroup.addOption(option);
+      } else {
+        createOpt(arg, arg.isParameterized(), arg.getHelpText(), options);
+      }
     }
+
+    // Add the mutually exclusive group to options
+    options.addOptionGroup(startingPositionGroup);
 
     Options parameterOptionsForHelp = new Options();
     for (Object obj: options.getOptions()) {
       Option o = (Option) obj;
       parameterOptionsForHelp.addOption(o);
+    }
+    // Add the starting position group options to help as well
+    for (Option option: startingPositionGroup.getOptions()) {
+      parameterOptionsForHelp.addOption(option);
     }
 
     options.addOptionGroup(commandGroup);
@@ -617,7 +716,7 @@ public class AdminTool {
     CommandLine cmd = parser.parse(options, args);
 
     if (cmd.hasOption(Arg.HELP.first())) {
-      printUsageAndExit(commandGroup, parameterOptionsForHelp);
+      printUsageAndExit(commandGroup, parameterOptionsForHelp, cmd);
     } else if (cmd.hasOption(Command.CONVERT_VSON_SCHEMA.toString())) {
       convertVsonSchemaAndExit(cmd);
     }
@@ -679,6 +778,17 @@ public class AdminTool {
     printObject(keySchema);
     MultiSchemaResponse valueSchemas = controllerClient.getAllValueSchema(store);
     printObject(valueSchemas);
+  }
+
+  private static void discoverCluster(CommandLine cmd) {
+    String storeName = getRequiredArgument(cmd, Arg.STORE, Command.DISCOVER_CLUSTER);
+    String veniceUrl = getRequiredArgument(cmd, Arg.URL);
+    D2ServiceDiscoveryResponse response = ControllerClient.discoverCluster(veniceUrl, storeName, sslFactory, 3);
+    if (response.isError()) {
+      printObject(response);
+    } else {
+      System.out.println(response.getCluster());
+    }
   }
 
   private static void executeDataRecovery(CommandLine cmd) {
@@ -817,8 +927,7 @@ public class AdminTool {
     String valueSchemaFile = getRequiredArgument(cmd, Arg.VALUE_SCHEMA, Command.NEW_STORE);
     String valueSchema = readFile(valueSchemaFile);
     String owner = getOptionalArgument(cmd, Arg.OWNER, "");
-    boolean isVsonStore =
-        Utils.parseBooleanFromString(getOptionalArgument(cmd, Arg.VSON_STORE, "false"), "isVsonStore");
+    boolean isVsonStore = Utils.parseBooleanOrThrow(getOptionalArgument(cmd, Arg.VSON_STORE, "false"), "isVsonStore");
     if (isVsonStore) {
       keySchema = VsonAvroSchemaAdapter.parse(keySchema).toString();
       valueSchema = VsonAvroSchemaAdapter.parse(valueSchema).toString();
@@ -835,6 +944,135 @@ public class AdminTool {
     verifyStoreExistence(store, true);
     TrackableControllerResponse response = controllerClient.deleteStore(store);
     printObject(response);
+  }
+
+  private static void clusterBatchTask(CommandLine cmd) {
+    String clusterName = getRequiredArgument(cmd, Arg.CLUSTER, Command.CLUSTER_BATCH_TASK);
+    String task = getRequiredArgument(cmd, Arg.TASK_NAME, Command.CLUSTER_BATCH_TASK);
+    String checkpointFile = getRequiredArgument(cmd, Arg.CHECKPOINT_FILE, Command.CLUSTER_BATCH_TASK);
+    int parallelism = Integer.parseInt(getOptionalArgument(cmd, Arg.THREAD_COUNT, "1"));
+    String storeFilterFile = getOptionalArgument(cmd, Arg.STORE_FILTER_FILE, "");
+    int kafkaTopicMinISR = Integer.parseInt(getOptionalArgument(cmd, Arg.KAFKA_TOPIC_MIN_IN_SYNC_REPLICA));
+    int kafkaTopicRtMinISR = Integer.parseInt(getOptionalArgument(cmd, Arg.KAFKA_RT_TOPICS_MIN_IN_SYNC_REPLICAS));
+    Set<String> interestedStoresSet = new HashSet<>();
+    LOGGER.info(
+        "[**** Cluster Command Params ****] Cluster: {}, Task: {}, Checkpoint: {}, Parallelism: {}, Store filter: {}",
+        clusterName,
+        task,
+        checkpointFile,
+        parallelism,
+        storeFilterFile);
+    // Create child data center controller client map.
+    ChildAwareResponse childAwareResponse = controllerClient.listChildControllers(clusterName);
+    Map<String, ControllerClient> controllerClientMap = getControllerClientMap(clusterName, childAwareResponse);
+
+    // Load store filter file.
+    if (!storeFilterFile.isEmpty()) {
+      try {
+        Path storeFilterFilePath = Paths.get(storeFilterFile);
+        if (!Files.exists(storeFilterFilePath.toAbsolutePath())) {
+          throw new VeniceException("Invalid store filter file path");
+        } else {
+          List<String> fileLines = Files.readAllLines(storeFilterFilePath);
+          interestedStoresSet.addAll(fileLines);
+        }
+      } catch (IOException e) {
+        throw new VeniceException(e);
+      }
+    }
+
+    // Fetch list cluster store list from parent region.
+    Map<String, Boolean> progressMap = new VeniceConcurrentHashMap<>();
+    MultiStoreResponse clusterStoreResponse = controllerClient.queryStoreList(false);
+    if (clusterStoreResponse.isError()) {
+      throw new VeniceException("Unable to fetch cluster store list: " + clusterStoreResponse.getError());
+    }
+    for (String storeName: clusterStoreResponse.getStores()) {
+      if (storeFilterFile.isEmpty()) {
+        progressMap.put(storeName, Boolean.FALSE);
+      } else {
+        // For now the default behavior is to only perform cluster operation on the intersection of the store filter
+        // file and stores in the cluster.
+        if (interestedStoresSet.contains(storeName)) {
+          progressMap.put(storeName, Boolean.FALSE);
+        }
+      }
+    }
+
+    // Load progress from checkpoint file. If file does not exist, it will create new one during checkpointing.
+    try {
+      Path checkpointFilePath = Paths.get(checkpointFile);
+      if (!Files.exists(checkpointFilePath.toAbsolutePath())) {
+        LOGGER.info(
+            "Checkpoint file path does not exist, will create a new checkpoint file: {}",
+            checkpointFilePath.toAbsolutePath());
+      } else {
+        List<String> fileLines = Files.readAllLines(checkpointFilePath);
+        for (String line: fileLines) {
+          String storeName = line.split(",")[0];
+          if (!progressMap.containsKey(storeName)) {
+            // The store is either filtered out or does not belong to this cluster.
+            continue;
+          }
+          // For now, it is boolean to start with, we can add more states to support retry.
+          boolean status = false;
+          if (line.split(",").length > 1) {
+            status = Boolean.parseBoolean(line.split(",")[1]);
+          }
+          progressMap.put(storeName, status);
+        }
+      }
+    } catch (IOException e) {
+      throw new VeniceException(e);
+    }
+    List<String> taskList =
+        progressMap.entrySet().stream().filter(e -> !e.getValue()).map(Map.Entry::getKey).collect(Collectors.toList());
+
+    // Validate task type. For now, we only has one task, if we have more task in the future, we can extend this logic.
+    Supplier<Function<String, Boolean>> functionSupplier = null;
+    if (SystemStorePushTask.TASK_NAME.equals(task)) {
+      String systemStoreType = getOptionalArgument(cmd, Arg.SYSTEM_STORE_TYPE);
+      if (systemStoreType != null) {
+        if (!(systemStoreType.equalsIgnoreCase(VeniceSystemStoreType.DAVINCI_PUSH_STATUS_STORE.toString())
+            || systemStoreType.equalsIgnoreCase(VeniceSystemStoreType.META_STORE.toString()))) {
+          printErrAndExit("System store type: " + systemStoreType + " is not supported.");
+        }
+      }
+      System.out.println(
+          functionSupplier = () -> new SystemStorePushTask(
+              controllerClient,
+              controllerClientMap,
+              clusterName,
+              systemStoreType == null ? Optional.empty() : Optional.of(systemStoreType)));
+    } else if (BackfillMinIsrTask.TASK_NAME.equals(task)) {
+      System.out.println(
+          functionSupplier = () -> new BackfillMinIsrTask(controllerClientMap, kafkaTopicMinISR, kafkaTopicRtMinISR));
+    } else {
+      printErrAndExit("Undefined task: " + task);
+    }
+
+    // Create thread pool and start parallel processing.
+    ExecutorService executorService = Executors.newFixedThreadPool(
+        parallelism,
+        new DaemonThreadFactory(
+            "AdminTool",
+            LogContext.newBuilder().setComponentName(VeniceComponent.ADMIN_TOOL.name()).build()));
+    List<Future> futureList = new ArrayList<>();
+    for (int i = 0; i < parallelism; i++) {
+      BatchMaintenanceTaskRunner batchMaintenanceTaskRunner =
+          new BatchMaintenanceTaskRunner(progressMap, checkpointFile, taskList, functionSupplier.get());
+      futureList.add(executorService.submit(batchMaintenanceTaskRunner));
+    }
+    for (int i = 0; i < parallelism; i++) {
+      try {
+        futureList.get(i).get();
+        LOGGER.info("Cluster task completed for thread : {}", i);
+      } catch (InterruptedException | ExecutionException e) {
+        LOGGER.warn(e.getMessage());
+        executorService.shutdownNow();
+      }
+    }
+    executorService.shutdownNow();
   }
 
   private static void backfillSystemStores(CommandLine cmd) {
@@ -1003,6 +1241,14 @@ public class AdminTool {
     printSuccess(response);
   }
 
+  private static void getPartitionIdForKey(CommandLine cmd) {
+    String storeName = getRequiredArgument(cmd, Arg.STORE, Command.GET_PARTITION_ID);
+    String key = getRequiredArgument(cmd, Arg.KEY, Command.GET_PARTITION_ID);
+    int version = Integer.parseInt(getOptionalArgument(cmd, Arg.VERSION, "-1"));
+    String keySchemaStr = controllerClient.getKeySchema(storeName).getSchemaStr();
+    TopicMessageFinder.findPartitionIdForKey(controllerClient, storeName, version, key, keySchemaStr);
+  }
+
   private static void integerParam(CommandLine cmd, Arg param, Consumer<Integer> setter, Set<Arg> argSet) {
     genericParam(cmd, param, s -> Utils.parseIntFromString(s, param.toString()), setter, argSet);
   }
@@ -1012,7 +1258,7 @@ public class AdminTool {
   }
 
   private static void booleanParam(CommandLine cmd, Arg param, Consumer<Boolean> setter, Set<Arg> argSet) {
-    genericParam(cmd, param, s -> Utils.parseBooleanFromString(s, param.toString()), setter, argSet);
+    genericParam(cmd, param, s -> Utils.parseBooleanOrThrow(s, param.toString()), setter, argSet);
   }
 
   private static void stringMapParam(
@@ -1042,6 +1288,20 @@ public class AdminTool {
     }
   }
 
+  /**
+   * Same as {@link #genericParam}, but for configs that are nullable. Passing
+   * {@link #CLEAR_CONFIG_TOKEN} as the argument value records an explicit request to clear the
+   * config back to null, which is distinct from omitting the flag altogether (leave unchanged).
+   */
+  private static <TYPE> void nullableParam(
+      CommandLine cmd,
+      Arg param,
+      Function<String, TYPE> parser,
+      Consumer<TYPE> setter,
+      Set<Arg> argSet) {
+    genericParam(cmd, param, s -> CLEAR_CONFIG_TOKEN.equalsIgnoreCase(s) ? null : parser.apply(s), setter, argSet);
+  }
+
   private static void updateStore(CommandLine cmd) {
     UpdateStoreQueryParams params = getUpdateStoreQueryParams(cmd);
     String storeName = getRequiredArgument(cmd, Arg.STORE, Command.UPDATE_STORE);
@@ -1053,6 +1313,13 @@ public class AdminTool {
     UpdateClusterConfigQueryParams params = getUpdateClusterConfigQueryParams(cmd);
 
     ControllerResponse response = controllerClient.updateClusterConfig(params);
+    printSuccess(response);
+  }
+
+  private static void updateDarkClusterConfig(CommandLine cmd) {
+    UpdateDarkClusterConfigQueryParams params = getUpdateDarkClusterConfigQueryParams(cmd);
+
+    ControllerResponse response = controllerClient.updateDarkClusterConfig(params);
     printSuccess(response);
   }
 
@@ -1082,6 +1349,7 @@ public class AdminTool {
     stringMapParam(cmd, Arg.PARTITIONER_PARAMS, p -> params.setPartitionerParams(p), argSet);
     integerParam(cmd, Arg.VERSION, p -> params.setCurrentVersion(p), argSet);
     integerParam(cmd, Arg.LARGEST_USED_VERSION_NUMBER, p -> params.setLargestUsedVersionNumber(p), argSet);
+    integerParam(cmd, Arg.LARGEST_USED_RT_VERSION_NUMBER, p -> params.setLargestUsedRTVersionNumber(p), argSet);
     booleanParam(cmd, Arg.READABILITY, p -> params.setEnableReads(p), argSet);
     booleanParam(cmd, Arg.WRITEABILITY, p -> params.setEnableWrites(p), argSet);
     longParam(cmd, Arg.STORAGE_QUOTA, p -> params.setStorageQuotaInByte(p), argSet);
@@ -1116,19 +1384,52 @@ public class AdminTool {
     integerParam(cmd, Arg.BATCH_GET_LIMIT, p -> params.setBatchGetLimit(p), argSet);
     integerParam(cmd, Arg.NUM_VERSIONS_TO_PRESERVE, p -> params.setNumVersionsToPreserve(p), argSet);
     booleanParam(cmd, Arg.INCREMENTAL_PUSH_ENABLED, p -> params.setIncrementalPushEnabled(p), argSet);
+    booleanParam(cmd, Arg.SEPARATE_REALTIME_TOPIC_ENABLED, p -> params.setSeparateRealTimeTopicEnabled(p), argSet);
     booleanParam(cmd, Arg.WRITE_COMPUTATION_ENABLED, p -> params.setWriteComputationEnabled(p), argSet);
     booleanParam(cmd, Arg.READ_COMPUTATION_ENABLED, p -> params.setReadComputationEnabled(p), argSet);
+    booleanParam(cmd, Arg.ENABLE_STORE_MIGRATION, p -> params.setStoreMigration(p), argSet);
     integerParam(
         cmd,
         Arg.BOOTSTRAP_TO_ONLINE_TIMEOUT_IN_HOUR,
         p -> params.setBootstrapToOnlineTimeoutInHours(p),
         argSet);
     genericParam(cmd, Arg.BACKUP_STRATEGY, s -> BackupStrategy.valueOf(s), p -> params.setBackupStrategy(p), argSet);
+    genericParam(
+        cmd,
+        Arg.INGESTION_PAUSE_MODE,
+        s -> IngestionPauseMode.valueOf(s),
+        p -> params.setIngestionPauseMode(p),
+        argSet);
+    genericParam(
+        cmd,
+        Arg.INGESTION_PAUSED_REGIONS,
+        s -> UpdateStoreQueryParams.normalizeRegions(Arrays.asList(s.split(","))),
+        p -> params.setIngestionPausedRegions(p),
+        argSet);
+    genericParam(cmd, Arg.STORAGE_MODE, StorageMode::valueOf, p -> params.setStorageMode(p), argSet);
+    genericParam(
+        cmd,
+        Arg.EXTERNAL_STORAGE_READ_MODE,
+        ExternalStorageReadMode::valueOf,
+        p -> params.setExternalStorageReadMode(p),
+        argSet);
     booleanParam(cmd, Arg.AUTO_SCHEMA_REGISTER_FOR_PUSHJOB_ENABLED, p -> params.setAutoSchemaPushJobEnabled(p), argSet);
     booleanParam(cmd, Arg.HYBRID_STORE_DISK_QUOTA_ENABLED, p -> params.setHybridStoreDiskQuotaEnabled(p), argSet);
     booleanParam(cmd, Arg.REGULAR_VERSION_ETL_ENABLED, p -> params.setRegularVersionETLEnabled(p), argSet);
     booleanParam(cmd, Arg.FUTURE_VERSION_ETL_ENABLED, p -> params.setFutureVersionETLEnabled(p), argSet);
     genericParam(cmd, Arg.ETLED_PROXY_USER_ACCOUNT, s -> s, p -> params.setEtledProxyUserAccount(p), argSet);
+    genericParam(
+        cmd,
+        Arg.VENICE_ETL_STRATEGY,
+        s -> VeniceETLStrategy.valueOf(s),
+        p -> params.setETLStrategy(p),
+        argSet);
+    genericParam(
+        cmd,
+        Arg.ETL_ACTIVE_FABRICS,
+        s -> UpdateStoreQueryParams.normalizeRegions(Arrays.asList(s.split(","))),
+        p -> params.setEtlActiveFabrics(p),
+        argSet);
     booleanParam(cmd, Arg.NATIVE_REPLICATION_ENABLED, p -> params.setNativeReplicationEnabled(p), argSet);
     genericParam(cmd, Arg.PUSH_STREAM_SOURCE_ADDRESS, s -> s, p -> params.setPushStreamSourceAddress(p), argSet);
     stringMapParam(cmd, Arg.STORE_VIEW_CONFIGS, p -> params.setStoreViews(p), argSet);
@@ -1148,10 +1449,55 @@ public class AdminTool {
     genericParam(cmd, Arg.REGIONS_FILTER, s -> s, p -> params.setRegionsFilter(p), argSet);
     genericParam(cmd, Arg.STORAGE_PERSONA, s -> s, p -> params.setStoragePersona(p), argSet);
     integerParam(cmd, Arg.LATEST_SUPERSET_SCHEMA_ID, p -> params.setLatestSupersetSchemaId(p), argSet);
+    booleanParam(cmd, Arg.ENABLE_COMPACTION, p -> params.setCompactionEnabled(p), argSet);
+    longParam(cmd, Arg.COMPACTION_THRESHOLD_MILLISECONDS, p -> params.setCompactionThresholdMilliseconds(p), argSet);
+    genericParam(cmd, Arg.PUB_SUB_ENCRYPTION_KEY_URN, s -> s, params::setPubSubEncryptionKeyUrn, argSet);
     longParam(cmd, Arg.MIN_COMPACTION_LAG_SECONDS, p -> params.setMinCompactionLagSeconds(p), argSet);
     longParam(cmd, Arg.MAX_COMPACTION_LAG_SECONDS, p -> params.setMaxCompactionLagSeconds(p), argSet);
+    integerParam(cmd, Arg.MAX_RECORD_SIZE_BYTES, params::setMaxRecordSizeBytes, argSet);
+    integerParam(cmd, Arg.MAX_NEARLINE_RECORD_SIZE_BYTES, params::setMaxNearlineRecordSizeBytes, argSet);
+    nullableParam(
+        cmd,
+        Arg.VENICE_UNITS,
+        s -> Utils.parseIntFromString(s, Arg.VENICE_UNITS.toString()),
+        params::setVeniceUnits,
+        argSet);
+    nullableParam(cmd, Arg.WORKLOAD_TYPE, s -> s, params::setWorkloadType, argSet);
+    longParam(cmd, Arg.THROUGHPUT_QUOTA_IN_BYTES, params::setThroughputQuotaInBytes, argSet);
+    longParam(cmd, Arg.THROUGHPUT_QUOTA_IN_RECORDS, params::setThroughputQuotaInRecords, argSet);
     booleanParam(cmd, Arg.UNUSED_SCHEMA_DELETION_ENABLED, p -> params.setUnusedSchemaDeletionEnabled(p), argSet);
     booleanParam(cmd, Arg.BLOB_TRANSFER_ENABLED, p -> params.setBlobTransferEnabled(p), argSet);
+    genericParam(
+        cmd,
+        Arg.BLOB_TRANSFER_IN_SERVER_ENABLED,
+        s -> s,
+        p -> params.setBlobTransferInServerEnabled(ConfigCommonUtils.ActivationState.valueOf(p)),
+        argSet);
+    genericParam(
+        cmd,
+        Arg.BLOB_DB_ENABLED,
+        s -> s,
+        p -> params.setBlobDbEnabled(ConfigCommonUtils.ActivationState.valueOf(p)),
+        argSet);
+    booleanParam(
+        cmd,
+        Arg.NEARLINE_PRODUCER_COMPRESSION_ENABLED,
+        p -> params.setNearlineProducerCompressionEnabled(p),
+        argSet);
+    integerParam(cmd, Arg.NEARLINE_PRODUCER_COUNT_PER_WRITER, p -> params.setNearlineProducerCountPerWriter(p), argSet);
+    genericParam(cmd, Arg.TARGET_SWAP_REGION, s -> s, p -> params.setTargetRegionSwap(p), argSet);
+    integerParam(cmd, Arg.TARGET_SWAP_REGION_WAIT_TIME, p -> params.setTargetRegionSwapWaitTime(p), argSet);
+    booleanParam(cmd, Arg.DAVINCI_HEARTBEAT_REPORTED, p -> params.setIsDavinciHeartbeatReported(p), argSet);
+    booleanParam(cmd, Arg.GLOBAL_RT_DIV_ENABLED, params::setGlobalRtDivEnabled, argSet);
+    booleanParam(cmd, Arg.TTL_REPUSH_ENABLED, params::setTTLRepushEnabled, argSet);
+    booleanParam(cmd, Arg.ENUM_SCHEMA_EVOLUTION_ALLOWED, params::setEnumSchemaEvolutionAllowed, argSet);
+
+    String storeLifecycleHooksStr = getOptionalArgument(cmd, Arg.STORE_LIFECYCLE_HOOKS_LIST);
+    List<LifecycleHooksRecord> lifecycleHooksList =
+        Utils.parseStoreLifecycleHooksListFromString(storeLifecycleHooksStr, Arg.STORE_LIFECYCLE_HOOKS_LIST.toString());
+    params.setStoreLifecycleHooks(lifecycleHooksList);
+
+    booleanParam(cmd, Arg.FLINK_VENICE_VIEWS_ENABLED, p -> params.setFlinkVeniceViewsEnabled(p), argSet);
 
     /**
      * {@link Arg#REPLICATE_ALL_CONFIGS} doesn't require parameters; once specified, it means true.
@@ -1195,6 +1541,18 @@ public class AdminTool {
         getOptionalArgument(cmd, Arg.CHILD_CONTROLLER_ADMIN_TOPIC_CONSUMPTION_ENABLED);
     if (adminTopicConsumptionEnabled != null) {
       params.setChildControllerAdminTopicConsumptionEnabled(Boolean.parseBoolean(adminTopicConsumptionEnabled));
+    }
+
+    return params;
+  }
+
+  protected static UpdateDarkClusterConfigQueryParams getUpdateDarkClusterConfigQueryParams(CommandLine cmd) {
+    UpdateDarkClusterConfigQueryParams params = new UpdateDarkClusterConfigQueryParams();
+
+    String storesToReplicateStr = getOptionalArgument(cmd, Arg.STORES_TO_REPLICATE);
+    if (storesToReplicateStr != null) {
+      List<String> storeToReplicate = Utils.parseCommaSeparatedStringToList(storesToReplicateStr);
+      params.setStoresToReplicate(storeToReplicate);
     }
 
     return params;
@@ -1281,15 +1639,7 @@ public class AdminTool {
     // Check SSL configs in JVM system arguments for ZK
     String zkSSLFile = getOptionalArgument(cmd, Arg.ZK_SSL_CONFIG_FILE, "");
     ZkClient zkClient = readZKConfigAndBuildZKClient(veniceZookeeperUrl, zkSSLFile);
-
-    String consumerConfigFile = getOptionalArgument(cmd, Arg.KAFKA_CONSUMER_CONFIG_FILE, "");
-    // Construct consumer to dump admin message
-    Properties consumerProperties =
-        consumerConfigFile.isEmpty() ? new Properties() : loadProperties(cmd, Arg.KAFKA_CONSUMER_CONFIG_FILE);
-    String pubSubBrokerUrl = getRequiredArgument(cmd, Arg.KAFKA_BOOTSTRAP_SERVERS, Command.RECOVER_STORE_METADATA);
-    consumerProperties = DumpAdminMessages.getPubSubConsumerProperties(pubSubBrokerUrl, consumerProperties);
-    PubSubConsumerAdapter consumer = getConsumer(consumerProperties, pubSubClientsFactory);
-
+    PubSubConsumerAdapter consumer = getConsumer(pubSubClientsFactory, createConsumerContext(cmd));
     try {
       RecoverStoreMetadata.recover(
           zkClient,
@@ -1517,10 +1867,8 @@ public class AdminTool {
   private static void deleteKafkaTopic(CommandLine cmd, PubSubClientsFactory pubSubClientsFactory) throws Exception {
     long startTime = System.currentTimeMillis();
     String kafkaBootstrapServer = getRequiredArgument(cmd, Arg.KAFKA_BOOTSTRAP_SERVERS);
-    Properties properties = loadProperties(cmd, Arg.KAFKA_CONSUMER_CONFIG_FILE);
-    properties.put(KAFKA_BOOTSTRAP_SERVERS, kafkaBootstrapServer);
-    VeniceProperties veniceProperties = new VeniceProperties(properties);
-    PubSubTopicRepository pubSubTopicRepository = new PubSubTopicRepository();
+    ConsumerContext context = createConsumerContext(cmd);
+    VeniceProperties veniceProperties = context.getVeniceProperties();
     int kafkaTimeOut = 30 * Time.MS_PER_SECOND;
     int topicDeletionStatusPollingInterval = 2 * Time.MS_PER_SECOND;
     if (cmd.hasOption(Arg.KAFKA_OPERATION_TIMEOUT.toString())) {
@@ -1534,16 +1882,18 @@ public class AdminTool {
             .setTopicMinLogCompactionLagMs(0L)
             .setPubSubConsumerAdapterFactory(pubSubClientsFactory.getConsumerAdapterFactory())
             .setPubSubAdminAdapterFactory(pubSubClientsFactory.getAdminAdapterFactory())
-            .setPubSubTopicRepository(pubSubTopicRepository)
+            .setPubSubTopicRepository(TOPIC_REPOSITORY)
+            .setPubSubPositionTypeRegistry(PubSubPositionTypeRegistry.fromPropertiesOrDefault(veniceProperties))
             .setTopicMetadataFetcherConsumerPoolSize(1)
             .setTopicMetadataFetcherThreadPoolSize(1)
+            .setVeniceComponent(VeniceComponent.ADMIN_TOOL)
             .build();
 
     try (TopicManager topicManager =
         new TopicManagerRepository(topicManagerContext, kafkaBootstrapServer).getLocalTopicManager()) {
       String topicName = getRequiredArgument(cmd, Arg.KAFKA_TOPIC_NAME);
       try {
-        topicManager.ensureTopicIsDeletedAndBlock(PUB_SUB_TOPIC_REPOSITORY.getTopic(topicName));
+        topicManager.ensureTopicIsDeletedAndBlock(TOPIC_REPOSITORY.getTopic(topicName));
         long runTime = System.currentTimeMillis() - startTime;
         printObject("Topic '" + topicName + "' is deleted. Run time: " + runTime + " ms.");
       } catch (PubSubOpTimeoutException e) {
@@ -1555,83 +1905,70 @@ public class AdminTool {
   }
 
   private static void dumpAdminMessages(CommandLine cmd, PubSubClientsFactory pubSubClientsFactory) {
-    Properties consumerProperties = loadProperties(cmd, Arg.KAFKA_CONSUMER_CONFIG_FILE);
-    String pubSubBrokerUrl = getRequiredArgument(cmd, Arg.KAFKA_BOOTSTRAP_SERVERS);
-    consumerProperties = DumpAdminMessages.getPubSubConsumerProperties(pubSubBrokerUrl, consumerProperties);
-    PubSubConsumerAdapter consumer = getConsumer(consumerProperties, pubSubClientsFactory);
-    List<DumpAdminMessages.AdminOperationInfo> adminMessages = DumpAdminMessages.dumpAdminMessages(
-        consumer,
-        getRequiredArgument(cmd, Arg.CLUSTER),
-        Long.parseLong(getRequiredArgument(cmd, Arg.STARTING_OFFSET)),
-        Integer.parseInt(getRequiredArgument(cmd, Arg.MESSAGE_COUNT)));
-    printObject(adminMessages);
+    ConsumerContext context = createConsumerContext(cmd);
+    PubSubPosition startingPosition = parsePositionFromArgs(cmd, context.getPositionDeserializer(), false);
+    if (startingPosition == null) {
+      startingPosition = PubSubSymbolicPosition.EARLIEST;
+    }
+    int messageCount = cmd.hasOption(Arg.MESSAGE_COUNT.first())
+        ? Integer.parseInt(cmd.getOptionValue(Arg.MESSAGE_COUNT.first()))
+        : Integer.MAX_VALUE;
+    LOGGER.info("Dump admin messages with starting position: {}, message count: {}", startingPosition, messageCount);
+    try (PubSubConsumerAdapter consumer = getConsumer(pubSubClientsFactory, context)) {
+      DumpAdminMessages
+          .dumpAdminMessages(consumer, getRequiredArgument(cmd, Arg.CLUSTER), startingPosition, messageCount);
+    }
   }
 
   private static void dumpControlMessages(CommandLine cmd, PubSubClientsFactory pubSubClientsFactory) {
-    Properties consumerProps = loadProperties(cmd, Arg.KAFKA_CONSUMER_CONFIG_FILE);
-    String kafkaUrl = getRequiredArgument(cmd, Arg.KAFKA_BOOTSTRAP_SERVERS);
-
-    consumerProps.setProperty(KAFKA_BOOTSTRAP_SERVERS, kafkaUrl);
-    // This is a temporary fix for the issue described here
-    // https://stackoverflow.com/questions/37363119/kafka-producer-org-apache-kafka-common-serialization-stringserializer-could-no
-    // In our case "com.linkedin.venice.serialization.KafkaKeySerializer" class can not be found
-    // because class loader has no venice-common in class path. This can be only reproduced on JDK11
-    // Trying to avoid class loading via Kafka's ConfigDef class
-    consumerProps.put(KEY_DESERIALIZER_CLASS_CONFIG, KafkaKeySerializer.class);
-    consumerProps.put(VALUE_DESERIALIZER_CLASS_CONFIG, KafkaValueSerializer.class);
-
-    String kafkaTopic = getRequiredArgument(cmd, Arg.KAFKA_TOPIC_NAME);
+    String topic = getRequiredArgument(cmd, Arg.KAFKA_TOPIC_NAME);
     int partitionNumber = Integer.parseInt(getRequiredArgument(cmd, Arg.KAFKA_TOPIC_PARTITION));
-    int startingOffset = Integer.parseInt(getRequiredArgument(cmd, Arg.STARTING_OFFSET));
+    ConsumerContext context = createConsumerContext(cmd);
+    PubSubPosition startingPosition = parsePositionFromArgs(cmd, context.getPositionDeserializer(), true);
     int messageCount = Integer.parseInt(getRequiredArgument(cmd, Arg.MESSAGE_COUNT));
-    try (PubSubConsumerAdapter consumer = getConsumer(consumerProps, pubSubClientsFactory)) {
-      new ControlMessageDumper(consumer, kafkaTopic, partitionNumber, startingOffset, messageCount).fetch().display();
+    boolean logHeaders = cmd.hasOption(Arg.LOG_HEADERS.toString());
+    LOGGER.info(
+        "Dump control messages from topic-partition: {}, starting position: {}, message count: {}, log headers: {}",
+        Utils.getReplicaId(topic, partitionNumber),
+        startingPosition,
+        messageCount,
+        logHeaders);
+    try (PubSubConsumerAdapter consumer = getConsumer(pubSubClientsFactory, context)) {
+      new ControlMessageDumper(consumer, topic, partitionNumber, startingPosition, messageCount, logHeaders).fetch()
+          .display();
     }
   }
 
   private static void queryKafkaTopic(CommandLine cmd, PubSubClientsFactory pubSubClientsFactory)
       throws java.text.ParseException {
-    Properties consumerProps = loadProperties(cmd, Arg.KAFKA_CONSUMER_CONFIG_FILE);
-    String kafkaUrl = getRequiredArgument(cmd, Arg.KAFKA_BOOTSTRAP_SERVERS);
-    consumerProps.setProperty(KAFKA_BOOTSTRAP_SERVERS, kafkaUrl);
-
-    String kafkaTopic = getRequiredArgument(cmd, Arg.KAFKA_TOPIC_NAME);
+    String topic = getRequiredArgument(cmd, Arg.KAFKA_TOPIC_NAME);
     String startDateInPST = getRequiredArgument(cmd, Arg.START_DATE);
-    String endDateInPST = getRequiredArgument(cmd, Arg.END_DATE);
-    String progressInterval = getRequiredArgument(cmd, Arg.PROGRESS_INTERVAL);
+    String endDateInPST = getOptionalArgument(cmd, Arg.END_DATE);
+    String progressInterval = getOptionalArgument(cmd, Arg.PROGRESS_INTERVAL);
     String keyString = getRequiredArgument(cmd, Arg.KEY);
-
-    SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy-MM-dd hh:mm:ss");
-    dateFormat.setTimeZone(TimeZone.getTimeZone("America/Los_Angeles"));
-    try (PubSubConsumerAdapter consumer = getConsumer(consumerProps, pubSubClientsFactory)) {
+    ConsumerContext context = createConsumerContext(cmd);
+    try (PubSubConsumerAdapter consumer = getConsumer(pubSubClientsFactory, context)) {
       TopicMessageFinder.find(
           controllerClient,
           consumer,
-          kafkaTopic,
+          topic,
           keyString,
-          dateFormat.parse(startDateInPST).getTime(),
-          dateFormat.parse(endDateInPST).getTime(),
-          Long.parseLong(progressInterval));
+          Utils.parseDateTimeToEpoch(startDateInPST, DEFAULT_DATE_FORMAT, PST_TIME_ZONE),
+          endDateInPST == null
+              ? Long.MAX_VALUE
+              : Utils.parseDateTimeToEpoch(endDateInPST, DEFAULT_DATE_FORMAT, PST_TIME_ZONE),
+          progressInterval == null ? 1000000 : Long.parseLong(progressInterval));
     }
   }
 
-  private static void dumpKafkaTopic(CommandLine cmd, PubSubClientsFactory pubSubClientsFactory) {
-    Properties consumerProps = loadProperties(cmd, Arg.KAFKA_CONSUMER_CONFIG_FILE);
-    String kafkaUrl = getRequiredArgument(cmd, Arg.KAFKA_BOOTSTRAP_SERVERS);
-
-    consumerProps.setProperty(KAFKA_BOOTSTRAP_SERVERS, kafkaUrl);
-    consumerProps.put(KEY_DESERIALIZER_CLASS_CONFIG, KafkaKeySerializer.class);
-    consumerProps.put(VALUE_DESERIALIZER_CLASS_CONFIG, KafkaValueSerializer.class);
-
-    String kafkaTopic = getRequiredArgument(cmd, Arg.KAFKA_TOPIC_NAME);
+  private static void dumpKafkaTopic(CommandLine cmd, PubSubClientsFactory pubSubClientsFactory)
+      throws java.text.ParseException {
+    String topic = getRequiredArgument(cmd, Arg.KAFKA_TOPIC_NAME);
     // optional arguments
     int partitionNumber = (getOptionalArgument(cmd, Arg.KAFKA_TOPIC_PARTITION) == null)
         ? -1
         : Integer.parseInt(getOptionalArgument(cmd, Arg.KAFKA_TOPIC_PARTITION));
-    long startingOffset = (getOptionalArgument(cmd, Arg.STARTING_OFFSET) == null)
-        ? -1
-        : Long.parseLong(getOptionalArgument(cmd, Arg.STARTING_OFFSET));
-    int messageCount = (getOptionalArgument(cmd, Arg.MESSAGE_COUNT) == null)
+    long messageCount = (getOptionalArgument(cmd, Arg.MESSAGE_COUNT) == null)
         ? -1
         : Integer.parseInt(getOptionalArgument(cmd, Arg.MESSAGE_COUNT));
     String parentDir = "./";
@@ -1642,24 +1979,68 @@ public class AdminTool {
     if (getOptionalArgument(cmd, Arg.MAX_POLL_ATTEMPTS) != null) {
       maxConsumeAttempts = Integer.parseInt(getOptionalArgument(cmd, Arg.MAX_POLL_ATTEMPTS));
     }
+    String startDatetime = getOptionalArgument(cmd, Arg.START_DATE);
+    long startTimestamp =
+        startDatetime == null ? -1 : Utils.parseDateTimeToEpoch(startDatetime, DEFAULT_DATE_FORMAT, PST_TIME_ZONE);
+    String endDatetime = getOptionalArgument(cmd, Arg.END_DATE);
+    long endTimestamp =
+        endDatetime == null ? -1 : Utils.parseDateTimeToEpoch(endDatetime, DEFAULT_DATE_FORMAT, PST_TIME_ZONE);
 
     boolean logMetadata = cmd.hasOption(Arg.LOG_METADATA.toString());
     boolean logDataRecord = cmd.hasOption(Arg.LOG_DATA_RECORD.toString());
     boolean logRmdRecord = cmd.hasOption(Arg.LOG_RMD_RECORD.toString());
-    try (PubSubConsumerAdapter consumer = getConsumer(consumerProps, pubSubClientsFactory)) {
+    boolean logTsRecord = cmd.hasOption(Arg.LOG_TS_RECORD.toString());
+
+    ConsumerContext context = createConsumerContext(cmd);
+    PubSubPosition startingPosition = parsePositionFromArgs(cmd, context.getPositionDeserializer(), false);
+    // If no starting position provided, default to offset -1 (earliest)
+    if (startingPosition == null) {
+      startingPosition = PubSubSymbolicPosition.EARLIEST;
+    }
+    if (startTimestamp != -1 && !PubSubSymbolicPosition.EARLIEST.equals(startingPosition)) {
+      throw new VeniceException("Only one of start date and starting offset can be specified");
+    }
+    LOGGER.info(
+        "Dump topic-partition: {} with parameters messageCount: {}, "
+            + "maxConsumeAttempts: {}, startDatetime: {}, endDatetime: {}, logMetadata: {}, logDataRecord: {}, "
+            + "logRmdRecord: {}, logTsRecord: {}, startingPosition: {}",
+        Utils.getReplicaId(topic, partitionNumber),
+        messageCount,
+        maxConsumeAttempts,
+        startDatetime,
+        endDatetime,
+        logMetadata,
+        logDataRecord,
+        logRmdRecord,
+        logTsRecord,
+        startingPosition);
+    try (PubSubConsumerAdapter consumer = getConsumer(pubSubClientsFactory, context)) {
+      PubSubTopicPartition topicPartition =
+          new PubSubTopicPartitionImpl(TOPIC_REPOSITORY.getTopic(topic), partitionNumber);
+      PubSubPosition startPosition =
+          KafkaTopicDumper.calculateStartingPosition(consumer, topicPartition, startingPosition, startTimestamp);
+      PubSubPosition endingPosition = KafkaTopicDumper.calculateEndingPosition(consumer, topicPartition, endTimestamp);
+      if (messageCount <= 0) {
+        messageCount = consumer.positionDifference(topicPartition, endingPosition, startPosition);
+      }
+      LOGGER.info(
+          "TopicPartition: {} start position: {}, end position: {}, message count: {}",
+          topicPartition,
+          startPosition,
+          endingPosition,
+          messageCount);
       try (KafkaTopicDumper ktd = new KafkaTopicDumper(
           controllerClient,
           consumer,
-          kafkaTopic,
-          partitionNumber,
-          startingOffset,
-          messageCount,
+          topicPartition,
           parentDir,
           maxConsumeAttempts,
           logMetadata,
           logDataRecord,
-          logRmdRecord)) {
-        ktd.fetchAndProcess();
+          logRmdRecord,
+          logTsRecord,
+          context.getPositionDeserializer())) {
+        ktd.fetchAndProcess(startPosition, endingPosition, messageCount);
       } catch (Exception e) {
         System.err.println("Something went wrong during topic dump");
         e.printStackTrace();
@@ -1683,6 +2064,23 @@ public class AdminTool {
     checkWhetherStoreMigrationIsAllowed(destClient);
   }
 
+  private static void assertStoreNotMigrating(ControllerClient controllerClient, String storeName) {
+    StoreResponse storeResponse = controllerClient.getStore(storeName);
+    if (storeResponse.isError()) {
+      printObject(storeResponse);
+    } else {
+      // Store migration should not be started already.
+      if (storeResponse.getStore().isMigrating()) {
+        System.err.println(
+            String.format(
+                "ERROR: store %s is migrating. Finish the current migration before starting a new one.",
+                storeName));
+        throw new VeniceException(
+            String.format("Store %s is migrating. Finish the current migration before starting a new one.", storeName));
+      }
+    }
+  }
+
   private static void migrateStore(CommandLine cmd) {
     String veniceUrl = getRequiredArgument(cmd, Arg.URL);
     String storeName = getRequiredArgument(cmd, Arg.STORE);
@@ -1695,19 +2093,7 @@ public class AdminTool {
     ControllerClient srcControllerClient = new ControllerClient(srcClusterName, veniceUrl, sslFactory);
     ControllerClient destControllerClient = new ControllerClient(destClusterName, veniceUrl, sslFactory);
     checkPreconditionForStoreMigration(srcControllerClient, destControllerClient);
-
-    StoreResponse storeResponse = srcControllerClient.getStore(storeName);
-    if (storeResponse.isError()) {
-      printObject(storeResponse);
-      return;
-    } else {
-      // Store migration should not be started already.
-      if (storeResponse.getStore().isMigrating()) {
-        System.err.println(
-            "ERROR: store " + storeName + " is migrating. Finish the current migration before starting a new one.");
-        return;
-      }
-    }
+    assertStoreNotMigrating(srcControllerClient, storeName);
 
     StoreMigrationResponse storeMigrationResponse = srcControllerClient.migrateStore(storeName, destClusterName);
     printObject(storeMigrationResponse);
@@ -1797,7 +2183,7 @@ public class AdminTool {
 
     ChildAwareResponse response = srcControllerClient.listChildControllers(srcClusterName);
 
-    if (response.getChildDataCenterControllerUrlMap() == null && response.getChildDataCenterControllerD2Map() == null) {
+    if (response.getChildDataCenterControllerUrlMap() == null) {
       // This is a controller in single datacenter setup
       printMigrationStatus(srcControllerClient, storeName, printFunction);
       printMigrationStatus(destControllerClient, storeName, printFunction);
@@ -1806,7 +2192,7 @@ public class AdminTool {
       printSystemStoreMigrationStatus(destControllerClient, storeName, printFunction);
     } else {
       // This is a parent controller
-      System.err.println("\n=================== Parent Controllers ====================");
+      printFunction.apply("\n=================== Parent Controllers ====================");
       printMigrationStatus(srcControllerClient, storeName, printFunction);
       printMigrationStatus(destControllerClient, storeName, printFunction);
 
@@ -1817,7 +2203,7 @@ public class AdminTool {
       Map<String, ControllerClient> destChildControllerClientMap = getControllerClientMap(destClusterName, response);
 
       for (Map.Entry<String, ControllerClient> entry: srcChildControllerClientMap.entrySet()) {
-        System.err.println("\n\n=================== Child Datacenter " + entry.getKey() + " ====================");
+        printFunction.apply("\n\n=================== Child Datacenter " + entry.getKey() + " ====================");
 
         ControllerClient srcChildController = entry.getValue();
         ControllerClient destChildController = destChildControllerClientMap.get(entry.getKey());
@@ -1843,7 +2229,7 @@ public class AdminTool {
     checkPreconditionForStoreMigration(srcControllerClient, destControllerClient);
 
     ChildAwareResponse response = destControllerClient.listChildControllers(destClusterName);
-    if (response.getChildDataCenterControllerUrlMap() == null && response.getChildDataCenterControllerD2Map() == null) {
+    if (response.getChildDataCenterControllerUrlMap() == null) {
       // This is a controller in single datacenter setup
       System.out.println("WARN: fabric option is ignored on child controller.");
       if (isClonedStoreOnline(srcControllerClient, destControllerClient, storeName)) {
@@ -1978,12 +2364,6 @@ public class AdminTool {
             .forEach(
                 (key, value) -> controllerClientMap.put(key, new ControllerClient(clusterName, value, sslFactory)));
       }
-      if (response.getChildDataCenterControllerD2Map() != null) {
-        response.getChildDataCenterControllerD2Map()
-            .forEach(
-                (key, value) -> controllerClientMap
-                    .put(key, new D2ControllerClient(response.getD2ServiceName(), clusterName, value, sslFactory)));
-      }
       return controllerClientMap;
     });
   }
@@ -2034,9 +2414,10 @@ public class AdminTool {
       throw new VeniceException("Source cluster and destination cluster cannot be the same!");
     }
     boolean terminate = false;
-
-    ControllerClient srcControllerClient = new ControllerClient(srcClusterName, veniceUrl, sslFactory);
-    ControllerClient destControllerClient = new ControllerClient(destClusterName, veniceUrl, sslFactory);
+    ControllerClient srcControllerClient =
+        ControllerClient.constructClusterControllerClient(srcClusterName, veniceUrl, sslFactory);
+    ControllerClient destControllerClient =
+        ControllerClient.constructClusterControllerClient(destClusterName, veniceUrl, sslFactory);
     checkPreconditionForStoreMigration(srcControllerClient, destControllerClient);
 
     // Check arguments
@@ -2069,9 +2450,10 @@ public class AdminTool {
     // Reset original store, storeConfig, and cluster discovery
     if (promptsOverride.length > 1) {
       terminate = !promptsOverride[1];
+
     } else {
       terminate = !userGivesPermission(
-          "Next step is to reset store migration flag, storeConfig and cluster"
+          "Next step is to reset store migration flag, storeConfig and cluster "
               + "discovery mapping. Do you want to proceed?");
     }
     if (terminate) {
@@ -2110,7 +2492,7 @@ public class AdminTool {
           "Deleting cloned store " + storeName + " in " + destControllerClient.getLeaderControllerUrl() + " ...");
       destControllerClient
           .updateStore(storeName, new UpdateStoreQueryParams().setEnableReads(false).setEnableWrites(false));
-      TrackableControllerResponse deleteResponse = destControllerClient.deleteStore(storeName);
+      TrackableControllerResponse deleteResponse = destControllerClient.deleteStore(storeName, true);
       printObject(deleteResponse);
       if (deleteResponse.isError()) {
         System.err.println("ERROR: failed to delete store " + storeName + " in the dest cluster " + destClusterName);
@@ -2122,7 +2504,7 @@ public class AdminTool {
     }
   }
 
-  private static boolean userGivesPermission(String prompt) {
+  static boolean userGivesPermission(String prompt) {
     Console console = System.console();
     String response = console.readLine(prompt + " (y/n): ").toLowerCase();
     while (!response.equals("y") && !response.equals("n")) {
@@ -2205,6 +2587,39 @@ public class AdminTool {
     printObject(controllerResponse);
   }
 
+  public static void autoMigrateStore(CommandLine cmd) {
+    String veniceUrl = getRequiredArgument(cmd, Arg.URL);
+    String storeName = getRequiredArgument(cmd, Arg.STORE);
+    String srcClusterName = getRequiredArgument(cmd, Arg.CLUSTER_SRC);
+    String destClusterName = getRequiredArgument(cmd, Arg.CLUSTER_DEST);
+    Optional<Boolean> abortOnFailure =
+        Optional.ofNullable(getOptionalArgument(cmd, Arg.ABORT_ON_FAILURE)).map(Boolean::parseBoolean);
+    Optional<Integer> currStep = Optional.ofNullable(getOptionalArgument(cmd, Arg.INITIAL_STEP)).map(Integer::parseInt);
+    Optional<Integer> pauseAfterStep =
+        Optional.ofNullable(getOptionalArgument(cmd, Arg.PAUSE_AFTER_STEP)).map(Integer::parseInt);
+
+    if (srcClusterName.equals(destClusterName)) {
+      throw new VeniceException("Source and destination cluster cannot be the same!");
+    }
+
+    ControllerClient srcControllerClient =
+        ControllerClientFactory.getControllerClient(srcClusterName, veniceUrl, sslFactory);
+    ControllerClient destControllerClient =
+        ControllerClientFactory.getControllerClient(destClusterName, veniceUrl, sslFactory);
+    checkPreconditionForStoreMigration(srcControllerClient, destControllerClient);
+    assertStoreNotMigrating(srcControllerClient, storeName);
+
+    StoreMigrationResponse storeMigrationResponse =
+        srcControllerClient.autoMigrateStore(storeName, destClusterName, currStep, pauseAfterStep, abortOnFailure);
+    printObject(storeMigrationResponse);
+
+    if (storeMigrationResponse.isError()) {
+      System.err.println("ERROR: Auto store migration failed!");
+      return;
+    }
+    System.err.println("\nThe auto store migration request has been submitted successfully.\n");
+  }
+
   private static void sendEndOfPush(CommandLine cmd) {
     String storeName = getRequiredArgument(cmd, Arg.STORE);
     String version = getRequiredArgument(cmd, Arg.VERSION);
@@ -2224,7 +2639,33 @@ public class AdminTool {
 
   /* Things that are not commands */
 
-  private static void printUsageAndExit(OptionGroup commandGroup, Options options) {
+  private static void printUsageAndExit(OptionGroup commandGroup, Options options, CommandLine cmd) {
+    /**
+     * Get the first command if it is available, otherwise print all commands.
+     */
+    Command foundCommand = null;
+    for (Command c: Command.values()) {
+      if (cmd.hasOption(c.toString())) {
+        foundCommand = c;
+      }
+    }
+    Command[] commands = Command.values();
+    if (foundCommand != null) {
+      commands = new Command[] { foundCommand };
+      commandGroup = new OptionGroup();
+      createCommandOpt(foundCommand, commandGroup);
+
+      /**
+       * Gather all the options belonging to the found command.
+       */
+      options = new Options();
+      for (Arg arg: foundCommand.getRequiredArgs()) {
+        createOpt(arg, arg.isParameterized(), arg.getHelpText(), options);
+      }
+      for (Arg arg: foundCommand.getOptionalArgs()) {
+        createOpt(arg, arg.isParameterized(), arg.getHelpText(), options);
+      }
+    }
 
     /* Commands */
     String command = "java -jar "
@@ -2240,7 +2681,6 @@ public class AdminTool {
 
     /* Examples */
     System.out.println("\nExamples:");
-    Command[] commands = Command.values();
     Arrays.sort(commands, Command.commandComparator);
     for (Command c: commands) {
       StringJoiner exampleArgs = new StringJoiner(" ");
@@ -2384,8 +2824,7 @@ public class AdminTool {
     String valueSchema = readFile(valueSchemaFile);
     String aclPerms = getRequiredArgument(cmd, Arg.ACL_PERMS, Command.NEW_STORE);
     String owner = getOptionalArgument(cmd, Arg.OWNER, "");
-    boolean isVsonStore =
-        Utils.parseBooleanFromString(getOptionalArgument(cmd, Arg.VSON_STORE, "false"), "isVsonStore");
+    boolean isVsonStore = Utils.parseBooleanOrThrow(getOptionalArgument(cmd, Arg.VSON_STORE, "false"), "isVsonStore");
     if (isVsonStore) {
       keySchema = VsonAvroSchemaAdapter.parse(keySchema).toString();
       valueSchema = VsonAvroSchemaAdapter.parse(valueSchema).toString();
@@ -2582,56 +3021,6 @@ public class AdminTool {
     }
   }
 
-  private static void enableNativeReplicationForCluster(CommandLine cmd) {
-    String storeType = getRequiredArgument(cmd, Arg.STORE_TYPE);
-    String sourceRegionParam = getOptionalArgument(cmd, Arg.NATIVE_REPLICATION_SOURCE_FABRIC);
-    Optional<String> sourceRegion =
-        StringUtils.isEmpty(sourceRegionParam) ? Optional.empty() : Optional.of(sourceRegionParam);
-    String regionsFilterParam = getOptionalArgument(cmd, Arg.REGIONS_FILTER);
-    Optional<String> regionsFilter =
-        StringUtils.isEmpty(regionsFilterParam) ? Optional.empty() : Optional.of(regionsFilterParam);
-
-    ControllerResponse response =
-        controllerClient.configureNativeReplicationForCluster(true, storeType, sourceRegion, regionsFilter);
-    printObject(response);
-  }
-
-  private static void disableNativeReplicationForCluster(CommandLine cmd) {
-    String storeType = getRequiredArgument(cmd, Arg.STORE_TYPE);
-    String sourceFabricParam = getOptionalArgument(cmd, Arg.NATIVE_REPLICATION_SOURCE_FABRIC);
-    Optional<String> sourceFabric =
-        StringUtils.isEmpty(sourceFabricParam) ? Optional.empty() : Optional.of(sourceFabricParam);
-    String regionsFilterParam = getOptionalArgument(cmd, Arg.REGIONS_FILTER);
-    Optional<String> regionsFilter =
-        StringUtils.isEmpty(regionsFilterParam) ? Optional.empty() : Optional.of(regionsFilterParam);
-
-    ControllerResponse response =
-        controllerClient.configureNativeReplicationForCluster(false, storeType, sourceFabric, regionsFilter);
-    printObject(response);
-  }
-
-  private static void enableActiveActiveReplicationForCluster(CommandLine cmd) {
-    String storeType = getRequiredArgument(cmd, Arg.STORE_TYPE);
-    String regionsFilterParam = getOptionalArgument(cmd, Arg.REGIONS_FILTER);
-    Optional<String> regionsFilter =
-        StringUtils.isEmpty(regionsFilterParam) ? Optional.empty() : Optional.of(regionsFilterParam);
-
-    ControllerResponse response =
-        controllerClient.configureActiveActiveReplicationForCluster(true, storeType, regionsFilter);
-    printObject(response);
-  }
-
-  private static void disableActiveActiveReplicationForCluster(CommandLine cmd) {
-    String storeType = getRequiredArgument(cmd, Arg.STORE_TYPE);
-    String regionsFilterParam = getOptionalArgument(cmd, Arg.REGIONS_FILTER);
-    Optional<String> regionsFilter =
-        StringUtils.isEmpty(regionsFilterParam) ? Optional.empty() : Optional.of(regionsFilterParam);
-
-    ControllerResponse response =
-        controllerClient.configureActiveActiveReplicationForCluster(false, storeType, regionsFilter);
-    printObject(response);
-  }
-
   private static void getDeletableStoreTopics(CommandLine cmd) {
     MultiStoreTopicsResponse response = controllerClient.getDeletableStoreTopics();
     printObject(response);
@@ -2649,6 +3038,35 @@ public class AdminTool {
     String clusterParam = getRequiredArgument(cmd, Arg.CLUSTER);
     String urlParam = getRequiredArgument(cmd, Arg.URL);
     ClusterStaleDataAuditResponse response = controllerClient.getClusterStaleStores(clusterParam, urlParam);
+    printObject(response);
+  }
+
+  private static void repushStore(CommandLine cmd) {
+    String storeName = getRequiredArgument(cmd, Arg.STORE);
+    RepushJobResponse response = controllerClient.repushStore(storeName);
+    printObject(response);
+  }
+
+  private static void getDeadStores(CommandLine cmd) {
+    String clusterName = getRequiredArgument(cmd, Arg.CLUSTER);
+    Optional<String> storeName = Optional.ofNullable(getOptionalArgument(cmd, Arg.STORE));
+    String includeSystemStoresStr = getOptionalArgument(cmd, Arg.INCLUDE_SYSTEM_STORES);
+    String lookBackMSStr = getOptionalArgument(cmd, Arg.LOOK_BACK_MS);
+
+    // Build parameters map for clean, extensible API
+    Map<String, String> params = new HashMap<>();
+
+    // Include system stores parameter (default: false if not specified)
+    if (includeSystemStoresStr != null && !includeSystemStoresStr.isEmpty()) {
+      params.put(ControllerApiConstants.INCLUDE_SYSTEM_STORES, includeSystemStoresStr);
+    }
+
+    // Look back MS parameter
+    if (lookBackMSStr != null && !lookBackMSStr.isEmpty()) {
+      params.put(ControllerApiConstants.LOOK_BACK_MS, lookBackMSStr);
+    }
+
+    MultiStoreInfoResponse response = controllerClient.getDeadStores(clusterName, storeName, params);
     printObject(response);
   }
 
@@ -2728,6 +3146,15 @@ public class AdminTool {
     });
   }
 
+  private static void updateKafkaTopicUncleanLeaderElection(CommandLine cmd) {
+    updateKafkaTopicConfig(cmd, client -> {
+      String kafkaTopicName = getRequiredArgument(cmd, Arg.KAFKA_TOPIC_NAME);
+      boolean uncleanLeaderElectionEnabled =
+          Boolean.parseBoolean(getRequiredArgument(cmd, Arg.KAFKA_TOPIC_UNCLEAN_LEADER_ELECTION_ENABLED));
+      return client.updateKafkaTopicUncleanLeaderElection(kafkaTopicName, uncleanLeaderElectionEnabled);
+    });
+  }
+
   private static void updateKafkaTopicConfig(CommandLine cmd, UpdateTopicConfigFunction updateTopicConfigFunction) {
     String veniceControllerUrls = getRequiredArgument(cmd, Arg.URL);
     String kafkaTopicName = getRequiredArgument(cmd, Arg.KAFKA_TOPIC_NAME);
@@ -2795,12 +3222,18 @@ public class AdminTool {
         System.out.println(latestStep);
         AdminTopicMetadataResponse response =
             checkControllerResponse(srcFabricChildControllerClient.getAdminTopicMetadata(Optional.empty()));
+        long executionId = response.getExecutionId();
+        PubSubPositionJsonWireFormat position = response.getPosition();
+        PubSubPositionJsonWireFormat upstreamPosition = response.getUpstreamPosition();
+
+        System.out.println(
+            "step4: execution id: " + executionId + " position " + position + " upstream position " + upstreamPosition);
         checkControllerResponse(
             destFabricChildControllerClient.updateAdminTopicMetadata(
-                response.getExecutionId(),
+                executionId,
                 Optional.empty(),
-                Optional.of(response.getOffset()),
-                Optional.of(response.getUpstreamOffset())));
+                Optional.of(position),
+                Optional.of(upstreamPosition)));
       }
 
       latestStep = "step5: copying store metadata and starting data recovery for non-existent stores in dest fabric";
@@ -2959,8 +3392,7 @@ public class AdminTool {
     String clusterName = getRequiredArgument(cmd, Arg.CLUSTER);
     try {
       ChildAwareResponse response = checkControllerResponse(controllerClient.listChildControllers(clusterName));
-      if (response.getChildDataCenterControllerUrlMap() == null
-          && response.getChildDataCenterControllerD2Map() == null) {
+      if (response.getChildDataCenterControllerUrlMap() == null) {
         throw new VeniceException("ERROR: Child controller could not run fabric buildout commands");
       }
       System.out.println("Enabling store migration from/to cluster " + clusterName);
@@ -3048,6 +3480,27 @@ public class AdminTool {
     }
   }
 
+  private static void getRequestBasedStoreProperties(CommandLine cmd) throws JsonProcessingException {
+    String url = getRequiredArgument(cmd, Arg.URL);
+    String serverUrl = getRequiredArgument(cmd, Arg.SERVER_URL);
+    String storeName = getRequiredArgument(cmd, Arg.STORE);
+    TransportClient transportClient = null;
+    try {
+      transportClient = getTransportClientForServer(storeName, serverUrl);
+      getAndPrintRequestBasedStoreProperties(
+          transportClient,
+          () -> ControllerClientFactory.discoverAndConstructControllerClient(
+              AvroProtocolDefinition.SERVER_STORE_PROPERTIES_PAYLOAD.getSystemStoreName(),
+              url,
+              sslFactory,
+              1),
+          serverUrl,
+          storeName);
+    } finally {
+      Utils.closeQuietlyWithErrorLogged(transportClient);
+    }
+  }
+
   private static TransportClient getTransportClientForServer(String storeName, String serverUrl) {
     ClientConfig clientConfig = ClientConfig.defaultGenericClientConfig(storeName).setVeniceURL(serverUrl);
     if (clientConfig.isHttps()) {
@@ -3088,6 +3541,210 @@ public class AdminTool {
     } finally {
       Utils.closeQuietlyWithErrorLogged(transportClient);
     }
+  }
+
+  private static void monitorIngestion(CommandLine cmd) {
+    String serverUrl = getRequiredArgument(cmd, Arg.SERVER_URL, Command.MONITOR_INGESTION);
+    String storeName = getRequiredArgument(cmd, Arg.STORE, Command.MONITOR_INGESTION);
+    int version = Integer.parseInt(getRequiredArgument(cmd, Arg.VERSION, Command.MONITOR_INGESTION));
+    int partition = Integer.parseInt(getRequiredArgument(cmd, Arg.PARTITION, Command.MONITOR_INGESTION));
+    String versionTopic = Version.composeKafkaTopic(storeName, version);
+
+    int grpcPort;
+    String grpcPortStr = getOptionalArgument(cmd, Arg.GRPC_PORT);
+    if (grpcPortStr != null) {
+      grpcPort = Integer.parseInt(grpcPortStr);
+    } else {
+      try {
+        java.net.URI uri = new java.net.URI(serverUrl);
+        int basePort = uri.getPort();
+        if (basePort <= 0) {
+          throw new VeniceException(
+              "Cannot derive gRPC port: server URL '" + serverUrl
+                  + "' has no explicit port. Please specify --grpc-port.");
+        }
+        grpcPort = basePort + 1;
+      } catch (java.net.URISyntaxException e) {
+        throw new VeniceException("Invalid server URL: " + serverUrl, e);
+      }
+    }
+
+    int intervalMs = 5000;
+    String intervalStr = getOptionalArgument(cmd, Arg.INTERVAL_MS);
+    if (intervalStr != null) {
+      intervalMs = Integer.parseInt(intervalStr);
+    }
+
+    // Extract host from server URL
+    String host;
+    try {
+      host = new java.net.URI(serverUrl).getHost();
+    } catch (java.net.URISyntaxException e) {
+      throw new VeniceException("Invalid server URL: " + serverUrl, e);
+    }
+    if (host == null || host.isEmpty()) {
+      throw new VeniceException(
+          "Cannot derive host from server URL '" + serverUrl
+              + "'. Please provide a URL with an explicit scheme and host, e.g. https://host:port.");
+    }
+
+    io.grpc.ManagedChannel channel = null;
+    try {
+      String serverAddress = host + ":" + grpcPort;
+      if (sslFactory.isPresent()) {
+        io.grpc.ChannelCredentials credentials =
+            com.linkedin.venice.grpc.GrpcUtils.buildChannelCredentials(sslFactory.get());
+        channel = io.grpc.Grpc.newChannelBuilder(serverAddress, credentials).build();
+      } else {
+        channel = io.grpc.ManagedChannelBuilder.forTarget(serverAddress).usePlaintext().build();
+      }
+
+      com.linkedin.venice.protocols.IngestionMonitorRequest request =
+          com.linkedin.venice.protocols.IngestionMonitorRequest.newBuilder()
+              .setVersionTopic(versionTopic)
+              .setPartition(partition)
+              .setIntervalMs(intervalMs)
+              .build();
+
+      java.util.Iterator<com.linkedin.venice.protocols.IngestionMonitorResponse> responses =
+          com.linkedin.venice.protocols.VeniceIngestionMonitorServiceGrpc.newBlockingStub(channel)
+              .monitorIngestion(request);
+
+      System.out.println(
+          "Connected to " + host + ":" + grpcPort + " - monitoring " + versionTopic + " partition " + partition
+              + " (interval: " + intervalMs + "ms)");
+      System.out.println("Press Ctrl+C to stop.\n");
+
+      // Print header
+      System.out.printf(
+          "%-24s %-10s %-7s %12s %12s %12s %12s %10s %10s %10s %10s %10s%n",
+          "Timestamp",
+          "L/F State",
+          "Hybrid",
+          "Rec/s In",
+          "MB/s In",
+          "Rec/s Out",
+          "MB/s Out",
+          "E2E ms",
+          "Put ms",
+          "Produce ms",
+          "Complete ms",
+          "Idle ms");
+      for (int i = 0; i < 160; i++) {
+        System.out.print('-');
+      }
+      System.out.println();
+
+      while (responses.hasNext()) {
+        com.linkedin.venice.protocols.IngestionMonitorResponse resp = responses.next();
+        System.out.printf(
+            "%-24s %-10s %-7s %12.1f %12.3f %12.1f %12.3f %10.2f %10.2f %10.2f %10.2f %10d%n",
+            java.time.Instant.ofEpochMilli(resp.getTimestampMs()).toString(),
+            resp.getLeaderFollowerState(),
+            resp.getIsHybrid(),
+            resp.getRecordsIngestedPerSec(),
+            resp.getBytesIngestedPerSec() / (1024.0 * 1024.0),
+            resp.getLeaderRecordsProducedPerSec(),
+            resp.getLeaderBytesProducedPerSec() / (1024.0 * 1024.0),
+            resp.getConsumedRecordE2EProcessingLatencyAvgMs(),
+            resp.getStorageEnginePutLatencyAvgMs(),
+            resp.getLeaderProduceLatencyAvgMs(),
+            resp.getLeaderProducerCompletionLatencyAvgMs(),
+            resp.getElapsedTimeSinceLastRecordMs());
+      }
+    } catch (io.grpc.StatusRuntimeException e) {
+      System.err.println("gRPC error: " + e.getStatus().getDescription());
+      throw new VeniceException("gRPC monitoring failed: " + e.getMessage(), e);
+    } finally {
+      if (channel != null) {
+        channel.shutdownNow();
+      }
+    }
+  }
+
+  static void dumpHostHeartbeatLag(
+      TransportClient transportClient,
+      String topicFilter,
+      String partitionFilter,
+      String lagFilter) throws Exception {
+    String topicName = topicFilter == null ? "" : topicFilter;
+    String partition = partitionFilter == null ? "-1" : partitionFilter;
+    String filterLag = lagFilter == null ? "false" : lagFilter;
+    StringBuilder sb = new StringBuilder(QueryAction.HOST_HEARTBEAT_LAG.toString().toLowerCase()).append("/")
+        .append(topicName)
+        .append("/")
+        .append(partition)
+        .append("/")
+        .append(filterLag);
+    String requestUrl = sb.toString();
+    byte[] responseBody;
+    TransportClientResponse transportClientResponse = transportClient.get(requestUrl).get();
+    responseBody = transportClientResponse.getBody();
+    ReplicaIngestionResponse currentVersionResponse =
+        OBJECT_MAPPER.readValue(responseBody, ReplicaIngestionResponse.class);
+    System.out.println(new String(currentVersionResponse.getPayload()));
+  }
+
+  private static void dumpHostHeartbeat(CommandLine cmd) throws Exception {
+    TransportClient transportClient = null;
+    try {
+      transportClient = getTransportClientForServer("dummy", getRequiredArgument(cmd, Arg.SERVER_URL));
+      dumpHostHeartbeatLag(
+          transportClient,
+          getRequiredArgument(cmd, Arg.KAFKA_TOPIC_NAME),
+          getOptionalArgument(cmd, Arg.PARTITION),
+          getOptionalArgument(cmd, Arg.LAG_FILTER_ENABLED));
+    } finally {
+      Utils.closeQuietlyWithErrorLogged(transportClient);
+    }
+  }
+
+  private static void updateAdminOperationProtocolVersion(CommandLine cmd) throws Exception {
+    String clusterName = getRequiredArgument(cmd, Arg.CLUSTER, Command.UPDATE_ADMIN_OPERATION_PROTOCOL_VERSION);
+    String protocolVersionInString =
+        getRequiredArgument(cmd, Arg.ADMIN_OPERATION_PROTOCOL_VERSION, Command.UPDATE_ADMIN_OPERATION_PROTOCOL_VERSION);
+    long protocolVersion =
+        Utils.parseLongFromString(protocolVersionInString, Arg.ADMIN_OPERATION_PROTOCOL_VERSION.name());
+    AdminTopicMetadataResponse response =
+        controllerClient.updateAdminOperationProtocolVersion(clusterName, protocolVersion);
+    printObject(response);
+  }
+
+  private static void migrateVeniceZKPaths(CommandLine cmd) throws Exception {
+    Set<String> clusterNames = Utils.parseCommaSeparatedStringToSet(getRequiredArgument(cmd, Arg.CLUSTER_LIST));
+    String srcZKUrl = getRequiredArgument(cmd, Arg.SRC_ZOOKEEPER_URL);
+    String srcZKSSLConfigs = getRequiredArgument(cmd, Arg.SRC_ZK_SSL_CONFIG_FILE);
+    String destZKUrl = getRequiredArgument(cmd, Arg.DEST_ZOOKEEPER_URL);
+    String destZKSSLConfigs = getRequiredArgument(cmd, Arg.DEST_ZK_SSL_CONFIG_FILE);
+    ZkClient srcZkClient = readZKConfigAndBuildZKClient(srcZKUrl, srcZKSSLConfigs);
+    ZkClient destZkClient = readZKConfigAndBuildZKClient(destZKUrl, destZKSSLConfigs);
+    try {
+      ZkCopier.migrateVenicePaths(srcZkClient, destZkClient, clusterNames, getRequiredArgument(cmd, Arg.BASE_PATH));
+    } finally {
+      srcZkClient.close();
+      destZkClient.close();
+    }
+  }
+
+  private static void extractVeniceZKPaths(CommandLine cmd) {
+    Set<String> clusterNames = Utils.parseCommaSeparatedStringToSet(getRequiredArgument(cmd, Arg.CLUSTER_LIST));
+    ZkCopier.extractVenicePaths(
+        getRequiredArgument(cmd, Arg.INFILE),
+        getRequiredArgument(cmd, Arg.OUTFILE),
+        clusterNames,
+        getRequiredArgument(cmd, Arg.BASE_PATH));
+  }
+
+  private static void getAggregatedHealthStatus(CommandLine cmd) throws JsonProcessingException {
+    String clusterName = getRequiredArgument(cmd, Arg.CLUSTER);
+    String instances = getRequiredArgument(cmd, Arg.INSTANCES);
+    String toBeStoppedNodes = getRequiredArgument(cmd, Arg.TO_BE_STOPPED_NODES);
+    ControllerResponse response = controllerClient.getAggregatedHealthStatus(
+        clusterName,
+        Utils.parseCommaSeparatedStringToList(instances),
+        Utils.parseCommaSeparatedStringToList(toBeStoppedNodes));
+    printObject(response);
+
   }
 
   private static void configureStoreView(CommandLine cmd) {
@@ -3145,9 +3802,9 @@ public class AdminTool {
     byte[] responseBody;
     TransportClientResponse transportClientResponse = transportClient.get(requestUrl).get();
     responseBody = transportClientResponse.getBody();
-    TopicPartitionIngestionContextResponse currentVersionResponse =
-        OBJECT_MAPPER.readValue(responseBody, TopicPartitionIngestionContextResponse.class);
-    System.out.println(new String(currentVersionResponse.getTopicPartitionIngestionContext()));
+    ReplicaIngestionResponse currentVersionResponse =
+        OBJECT_MAPPER.readValue(responseBody, ReplicaIngestionResponse.class);
+    System.out.println(new String(currentVersionResponse.getPayload()));
   }
 
   static void getAndPrintRequestBasedMetadata(
@@ -3189,12 +3846,51 @@ public class AdminTool {
     System.out.println(jsonWriter.writeValueAsString(printObject));
   }
 
+  static void getAndPrintRequestBasedStoreProperties(
+      TransportClient transportClient,
+      Supplier<ControllerClient> controllerClientSupplier,
+      String serverUrl,
+      String storeName) throws JsonProcessingException {
+    String requestBasedStorePropertiesURL = QueryAction.STORE_PROPERTIES.toString().toLowerCase() + "/" + storeName;
+    byte[] body;
+    int writerSchemaId;
+    try {
+      TransportClientResponse transportClientResponse = transportClient.get(requestBasedStorePropertiesURL).get();
+      writerSchemaId = transportClientResponse.getSchemaId();
+      body = transportClientResponse.getBody();
+    } catch (Exception e) {
+      throw new VeniceException(
+          "Encountered exception while trying to send store properties request to: " + serverUrl + "/"
+              + requestBasedStorePropertiesURL,
+          e);
+    }
+    Schema writerSchema;
+    if (writerSchemaId != AvroProtocolDefinition.SERVER_STORE_PROPERTIES_PAYLOAD.getCurrentProtocolVersion()) {
+      SchemaResponse schemaResponse = controllerClientSupplier.get()
+          .getValueSchema(AvroProtocolDefinition.SERVER_STORE_PROPERTIES_PAYLOAD.getSystemStoreName(), writerSchemaId);
+      if (schemaResponse.isError()) {
+        throw new VeniceException(
+            "Failed to fetch store properties response schema from controller, error: " + schemaResponse.getError());
+      }
+      writerSchema = parseSchemaFromJSONLooseValidation(schemaResponse.getSchemaStr());
+    } else {
+      writerSchema = StorePropertiesPayloadRecord.SCHEMA$;
+    }
+    RecordDeserializer<GenericRecord> storePropertiesPayloadDeserializer =
+        FastSerializerDeserializerFactory.getFastAvroGenericDeserializer(writerSchema, writerSchema);
+    GenericRecord storePropertiesPayload = storePropertiesPayloadDeserializer.deserialize(body);
+    // Using the jsonWriter to print Avro objects directly does not handle the collection types (List and Map) well.
+    // Use the Avro record's toString() instead and pretty print it.
+    Object printObject = ObjectMapperFactory.getInstance().readValue(storePropertiesPayload.toString(), Object.class);
+    System.out.println(jsonWriter.writeValueAsString(printObject));
+  }
+
   private static Map<String, ControllerClient> getAndCheckChildControllerClientMap(
       String clusterName,
       String srcFabric,
       String destFabric) {
     ChildAwareResponse response = checkControllerResponse(controllerClient.listChildControllers(clusterName));
-    if (response.getChildDataCenterControllerUrlMap() == null && response.getChildDataCenterControllerD2Map() == null) {
+    if (response.getChildDataCenterControllerUrlMap() == null) {
       throw new VeniceException("ERROR: Child controller could not run fabric buildout commands");
     }
     Map<String, ControllerClient> childControllerClientMap = getControllerClientMap(clusterName, response);
@@ -3221,6 +3917,54 @@ public class AdminTool {
 
   private static void createOpt(Arg name, boolean hasArg, String help, Options options) {
     options.addOption(new Option(name.first(), name.toString(), hasArg, help));
+  }
+
+  /**
+   * Helper method to parse position from mutually exclusive offset/position arguments.
+   * Handles both STARTING_OFFSET/STARTING_POSITION pairs.
+   * Uses STARTING_OFFSET and STARTING_POSITION arguments internally.
+   *
+   * @param cmd CommandLine object containing parsed arguments
+   * @param pubSubPositionDeserializer Deserializer for position wire format
+   * @param required Whether at least one of the arguments is required
+   * @return PubSubPosition parsed from the provided arguments, or null if neither provided and not required
+   */
+  @VisibleForTesting
+  static PubSubPosition parsePositionFromArgs(
+      CommandLine cmd,
+      PubSubPositionDeserializer pubSubPositionDeserializer,
+      boolean required) {
+    boolean hasOffset = cmd.hasOption(Arg.STARTING_OFFSET.first());
+    boolean hasPosition = cmd.hasOption(Arg.STARTING_POSITION.first());
+
+    if (hasOffset && hasPosition) {
+      printErrAndExit(
+          Arg.STARTING_OFFSET.getArgName() + " and " + Arg.STARTING_POSITION.getArgName()
+              + " are mutually exclusive. Please specify only one.");
+    }
+
+    if (required && !hasOffset && !hasPosition) {
+      printErrAndExit(
+          "At least one of " + Arg.STARTING_OFFSET.getArgName() + " or " + Arg.STARTING_POSITION.getArgName()
+              + " is required.");
+    }
+
+    if (!hasOffset && !hasPosition) {
+      return null; // Neither provided and not required
+    }
+
+    if (hasOffset) {
+      String offsetValue = cmd.getOptionValue(Arg.STARTING_OFFSET.first()).trim();
+      if ("earliest".equalsIgnoreCase(offsetValue)) {
+        return PubSubSymbolicPosition.EARLIEST;
+      } else if ("latest".equalsIgnoreCase(offsetValue)) {
+        return PubSubSymbolicPosition.LATEST;
+      }
+      return PubSubUtil.fromKafkaOffset(Long.parseLong(offsetValue));
+    } else {
+      return PubSubUtil
+          .parsePositionWireFormat(cmd.getOptionValue(Arg.STARTING_POSITION.first()), pubSubPositionDeserializer);
+    }
   }
 
   private static void createCommandOpt(Command command, OptionGroup group) {
@@ -3292,15 +4036,67 @@ public class AdminTool {
     }
   }
 
-  private static PubSubConsumerAdapter getConsumer(
-      Properties consumerProps,
-      PubSubClientsFactory pubSubClientsFactory) {
-    PubSubMessageDeserializer pubSubMessageDeserializer = new PubSubMessageDeserializer(
-        new OptimizedKafkaValueSerializer(),
-        new LandFillObjectPool<>(KafkaMessageEnvelope::new),
-        new LandFillObjectPool<>(KafkaMessageEnvelope::new));
-    return pubSubClientsFactory.getConsumerAdapterFactory()
-        .create(new VeniceProperties(consumerProps), false, pubSubMessageDeserializer, "admin-tool-topic-dumper");
+  /**
+   * Helper class to encapsulate consumer properties and related dependencies.
+   * Package-private and final to allow direct access in tests without reflection.
+   */
+  static final class ConsumerContext {
+    private final VeniceProperties veniceProperties;
+    private final PubSubPositionTypeRegistry positionTypeRegistry;
+    private final PubSubPositionDeserializer positionDeserializer;
+
+    public ConsumerContext(
+        VeniceProperties veniceProperties,
+        PubSubPositionTypeRegistry positionTypeRegistry,
+        PubSubPositionDeserializer positionDeserializer) {
+      this.veniceProperties = veniceProperties;
+      this.positionTypeRegistry = positionTypeRegistry;
+      this.positionDeserializer = positionDeserializer;
+    }
+
+    public VeniceProperties getVeniceProperties() {
+      return veniceProperties;
+    }
+
+    public PubSubPositionTypeRegistry getPositionTypeRegistry() {
+      return positionTypeRegistry;
+    }
+
+    public PubSubPositionDeserializer getPositionDeserializer() {
+      return positionDeserializer;
+    }
   }
 
+  /**
+   * Creates a complete consumer context with all necessary dependencies.
+   * Consolidates the repeated pattern of loading consumer properties, setting bootstrap servers,
+   * and creating VeniceProperties, PubSubPositionTypeRegistry, and PubSubPositionDeserializer.
+   *
+   * @param cmd CommandLine containing the arguments
+   */
+  private static ConsumerContext createConsumerContext(CommandLine cmd) {
+    // Load consumer properties and set bootstrap servers
+    Properties consumerProps = loadProperties(cmd, Arg.KAFKA_CONSUMER_CONFIG_FILE);
+    String pubSubBrokerUrl = getRequiredArgument(cmd, Arg.KAFKA_BOOTSTRAP_SERVERS);
+    PubSubUtil.addPubSubBrokerAddress(consumerProps, pubSubBrokerUrl);
+
+    // Create all necessary dependencies
+    VeniceProperties veniceProperties = new VeniceProperties(consumerProps);
+    PubSubPositionTypeRegistry positionTypeRegistry =
+        PubSubPositionTypeRegistry.fromPropertiesOrDefault(veniceProperties);
+    PubSubPositionDeserializer positionDeserializer = new PubSubPositionDeserializer(positionTypeRegistry);
+
+    return new ConsumerContext(veniceProperties, positionTypeRegistry, positionDeserializer);
+  }
+
+  private static PubSubConsumerAdapter getConsumer(PubSubClientsFactory pubSubClientsFactory, ConsumerContext context) {
+    return pubSubClientsFactory.getConsumerAdapterFactory()
+        .create(
+            new PubSubConsumerAdapterContext.Builder()
+                .setPubSubMessageDeserializer(PubSubMessageDeserializer.createOptimizedDeserializer())
+                .setPubSubPositionTypeRegistry(context.getPositionTypeRegistry())
+                .setVeniceProperties(context.getVeniceProperties())
+                .setConsumerName("admin-tool-topic-dumper")
+                .build());
+  }
 }

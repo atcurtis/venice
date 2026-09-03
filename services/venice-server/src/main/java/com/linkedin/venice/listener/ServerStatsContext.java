@@ -1,13 +1,17 @@
 package com.linkedin.venice.listener;
 
+import static com.linkedin.venice.listener.response.stats.ResponseStatsUtil.consumeIntIfAbove;
+import static com.linkedin.venice.stats.dimensions.VeniceResponseStatusCategory.getVeniceResponseStatusCategory;
+
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.listener.request.RouterRequest;
+import com.linkedin.venice.listener.response.stats.ReadResponseStatsRecorder;
 import com.linkedin.venice.read.RequestType;
 import com.linkedin.venice.stats.AggServerHttpRequestStats;
+import com.linkedin.venice.stats.OpenTelemetryMetricsSetup;
 import com.linkedin.venice.stats.ServerHttpRequestStats;
-import io.netty.channel.ChannelHandlerContext;
+import com.linkedin.venice.stats.dimensions.VeniceResponseStatusCategory;
 import io.netty.handler.codec.http.HttpResponseStatus;
-import it.unimi.dsi.fastutil.ints.IntList;
 
 
 /**
@@ -19,34 +23,34 @@ import it.unimi.dsi.fastutil.ints.IntList;
  * direct copy of StatsHandler, without Netty Channel Read/Write logic.
  */
 public class ServerStatsContext {
+  /**
+   * Sentinel store name used when the actual store name is unknown (e.g., request failed before
+   * store resolution). Using a sentinel instead of {@code null} ensures both Tehuti and OTel
+   * metrics are recorded rather than otel getting silently dropped as otel needs non-null values
+   * for all dimensions rather than having a diff metric for such cases.
+   */
+  public static final String UNKNOWN_STORE_NAME = OpenTelemetryMetricsSetup.UNKNOWN_STORE_NAME;
+
+  private ReadResponseStatsRecorder responseStatsRecorder;
   private long startTimeInNS;
   private HttpResponseStatus responseStatus;
   private String storeName = null;
   private boolean isMetadataRequest;
-  private double databaseLookupLatency = -1;
-  private int multiChunkLargeValueCount = -1;
   private int requestKeyCount = -1;
-  private int successRequestKeyCount = -1;
   private int requestSizeInBytes = -1;
-  private double readComputeLatency = -1;
-  private double readComputeDeserializationLatency = -1;
-  private double readComputeSerializationLatency = -1;
-  private int dotProductCount = 0;
-  private int cosineSimilarityCount = 0;
-  private int hadamardProductCount = 0;
-  private int countOperatorCount = 0;
   private boolean isRequestTerminatedEarly = false;
-
-  private IntList keySizeList;
-  private IntList valueSizeList;
-
-  private int valueSize = 0;
-  private int readComputeOutputSize = 0;
-
   private final AggServerHttpRequestStats singleGetStats;
   private final AggServerHttpRequestStats multiGetStats;
   private final AggServerHttpRequestStats computeStats;
   private AggServerHttpRequestStats currentStats;
+  private RequestType requestType = RequestType.SINGLE_GET;
+  /**
+   * Best-effort, observability-only copy of the raw request URI, used by {@link StatsHandler} when logging an error
+   * that was recorded without a store attribution. There is currently no handler upstream of the SSL/ACL rejection
+   * points that can populate this for those cases, so it is frequently {@code null}; the logging treats it as optional
+   * and never relies on it being present.
+   */
+  private String requestUri = null;
 
   // a flag that indicates if this is a new HttpRequest. Netty is TCP-based, so a HttpRequest is chunked into packages.
   // Set the startTimeInNS in ChannelRead if it is the first package within a HttpRequest.
@@ -56,69 +60,13 @@ public class ServerStatsContext {
    * This is mostly to bypass the issue that stat callback could be triggered multiple times for one single request.
    */
   private boolean statCallbackExecuted = false;
-  private double storageExecutionSubmissionWaitTime;
-  private int storageExecutionQueueLen;
-
-  /**
-   * Normally, one multi-get request will be split into two parts, and it means
-   * {@link StatsHandler#channelRead(ChannelHandlerContext, Object)} will be invoked twice.
-   *
-   * 'firstPartLatency' will measure the time took by:
-   * {@link StatsHandler}
-   * {@link HttpServerCodec}
-   * {@link HttpObjectAggregator}
-   *
-   * 'partsInvokeDelayLatency' will measure the delay between the invocation of part1
-   * and the invocation of part2;
-   *
-   * 'secondPartLatency' will measure the time took by:
-   * {@link StatsHandler}
-   * {@link HttpServerCodec}
-   * {@link HttpObjectAggregator}
-   * {@link VerifySslHandler}
-   * {@link ServerAclHandler}
-   * {@link RouterRequestHttpHandler}
-   * {@link StorageReadRequestHandler}
-   *
-   */
-  private double firstPartLatency = -1;
-  private double secondPartLatency = -1;
-  private double partsInvokeDelayLatency = -1;
-  private int requestPartCount = -1;
-  private boolean isComplete;
 
   private boolean isMisroutedStoreVersion = false;
+  private double flushLatency = -1;
+  private int responseSize = -1;
 
   public boolean isNewRequest() {
     return newRequest;
-  }
-
-  public double getSecondPartLatency() {
-    return secondPartLatency;
-  }
-
-  public void setSecondPartLatency(double secondPartLatency) {
-    this.secondPartLatency = secondPartLatency;
-  }
-
-  public double getPartsInvokeDelayLatency() {
-    return partsInvokeDelayLatency;
-  }
-
-  public void setPartsInvokeDelayLatency(double partsInvokeDelayLatency) {
-    this.partsInvokeDelayLatency = partsInvokeDelayLatency;
-  }
-
-  public int getRequestPartCount() {
-    return requestPartCount;
-  }
-
-  public void setRequestPartCount(int requestPartCount) {
-    this.requestPartCount = requestPartCount;
-  }
-
-  public void incrementRequestPartCount() {
-    this.requestPartCount++;
   }
 
   public ServerStatsContext(
@@ -133,36 +81,25 @@ public class ServerStatsContext {
   }
 
   public void resetContext() {
+    this.responseStatsRecorder = null;
     storeName = null;
     startTimeInNS = System.nanoTime();
-    partsInvokeDelayLatency = -1;
-    secondPartLatency = -1;
-    requestPartCount = 1;
     isMetadataRequest = false;
     responseStatus = null;
     statCallbackExecuted = false;
-    databaseLookupLatency = -1;
-    storageExecutionSubmissionWaitTime = -1;
-    storageExecutionQueueLen = -1;
     requestKeyCount = -1;
-    successRequestKeyCount = -1;
     requestSizeInBytes = -1;
-    multiChunkLargeValueCount = -1;
-    readComputeLatency = -1;
-    readComputeDeserializationLatency = -1;
-    readComputeSerializationLatency = -1;
-    dotProductCount = 0;
-    cosineSimilarityCount = 0;
-    hadamardProductCount = 0;
     isRequestTerminatedEarly = false;
-    isComplete = false;
     isMisroutedStoreVersion = false;
+    flushLatency = -1;
+    responseSize = -1;
+    requestUri = null;
 
     newRequest = false;
   }
 
-  public void setFirstPartLatency(double firstPartLatency) {
-    this.firstPartLatency = firstPartLatency;
+  public void setReadResponseStats(ReadResponseStatsRecorder responseStatsRecorder) {
+    this.responseStatsRecorder = responseStatsRecorder;
   }
 
   public void setNewRequest() {
@@ -193,6 +130,18 @@ public class ServerStatsContext {
     this.storeName = name;
   }
 
+  public String getRequestUri() {
+    return requestUri;
+  }
+
+  /**
+   * Best-effort: records the raw request URI for observability only (see {@link #requestUri}). May be left unset, in
+   * which case {@link StatsHandler} simply logs the error without it.
+   */
+  public void setRequestUri(String requestUri) {
+    this.requestUri = requestUri;
+  }
+
   public void setMetadataRequest(boolean metadataRequest) {
     this.isMetadataRequest = metadataRequest;
   }
@@ -206,6 +155,7 @@ public class ServerStatsContext {
   }
 
   public void setRequestType(RequestType requestType) {
+    this.requestType = requestType;
     switch (requestType) {
       case MULTI_GET:
       case MULTI_GET_STREAMING:
@@ -218,6 +168,10 @@ public class ServerStatsContext {
       default:
         currentStats = singleGetStats;
     }
+  }
+
+  public RequestType getRequestType() {
+    return requestType;
   }
 
   public void setRequestKeyCount(int keyCount) {
@@ -238,201 +192,109 @@ public class ServerStatsContext {
     this.requestSizeInBytes = requestSizeInBytes;
   }
 
-  public void setSuccessRequestKeyCount(int successKeyCount) {
-    this.successRequestKeyCount = successKeyCount;
-  }
-
-  public void setDatabaseLookupLatency(double latency) {
-    this.databaseLookupLatency = latency;
-  }
-
-  public void setReadComputeLatency(double latency) {
-    this.readComputeLatency = latency;
-  }
-
-  public void setReadComputeDeserializationLatency(double latency) {
-    this.readComputeDeserializationLatency = latency;
-  }
-
-  public void setReadComputeSerializationLatency(double latency) {
-    this.readComputeSerializationLatency = latency;
-  }
-
-  public void setDotProductCount(int count) {
-    this.dotProductCount = count;
-  }
-
-  public void setCosineSimilarityCount(int count) {
-    this.cosineSimilarityCount = count;
-  }
-
-  public void setHadamardProductCount(int count) {
-    this.hadamardProductCount = count;
-  }
-
-  public void setCountOperatorCount(int count) {
-    this.countOperatorCount = count;
-  }
-
-  public void setStorageExecutionHandlerSubmissionWaitTime(double storageExecutionSubmissionWaitTime) {
-    this.storageExecutionSubmissionWaitTime = storageExecutionSubmissionWaitTime;
-  }
-
-  public void setStorageExecutionQueueLen(int storageExecutionQueueLen) {
-    this.storageExecutionQueueLen = storageExecutionQueueLen;
-  }
-
-  public boolean isAssembledMultiChunkLargeValue() {
-    return multiChunkLargeValueCount > 0;
-  }
-
-  public void setMultiChunkLargeValueCount(int multiChunkLargeValueCount) {
-    this.multiChunkLargeValueCount = multiChunkLargeValueCount;
-  }
-
-  public void setKeySizeList(IntList keySizeList) {
-    this.keySizeList = keySizeList;
-  }
-
-  public void setValueSizeList(IntList valueSizeList) {
-    this.valueSizeList = valueSizeList;
-  }
-
   public long getRequestStartTimeInNS() {
     return this.startTimeInNS;
   }
 
+  public void setFlushLatency(double latency) {
+    this.flushLatency = latency;
+  }
+
+  public void setResponseSize(int size) {
+    this.responseSize = size;
+  }
+
+  /**
+   * Records request-level and response-level metrics for the current request.
+   *
+   * <p>{@code responseStatus} must be non-null when this method is called. Both callers enforce this:
+   * {@link StatsHandler#write} throws {@link VeniceException} if responseStatus is null, and
+   * {@link com.linkedin.venice.listener.grpc.handlers.GrpcOutboundStatsHandler#processRequest} does the same.
+   * The null guard on responseStatus below is purely defensive.
+   *
+   * @param serverHttpRequestStats the per-store stats object; may be null if the store name is unknown,
+   *        in which case this method is a no-op. This is acceptable because when the store is unknown the
+   *        request failed before store resolution, so most fields here (keyCount, requestSize, responseStats)
+   *        won't have meaningful values. The critical error count and latency metrics are still captured by
+   *        {@link #errorRequest}, which resolves unknown stores to {@link #UNKNOWN_STORE_NAME}.
+   */
   public void recordBasicMetrics(ServerHttpRequestStats serverHttpRequestStats) {
-    if (serverHttpRequestStats != null) {
-      if (databaseLookupLatency >= 0) {
-        serverHttpRequestStats.recordDatabaseLookupLatency(databaseLookupLatency, isAssembledMultiChunkLargeValue());
+    if (serverHttpRequestStats == null) {
+      return;
+    }
+
+    // Metrics that do not require responseStatus for dimensions
+    consumeIntIfAbove(serverHttpRequestStats::recordRequestKeyCount, this.requestKeyCount, 0);
+    consumeIntIfAbove(serverHttpRequestStats::recordRequestSizeInBytes, this.requestSizeInBytes, 0);
+    if (this.isRequestTerminatedEarly) {
+      // Tehuti-only: OTel captures this via READ_CALL_COUNT with HTTP 408 status dimension
+      serverHttpRequestStats.recordEarlyTerminatedEarlyRequest();
+    }
+    if (flushLatency >= 0) {
+      serverHttpRequestStats.recordFlushLatency(flushLatency);
+    }
+
+    // Status-dependent metrics require responseStatus for OTel dimensions
+    if (responseStatus != null) {
+      VeniceResponseStatusCategory veniceCategory = getVeniceResponseStatusCategory(responseStatus);
+
+      if (this.responseStatsRecorder != null) {
+        this.responseStatsRecorder.recordMetrics(serverHttpRequestStats, responseStatus, veniceCategory);
       }
-      if (storageExecutionSubmissionWaitTime >= 0) {
-        currentStats.recordStorageExecutionHandlerSubmissionWaitTime(storageExecutionSubmissionWaitTime);
-      }
-      if (storageExecutionQueueLen >= 0) {
-        currentStats.recordStorageExecutionQueueLen(storageExecutionQueueLen);
-      }
-      if (multiChunkLargeValueCount > 0) {
-        // We only record this metric for requests where large values occurred
-        serverHttpRequestStats.recordMultiChunkLargeValueCount(multiChunkLargeValueCount);
-      }
-      if (requestKeyCount > 0) {
-        serverHttpRequestStats.recordRequestKeyCount(requestKeyCount);
-      }
-      if (successRequestKeyCount > 0) {
-        serverHttpRequestStats.recordSuccessRequestKeyCount(successRequestKeyCount);
-      }
-      if (requestSizeInBytes > 0) {
-        serverHttpRequestStats.recordRequestSizeInBytes(requestSizeInBytes);
-      }
-      if (firstPartLatency > 0) {
-        serverHttpRequestStats.recordRequestFirstPartLatency(firstPartLatency);
-      }
-      if (partsInvokeDelayLatency > 0) {
-        serverHttpRequestStats.recordRequestPartsInvokeDelayLatency(partsInvokeDelayLatency);
-      }
-      if (secondPartLatency > 0) {
-        serverHttpRequestStats.recordRequestSecondPartLatency(secondPartLatency);
-      }
-      if (requestPartCount > 0) {
-        serverHttpRequestStats.recordRequestPartCount(requestPartCount);
-      }
-      if (readComputeLatency >= 0) {
-        serverHttpRequestStats.recordReadComputeLatency(readComputeLatency, isAssembledMultiChunkLargeValue());
-      }
-      if (readComputeDeserializationLatency >= 0) {
-        serverHttpRequestStats.recordReadComputeDeserializationLatency(
-            readComputeDeserializationLatency,
-            isAssembledMultiChunkLargeValue());
-      }
-      if (readComputeSerializationLatency >= 0) {
-        serverHttpRequestStats
-            .recordReadComputeSerializationLatency(readComputeSerializationLatency, isAssembledMultiChunkLargeValue());
-      }
-      if (dotProductCount > 0) {
-        serverHttpRequestStats.recordDotProductCount(dotProductCount);
-      }
-      if (cosineSimilarityCount > 0) {
-        serverHttpRequestStats.recordCosineSimilarityCount(cosineSimilarityCount);
-      }
-      if (hadamardProductCount > 0) {
-        serverHttpRequestStats.recordHadamardProduct(hadamardProductCount);
-      }
-      if (countOperatorCount > 0) {
-        serverHttpRequestStats.recordCountOperator(countOperatorCount);
-      }
-      if (isRequestTerminatedEarly) {
-        serverHttpRequestStats.recordEarlyTerminatedEarlyRequest();
-      }
-      if (keySizeList != null) {
-        for (int i = 0; i < keySizeList.size(); i++) {
-          serverHttpRequestStats.recordKeySizeInByte(keySizeList.getInt(i));
-        }
-      }
-      if (valueSizeList != null) {
-        for (int i = 0; i < valueSizeList.size(); i++) {
-          if (valueSizeList.getInt(i) != -1) {
-            serverHttpRequestStats.recordValueSizeInByte(valueSizeList.getInt(i));
-          }
-        }
-      }
-      if (readComputeOutputSize > 0) {
-        serverHttpRequestStats.recordReadComputeEfficiency((double) valueSize / readComputeOutputSize);
+      if (responseSize >= 0) {
+        serverHttpRequestStats.recordResponseSize(responseStatus, veniceCategory, responseSize);
       }
     }
   }
 
-  // This method does not have to be synchronized since operations in Tehuti are already synchronized.
-  // Please re-consider the race condition if new logic is added.
+  // This method does not have to be synchronized since Tehuti Sensor.record() is internally synchronized
+  // and OTel SDK recording methods are thread-safe. Please re-consider if new logic is added.
   public void successRequest(ServerHttpRequestStats stats, double elapsedTime) {
-    isComplete = true;
-    if (stats != null) {
-      stats.recordSuccessRequest();
-      stats.recordSuccessRequestLatency(elapsedTime);
-    } else {
+    if (stats == null) {
       throw new VeniceException("store name could not be null if request succeeded");
     }
-  }
 
-  public void errorRequest(ServerHttpRequestStats stats, double elapsedTime) {
-    isComplete = true;
-    if (stats == null) {
-      currentStats.recordErrorRequest();
-      currentStats.recordErrorRequestLatency(elapsedTime);
-      if (isMisroutedStoreVersion) {
-        currentStats.recordMisroutedStoreVersionRequest();
-      }
-    } else {
-      stats.recordErrorRequest();
-      stats.recordErrorRequestLatency(elapsedTime);
-      if (isMisroutedStoreVersion) {
-        stats.recordMisroutedStoreVersionRequest();
-      }
+    if (responseStatus == null) {
+      throw new VeniceException("response status could not be null");
     }
+
+    stats.recordSuccessRequestAndLatency(
+        responseStatus,
+        VeniceResponseStatusCategory.SUCCESS,
+        elapsedTime,
+        requestKeyCount);
   }
 
-  public void setValueSize(int size) {
-    this.valueSize = size;
-  }
+  /**
+   * Records error request metrics. When {@code stats} is null (store unknown), resolves a
+   * per-store stats object using {@link #UNKNOWN_STORE_NAME} so that both Tehuti and OTel
+   * metrics are recorded rather than OTel getting silently dropped.
+   *
+   * <p>This method does not have to be synchronized since Tehuti Sensor.record() is internally
+   * synchronized and OTel SDK recording methods are thread-safe. Please re-consider if new
+   * logic is added.
+   */
+  public void errorRequest(ServerHttpRequestStats stats, double elapsedTime) {
+    if (stats == null) {
+      stats = currentStats.getStoreStats(UNKNOWN_STORE_NAME);
+    }
 
-  public void setReadComputeOutputSize(int size) {
-    this.readComputeOutputSize = size;
+    if (responseStatus == null) {
+      throw new VeniceException("response status could not be null");
+    }
+
+    stats.recordErrorRequestAndLatency(responseStatus, VeniceResponseStatusCategory.FAIL, elapsedTime, requestKeyCount);
+    if (isMisroutedStoreVersion) {
+      // Tehuti-only: OTel captures this via READ_CALL_COUNT with HTTP 500 status dimension
+      stats.recordMisroutedStoreVersionRequest();
+    }
   }
 
   public int getRequestKeyCount() {
     return requestKeyCount;
   }
 
-  public boolean isComplete() {
-    return isComplete;
-  }
-
   public void setMisroutedStoreVersion(boolean misroutedStoreVersion) {
     isMisroutedStoreVersion = misroutedStoreVersion;
-  }
-
-  public boolean isMisroutedStoreVersion() {
-    return isMisroutedStoreVersion;
   }
 }

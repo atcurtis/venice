@@ -3,14 +3,12 @@ package com.linkedin.venice.endToEnd;
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_AUTO_MATERIALIZE_DAVINCI_PUSH_STATUS_SYSTEM_STORE;
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_AUTO_MATERIALIZE_META_SYSTEM_STORE;
 import static com.linkedin.venice.ConfigKeys.OFFLINE_JOB_START_TIMEOUT_MS;
-import static com.linkedin.venice.ConfigKeys.SERVER_PROMOTION_TO_LEADER_REPLICA_DELAY_SECONDS;
 import static com.linkedin.venice.ConfigKeys.TOPIC_CLEANUP_SLEEP_INTERVAL_BETWEEN_TOPIC_LIST_FETCH_MS;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertTrue;
 
 import com.linkedin.venice.AdminTool;
-import com.linkedin.venice.common.VeniceSystemStoreUtils;
 import com.linkedin.venice.controllerapi.ControllerClient;
 import com.linkedin.venice.controllerapi.ControllerClientFactory;
 import com.linkedin.venice.controllerapi.ControllerResponse;
@@ -19,10 +17,11 @@ import com.linkedin.venice.controllerapi.SchemaResponse;
 import com.linkedin.venice.controllerapi.StoreResponse;
 import com.linkedin.venice.controllerapi.UpdateStoreQueryParams;
 import com.linkedin.venice.exceptions.VeniceException;
+import com.linkedin.venice.integration.utils.IntegrationTestUtils;
 import com.linkedin.venice.integration.utils.ServiceFactory;
 import com.linkedin.venice.integration.utils.VeniceMultiClusterWrapper;
+import com.linkedin.venice.integration.utils.VeniceMultiRegionClusterCreateOptions;
 import com.linkedin.venice.integration.utils.VeniceTwoLayerMultiRegionMultiClusterWrapper;
-import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.utils.TestUtils;
 import com.linkedin.venice.utils.Time;
 import com.linkedin.venice.utils.Utils;
@@ -59,21 +58,20 @@ public class StoreMetadataRecoveryTest {
     parentControllerProperties.setProperty(CONTROLLER_AUTO_MATERIALIZE_DAVINCI_PUSH_STATUS_SYSTEM_STORE, "false");
 
     Properties serverProperties = new Properties();
-    serverProperties.put(SERVER_PROMOTION_TO_LEADER_REPLICA_DELAY_SECONDS, 1L);
 
     // 1 parent controller, 1 child region, 1 clusters per child region, 2 servers per cluster
-    twoLayerClusterWrapper = ServiceFactory.getVeniceTwoLayerMultiRegionMultiClusterWrapper(
-        1,
-        1,
-        1,
-        1,
-        2,
-        0,
-        2,
-        Optional.of(parentControllerProperties),
-        Optional.empty(),
-        Optional.of(serverProperties),
-        false);
+    VeniceMultiRegionClusterCreateOptions.Builder optionsBuilder =
+        new VeniceMultiRegionClusterCreateOptions.Builder().numberOfRegions(1)
+            .numberOfClusters(1)
+            .numberOfParentControllers(1)
+            .numberOfChildControllers(1)
+            .numberOfServers(2)
+            .numberOfRouters(0)
+            .replicationFactor(2)
+            .forkServer(false)
+            .parentControllerProperties(parentControllerProperties)
+            .serverProperties(serverProperties);
+    twoLayerClusterWrapper = ServiceFactory.getVeniceTwoLayerMultiRegionMultiClusterWrapper(optionsBuilder.build());
 
     multiClusterWrapper = twoLayerClusterWrapper.getChildRegions().get(0);
     String[] clusterNames = multiClusterWrapper.getClusterNames();
@@ -84,17 +82,7 @@ public class StoreMetadataRecoveryTest {
     parentKafkaUrl = twoLayerClusterWrapper.getParentKafkaBrokerWrapper().getAddress();
     childControllerUrl = multiClusterWrapper.getControllerConnectString();
 
-    for (String cluster: clusterNames) {
-      try (ControllerClient controllerClient = new ControllerClient(cluster, childControllerUrl)) {
-        // Verify the participant store is up and running in child region
-        String participantStoreName = VeniceSystemStoreUtils.getParticipantStoreNameForCluster(cluster);
-        TestUtils.waitForNonDeterministicPushCompletion(
-            Version.composeKafkaTopic(participantStoreName, 1),
-            controllerClient,
-            5,
-            TimeUnit.MINUTES);
-      }
-    }
+    IntegrationTestUtils.waitForParticipantStorePush(clusterNames, childControllerUrl);
   }
 
   @AfterClass(alwaysRun = true)
@@ -109,8 +97,8 @@ public class StoreMetadataRecoveryTest {
         ControllerClientFactory.getControllerClient(clusterName, parentControllerUrl, Optional.empty());
     ControllerClient childControllerClient =
         ControllerClientFactory.getControllerClient(clusterName, childControllerUrl, Optional.empty());
-    String storeName1 = TestUtils.getUniqueTopicString("store_metadata_recovery");
-    String storeName2 = TestUtils.getUniqueTopicString("store_metadata_recovery");
+    String storeName1 = Utils.getUniqueString("store_metadata_recovery");
+    String storeName2 = Utils.getUniqueString("store_metadata_recovery");
     String keySchemaStr = "\"string\"";
     String simpleValueSchemaStr = "\"string\"";
     String recordValueSchemaStr1 =

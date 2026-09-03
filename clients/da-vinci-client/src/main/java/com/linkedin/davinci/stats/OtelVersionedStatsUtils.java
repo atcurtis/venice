@@ -1,0 +1,119 @@
+package com.linkedin.davinci.stats;
+
+import static com.linkedin.venice.meta.Store.NON_EXISTING_VERSION;
+
+import com.linkedin.venice.meta.Version;
+import com.linkedin.venice.meta.VersionStatus;
+import com.linkedin.venice.server.VersionRole;
+import java.util.List;
+import java.util.Set;
+
+
+/**
+ * Shared utilities for OpenTelemetry versioned stats classes that classify and resolve version roles.
+ */
+public class OtelVersionedStatsUtils {
+  private OtelVersionedStatsUtils() {
+  }
+
+  /**
+   * Immutable holder for current and future version numbers.
+   * Used to classify versions as CURRENT, FUTURE, or BACKUP.
+   */
+  public static final class VersionInfo {
+    /** Sentinel for stores with no version assigned yet or whose version info has been reset (e.g., after deletion). */
+    public static final VersionInfo NON_EXISTING = new VersionInfo(NON_EXISTING_VERSION, NON_EXISTING_VERSION);
+
+    private final int currentVersion;
+    private final int futureVersion;
+
+    public VersionInfo(int currentVersion, int futureVersion) {
+      this.currentVersion = currentVersion;
+      this.futureVersion = futureVersion;
+    }
+
+    public int getCurrentVersion() {
+      return currentVersion;
+    }
+
+    public int getFutureVersion() {
+      return futureVersion;
+    }
+  }
+
+  /**
+   * Computes the future version from a list of versions. A version is considered "future"
+   * if its status is {@link VersionStatus#STARTED} or {@link VersionStatus#PUSHED}.
+   * Returns the highest such version number, or {@link com.linkedin.venice.meta.Store#NON_EXISTING_VERSION} if none.
+   *
+   * <p>Caller is responsible for passing a non-null list.
+   */
+  public static int computeFutureVersion(List<Version> versions) {
+    int futureVersion = NON_EXISTING_VERSION;
+    for (Version version: versions) {
+      VersionStatus status = version.getStatus();
+      if (status == VersionStatus.STARTED || status == VersionStatus.PUSHED) {
+        futureVersion = Math.max(futureVersion, version.getNumber());
+      }
+    }
+    return futureVersion;
+  }
+
+  /**
+   * Classifies a version as CURRENT, FUTURE, or BACKUP.
+   * Returns {@link VersionRole#BACKUP} when {@code versionInfo} is null (e.g., store
+   * not yet registered in a per-store version info map).
+   *
+   * @param version The version number to classify
+   * @param versionInfo The current/future version info, or null
+   * @return {@link VersionRole#CURRENT} if version matches currentVersion,
+   *         {@link VersionRole#FUTURE} if version matches futureVersion,
+   *         {@link VersionRole#BACKUP} otherwise or if versionInfo is null
+   */
+  public static VersionRole classifyVersion(int version, VersionInfo versionInfo) {
+    if (versionInfo == null) {
+      return VersionRole.BACKUP;
+    }
+    if (version == versionInfo.getCurrentVersion()) {
+      return VersionRole.CURRENT;
+    } else if (version == versionInfo.getFutureVersion()) {
+      return VersionRole.FUTURE;
+    }
+    return VersionRole.BACKUP;
+  }
+
+  /**
+   * Resolves a {@link VersionRole} to a version number using the given {@link VersionInfo}
+   * and a set of known version numbers. For {@link VersionRole#BACKUP}, returns the smallest
+   * version that is neither current nor future (deterministic selection from an unordered set).
+   *
+   * @param role The version role to resolve
+   * @param versionInfo The current/future version info (read once from volatile before calling)
+   * @param knownVersions The set of known version numbers (e.g., from a per-version map's keySet)
+   * @return The version number, or {@link com.linkedin.venice.meta.Store#NON_EXISTING_VERSION} if
+   *         versionInfo is null, no backup version exists, or the role is not recognized
+   */
+  public static int getVersionForRole(VersionRole role, VersionInfo versionInfo, Set<Integer> knownVersions) {
+    if (versionInfo == null) {
+      return NON_EXISTING_VERSION;
+    }
+    switch (role) {
+      case CURRENT:
+        return versionInfo.getCurrentVersion();
+      case FUTURE:
+        return versionInfo.getFutureVersion();
+      case BACKUP:
+        int backupVersion = NON_EXISTING_VERSION;
+        for (Integer version: knownVersions) {
+          if (version != versionInfo.getCurrentVersion() && version != versionInfo.getFutureVersion()) {
+            if (backupVersion == NON_EXISTING_VERSION || version < backupVersion) {
+              backupVersion = version;
+            }
+          }
+        }
+        return backupVersion;
+      default:
+        return NON_EXISTING_VERSION;
+    }
+  }
+}

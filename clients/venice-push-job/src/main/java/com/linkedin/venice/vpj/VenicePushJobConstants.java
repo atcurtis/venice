@@ -1,0 +1,672 @@
+package com.linkedin.venice.vpj;
+
+import static com.linkedin.venice.ConfigKeys.PUBSUB_CLIENT_CONFIG_PREFIX;
+import static com.linkedin.venice.utils.ByteUtils.BYTES_PER_MB;
+
+import com.github.luben.zstd.ZstdDictTrainer;
+import com.linkedin.venice.compression.CompressionStrategy;
+import com.linkedin.venice.hadoop.VenicePushJob;
+import com.linkedin.venice.hadoop.mapreduce.datawriter.map.AbstractVeniceMapper;
+import com.linkedin.venice.jobs.DataWriterComputeJob;
+import com.linkedin.venice.meta.StoreInfo;
+import com.linkedin.venice.utils.Time;
+import com.linkedin.venice.vpj.pubsub.input.PartitionSplitStrategy;
+import com.linkedin.venice.vpj.pubsub.input.SplitRequest;
+import java.util.concurrent.TimeUnit;
+import org.apache.hadoop.fs.PathFilter;
+import org.apache.hadoop.fs.permission.FsPermission;
+
+
+public final class VenicePushJobConstants {
+  private VenicePushJobConstants() {
+  }
+
+  // Avro input configs
+  public static final String LEGACY_AVRO_KEY_FIELD_PROP = "avro.key.field";
+  public static final String LEGACY_AVRO_VALUE_FIELD_PROP = "avro.value.field";
+
+  public static final String KEY_FIELD_PROP = "key.field";
+  public static final String VALUE_FIELD_PROP = "value.field";
+  public static final String RMD_FIELD_PROP = "timestamp.field";
+  public static final String DEFAULT_KEY_FIELD_PROP = "key";
+  public static final String DEFAULT_VALUE_FIELD_PROP = "value";
+  public static final String DEFAULT_RMD_FIELD_PROP = "rmd";
+  public static final boolean DEFAULT_SSL_ENABLED = false;
+  public static final String SCHEMA_STRING_PROP = "schema";
+  public static final String KAFKA_SOURCE_KEY_SCHEMA_STRING_PROP = "kafka.source.key.schema";
+  public static final String EXTENDED_SCHEMA_VALIDITY_CHECK_ENABLED = "extended.schema.validity.check.enabled";
+  public static final boolean DEFAULT_EXTENDED_SCHEMA_VALIDITY_CHECK_ENABLED = true;
+  public static final String UPDATE_SCHEMA_STRING_PROP = "update.schema";
+  /** Serialized writer (target) value schema to project superset input records down to. Set when projection is enabled. */
+  public static final String WRITER_VALUE_SCHEMA_STRING_PROP = "writer.value.schema";
+  /** Serialized writer (target) RMD schema to project superset input RMD down to. Set when projection is enabled and input carries RMD. */
+  public static final String WRITER_RMD_SCHEMA_STRING_PROP = "writer.rmd.schema";
+  public static final String RMD_SCHEMA_PROP = "rmd.schema";
+
+  // This is a temporary config used to rollout the native input format for Spark. This will be removed soon
+  public static final String SPARK_NATIVE_INPUT_FORMAT_ENABLED = "spark.native.input.format.enabled";
+
+  // Vson input configs
+  // Vson files store key/value schema on file header. key / value fields are optional
+  // and should be specified only when key / value schema is the partial of the files.
+  public static final String FILE_KEY_SCHEMA = "key.schema";
+  public static final String FILE_VALUE_SCHEMA = "value.schema";
+  public static final String INCREMENTAL_PUSH = "incremental.push";
+  public static final String GENERATE_PARTIAL_UPDATE_RECORD_FROM_INPUT = "generate.partial.update.record.from.input";
+  // veniceReducer will not fail fast and override the previous key if this is true and duplicate keys incur.
+  public static final String PARTITION_COUNT = "partition.count";
+  public static final String ALLOW_DUPLICATE_KEY = "allow.duplicate.key";
+  public static final String POLL_STATUS_RETRY_ATTEMPTS = "poll.status.retry.attempts";
+  public static final int DEFAULT_POLL_STATUS_RETRY_ATTEMPTS = 100;
+  public static final String CONTROLLER_REQUEST_RETRY_ATTEMPTS = "controller.request.retry.attempts";
+  public static final int DEFAULT_CONTROLLER_REQUEST_RETRY_ATTEMPTS = 10;
+  public static final String POLL_JOB_STATUS_INTERVAL_MS = "poll.job.status.interval.ms";
+  public static final String JOB_STATUS_IN_UNKNOWN_STATE_TIMEOUT_MS = "job.status.in.unknown.state.timeout.ms";
+  public static final String PUSH_JOB_TIMEOUT_OVERRIDE_MS = "push.job.timeout.override.ms";
+  public static final String SEND_CONTROL_MESSAGES_DIRECTLY = "send.control.messages.directly";
+  public static final String SOURCE_ETL = "source.etl";
+  public static final String ETL_VALUE_SCHEMA_TRANSFORMATION = "etl.value.schema.transformation";
+  public static final String SYSTEM_SCHEMA_READER_ENABLED = "system.schema.reader.enabled";
+
+  /**
+   *  Config to enable/disable the feature to collect extra metrics wrt compression.
+   *  Enabling this collects metrics for all compression strategies regardless of
+   *  the configured compression strategy. This means: zstd dictionary will be
+   *  created even if {@link CompressionStrategy#ZSTD_WITH_DICT} is not the configured
+   *  store compression strategy (refer to {@code VenicePushJob.shouldBuildZstdCompressionDictionary})
+   *  <br><br>
+   *
+   *  This config also gets evaluated in {@code VenicePushJob.evaluateCompressionMetricCollectionEnabled}
+   *  <br><br>
+   */
+  public static final String COMPRESSION_METRIC_COLLECTION_ENABLED = "compression.metric.collection.enabled";
+  public static final boolean DEFAULT_COMPRESSION_METRIC_COLLECTION_ENABLED = false;
+
+  /**
+   * Known <a href="https://github.com/luben/zstd-jni/issues/253">zstd lib issue</a> which
+   * crashes if the input sample is too small. So adding a preventive check to skip training
+   * the dictionary in such cases using a minimum limit of 20. Keeping it simple and hard coding
+   * it as if this check doesn't prevent some edge cases then we can disable the feature itself
+   */
+  public static final int MINIMUM_NUMBER_OF_SAMPLES_REQUIRED_TO_BUILD_ZSTD_DICTIONARY = 20;
+
+  /**
+   * Configs to pass to {@link AbstractVeniceMapper} based on the input configs and Dictionary
+   * training status
+   */
+  public static final String ZSTD_DICTIONARY_CREATION_REQUIRED = "zstd.dictionary.creation.required";
+  public static final String ZSTD_DICTIONARY_CREATION_SUCCESS = "zstd.dictionary.creation.success";
+
+  // keys inside the avro file
+  public static final String KEY_ZSTD_COMPRESSION_DICTIONARY = "zstdDictionary";
+  public static final String KEY_INPUT_FILE_DATA_SIZE = "inputFileDataSize";
+
+  /**
+   * Configs used to enable Kafka Input.
+   */
+  public static final String SOURCE_KAFKA = "source.kafka";
+  /**
+   * TODO: consider to automatically discover the source topic for the specified store.
+   * We need to be careful in the following scenarios:
+   * 1. Not all the prod colos are using the same current version if the previous push experiences a partial failure.
+   * 2. We might want to re-push from a backup version, which should be unlikely.
+   */
+  public static final String KAFKA_INPUT_TOPIC = "kafka.input.topic";
+  public static final String KAFKA_INPUT_FABRIC = "kafka.input.fabric";
+  /**
+   * @deprecated Use {@link #VENICE_REPUSH_SOURCE_PUBSUB_BROKER} instead.
+   */
+  @Deprecated
+  public static final String KAFKA_INPUT_BROKER_URL = "kafka.input.broker.url";
+
+  /**
+   * PubSub broker URL for the push destination — the Kafka cluster where new version data is
+   * produced. Set from {@code VersionCreationResponse.getKafkaBootstrapServers()}, which returns
+   * the NR (Native Replication) source region's broker. In cross-fabric repush (e.g., input from
+   * dc-1, NR source dc-0), this points to dc-0 — the cluster that receives the new version data.
+   *
+   * <p>This key is set in the global Spark/MR job config by {@code AbstractDataWriterSparkJob} and
+   * {@code DataWriterMRJob}. Neither {@code PUBSUB_BROKER_ADDRESS} nor {@code KAFKA_BOOTSTRAP_SERVERS}
+   * is set in the global config. Instead, at the task level:
+   * <ul>
+   *   <li>{@code AbstractPartitionWriter.configureTask()} resolves this to {@code PUBSUB_BROKER_ADDRESS}
+   *       for {@code VeniceWriterFactory} and {@code DictionaryUtils} (ZSTD dict read from dest topic).</li>
+   *   <li>{@code AbstractInputRecordProcessor.configureTask()} does the same for mapper-side ZSTD dict.</li>
+   *   <li>{@code VeniceKafkaInputReducer} reads this for the destination compressor.</li>
+   * </ul>
+   *
+   * @see #VENICE_REPUSH_SOURCE_PUBSUB_BROKER the "input/source" broker for KIF repush reads
+   */
+  public static final String VENICE_PUSH_DESTINATION_PUBSUB_BROKER = "venice.push.destination.pubsub.broker";
+
+  /**
+   * PubSub broker URL for the repush input source — the Kafka cluster from which existing version
+   * topic data is consumed during a KIF repush. Set from {@code RepushInfoResponse.getKafkaBrokerUrl()}
+   * (which resolves {@code KAFKA_INPUT_FABRIC} to a broker URL). In cross-fabric repush (e.g., input
+   * from dc-1, NR source dc-0), this points to dc-1 — the cluster that holds the source version data.
+   *
+   * <p>{@code VenicePushJob.initKIFRepushDetails()} reads this key first, falling back to the deprecated
+   * {@link #KAFKA_INPUT_BROKER_URL} for backward compatibility.
+   *
+   * <p>This key is set in the global Spark/MR job config. At the point of use:
+   * <ul>
+   *   <li>{@code KafkaInputUtils.getConsumerProperties()} resolves this to {@code PUBSUB_BROKER_ADDRESS}
+   *       for PubSub consumer creation.</li>
+   *   <li>{@code SparkPubSubPartitionReaderFactory} and {@code PubSubSplitPlanner} read it directly.</li>
+   *   <li>{@code VeniceKafkaInputReducer} reads this for the source compressor.</li>
+   *   <li>{@code VeniceRmdTTLFilter} and {@code KafkaInputDictTrainer} read it for source topic access.</li>
+   * </ul>
+   *
+   * @see #VENICE_PUSH_DESTINATION_PUBSUB_BROKER the "output/destination" broker for writing new version data
+   */
+  public static final String VENICE_REPUSH_SOURCE_PUBSUB_BROKER = "venice.repush.source.pubsub.broker";
+  // Optional
+  public static final String KAFKA_INPUT_MAX_RECORDS_PER_MAPPER = "kafka.input.max.records.per.mapper";
+
+  // Legacy prefix kept for backward compatibility
+  public static final String KIF_RECORD_READER_KAFKA_CONFIG_PREFIX = "kif.record.reader.kafka.";
+
+  /**
+   * The default max records per mapper, and if there are more records in one topic partition, it will be
+   * consumed by multiple mappers in parallel.
+   * BTW, this calculation is not accurate since it is purely based on offset, and the topic
+   * being consumed could have log compaction enabled.
+   */
+  public static final long DEFAULT_PUBSUB_INPUT_MAX_RECORDS_PER_MAPPER = 5_000_000L;
+
+  /**
+   * Use a locally generated logical index as the secondary comparator after comparing keys
+   * in repush mappers. Both strategies order records latest first:
+   * - Disabled: use PubSub position/offset, higher position first.
+   * - Enabled: use a local logical index (assigned after poll call), higher indices first.
+   *
+   * This remains configurable because the local index may misorder records in rare cases:
+   * for example, if log compaction occurs during repush consumption and a split fails or
+   * runs speculatively, a newer record could get a lower logical index. Offsets avoid that risk.
+   *
+   * Once we no longer depend on PubSub log compaction, the logical index alone will be sufficient.
+   *
+   * Default: false
+   */
+  public static final String PUBSUB_INPUT_SECONDARY_COMPARATOR_USE_LOCAL_LOGICAL_INDEX =
+      PUBSUB_CLIENT_CONFIG_PREFIX + "input.secondary.comparator.use.local.logical.index";
+  public static final boolean DEFAULT_PUBSUB_INPUT_SECONDARY_COMPARATOR_USE_LOCAL_LOGICAL_INDEX = false;
+
+  /**
+   * Configuration key for specifying the PubSub input split strategy.
+   * <p>
+   * The split type determines how input splits are generated for processing PubSub records.
+   * Supported values include {@code PartitionSplitStrategy} supported by the system.
+   */
+  public static final String PUBSUB_INPUT_SPLIT_STRATEGY = PUBSUB_CLIENT_CONFIG_PREFIX + "input.split.strategy";
+
+  /**
+   * Default split type for PubSub input.
+   * <p>
+   * This value is derived from {@link PartitionSplitStrategy#FIXED_RECORD_COUNT}, which generates splits
+   * containing a fixed number of records.
+   */
+  public static final String DEFAULT_PUBSUB_INPUT_SPLIT_STRATEGY = PartitionSplitStrategy.FIXED_RECORD_COUNT.name();
+
+  /**
+   * Configuration key for the maximum number of splits to create per PubSub topic-partition.
+   * <p>
+   * This setting limits the total number of input splits generated for large partitions.
+   * The default value is {@link #DEFAULT_MAX_SPLITS_PER_PARTITION}.
+   */
+  public static final String PUBSUB_INPUT_MAX_SPLITS_PER_PARTITION =
+      PUBSUB_CLIENT_CONFIG_PREFIX + "input.max.splits.per.partition";
+
+  /**
+   * Default maximum number of splits to create per PubSub topic-partition.
+   * <p>
+   * This value is taken from {@link SplitRequest#DEFAULT_MAX_SPLITS}.
+   */
+  public static final int DEFAULT_MAX_SPLITS_PER_PARTITION = SplitRequest.DEFAULT_MAX_SPLITS;
+
+  /**
+   * Configuration key for the time window (in minutes) used to split PubSub input topic-partition.
+   * <p>
+   * Splits are generated so that each covers at most the configured time window.
+   * The default value is {@link #DEFAULT_PUBSUB_INPUT_TIME_WINDOW_IN_MINUTES}.
+   */
+  public static final String PUBSUB_INPUT_SPLIT_TIME_WINDOW_IN_MINUTES =
+      PUBSUB_CLIENT_CONFIG_PREFIX + "input.split.time.window.in.minutes";
+
+  /**
+   * Default time window (in minutes) for splitting PubSub input topic-partition.
+   * <p>
+   * This value is derived from {@link SplitRequest#DEFAULT_TIME_WINDOW_MS}
+   * and converted from milliseconds to minutes.
+   */
+  public static final long DEFAULT_PUBSUB_INPUT_TIME_WINDOW_IN_MINUTES =
+      TimeUnit.MILLISECONDS.toMinutes(SplitRequest.DEFAULT_TIME_WINDOW_MS);
+
+  public static final String KAFKA_INPUT_COMBINER_ENABLED = "kafka.input.combiner.enabled";
+  // Whether to build a new dict in the repushed version or not while the original version has already enabled dict
+  // compression.
+  public static final String KAFKA_INPUT_COMPRESSION_BUILD_NEW_DICT_ENABLED =
+      "kafka.input.compression.build.new.dict.enabled";
+
+  public static final String KAFKA_INPUT_SOURCE_TOPIC_CHUNKING_ENABLED = "kafka.input.source.topic.chunking.enabled";
+  /**
+   * Optional.
+   * If we want to use a different rewind time from the default store-level rewind time config for Kafka Input re-push,
+   * the following property needs to specified explicitly.
+   *
+   * This property comes to play when the default rewind time configured in store-level is too short or too long.
+   * 1. If the default rewind time config is too short (for example 0 or several mins), it could cause data gap with
+   * re-push since the push job itself could take several hours, and we would like to make sure the re-pushed version
+   * will contain the same dataset as the source version.
+   * 2. If the default rewind time config is too long (such as 28 days), it will be a big waste to rewind so much time
+   * since the time gap between the source version and the re-push version should be comparable to the re-push time
+   * if the whole ingestion pipeline is not lagging.
+   *
+   * There are some challenges to automatically detect the right rewind time for re-push because of the following reasons:
+   * 1. For Venice Aggregate use case, some colo could be lagging behind other prod colos, so if the re-push source is
+   * from a fast colo, too short rewind time could cause a data gap in the slower colos. Ideally, it is good to use
+   * the slowest colo as the re-push source.
+   * 2. For Venice non-Aggregate use case, the ingestion pipeline will include the following several phases:
+   * 2.1 Customer's Kafka aggregation and mirroring pipeline to replicate the same data to all prod colos.
+   * 2.2 Venice Ingestion pipeline to consume the local real-time topic.
+   * We have visibility to 2.2, but not 2.1, so we may need to work with customer to understand how 2.1 can be measured
+   * or use a long enough rewind time to mitigate all the potential issues.
+   *
+   * Make this property available in generic since it should be useful for ETL+VPJ use case as well.
+   */
+  public static final String REWIND_TIME_IN_SECONDS_OVERRIDE = "rewind.time.in.seconds.override";
+
+  /**
+   * A time stamp specified to rewind to before replaying data. This config is ignored if rewind.time.in.seconds.override
+   * is provided. This config at time of push will be leveraged to fill in the rewind.time.in.seconds.override by taking
+   * System.currentTime - rewind.epoch.time.in.seconds.override and storing the result in rewind.time.in.seconds.override.
+   * With this in mind, a push policy of REWIND_FROM_SOP should be used in order to get a behavior that makes sense to a user.
+   * A timestamp that is in the future is not valid and will result in an exception.
+   */
+  public static final String REWIND_EPOCH_TIME_IN_SECONDS_OVERRIDE = "rewind.epoch.time.in.seconds.override";
+
+  /**
+   * Relates to the {@link #REWIND_EPOCH_TIME_IN_SECONDS_OVERRIDE}. An overridable amount of buffer to be applied to the epoch
+   * (as the rewind isn't perfectly instantaneous). Defaults to 1 minute.
+   */
+  public static final String REWIND_EPOCH_TIME_BUFFER_IN_SECONDS_OVERRIDE =
+      "rewind.epoch.time.buffer.in.seconds.override";
+
+  /**
+   * This config is a boolean which suppresses submitting the end of push message after data has been sent and does
+   * not poll for the status of the job to complete. Using this flag means that a user must manually mark the job success
+   * or failed.
+   */
+  public static final String SUPPRESS_END_OF_PUSH_MESSAGE = "suppress.end.of.push.message";
+
+  /**
+   * This config is a boolean which waits for an external signal to trigger version swap after buffer replay is complete.
+   */
+  public static final String DEFER_VERSION_SWAP = "defer.version.swap";
+
+  /**
+   * This config specifies the prefix for d2 zk hosts config. Configs of type {@literal <prefix>.<regionName>} are
+   * expected to be defined.
+   */
+  public static final String D2_ZK_HOSTS_PREFIX = "d2.zk.hosts.";
+
+  /**
+   * This config specifies the region identifier where parent controller is running
+   */
+  public static final String PARENT_CONTROLLER_REGION_NAME = "parent.controller.region.name";
+
+  /**
+   * In single-region mode, this must be a comma-separated list of child controller URLs or {@literal d2://<d2ServiceNameForChildController>}
+   * In multi-region mode, it must be a comma-separated list of parent controller URLs or {@literal d2://<d2ServiceNameForParentController>}
+   */
+  public static final String VENICE_DISCOVER_URL_PROP = "venice.discover.urls";
+
+  /**
+   * An identifier of the data center which is used to determine the Kafka URL and child controllers that push jobs communicate with
+   */
+  public static final String SOURCE_GRID_FABRIC = "source.grid.fabric";
+
+  public static final String ENABLE_WRITE_COMPUTE = "venice.write.compute.enable";
+  public static final String ENABLE_SSL = "venice.ssl.enable";
+  public static final String VENICE_STORE_NAME_PROP = "venice.store.name";
+  public static final String INPUT_PATH_PROP = "input.path";
+  public static final String INPUT_PATH_LAST_MODIFIED_TIME = "input.path.last.modified.time";
+  public static final String BATCH_NUM_BYTES_PROP = "batch.num.bytes";
+
+  /**
+   * ignore hdfs files with prefix "_" and "."
+   */
+  public static final PathFilter PATH_FILTER = p -> !p.getName().startsWith("_") && !p.getName().startsWith(".");
+  public static final String GLOB_FILTER_PATTERN = "[^_.]*";
+
+  // Configs to control temp paths and their permissions
+  public static final String HADOOP_TMP_DIR = "hadoop.tmp.dir";
+  public static final String TEMP_DIR_PREFIX = "tmp.dir.prefix";
+  // World-readable and world-writable
+  public static final FsPermission PERMISSION_777 = FsPermission.createImmutable((short) 0777);
+  // Only readable and writable by the user running VPJ - restricted access
+  public static final FsPermission PERMISSION_700 = FsPermission.createImmutable((short) 0700);
+
+  public static final String VALUE_SCHEMA_ID_PROP = "value.schema.id";
+
+  /**
+   * <strong>Internal / advanced use only &mdash; NOT for regular push jobs.</strong> Optional writer (target) value
+   * schema ID; when set, input records are projected down to that registered schema (via
+   * {@link com.linkedin.venice.schema.projection.VeniceSchemaProjector}) before serialization. The input schema must
+   * be a projection-compatible superset. Supports full (batch) pushes only. Projection <em>drops</em> fields absent
+   * from the target schema (silent, irreversible data loss if misused); leave unset (default {@code -1}) unless
+   * operating an internal flow (e.g. purger/re-push) that requires it.
+   */
+  public static final String TARGET_WRITER_VALUE_SCHEMA_ID_PROP = "target.writer.value.schema.id";
+
+  public static final String RMD_SCHEMA_ID_PROP = "rmd.schema.id";
+  public static final String DERIVED_SCHEMA_ID_PROP = "derived.schema.id";
+  public static final String TOPIC_PROP = "venice.kafka.topic";
+  public static final String HADOOP_VALIDATE_SCHEMA_AND_BUILD_DICT_PREFIX = "hadoop-dict-build-conf.";
+  public static final String SSL_PREFIX = "ssl";
+
+  public static final String STORAGE_QUOTA_PROP = "storage.quota";
+  public static final String STORAGE_ENGINE_OVERHEAD_RATIO = "storage_engine_overhead_ratio";
+  @Deprecated
+  public static final String VSON_PUSH = "vson.push";
+  public static final String COMPRESSION_STRATEGY = "compression.strategy";
+  public static final String KAFKA_INPUT_SOURCE_COMPRESSION_STRATEGY = "kafka.input.source.compression.strategy";
+  public static final String SSL_CONFIGURATOR_CLASS_CONFIG = "ssl.configurator.class";
+  public static final String SSL_KEY_STORE_PROPERTY_NAME = "ssl.key.store.property.name";
+  public static final String SSL_TRUST_STORE_PROPERTY_NAME = "ssl.trust.store.property.name";
+  public static final String SSL_KEY_STORE_PASSWORD_PROPERTY_NAME = "ssl.key.store.password.property.name";
+  public static final String SSL_KEY_PASSWORD_PROPERTY_NAME = "ssl.key.password.property.name";
+
+  // Configs that uniquely identify a VenicePushJob execution.
+  /**
+   * This will define the execution servers url for easy access to the job execution during debugging. This can be any
+   * string that is meaningful to the execution environment.
+   */
+  public static final String JOB_EXEC_URL = "job.execution.url";
+  /**
+   * The short name of the server where the job runs
+   */
+  public static final String JOB_SERVER_NAME = "job.server.name";
+  /**
+   * The execution ID of the execution if this job is a part of a multi-step flow. Each step in the flow can have the
+   * same execution id
+   */
+  public static final String JOB_EXEC_ID = "job.execution.id";
+
+  public static final String REDUCER_SPECULATIVE_EXECUTION_ENABLE = "reducer.speculative.execution.enable";
+
+  /**
+   * The interval of number of messages upon which certain info is printed in the reducer logs.
+   */
+  public static final String TELEMETRY_MESSAGE_INTERVAL = "telemetry.message.interval";
+
+  /**
+   * Config to control the Compression Level for ZSTD Dictionary Compression.
+   */
+  public static final String ZSTD_COMPRESSION_LEVEL = "zstd.compression.level";
+  public static final int DEFAULT_BATCH_BYTES_SIZE = 1000000;
+  /**
+   * The rewind override when performing re-push to prevent data loss; if the store has higher rewind config setting than
+   * 1 days, adopt the store config instead; otherwise, override the rewind config to 1 day if push job config doesn't
+   * try to override it.
+   */
+  public static final long DEFAULT_RE_PUSH_REWIND_IN_SECONDS_OVERRIDE = Time.SECONDS_PER_DAY;
+  /**
+   * Config to control the TTL behaviors in repush.
+   */
+  /**
+   * When enabled, KIF repush will use the store's latest value schema ID as a fallback if per-record
+   * schema IDs are not embedded in the source version topic (put.getSchemaId() returns -1). By default
+   * this is disabled and the job will fail if per-record schema IDs are missing, to avoid silently
+   * re-writing records with a potentially incorrect schema.
+   */
+  public static final String REPUSH_USE_FALLBACK_VALUE_SCHEMA_ID = "repush.use.fallback.value.schema.id";
+
+  public static final String REPUSH_TTL_ENABLE = "repush.ttl.enable";
+  public static final String REPUSH_TTL_POLICY = "repush.ttl.policy";
+  public static final String REPUSH_TTL_SECONDS = "repush.ttl.seconds";
+  public static final String REPUSH_TTL_START_TIMESTAMP = "repush.ttl.start.timestamp";
+
+  /**
+   * Config to indicate this is a compliance push which could be used for a variety of reasons
+   * by the operator like purging or updating a subset/all the data for compliance purposes.
+   * Compliance pushes can be killed by user-initiated pushes, allowing users to preempt
+   * long-running compliance workflows.
+   */
+  public static final String COMPLIANCE_PUSH = "compliance.push";
+
+  public static final String RMD_SCHEMA_DIR = "rmd.schema.dir";
+  public static final String VALUE_SCHEMA_DIR = "value.schema.dir";
+  public static final int NOT_SET = -1;
+
+  /**
+   * Config to enable single targeted region push mode in VPJ.
+   * In this mode, the VPJ will only push data to a single region.
+   * The single region is decided by the store config in {@link StoreInfo#getNativeReplicationSourceFabric()}}.
+   * For multiple targeted regions push, may use the advanced mode. See {@link #TARGETED_REGION_PUSH_LIST}.
+   */
+  public static final String TARGETED_REGION_PUSH_ENABLED = "targeted.region.push.enabled";
+
+  /**
+   * Config to enable memtable based ingestion of hybrid store batch push. In this mode servers
+   * will not use SST table writer to ingest batch data for hybrid store stores. This will help in
+   * preventing log compaction of contol messages from speculative producers.
+   */
+  public static final String HYBRID_BATCH_WRITE_OPTIMIZATION_ENABLED = "hybrid.batch.write.optimization.enabled";
+
+  /**
+   * This is experimental config to specify a list of regions used for targeted region push in VPJ.
+   * {@link #TARGETED_REGION_PUSH_ENABLED} has to be enabled to use this config.
+   * In this mode, the VPJ will only push data to the provided regions.
+   * The input is comma separated list of region names, e.g. "dc-0,dc-1,dc-2".
+   * For single targeted region push, see {@link #TARGETED_REGION_PUSH_ENABLED}.
+   */
+  public static final String TARGETED_REGION_PUSH_LIST = "targeted.region.push.list";
+
+  /**
+   * Config to enable target region push with deferred version swap
+   * In this mode, the VPJ will push data to all regions and only switch to the new version in a single region.
+   * The single region is decided by the store config in {@link StoreInfo#getNativeReplicationSourceFabric()}} unless
+   * a list of regions is passed in from targeted.region.push.list
+   * After a specified wait time (default 1h), the remaining regions will switch to the new version.
+   */
+  public static final String TARGETED_REGION_PUSH_WITH_DEFERRED_SWAP = "targeted.region.push.with.deferred.swap";
+
+  /**
+   * Config to update the wait time in minutes for target region push with deferred version swap
+   */
+  public static final String TARGETED_REGION_PUSH_WITH_DEFERRED_SWAP_WAIT_TIME_MINUTES =
+      "targeted.region.push.with.deferred.swap.wait.time.minutes";
+
+  public static final boolean DEFAULT_IS_DUPLICATED_KEY_ALLOWED = false;
+
+  /**
+   * Config used only for tests. Should not be used at regular runtime.
+   */
+  public static final String MAP_REDUCE_PARTITIONER_CLASS_CONFIG = "map.reduce.partitioner.class";
+
+  /**
+   * Placeholder for version number that is yet to be created.
+   */
+  public static final int UNCREATED_VERSION_NUMBER = -1;
+  public static final long DEFAULT_POLL_STATUS_INTERVAL_MS = 5 * Time.MS_PER_MINUTE;
+
+  /**
+   * The default total time we wait before failing a job if the job status stays in UNKNOWN state.
+   */
+  public static final long DEFAULT_JOB_STATUS_IN_UNKNOWN_STATE_TIMEOUT_MS = 30 * Time.MS_PER_MINUTE;
+  public static final String NON_CRITICAL_EXCEPTION = "This exception does not fail the push job. ";
+
+  /** Sample size to collect for building dictionary: Can be assigned a max of 2GB as {@link ZstdDictTrainer} in ZSTD library takes in sample size as int */
+  public static final String COMPRESSION_DICTIONARY_SAMPLE_SIZE = "compression.dictionary.sample.size";
+  public static final int DEFAULT_COMPRESSION_DICTIONARY_SAMPLE_SIZE = 200 * BYTES_PER_MB; // 200MB
+  /** Maximum final dictionary size TODO add more details about the current limits */
+  public static final String COMPRESSION_DICTIONARY_SIZE_LIMIT = "compression.dictionary.size.limit";
+
+  // Compute engine abstraction
+  /**
+   * Config to set the class for the DataWriter job. When using KIF, we currently will continue to fall back to MR mode.
+   * The class must extend {@link DataWriterComputeJob} and have a zero-arg constructor.
+   */
+  public static final String DATA_WRITER_COMPUTE_JOB_CLASS = "data.writer.compute.job.class";
+
+  /** Enables Spark's pre-write quota check. Disabled by default. */
+  public static final String SPARK_PRE_WRITE_QUOTA_CHECK = "spark.pre.write.quota.check";
+
+  /**
+   * Namespace for the external-storage dual-write subsystem. Every property whose key starts with this
+   * prefix is forwarded verbatim from the VPJ driver into the Spark executor's {@code RuntimeConfig} so
+   * that impls of {@code ExternalStorageWriter} can read their own configuration (cluster endpoints,
+   * credentials, table mappings, timeouts, etc.) from {@code VeniceProperties} inside {@code configure()}.
+   * <p>OSS Venice interprets a small set of keys under this prefix directly:
+   * <ul>
+   *   <li>{@link #PUSH_JOB_EXTERNAL_STORAGE_WRITER_CLASS} — gating: impl class name</li>
+   *   <li>{@link #PUSH_JOB_EXTERNAL_STORAGE_BATCH_SIZE} — buffer threshold for the dual-write wrapper</li>
+   *   <li>{@link #PUSH_JOB_EXTERNAL_STORAGE_BATCHPUT_RETRIES} — bounded retry count for {@code batchPut}</li>
+   *   <li>{@link #PUSH_JOB_EXTERNAL_STORAGE_BATCHPUT_RETRY_BACKOFF_MS} — sleep between retry attempts</li>
+   *   <li>{@link #PUSH_JOB_EXTERNAL_STORAGE_FAIL_OPEN_ON_REGION_FAILURE} — optionally disable a region after retry exhaustion and continue the push</li>
+   *   <li>{@link #PUSH_JOB_EXTERNAL_STORAGE_WRITE_QUOTA_RECORDS_PER_REGION_PER_SECOND} — per-region global record-rate cap</li>
+   *   <li>{@link #PUSH_JOB_EXTERNAL_STORAGE_WRITE_QUOTA_BYTES_PER_REGION_PER_SECOND} — per-region global byte-rate cap</li>
+   * </ul>
+   * Any other key under this prefix is opaque pass-through and is the responsibility of the impl to
+   * interpret. Operators should not assume new OSS-owned keys will appear here without a release note.
+   */
+  public static final String PUSH_JOB_EXTERNAL_STORAGE_PROP_PREFIX = "push.job.external.storage.";
+
+  /**
+   * Fully-qualified class name of the external storage writer used by the VPJ dual-write path. The class must
+   * implement {@code com.linkedin.venice.hadoop.task.datawriter.ExternalStorageWriter}. Presence of a non-empty
+   * value here is the VPJ-side half of the dual-write gating predicate; the store-version-side half is
+   * {@code Version.getStorageMode() == StorageMode.DUAL_WRITE}.
+   */
+  public static final String PUSH_JOB_EXTERNAL_STORAGE_WRITER_CLASS = "push.job.external.storage.writer.class";
+
+  /**
+   * Maximum number of records the VPJ partition writer buffers before calling
+   * {@code ExternalStorageWriter.batchPut(...)}. {@code 1} (the default) disables buffering — every record is
+   * forwarded to the external sink immediately via a single-element {@code batchPut}, matching pre-batching
+   * semantics. Values greater than {@code 1} accumulate up to {@code N} records per task, then flush as one
+   * batchPut before the corresponding Kafka produces fire. Any partial batch is drained on {@code flush()}.
+   */
+  public static final String PUSH_JOB_EXTERNAL_STORAGE_BATCH_SIZE = "push.job.external.storage.batch.size";
+  public static final int DEFAULT_PUSH_JOB_EXTERNAL_STORAGE_BATCH_SIZE = 1;
+
+  /**
+   * Number of retries the dual-write wrapper performs on a failing {@code ExternalStorageWriter.batchPut}
+   * call before letting the exception propagate (which fails the Spark task and triggers a whole-partition
+   * replay). {@code 3} retries (4 attempts total) is a conservative default that absorbs transient
+   * network blips on the external sink without burning Spark task attempts. Set to {@code 0} to opt out
+   * (single attempt, original throw propagates immediately).
+   */
+  public static final String PUSH_JOB_EXTERNAL_STORAGE_BATCHPUT_RETRIES = "push.job.external.storage.batchput.retries";
+  public static final int DEFAULT_PUSH_JOB_EXTERNAL_STORAGE_BATCHPUT_RETRIES = 3;
+
+  /**
+   * Backoff between {@code batchPut} retry attempts in milliseconds. Fixed (not exponential) — operators
+   * can tune via this knob if exponential is later proven necessary.
+   */
+  public static final String PUSH_JOB_EXTERNAL_STORAGE_BATCHPUT_RETRY_BACKOFF_MS =
+      "push.job.external.storage.batchput.retry.backoff.ms";
+  public static final long DEFAULT_PUSH_JOB_EXTERNAL_STORAGE_BATCHPUT_RETRY_BACKOFF_MS = 1000L;
+
+  /**
+   * Whether VPJ should fail open when one region's external writer keeps failing after exhausting
+   * {@link #PUSH_JOB_EXTERNAL_STORAGE_BATCHPUT_RETRIES}. Default {@code false} preserves the historical
+   * fail-fast behavior: any regional external-write failure aborts the push before Kafka produce. When set
+   * to {@code true}, the failed region is reported once, its external writer is disabled for the rest of the
+   * task, healthy external regions continue receiving writes, Kafka produce continues, and the VPJ driver is
+   * expected to flip that region's current version {@code storageMode} to {@code INTERNAL} before EOP.
+   */
+  public static final String PUSH_JOB_EXTERNAL_STORAGE_FAIL_OPEN_ON_REGION_FAILURE =
+      "push.job.external.storage.fail.open.on.region.failure";
+  public static final boolean DEFAULT_PUSH_JOB_EXTERNAL_STORAGE_FAIL_OPEN_ON_REGION_FAILURE = false;
+
+  /**
+   * Global write quota in records per second for the external-storage dual-write path, applied <em>per target
+   * region</em>. Any value {@code <= 0} disables record-rate throttling ({@code -1} is the recommended
+   * "unlimited" sentinel). Because partition-writer tasks run in separate executors with no shared throttler,
+   * the budget is enforced by static even split: each task limits its external writes to
+   * {@code value / partition.count} records/sec, so the aggregate across all tasks writing to one region stays
+   * at or below {@code value}. The split requires {@code value >= partition.count} (else a task would get
+   * 0/sec); a smaller value fails the task fast. Independent of
+   * {@link #PUSH_JOB_EXTERNAL_STORAGE_WRITE_QUOTA_BYTES_PER_REGION_PER_SECOND} — either dimension may be set alone.
+   */
+  public static final String PUSH_JOB_EXTERNAL_STORAGE_WRITE_QUOTA_RECORDS_PER_REGION_PER_SECOND =
+      "push.job.external.storage.write.quota.records.per.region.per.second";
+
+  /**
+   * Global write quota in bytes per second for the external-storage dual-write path, applied <em>per target
+   * region</em>. Bytes counted per record are the external key bytes plus the RocksDB-formatted value bytes
+   * (4-byte schema-id prefix + value payload). Any value {@code <= 0} disables byte-rate throttling
+   * ({@code -1} = unlimited). Split evenly across {@code partition.count} tasks exactly like
+   * {@link #PUSH_JOB_EXTERNAL_STORAGE_WRITE_QUOTA_RECORDS_PER_REGION_PER_SECOND}.
+   */
+  public static final String PUSH_JOB_EXTERNAL_STORAGE_WRITE_QUOTA_BYTES_PER_REGION_PER_SECOND =
+      "push.job.external.storage.write.quota.bytes.per.region.per.second";
+
+  /**
+   * Comma-separated list of region names whose store-level {@link com.linkedin.venice.meta.StorageMode} is
+   * {@code DUAL_WRITE} for this push. Resolved by the VPJ driver per region (the parent controller fans out
+   * to each child region's store-level storage mode), propagated to each Spark/MR executor's task
+   * properties, and consulted by the dual-write gating predicate. The partition writer loads one
+   * {@code ExternalStorageWriter} per region in this list and passes the region name to {@code configure} so
+   * the impl routes to that region's endpoint. Empty / absent means no region opted into dual-write and the
+   * path stays off (Kafka-only). The key does not live under the {@code push.job.external.storage.*} prefix
+   * because it is OSS-owned, not impl-specific.
+   */
+  public static final String PUSH_JOB_DUAL_WRITE_TARGET_REGIONS = "push.job.dual.write.target.regions";
+
+  public static final String PUSH_TO_SEPARATE_REALTIME_TOPIC = "push.to.separate.realtime.topic";
+  public static final String STORE_SEPARATE_REALTIME_TOPIC_ENABLED = "store.separate.realtime.topic.enabled";
+
+  /**
+   * Currently regular batch pushes are not compatible with TTL re-push enabled stores. This is because a regular batch
+   * push does not provide any RMD to be used for TTL. You can use the TIMESTAMP_FIELD_PROP to provide record level
+   * timestamp to perform compatible batch push or use this setting to override the batch push and TTL re-push check.
+   */
+  public static final String ALLOW_REGULAR_PUSH_WITH_TTL_REPUSH = "allow.regular.push.with.ttl.repush";
+
+  /**
+   * Configuration prefix used to pass newer Kafka Message Envelope (KME) schemas into Hadoop job configurations.
+   * This prefix is used to store a map of schema ID to schema string pairs in job properties, where each
+   * property key follows the format: NEWER_KME_SCHEMAS_PREFIX + schemaId.
+   * These schemas represent newer KME schemas that have been added to the controller but may not yet be
+   * propagated to all {@link VenicePushJob} components.
+   */
+  public static final String NEWER_KME_SCHEMAS_PREFIX = "newer.kme.schemas.prefix.";
+
+  /**
+   * Global write quota in records per second for incremental pushes.
+   * Any value {@code <= 0} disables throttling (unlimited writes). The recommended sentinel for
+   * explicitly configuring "unlimited" is {@code -1}.
+   * This quota is split evenly across partition-writer tasks for local enforcement, so the effective aggregate
+   * write rate across the job/store is at or below the configured value.
+   */
+  public static final String INCREMENTAL_PUSH_WRITE_QUOTA_RECORDS_PER_SECOND =
+      "incremental.push.write.quota.records.per.second";
+
+  /**
+   * Internal, driver-computed per-partition-writer slice of {@link #INCREMENTAL_PUSH_WRITE_QUOTA_RECORDS_PER_SECOND}.
+   * The driver computes {@code globalQuota / partitionCount} once (after validating splittability) and forwards this
+   * value to the data-writer tasks, so each partition writer enforces it directly without re-deriving the split. A
+   * value {@code <= 0} means throttling does not apply (batch push, separate real-time topic push, or disabled quota).
+   * This is not a user-facing config; it is set by {@link VenicePushJob}.
+   */
+  public static final String INCREMENTAL_PUSH_WRITE_QUOTA_RECORDS_PER_SECOND_PER_PARTITION =
+      "incremental.push.write.quota.records.per.second.per.partition";
+
+  /**
+   * Time window in milliseconds over which throttling is measured. Defaults to 1 second.
+   * This parameter is only applicable when using TOKEN_BUCKET_INCREMENTAL_REFILL or
+   * TOKEN_BUCKET_GREEDY_REFILL rate limiter types.
+   */
+  public static final String INCREMENTAL_PUSH_WRITE_QUOTA_TIME_WINDOW_MS =
+      "incremental.push.write.quota.time.window.ms";
+
+  /**
+   * Rate limiter implementation for incremental push throttling. Supported values are
+   * defined by {@link com.linkedin.venice.throttle.VeniceRateLimiter.RateLimiterType}.
+   * Defaults to GUAVA_RATE_LIMITER.
+   */
+  public static final String INCREMENTAL_PUSH_RATE_LIMITER_TYPE = "incremental.push.rate.limiter.type";
+}

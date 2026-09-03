@@ -5,18 +5,23 @@ import com.linkedin.venice.common.VeniceSystemStoreType;
 import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.exceptions.StoreDisabledException;
 import com.linkedin.venice.exceptions.VeniceException;
+import com.linkedin.venice.systemstore.schemas.StoreLifecycleHooksRecord;
 import com.linkedin.venice.systemstore.schemas.StoreProperties;
 import com.linkedin.venice.systemstore.schemas.StoreVersion;
 import com.linkedin.venice.utils.AvroCompatibilityUtils;
 import com.linkedin.venice.utils.AvroRecordUtils;
+import com.linkedin.venice.utils.CollectionUtils;
 import com.linkedin.venice.utils.StoreUtils;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.stream.Collectors;
 import org.apache.avro.util.Utf8;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 
 /**
@@ -49,6 +54,8 @@ import org.apache.avro.util.Utf8;
  * TODO: In the future, we could consider to use avro json serialization directly to make it simpler.
  */
 public class ZKStore extends AbstractStore implements DataModelBackedStructure<StoreProperties> {
+  private static final Logger LOGGER = LogManager.getLogger(ZKStore.class);
+
   /**
    * Internal data model
    */
@@ -93,7 +100,7 @@ public class ZKStore extends AbstractStore implements DataModelBackedStructure<S
       HybridStoreConfig hybridStoreConfig,
       PartitionerConfig partitionerConfig,
       int replicationFactor) {
-    if (!Store.isValidStoreName(name)) {
+    if (!StoreName.isValidStoreName(name)) {
       throw new VeniceException("Invalid store name: " + name);
     }
 
@@ -151,7 +158,7 @@ public class ZKStore extends AbstractStore implements DataModelBackedStructure<S
   }
 
   public ZKStore(StoreProperties storeProperties) {
-    if (!Store.isValidStoreName(storeProperties.name.toString())) {
+    if (!StoreName.isValidStoreName(storeProperties.name.toString())) {
       throw new VeniceException("Invalid store name: " + storeProperties.name.toString());
     }
     this.storeProperties = storeProperties;
@@ -198,13 +205,21 @@ public class ZKStore extends AbstractStore implements DataModelBackedStructure<S
     setBatchGetLimit(store.getBatchGetLimit());
     setNumVersionsToPreserve(store.getNumVersionsToPreserve());
     setIncrementalPushEnabled(store.isIncrementalPushEnabled());
+    setSeparateRealTimeTopicEnabled(store.isSeparateRealTimeTopicEnabled());
     setLargestUsedVersionNumber(store.getLargestUsedVersionNumber());
+    setLargestUsedRTVersionNumber(store.getLargestUsedRTVersionNumber());
     setMigrating(store.isMigrating());
     setWriteComputationEnabled(store.isWriteComputationEnabled());
     setReadComputationEnabled(store.isReadComputationEnabled());
     setBootstrapToOnlineTimeoutInHours(store.getBootstrapToOnlineTimeoutInHours());
     setNativeReplicationEnabled(store.isNativeReplicationEnabled());
     setBackupStrategy(store.getBackupStrategy());
+    setIngestionPauseMode(store.getIngestionPauseMode());
+    setIngestionPausedRegions(store.getIngestionPausedRegions());
+    setExternalStorageReadMode(store.getExternalStorageReadMode());
+    setStorageMode(store.getStorageMode());
+    setVeniceUnits(store.getVeniceUnits());
+    setWorkloadType(store.getWorkloadType());
     setSchemaAutoRegisterFromPushJobEnabled(store.isSchemaAutoRegisterFromPushJobEnabled());
     setLatestSuperSetValueSchemaId(store.getLatestSuperSetValueSchemaId());
     setHybridStoreDiskQuotaEnabled(store.isHybridStoreDiskQuotaEnabled());
@@ -222,8 +237,32 @@ public class ZKStore extends AbstractStore implements DataModelBackedStructure<S
     setViewConfigs(store.getViewConfigs());
     setStorageNodeReadQuotaEnabled(store.isStorageNodeReadQuotaEnabled());
     setUnusedSchemaDeletionEnabled(store.isUnusedSchemaDeletionEnabled());
+    setCompactionEnabled(store.isCompactionEnabled());
+    setCompactionThresholdMilliseconds(store.getCompactionThresholdMilliseconds());
+    setEncryptionEnabled(store.isEncryptionEnabled());
+    setPubSubEncryptionKeyUrn(store.getPubSubEncryptionKeyUrn());
     setMinCompactionLagSeconds(store.getMinCompactionLagSeconds());
     setMaxCompactionLagSeconds(store.getMaxCompactionLagSeconds());
+    setMaxRecordSizeBytes(store.getMaxRecordSizeBytes());
+    setMaxNearlineRecordSizeBytes(store.getMaxNearlineRecordSizeBytes());
+    setThroughputQuotaInBytes(store.getThroughputQuotaInBytes());
+    setThroughputQuotaInRecords(store.getThroughputQuotaInRecords());
+    setBlobTransferEnabled(store.isBlobTransferEnabled());
+    setBlobTransferInServerEnabled(store.getBlobTransferInServerEnabled());
+    setBlobDbEnabled(store.getBlobDbEnabled());
+    setNearlineProducerCompressionEnabled(store.isNearlineProducerCompressionEnabled());
+    setNearlineProducerCountPerWriter(store.getNearlineProducerCountPerWriter());
+    setTargetSwapRegion(store.getTargetSwapRegion());
+    setTargetSwapRegionWaitTime(store.getTargetSwapRegionWaitTime());
+    setIsDavinciHeartbeatReported(store.getIsDavinciHeartbeatReported());
+    setGlobalRtDivEnabled(store.isGlobalRtDivEnabled());
+    setTTLRepushEnabled(store.isTTLRepushEnabled());
+    setEnumSchemaEvolutionAllowed(store.isEnumSchemaEvolutionAllowed());
+    setStoreLifecycleHooks(store.getStoreLifecycleHooks());
+    setKeyUrnCompressionEnabled(store.isKeyUrnCompressionEnabled());
+    setKeyUrnFields(store.getKeyUrnFields());
+    setFlinkVeniceViewsEnabled(store.isFlinkVeniceViewsEnabled());
+    setPreviousCurrentVersion(store.getPreviousCurrentVersion());
 
     for (Version storeVersion: store.getVersions()) {
       forceAddVersion(storeVersion.cloneVersion(), true);
@@ -235,6 +274,8 @@ public class ZKStore extends AbstractStore implements DataModelBackedStructure<S
      * calling {@link #forceAddVersion(Version)}.
      */
     setLargestUsedVersionNumber(store.getLargestUsedVersionNumber());
+
+    setLargestUsedRTVersionNumber(store.getLargestUsedRTVersionNumber());
 
     // Clone systemStores
     Map<String, SystemStoreAttributes> clonedSystemStores = new HashMap<>();
@@ -265,7 +306,7 @@ public class ZKStore extends AbstractStore implements DataModelBackedStructure<S
     this.storeProperties.owner = owner;
   }
 
-  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to Zoo Keeper
+  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to ZooKeeper
   @Override
   public long getCreatedTime() {
     return this.storeProperties.createdTime;
@@ -279,16 +320,38 @@ public class ZKStore extends AbstractStore implements DataModelBackedStructure<S
   /**
    * Set current serving version number of this store. If store is disabled to write, thrown {@link
    * StoreDisabledException}.
+   *
+   * When a new version is promoted to current, this method also sets the previousCurrentVersion
+   * field on the NEW current version to track which version was current before.
    */
   @Override
   public void setCurrentVersion(int currentVersion) {
     checkDisableStoreWrite("setStoreCurrentVersion", currentVersion);
     // Update the latest version promotion to current timestamp, which is useful for backup version retention.
     setLatestVersionPromoteToCurrentTimestamp(System.currentTimeMillis());
+
+    // Capture old current version before updating
+    int oldCurrentVersion = getCurrentVersion();
+
     setCurrentVersionWithoutCheck(currentVersion);
+
+    // Set previousCurrentVersion on the NEW current version
+    if (oldCurrentVersion != Store.NON_EXISTING_VERSION && currentVersion != Store.NON_EXISTING_VERSION) {
+      updateVersionPreviousCurrentVersion(currentVersion, oldCurrentVersion);
+    }
   }
 
-  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to Zoo Keeper
+  /** Updates the previousCurrentVersion field on a version. */
+  private void updateVersionPreviousCurrentVersion(int versionNumber, int previousCurrentVersion) {
+    for (StoreVersion storeVersion: storeProperties.versions) {
+      if (storeVersion.number == versionNumber) {
+        storeVersion.previousCurrentVersion = previousCurrentVersion;
+        return;
+      }
+    }
+  }
+
+  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to ZooKeeper
   @JsonProperty("currentVersion")
   @Override
   public void setCurrentVersionWithoutCheck(int currentVersion) {
@@ -305,7 +368,7 @@ public class ZKStore extends AbstractStore implements DataModelBackedStructure<S
     this.storeProperties.lowWatermark = lowWatermark;
   }
 
-  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to Zoo Keeper
+  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to ZooKeeper
   @Override
   public PersistenceType getPersistenceType() {
     return PersistenceType.getPersistenceTypeFromInt(this.storeProperties.persistenceType);
@@ -316,25 +379,25 @@ public class ZKStore extends AbstractStore implements DataModelBackedStructure<S
     this.storeProperties.persistenceType = persistenceType.ordinal();
   }
 
-  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to Zoo Keeper
+  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to ZooKeeper
   @Override
   public RoutingStrategy getRoutingStrategy() {
     return RoutingStrategy.getRoutingStrategyFromInt(this.storeProperties.routingStrategy);
   }
 
-  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to Zoo Keeper
+  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to ZooKeeper
   @Override
   public ReadStrategy getReadStrategy() {
     return ReadStrategy.getReadStrategyFromInt(this.storeProperties.readStrategy);
   }
 
-  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to Zoo Keeper
+  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to ZooKeeper
   @Override
   public OfflinePushStrategy getOffLinePushStrategy() {
     return OfflinePushStrategy.getOfflinePushStrategyFromInt(this.storeProperties.offlinePushStrategy);
   }
 
-  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to Zoo Keeper
+  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to ZooKeeper
   @Override
   public void setVersions(List<Version> versions) {
     super.setVersions(versions);
@@ -344,19 +407,31 @@ public class ZKStore extends AbstractStore implements DataModelBackedStructure<S
     }
   }
 
-  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to Zoo Keeper
+  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to ZooKeeper
   @Override
   public int getLargestUsedVersionNumber() {
     return this.storeProperties.largestUsedVersionNumber;
   }
 
-  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to Zoo Keeper
+  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to ZooKeeper
   @Override
   public void setLargestUsedVersionNumber(int largestUsedVersionNumber) {
     this.storeProperties.largestUsedVersionNumber = largestUsedVersionNumber;
   }
 
-  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to Zoo Keeper
+  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to ZooKeeper
+  @Override
+  public int getLargestUsedRTVersionNumber() {
+    return this.storeProperties.largestUsedRTVersionNumber;
+  }
+
+  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to ZooKeeper
+  @Override
+  public void setLargestUsedRTVersionNumber(int largestUsedRTVersionNumber) {
+    this.storeProperties.largestUsedRTVersionNumber = largestUsedRTVersionNumber;
+  }
+
+  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to ZooKeeper
   @Override
   public long getStorageQuotaInByte() {
     // This is a safeguard in case that some old stores do not have storage quota field
@@ -366,7 +441,7 @@ public class ZKStore extends AbstractStore implements DataModelBackedStructure<S
             : this.storeProperties.storageQuotaInByte;
   }
 
-  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to Zoo Keeper
+  @SuppressWarnings("unused") // Used by Serializer/De-serializer for storing to ZooKeeper
   @Override
   public void setStorageQuotaInByte(long storageQuotaInByte) {
     this.storeProperties.storageQuotaInByte = storageQuotaInByte;
@@ -405,9 +480,6 @@ public class ZKStore extends AbstractStore implements DataModelBackedStructure<S
   @Override
   public void setEnableWrites(boolean enableWrites) {
     this.storeProperties.enableWrites = enableWrites;
-    if (enableWrites) {
-      setPushedVersionsOnline();
-    }
   }
 
   @Override
@@ -478,6 +550,16 @@ public class ZKStore extends AbstractStore implements DataModelBackedStructure<S
   }
 
   @Override
+  public boolean isFlinkVeniceViewsEnabled() {
+    return this.storeProperties.flinkVeniceViewsEnabled;
+  }
+
+  @Override
+  public void setFlinkVeniceViewsEnabled(boolean flinkVeniceViewsEnabled) {
+    this.storeProperties.flinkVeniceViewsEnabled = flinkVeniceViewsEnabled;
+  }
+
+  @Override
   public boolean isHybrid() {
     return this.storeProperties.hybridConfig != null;
   }
@@ -539,6 +621,16 @@ public class ZKStore extends AbstractStore implements DataModelBackedStructure<S
   @Override
   public void setIncrementalPushEnabled(boolean incrementalPushEnabled) {
     this.storeProperties.incrementalPushEnabled = incrementalPushEnabled;
+  }
+
+  @Override
+  public boolean isSeparateRealTimeTopicEnabled() {
+    return this.storeProperties.separateRealTimeTopicEnabled;
+  }
+
+  @Override
+  public void setSeparateRealTimeTopicEnabled(boolean separateRealTimeTopicEnabled) {
+    this.storeProperties.separateRealTimeTopicEnabled = separateRealTimeTopicEnabled;
   }
 
   /**
@@ -645,6 +737,71 @@ public class ZKStore extends AbstractStore implements DataModelBackedStructure<S
   @Override
   public void setBackupStrategy(BackupStrategy value) {
     this.storeProperties.backupStrategy = value.ordinal();
+  }
+
+  @Override
+  public IngestionPauseMode getIngestionPauseMode() {
+    return IngestionPauseMode.fromInt(this.storeProperties.ingestionPauseMode);
+  }
+
+  @Override
+  public void setIngestionPauseMode(IngestionPauseMode value) {
+    this.storeProperties.ingestionPauseMode = value.getValue();
+  }
+
+  @Override
+  public List<String> getIngestionPausedRegions() {
+    if (this.storeProperties.ingestionPausedRegions == null) {
+      return Collections.emptyList();
+    }
+    return this.storeProperties.ingestionPausedRegions.stream().map(Objects::toString).collect(Collectors.toList());
+  }
+
+  @Override
+  public void setIngestionPausedRegions(List<String> regions) {
+    this.storeProperties.ingestionPausedRegions = regions.stream().map(Objects::toString).collect(Collectors.toList());
+  }
+
+  @Override
+  public ExternalStorageReadMode getExternalStorageReadMode() {
+    return ExternalStorageReadMode.valueOf(this.storeProperties.externalStorageReadMode);
+  }
+
+  @Override
+  public void setExternalStorageReadMode(ExternalStorageReadMode externalStorageReadMode) {
+    this.storeProperties.externalStorageReadMode = externalStorageReadMode == null
+        ? ExternalStorageReadMode.VENICE_ONLY.getValue()
+        : externalStorageReadMode.getValue();
+  }
+
+  @Override
+  public StorageMode getStorageMode() {
+    return StorageMode.valueOf(this.storeProperties.storageMode);
+  }
+
+  @Override
+  public void setStorageMode(StorageMode storageMode) {
+    this.storeProperties.storageMode = storageMode == null ? StorageMode.INTERNAL.getValue() : storageMode.getValue();
+  }
+
+  @Override
+  public Integer getVeniceUnits() {
+    return this.storeProperties.veniceUnits;
+  }
+
+  @Override
+  public void setVeniceUnits(Integer veniceUnits) {
+    this.storeProperties.veniceUnits = veniceUnits;
+  }
+
+  @Override
+  public String getWorkloadType() {
+    return this.storeProperties.workloadType == null ? null : this.storeProperties.workloadType.toString();
+  }
+
+  @Override
+  public void setWorkloadType(String workloadType) {
+    this.storeProperties.workloadType = workloadType;
   }
 
   @Override
@@ -835,6 +992,46 @@ public class ZKStore extends AbstractStore implements DataModelBackedStructure<S
   }
 
   @Override
+  public void setCompactionEnabled(boolean compactionEnabled) {
+    this.storeProperties.compactionEnabled = compactionEnabled;
+  }
+
+  @Override
+  public boolean isCompactionEnabled() {
+    return this.storeProperties.compactionEnabled;
+  }
+
+  @Override
+  public void setCompactionThresholdMilliseconds(long compactionThresholdMilliseconds) {
+    this.storeProperties.compactionThresholdMilliseconds = compactionThresholdMilliseconds;
+  }
+
+  @Override
+  public long getCompactionThresholdMilliseconds() {
+    return this.storeProperties.compactionThresholdMilliseconds;
+  }
+
+  @Override
+  public void setEncryptionEnabled(boolean encryptionEnabled) {
+    this.storeProperties.encryptionEnabled = encryptionEnabled;
+  }
+
+  @Override
+  public boolean isEncryptionEnabled() {
+    return this.storeProperties.encryptionEnabled;
+  }
+
+  @Override
+  public String getPubSubEncryptionKeyUrn() {
+    return this.storeProperties.pubSubEncryptionKeyUrn.toString();
+  }
+
+  @Override
+  public void setPubSubEncryptionKeyUrn(String pubSubEncryptionKeyUrn) {
+    this.storeProperties.pubSubEncryptionKeyUrn = pubSubEncryptionKeyUrn;
+  }
+
+  @Override
   public void setMinCompactionLagSeconds(long minCompactionLagSeconds) {
     this.storeProperties.minCompactionLagSeconds = minCompactionLagSeconds;
   }
@@ -847,6 +1044,46 @@ public class ZKStore extends AbstractStore implements DataModelBackedStructure<S
   @Override
   public void setMaxCompactionLagSeconds(long maxCompactionLagSeconds) {
     this.storeProperties.maxCompactionLagSeconds = maxCompactionLagSeconds;
+  }
+
+  @Override
+  public int getMaxRecordSizeBytes() {
+    return this.storeProperties.maxRecordSizeBytes;
+  }
+
+  @Override
+  public void setMaxRecordSizeBytes(int maxRecordSizeBytes) {
+    this.storeProperties.maxRecordSizeBytes = maxRecordSizeBytes;
+  }
+
+  @Override
+  public int getMaxNearlineRecordSizeBytes() {
+    return this.storeProperties.maxNearlineRecordSizeBytes;
+  }
+
+  @Override
+  public void setMaxNearlineRecordSizeBytes(int maxNearlineRecordSizeBytes) {
+    this.storeProperties.maxNearlineRecordSizeBytes = maxNearlineRecordSizeBytes;
+  }
+
+  @Override
+  public long getThroughputQuotaInBytes() {
+    return this.storeProperties.throughputQuotaInBytes;
+  }
+
+  @Override
+  public void setThroughputQuotaInBytes(long throughputQuotaInBytes) {
+    this.storeProperties.throughputQuotaInBytes = throughputQuotaInBytes;
+  }
+
+  @Override
+  public long getThroughputQuotaInRecords() {
+    return this.storeProperties.throughputQuotaInRecords;
+  }
+
+  @Override
+  public void setThroughputQuotaInRecords(long throughputQuotaInRecords) {
+    this.storeProperties.throughputQuotaInRecords = throughputQuotaInRecords;
   }
 
   @Override
@@ -869,18 +1106,167 @@ public class ZKStore extends AbstractStore implements DataModelBackedStructure<S
     return this.storeProperties.blobTransferEnabled;
   }
 
-  /**
-   * Set all of PUSHED version to ONLINE once store is enabled to write.
-   */
-  private void setPushedVersionsOnline() {
-    // TODO, if the PUSHED version is the latest vesion, after store is enabled to write, shall we put this version as
-    // the current version?
-    for (StoreVersion storeVersion: this.storeProperties.versions) {
-      Version version = new VersionImpl(storeVersion);
-      if (version.getStatus().equals(VersionStatus.PUSHED)) {
-        updateVersionStatus(version.getNumber(), VersionStatus.ONLINE);
-      }
+  @Override
+  public void setBlobTransferInServerEnabled(String blobTransferServerEnabled) {
+    this.storeProperties.blobTransferInServerEnabled = blobTransferServerEnabled;
+  }
+
+  @Override
+  public String getBlobTransferInServerEnabled() {
+    return this.storeProperties.blobTransferInServerEnabled.toString();
+  }
+
+  @Override
+  public void setBlobDbEnabled(String blobDbEnabled) {
+    this.storeProperties.blobDbEnabled = blobDbEnabled;
+  }
+
+  @Override
+  public String getBlobDbEnabled() {
+    return this.storeProperties.blobDbEnabled.toString();
+  }
+
+  @Override
+  public boolean isNearlineProducerCompressionEnabled() {
+    return this.storeProperties.nearlineProducerCompressionEnabled;
+  }
+
+  @Override
+  public void setNearlineProducerCompressionEnabled(boolean compressionEnabled) {
+    this.storeProperties.nearlineProducerCompressionEnabled = compressionEnabled;
+  }
+
+  @Override
+  public int getNearlineProducerCountPerWriter() {
+    return this.storeProperties.nearlineProducerCountPerWriter;
+  }
+
+  @Override
+  public void setNearlineProducerCountPerWriter(int producerCnt) {
+    this.storeProperties.nearlineProducerCountPerWriter = producerCnt;
+  }
+
+  @Override
+  public int getTargetSwapRegionWaitTime() {
+    return this.storeProperties.targetSwapRegionWaitTime;
+  }
+
+  @Override
+  public String getTargetSwapRegion() {
+    return this.storeProperties.targetSwapRegion.toString();
+  }
+
+  @Override
+  public void setTargetSwapRegion(String targetRegion) {
+    this.storeProperties.targetSwapRegion = targetRegion;
+  }
+
+  @Override
+  public void setTargetSwapRegionWaitTime(int waitTime) {
+    this.storeProperties.targetSwapRegionWaitTime = waitTime;
+  }
+
+  @Override
+  public void setIsDavinciHeartbeatReported(boolean isReported) {
+    this.storeProperties.isDaVinciHeartBeatReported = isReported;
+  }
+
+  @Override
+  public boolean getIsDavinciHeartbeatReported() {
+    return this.storeProperties.isDaVinciHeartBeatReported;
+  }
+
+  @Override
+  public void setGlobalRtDivEnabled(boolean globalRtDivEnabled) {
+    this.storeProperties.globalRtDivEnabled = globalRtDivEnabled;
+  }
+
+  @Override
+  public boolean isTTLRepushEnabled() {
+    return this.storeProperties.ttlRepushEnabled;
+  }
+
+  @Override
+  public void setTTLRepushEnabled(boolean ttlRepushEnabled) {
+    this.storeProperties.ttlRepushEnabled = ttlRepushEnabled;
+  }
+
+  @Override
+  public boolean isEnumSchemaEvolutionAllowed() {
+    return this.storeProperties.enumSchemaEvolutionAllowed;
+  }
+
+  @Override
+  public void setEnumSchemaEvolutionAllowed(boolean enumSchemaEvolutionAllowed) {
+    this.storeProperties.enumSchemaEvolutionAllowed = enumSchemaEvolutionAllowed;
+  }
+
+  @Override
+  public List<LifecycleHooksRecord> getStoreLifecycleHooks() {
+    if (this.storeProperties.storeLifecycleHooks.isEmpty()) {
+      return Collections.emptyList();
     }
+
+    List<LifecycleHooksRecord> storeLifecycleHooks = new ArrayList<>();
+    for (StoreLifecycleHooksRecord storeLifecycleHooksRecord: this.storeProperties.storeLifecycleHooks) {
+      storeLifecycleHooks.add(
+          new LifecycleHooksRecordImpl(
+              storeLifecycleHooksRecord.getStoreLifecycleHooksClassName().toString(),
+              CollectionUtils
+                  .convertCharSequenceMapToStringMap(storeLifecycleHooksRecord.getStoreLifecycleHooksParams())));
+    }
+    return storeLifecycleHooks;
+  }
+
+  @Override
+  public void setStoreLifecycleHooks(List<LifecycleHooksRecord> storeLifecycleHooks) {
+    List<StoreLifecycleHooksRecord> convertedStoreLifecycleHooks = new ArrayList<>();
+    for (LifecycleHooksRecord storeLifecycleHooksRecord: storeLifecycleHooks) {
+      convertedStoreLifecycleHooks.add(
+          new StoreLifecycleHooksRecord(
+              storeLifecycleHooksRecord.getStoreLifecycleHooksClassName(),
+              CollectionUtils
+                  .convertStringMapToCharSequenceMap(storeLifecycleHooksRecord.getStoreLifecycleHooksParams())));
+    }
+    this.storeProperties.storeLifecycleHooks = convertedStoreLifecycleHooks;
+  }
+
+  @Override
+  public void setKeyUrnCompressionEnabled(boolean keyUrnCompressionEnabled) {
+    this.storeProperties.keyUrnCompressionEnabled = keyUrnCompressionEnabled;
+  }
+
+  @Override
+  public boolean isKeyUrnCompressionEnabled() {
+    return this.storeProperties.keyUrnCompressionEnabled;
+  }
+
+  @Override
+  public void setKeyUrnFields(List<String> keyUrnFields) {
+    this.storeProperties.keyUrnFields = keyUrnFields.stream().map(Objects::toString).collect(Collectors.toList());
+  }
+
+  @Override
+  public List<String> getKeyUrnFields() {
+    if (this.storeProperties.keyUrnFields == null) {
+      return Collections.emptyList();
+    }
+    return this.storeProperties.keyUrnFields.stream().map(Objects::toString).collect(Collectors.toList());
+  }
+
+  @Override
+  public int getPreviousCurrentVersion() {
+    return this.storeProperties.previousCurrentVersion;
+  }
+
+  @Override
+  public void setPreviousCurrentVersion(int previousCurrentVersion) {
+    this.storeProperties.previousCurrentVersion = previousCurrentVersion;
+  }
+
+  @Override
+  public boolean isGlobalRtDivEnabled() {
+    return this.storeProperties.globalRtDivEnabled;
   }
 
   @Override

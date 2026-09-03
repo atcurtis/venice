@@ -3,7 +3,12 @@ package com.linkedin.venice.pushmonitor;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.pushstatushelper.PushStatusStoreReader;
+import com.linkedin.venice.utils.RedundantExceptionFilter;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -19,6 +24,13 @@ import org.apache.logging.log4j.Logger;
 public class PushMonitorUtils {
   private static long daVinciErrorInstanceWaitTime = 5;
 
+  private static final int INCOMPLETE_PARTITIONS_PRINT_THRESHOLD = 10;
+
+  private static final int INCOMPLETE_INSTANCES_PRINT_THRESHOLD = 10;
+
+  protected static final RedundantExceptionFilter REDUNDANT_LOGGING_FILTER =
+      new RedundantExceptionFilter(RedundantExceptionFilter.DEFAULT_BITSET_SIZE, TimeUnit.MINUTES.toMillis(10));
+
   private static final Map<String, Long> storeVersionToDVCDeadInstanceTimeMap = new ConcurrentHashMap<>();
   private static final Logger LOGGER = LogManager.getLogger(PushMonitorUtils.class);
 
@@ -26,8 +38,6 @@ public class PushMonitorUtils {
     switch (errorReplicaStatus) {
       case DVC_INGESTION_ERROR_DISK_FULL:
         return " due to disk threshold reached";
-      case DVC_INGESTION_ERROR_MEMORY_LIMIT_REACHED:
-        return " due to memory limit reached";
       default:
         return "";
     }
@@ -59,10 +69,8 @@ public class PushMonitorUtils {
     String storeName = Version.parseStoreFromKafkaTopicName(topicName);
     int version = Version.parseVersionFromVersionTopicName(topicName);
     Map<CharSequence, Integer> instances = null;
-    if (!incrementalPushVersion.isPresent()) {
-      // For batch pushes, try to read from version level status key first.
-      instances = reader.getVersionStatus(storeName, version);
-    }
+    // Try to read from version level status key first.
+    instances = reader.getVersionStatus(storeName, version, incrementalPushVersion);
     if (instances == null) {
       // Fallback to partition level status key if version level status key is not found.
       return getDaVinciPartitionLevelPushStatusAndDetails(
@@ -72,31 +80,42 @@ public class PushMonitorUtils {
           incrementalPushVersion,
           maxOfflineInstanceCount,
           maxOfflineInstanceRatio,
-          useDaVinciSpecificExecutionStatusForError);
+          useDaVinciSpecificExecutionStatusForError,
+          Collections.EMPTY_SET);
     } else {
       // DaVinci starts using new status key format, which contains status for all partitions in one key.
       // Only batch pushes will use this key; incremental pushes will still use partition level status key.
-      LOGGER.info("Getting Da Vinci version level push status for topic: {}", topicName);
+      LOGGER.info("Got Da Vinci version level push status for topic: {}", topicName);
       final int totalInstanceCount = instances.size();
-      ExecutionStatus completeStatus = ExecutionStatus.COMPLETED;
+      ExecutionStatus completeStatus = incrementalPushVersion.isPresent()
+          ? ExecutionStatus.END_OF_INCREMENTAL_PUSH_RECEIVED
+          : ExecutionStatus.COMPLETED;
       int completedInstanceCount = 0;
       boolean allInstancesCompleted = true;
       int liveInstanceCount = 0;
       int offlineInstanceCount = 0;
       Optional<String> erroredInstance = Optional.empty();
       Set<String> offlineInstanceList = new HashSet<>();
-      Set<String> incompleteInstanceList = new HashSet<>();
+      Map<CharSequence, String> incompleteInstancesStatus = new HashMap<>();
       ExecutionStatus errorStatus = ExecutionStatus.ERROR;
       for (Map.Entry<CharSequence, Integer> entry: instances.entrySet()) {
-        ExecutionStatus status = ExecutionStatus.fromInt(entry.getValue());
+        PushStatusStoreReader.InstanceStatus instanceStatus =
+            reader.getInstanceStatus(storeName, entry.getKey().toString());
+        if (instanceStatus.equals(PushStatusStoreReader.InstanceStatus.BOOTSTRAPPING)) {
+          continue;
+        }
+        ExecutionStatus status = ExecutionStatus.valueOf(entry.getValue());
         // We will skip completed instances, as they have stopped emitting heartbeats and will not be counted as live
         // instances.
         if (status == completeStatus) {
           completedInstanceCount++;
           continue;
         }
-        boolean isInstanceAlive = reader.isInstanceAlive(storeName, entry.getKey().toString());
-        if (!isInstanceAlive) {
+        if (incompleteInstancesStatus.size() < INCOMPLETE_INSTANCES_PRINT_THRESHOLD) {
+          // Keep at most INCOMPLETE_INSTANCES_PRINTING_THRESHOLD incomplete instances for logging purpose.
+          incompleteInstancesStatus.put(entry.getKey().toString(), status.name());
+        }
+        if (instanceStatus.equals(PushStatusStoreReader.InstanceStatus.DEAD)) {
           offlineInstanceCount++;
           // Keep at most 5 offline instances for logging purpose.
           if (offlineInstanceList.size() < 5) {
@@ -111,10 +130,6 @@ public class PushMonitorUtils {
           errorStatus = status;
           erroredInstance = Optional.of(entry.getKey().toString());
           break;
-        }
-        if (incompleteInstanceList.size() < 2) {
-          // Keep at most 2 incomplete instances for logging purpose.
-          incompleteInstanceList.add(entry.getKey().toString());
         }
       }
 
@@ -156,13 +171,26 @@ public class PushMonitorUtils {
             .append(". Live instance count: ")
             .append(liveInstanceCount);
       }
-      if (incompleteInstanceList.size() > 0) {
-        statusDetailStringBuilder.append(". Some example incomplete instances ").append(incompleteInstanceList);
+      if (!incompleteInstancesStatus.isEmpty()) {
+        statusDetailStringBuilder.append(". Some example incomplete instances: ");
+        incompleteInstancesStatus.forEach((instance, status) -> {
+          statusDetailStringBuilder.append(instance).append("-").append(status).append(",");
+        });
       }
       String statusDetail = statusDetailStringBuilder.toString();
       if (allInstancesCompleted) {
+        LOGGER.info(
+            "All {} live Da Vinci instances are at {} state for topic: {}, and there are {} offline instances based on version level push status.",
+            liveInstanceCount,
+            completeStatus,
+            topicName,
+            offlineInstanceCount);
+        // To cover edge case that some instances are not upgraded to new config yet:
         // In case Da Vinci instances are partially upgraded to the release that produces version level status key,
         // we should always try to query the partition level status key for the old instances.
+        // To cover edge case that some instances finish upgrades recently:
+        // Besides, for instances that start reporting version level status key, they might have reported partition
+        // level status key before, and we should also ignore the partition level status key for them.
         ExecutionStatusWithDetails partitionLevelStatus = getDaVinciPartitionLevelPushStatusAndDetails(
             reader,
             topicName,
@@ -170,7 +198,13 @@ public class PushMonitorUtils {
             incrementalPushVersion,
             maxOfflineInstanceCount,
             maxOfflineInstanceRatio,
-            useDaVinciSpecificExecutionStatusForError);
+            useDaVinciSpecificExecutionStatusForError,
+            instances.keySet());
+        LOGGER.info(
+            "Always query partition level status for topic: {} after version level status key is found."
+                + " Push status result from partition level key: {}",
+            topicName,
+            partitionLevelStatus.getStatus());
         if (partitionLevelStatus.getStatus() != ExecutionStatus.COMPLETED) {
           // Do not report COMPLETED, instead, report status from the partition level status key.
           statusDetailStringBuilder.append(
@@ -194,11 +228,11 @@ public class PushMonitorUtils {
   }
 
   /**
-   * @Deprecated.
    * This method checks Da Vinci client push status of all partitions from push status store and compute a final status.
    * Inside each partition, this method will compute status based on all active Da Vinci instances.
    * A Da Vinci instance sent heartbeat to controllers recently is considered active.
    */
+  @Deprecated
   public static ExecutionStatusWithDetails getDaVinciPartitionLevelPushStatusAndDetails(
       PushStatusStoreReader reader,
       String topicName,
@@ -206,7 +240,8 @@ public class PushMonitorUtils {
       Optional<String> incrementalPushVersion,
       int maxOfflineInstanceCount,
       double maxOfflineInstanceRatio,
-      boolean useDaVinciSpecificExecutionStatusForError) {
+      boolean useDaVinciSpecificExecutionStatusForError,
+      Set<CharSequence> instancesToIgnore) {
     if (reader == null) {
       throw new VeniceException("PushStatusStoreReader is null");
     }
@@ -230,21 +265,53 @@ public class PushMonitorUtils {
     int completedReplicaCount = 0;
     Set<String> offlineInstanceList = new HashSet<>();
     Set<Integer> incompletePartition = new HashSet<>();
+    /**
+     * This cache is used to reduce the duplicate calls for liveness check as one host can host multiple partitions.
+     */
+    Map<String, PushStatusStoreReader.InstanceStatus> instanceLivenessCache = new HashMap<>();
+    /**
+     * Map to store incomplete partition details with their associated instances
+     */
+    Map<Integer, Set<String>> incompletePartitionInstances = new HashMap<>();
     for (int partitionId = 0; partitionId < partitionCount; partitionId++) {
       Map<CharSequence, Integer> instances =
           reader.getPartitionStatus(storeName, version, partitionId, incrementalPushVersion);
       boolean allInstancesCompleted = true;
       totalReplicaCount += instances.size();
       for (Map.Entry<CharSequence, Integer> entry: instances.entrySet()) {
-        ExecutionStatus status = ExecutionStatus.fromInt(entry.getValue());
+        // Ignore the instance that are in the ignore set
+        if (instancesToIgnore.contains(entry.getKey())) {
+          totalReplicaCount--;
+          // Log about this decision
+          String msg = "Skipping ingestion status report from instance: " + entry.getKey() + " for topic: " + topicName
+              + " partition: " + partitionId;
+          if (!REDUNDANT_LOGGING_FILTER.isRedundantException(msg)) {
+            LOGGER.info(msg);
+          }
+          continue;
+        }
+        String instanceName = entry.getKey().toString();
+        PushStatusStoreReader.InstanceStatus instanceStatus = instanceLivenessCache
+            .computeIfAbsent(instanceName, ignored -> reader.getInstanceStatus(storeName, instanceName));
+        if (instanceStatus.equals(PushStatusStoreReader.InstanceStatus.BOOTSTRAPPING)) {
+          // Don't count bootstrapping instance status report.
+          totalReplicaCount--;
+          String msg = "Skipping ingestion status report from bootstrapping instance: " + entry.getKey()
+              + " for topic: " + topicName + " partition: " + partitionId;
+          if (!REDUNDANT_LOGGING_FILTER.isRedundantException(msg)) {
+            LOGGER.info(msg);
+          }
+          continue;
+        }
+
+        ExecutionStatus status = ExecutionStatus.valueOf(entry.getValue());
         // We will skip completed replicas, as they have stopped emitting heartbeats and will not be counted as live
         // replicas.
         if (status == completeStatus) {
           completedReplicaCount++;
           continue;
         }
-        boolean isInstanceAlive = reader.isInstanceAlive(storeName, entry.getKey().toString());
-        if (!isInstanceAlive) {
+        if (instanceStatus.equals(PushStatusStoreReader.InstanceStatus.DEAD)) {
           // Keep at most 5 offline instances for logging purpose.
           if (offlineInstanceList.size() < 5) {
             offlineInstanceList.add(entry.getKey().toString());
@@ -270,6 +337,19 @@ public class PushMonitorUtils {
         completedPartitions++;
       } else {
         incompletePartition.add(partitionId);
+        // Collect instance information for incomplete partitions
+        Set<String> partitionInstances = new HashSet<>();
+        for (Map.Entry<CharSequence, Integer> entry: instances.entrySet()) {
+          if (instancesToIgnore.contains(entry.getKey())) {
+            continue;
+          }
+          String instanceName = entry.getKey().toString();
+          ExecutionStatus status = ExecutionStatus.valueOf(entry.getValue());
+          if (status != completeStatus) {
+            partitionInstances.add(instanceName);
+          }
+        }
+        incompletePartitionInstances.put(partitionId, partitionInstances);
       }
     }
     boolean noDaVinciStatusReported = totalReplicaCount == 0;
@@ -322,10 +402,32 @@ public class PushMonitorUtils {
           .append(totalReplicaCount);
     }
     int incompleteSize = incompletePartition.size();
-    if (incompleteSize > 0 && incompleteSize <= 5) {
-      statusDetailStringBuilder.append(". Following partitions still not complete ")
-          .append(incompletePartition)
-          .append(". Live replica count: ")
+    if (incompleteSize > 0) {
+      List<Integer> list = new ArrayList<>(incompletePartition);
+      statusDetailStringBuilder.append(". Following partitions still not complete (capped at 10) ");
+
+      if (incompleteSize > INCOMPLETE_PARTITIONS_PRINT_THRESHOLD) {
+        // If more than 10 partitions, show only partition IDs like before
+        statusDetailStringBuilder.append(list.subList(0, INCOMPLETE_PARTITIONS_PRINT_THRESHOLD));
+      } else {
+        // If 10 or fewer partitions, show partition IDs with their associated instances
+        for (int i = 0; i < list.size(); i++) {
+          int partitionId = list.get(i);
+          List<String> instances = new ArrayList<>(incompletePartitionInstances.get(partitionId));
+          if (instances.size() > INCOMPLETE_INSTANCES_PRINT_THRESHOLD) {
+            instances = instances.subList(0, INCOMPLETE_INSTANCES_PRINT_THRESHOLD);
+          }
+          statusDetailStringBuilder.append("Partition: ").append(partitionId);
+          if (instances != null && !instances.isEmpty()) {
+            statusDetailStringBuilder.append(" (instances: ").append(instances).append(")");
+          }
+          if (i < list.size() - 1) {
+            statusDetailStringBuilder.append(", ");
+          }
+        }
+      }
+
+      statusDetailStringBuilder.append(". Live replica count: ")
           .append(liveReplicaCount)
           .append(", completed replica count: ")
           .append(completedReplicaCount)
@@ -349,5 +451,10 @@ public class PushMonitorUtils {
 
   static void setDaVinciErrorInstanceWaitTime(int time) {
     daVinciErrorInstanceWaitTime = time;
+  }
+
+  // For testing purpose
+  static void setDVCDeadInstanceTime(String topicName, long timestamp) {
+    storeVersionToDVCDeadInstanceTimeMap.put(topicName, timestamp);
   }
 }

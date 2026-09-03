@@ -127,10 +127,10 @@ services:
         condition: service_healthy
     healthcheck:
         test: ["CMD-SHELL", "bash -x bin/kafka-topics.sh --bootstrap-server localhost:9092 --list"]
-        start_period: 60s
+        start_period: 20s
         interval: 5s
         timeout: 20s
-        retries: 5
+        retries: 10
 
   venice-controller:
     image: "venicedb/venice-controller:latest-dev"
@@ -141,26 +141,30 @@ services:
       kafka:
         condition: service_healthy
     healthcheck:
-        test: ["CMD-SHELL", "sleep 5"]
-        start_period: 20s
+        test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/5555' 2>/dev/null"]
+        start_period: 10s
         interval: 5s
-        timeout: 20s
-        retries: 5
+        timeout: 5s
+        retries: 10
 
   venice-server:
     image: "venicedb/venice-server:latest-dev"
     hostname: venice-server
+    command: |
+      bash -c "echo server.promotion.to.leader.replica.delay.seconds=1 >> configs/single-dc/server.properties && \
+               echo server.netty.graceful.shutdown.period.seconds=0 >> configs/single-dc/server.properties && \
+               exec java -jar bin/venice-server-all.jar configs/single-dc"
     networks:
       - pulsar
     depends_on:
       venice-controller:
         condition: service_healthy
     healthcheck:
-        test: ["CMD-SHELL", "sleep 5"]
-        start_period: 20s
+        test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/54093' 2>/dev/null"]
+        start_period: 10s
         interval: 5s
-        timeout: 20s
-        retries: 5
+        timeout: 5s
+        retries: 10
 
   venice-router:
     image: "venicedb/venice-router:latest-dev"
@@ -171,11 +175,11 @@ services:
       venice-server:
         condition: service_healthy
     healthcheck:
-        test: ["CMD-SHELL", "sleep 5"]
-        start_period: 20s
+        test: ["CMD-SHELL", "bash -c 'echo > /dev/tcp/localhost/7777' 2>/dev/null"]
+        start_period: 10s
         interval: 5s
-        timeout: 20s
-        retries: 5
+        timeout: 5s
+        retries: 10
 
   venice-client:
     image: "venicedb/venice-client:latest-dev"

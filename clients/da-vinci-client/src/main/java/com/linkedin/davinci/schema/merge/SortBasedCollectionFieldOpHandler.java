@@ -2,6 +2,7 @@ package com.linkedin.davinci.schema.merge;
 
 import com.linkedin.avro.api.PrimitiveLongList;
 import com.linkedin.avro.fastserde.primitive.PrimitiveLongArrayList;
+import com.linkedin.avroutil1.compatibility.AvroCompatibilityHelper;
 import com.linkedin.davinci.schema.SchemaUtils;
 import com.linkedin.davinci.utils.IndexedHashMap;
 import com.linkedin.venice.exceptions.VeniceException;
@@ -20,13 +21,28 @@ import java.util.function.Function;
 import java.util.function.Supplier;
 import javax.annotation.concurrent.ThreadSafe;
 import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
 
 
 @ThreadSafe
 public class SortBasedCollectionFieldOpHandler extends CollectionFieldOperationHandler {
+  /**
+   * When true, a collection-merge (SET_UNION) element that wins a conflict against an existing, comparison-equal element
+   * replaces the stored element (so content in {@code order: ignore} fields is propagated) rather than only advancing the
+   * existing element's replication-metadata timestamp. See ConfigKeys#SERVER_AA_COLLECTION_FIELD_ELEMENT_REPLACEMENT_ENABLED.
+   */
+  private final boolean elementReplacementEnabled;
+
   public SortBasedCollectionFieldOpHandler(AvroCollectionElementComparator elementComparator) {
+    this(elementComparator, false);
+  }
+
+  public SortBasedCollectionFieldOpHandler(
+      AvroCollectionElementComparator elementComparator,
+      boolean elementReplacementEnabled) {
     super(elementComparator);
+    this.elementReplacementEnabled = elementReplacementEnabled;
   }
 
   @Override
@@ -289,8 +305,11 @@ public class SortBasedCollectionFieldOpHandler extends CollectionFieldOperationH
     collectionFieldRmd.setPutOnlyPartLength(0); // No put-only part because it should be deleted completely.
 
     if (collectionFieldRmd.isInPutOnlyState()) {
-      // Do not use Collections.empty() in case this field is modified later.
-      currValueRecord.put(currValueRecordField.pos(), new ArrayList<>(0));
+      Object curFieldDefaultValue = GenericData.get()
+          .deepCopy(
+              currValueRecordField.schema(),
+              AvroCompatibilityHelper.getGenericDefaultValue(currValueRecordField));
+      currValueRecord.put(currValueRecordField.pos(), curFieldDefaultValue);
       return UpdateResultStatus.COMPLETELY_UPDATED;
     }
 
@@ -313,8 +332,15 @@ public class SortBasedCollectionFieldOpHandler extends CollectionFieldOperationH
     while (currListIterator.hasNext()) {
       remainingList.add(currListIterator.next());
     }
-
-    currValueRecord.put(currValueRecordField.pos(), remainingList);
+    if (remainingList.isEmpty()) {
+      Object curFieldDefaultValue = GenericData.get()
+          .deepCopy(
+              currValueRecordField.schema(),
+              AvroCompatibilityHelper.getGenericDefaultValue(currValueRecordField));
+      currValueRecord.put(currValueRecordField.pos(), curFieldDefaultValue);
+    } else {
+      currValueRecord.put(currValueRecordField.pos(), remainingList);
+    }
     return collectionFieldRmd.isInPutOnlyState()
         ? UpdateResultStatus.COMPLETELY_UPDATED
         : UpdateResultStatus.PARTIALLY_UPDATED;
@@ -339,7 +365,11 @@ public class SortBasedCollectionFieldOpHandler extends CollectionFieldOperationH
     collectionFieldRmd.setPutOnlyPartLength(0); // No put-only part because it should be deleted completely.
 
     if (collectionFieldRmd.isInPutOnlyState()) {
-      currValueRecord.put(currValueRecordField.pos(), new IndexedHashMap<>(0));
+      Object curFieldDefaultValue = GenericData.get()
+          .deepCopy(
+              currValueRecordField.schema(),
+              AvroCompatibilityHelper.getGenericDefaultValue(currValueRecordField));
+      currValueRecord.put(currValueRecordField.pos(), curFieldDefaultValue);
       return UpdateResultStatus.COMPLETELY_UPDATED;
     }
 
@@ -363,7 +393,15 @@ public class SortBasedCollectionFieldOpHandler extends CollectionFieldOperationH
       Map.Entry<String, Object> remainingEntry = currMap.getByIndex(i);
       remainingMap.put(remainingEntry.getKey(), remainingEntry.getValue());
     }
-    currValueRecord.put(currValueRecordField.pos(), remainingMap);
+    if (remainingMap.isEmpty()) {
+      Object curFieldDefaultValue = GenericData.get()
+          .deepCopy(
+              currValueRecordField.schema(),
+              AvroCompatibilityHelper.getGenericDefaultValue(currValueRecordField));
+      currValueRecord.put(currValueRecordField.pos(), curFieldDefaultValue);
+    } else {
+      currValueRecord.put(currValueRecordField.pos(), remainingMap);
+    }
     return collectionFieldRmd.isInPutOnlyState()
         ? UpdateResultStatus.COMPLETELY_UPDATED
         : UpdateResultStatus.PARTIALLY_UPDATED;
@@ -565,8 +603,29 @@ public class SortBasedCollectionFieldOpHandler extends CollectionFieldOperationH
         activeElementToTsMap.put(toAddElement, modifyTimestamp);
         updated = true;
       } else if (activeTimestamp < modifyTimestamp) {
+        if (elementReplacementEnabled) {
+          // The incoming element wins on a strictly newer timestamp. Drop the stored element first so the incoming one
+          // (which may carry different content in order:ignore fields) replaces it, rather than IndexedHashMap#put
+          // keeping the existing key and only updating its timestamp.
+          activeElementToTsMap.remove(toAddElement);
+        }
         activeElementToTsMap.put(toAddElement, modifyTimestamp);
         updated = true;
+      } else if (elementReplacementEnabled && activeTimestamp == modifyTimestamp) {
+        // Same timestamp: break the tie deterministically using full element content (including order:ignore fields),
+        // so all Active/Active colos converge on the same element. A negative index means the element was removed above
+        // as part of the put-only part, in which case the legacy behavior is preserved.
+        int existingElementIndex = activeElementToTsMap.indexOf(toAddElement);
+        if (existingElementIndex >= 0) {
+          Object existingElement = activeElementToTsMap.getByIndex(existingElementIndex).getKey();
+          Schema elementSchema = getArraySchema(currValueRecordField.schema()).getElementType();
+          if (AvroCollectionElementComparator.FULL_COMPARISON_INSTANCE
+              .compare(toAddElement, existingElement, elementSchema) > 0) {
+            activeElementToTsMap.remove(toAddElement);
+            activeElementToTsMap.put(toAddElement, modifyTimestamp);
+            updated = true;
+          }
+        }
       }
     }
 

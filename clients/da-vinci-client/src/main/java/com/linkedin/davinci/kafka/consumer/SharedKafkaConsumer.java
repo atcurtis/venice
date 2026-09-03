@@ -1,28 +1,32 @@
 package com.linkedin.davinci.kafka.consumer;
 
+import static com.linkedin.venice.utils.LatencyUtils.getElapsedTimeFromMsToMs;
+
 import com.linkedin.davinci.stats.AggKafkaConsumerServiceStats;
+import com.linkedin.venice.annotation.UnderDevelopment;
 import com.linkedin.venice.exceptions.VeniceException;
-import com.linkedin.venice.kafka.protocol.KafkaMessageEnvelope;
-import com.linkedin.venice.message.KafkaKey;
 import com.linkedin.venice.pubsub.PubSubTopicPartitionInfo;
+import com.linkedin.venice.pubsub.api.DefaultPubSubMessage;
 import com.linkedin.venice.pubsub.api.PubSubConsumerAdapter;
-import com.linkedin.venice.pubsub.api.PubSubMessage;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
 import com.linkedin.venice.pubsub.api.PubSubTopic;
 import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
 import com.linkedin.venice.pubsub.api.exceptions.PubSubUnsubscribedTopicPartitionException;
-import com.linkedin.venice.utils.LatencyUtils;
 import com.linkedin.venice.utils.SystemTime;
 import com.linkedin.venice.utils.Time;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
+import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
+import javax.annotation.Nonnull;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -31,7 +35,7 @@ import org.apache.logging.log4j.Logger;
  * This class is a synchronized version of {@link PubSubConsumerAdapter}.
  *
  * In addition to the existing API of {@link PubSubConsumerAdapter}, this class also adds specific functions used by
- * {@link KafkaConsumerService}, notably: {@link #subscribe(PubSubTopic, PubSubTopicPartition, long)} which keeps track of the
+ * {@link KafkaConsumerService}, notably: {@link #subscribe(PubSubTopic, PubSubTopicPartition, PubSubPosition, boolean)} which keeps track of the
  * mapping of which TopicPartition is used by which version-topic.
  *
  * It also provides some callbacks used by the {@link KafkaConsumerService} to react to certain changes, in a way that
@@ -39,8 +43,16 @@ import org.apache.logging.log4j.Logger;
  * TODO: move this logic inside consumption task, this class does not need to be sub-class of {@link PubSubConsumerAdapter}
  */
 class SharedKafkaConsumer implements PubSubConsumerAdapter {
+  public static final long DEFAULT_MAX_WAIT_MS = TimeUnit.SECONDS.toMillis(10);
+
+  /**
+   * Increase the max wait during state transitions to ensure that it waits for the messages to finish processing. A
+   * poll() indicates that all previous inflight messages under the previous state were processed, so there can't be a
+   * state mismatch. The consumer_records_producing_to_write_buffer_latency metric suggests how long the wait should be.
+   */
+  public static final long STATE_TRANSITION_MAX_WAIT_MS = TimeUnit.MINUTES.toMillis(30);
+
   private static final Logger LOGGER = LogManager.getLogger(SharedKafkaConsumer.class);
-  private long nextPollTimeOutSeconds = 10;
 
   protected final PubSubConsumerAdapter delegate;
 
@@ -61,7 +73,11 @@ class SharedKafkaConsumer implements PubSubConsumerAdapter {
    */
   private final AtomicBoolean waitingForPoll = new AtomicBoolean(false);
 
+  private long timeoutMsOverride = -1; // for unit test purposes
+
   private final Time time;
+
+  private final String toString;
 
   /**
    * Used to keep track of which version-topic is intended to use a given subscription, in order to detect
@@ -86,8 +102,10 @@ class SharedKafkaConsumer implements PubSubConsumerAdapter {
       PubSubConsumerAdapter delegate,
       AggKafkaConsumerServiceStats stats,
       Runnable assignmentChangeListener,
-      UnsubscriptionListener unsubscriptionListener) {
-    this(delegate, stats, assignmentChangeListener, unsubscriptionListener, new SystemTime());
+      UnsubscriptionListener unsubscriptionListener,
+      String regionName,
+      int idx) {
+    this(delegate, stats, assignmentChangeListener, unsubscriptionListener, new SystemTime(), regionName, idx);
   }
 
   SharedKafkaConsumer(
@@ -95,7 +113,9 @@ class SharedKafkaConsumer implements PubSubConsumerAdapter {
       AggKafkaConsumerServiceStats stats,
       Runnable assignmentChangeListener,
       UnsubscriptionListener unsubscriptionListener,
-      Time time) {
+      Time time,
+      String regionName,
+      int idx) {
     this.delegate = delegate;
     this.stats = stats;
     this.assignmentChangeListener = assignmentChangeListener;
@@ -103,13 +123,14 @@ class SharedKafkaConsumer implements PubSubConsumerAdapter {
     this.time = time;
     this.currentAssignment = Collections.emptySet();
     this.currentAssignmentSize = new AtomicInteger(0);
+    this.toString = String.format("SharedKafkaConsumer-%s:%s", idx, regionName);
   }
 
   /**
    * Listeners may use this callback to clean up lingering state they may be holding about a consumer.
    */
   interface UnsubscriptionListener {
-    void call(SharedKafkaConsumer consumer, PubSubTopicPartition pubSubTopicPartition);
+    void call(SharedKafkaConsumer consumer, PubSubTopic versionTopic, PubSubTopicPartition pubSubTopicPartition);
   }
 
   protected synchronized void updateCurrentAssignment(Set<PubSubTopicPartition> newAssignment) {
@@ -117,22 +138,30 @@ class SharedKafkaConsumer implements PubSubConsumerAdapter {
     currentAssignmentSize.set(newAssignment.size());
     currentAssignment = Collections.unmodifiableSet(newAssignment);
     assignmentChangeListener.run();
-    stats.recordTotalUpdateCurrentAssignmentLatency(
-        LatencyUtils.getElapsedTimeFromMsToMs(updateCurrentAssignmentStartTime));
+    stats.recordTotalUpdateCurrentAssignmentLatency(getElapsedTimeFromMsToMs(updateCurrentAssignmentStartTime));
+  }
+
+  @UnderDevelopment(value = "This API may not be implemented in all PubSubConsumerAdapter implementations.")
+  @Override
+  public synchronized void subscribe(PubSubTopicPartition pubSubTopicPartition, PubSubPosition lastReadPubSubPosition) {
+    throw new VeniceException(this + " does not support subscribe without specifying a version-topic.");
   }
 
   @Override
-  public synchronized void subscribe(PubSubTopicPartition pubSubTopicPartition, long lastReadOffset) {
-    throw new VeniceException(
-        this.getClass().getSimpleName() + " does not support subscribe without specifying a version-topic.");
+  public void subscribe(
+      @Nonnull PubSubTopicPartition pubSubTopicPartition,
+      @Nonnull PubSubPosition position,
+      boolean isInclusive) {
+    throw new VeniceException(this + " does not support subscribe without specifying a version-topic.");
   }
 
   synchronized void subscribe(
       PubSubTopic versionTopic,
       PubSubTopicPartition topicPartitionToSubscribe,
-      long lastReadOffset) {
+      PubSubPosition lastReadPosition,
+      boolean inclusive) {
     long delegateSubscribeStartTime = System.currentTimeMillis();
-    this.delegate.subscribe(topicPartitionToSubscribe, lastReadOffset);
+    this.delegate.subscribe(topicPartitionToSubscribe, lastReadPosition, inclusive);
     PubSubTopic previousVersionTopic =
         subscribedTopicPartitionToVersionTopic.put(topicPartitionToSubscribe, versionTopic);
     if (previousVersionTopic != null && !previousVersionTopic.equals(versionTopic)) {
@@ -141,8 +170,12 @@ class SharedKafkaConsumer implements PubSubConsumerAdapter {
               + " versionTopic: " + versionTopic + ", previousVersionTopic: " + previousVersionTopic
               + ", topicPartitionToSubscribe: " + topicPartitionToSubscribe);
     }
-    stats.recordTotalDelegateSubscribeLatency(LatencyUtils.getElapsedTimeFromMsToMs(delegateSubscribeStartTime));
+    stats.recordTotalDelegateSubscribeLatency(getElapsedTimeFromMsToMs(delegateSubscribeStartTime));
     updateCurrentAssignment(delegate.getAssignment());
+  }
+
+  public synchronized void unSubscribe(PubSubTopicPartition pubSubTopicPartition) {
+    unSubscribe(pubSubTopicPartition, DEFAULT_MAX_WAIT_MS);
   }
 
   /**
@@ -151,14 +184,13 @@ class SharedKafkaConsumer implements PubSubConsumerAdapter {
    * {@link SharedKafkaConsumer#poll(long)} and produceToStoreBufferService sequentially. So waiting for at least one more
    * invocation of {@link SharedKafkaConsumer#poll(long)} achieves the above objective.
    */
-  @Override
-  public synchronized void unSubscribe(PubSubTopicPartition pubSubTopicPartition) {
+  public synchronized void unSubscribe(PubSubTopicPartition pubSubTopicPartition, long timeoutMs) {
     unSubscribeAction(() -> {
       this.delegate.unSubscribe(pubSubTopicPartition);
-      subscribedTopicPartitionToVersionTopic.remove(pubSubTopicPartition);
-      unsubscriptionListener.call(this, pubSubTopicPartition);
+      PubSubTopic versionTopic = subscribedTopicPartitionToVersionTopic.remove(pubSubTopicPartition);
+      unsubscriptionListener.call(this, versionTopic, pubSubTopicPartition);
       return Collections.singleton(pubSubTopicPartition);
-    });
+    }, timeoutMs);
   }
 
   @Override
@@ -166,11 +198,11 @@ class SharedKafkaConsumer implements PubSubConsumerAdapter {
     unSubscribeAction(() -> {
       this.delegate.batchUnsubscribe(pubSubTopicPartitionSet);
       for (PubSubTopicPartition pubSubTopicPartition: pubSubTopicPartitionSet) {
-        subscribedTopicPartitionToVersionTopic.remove(pubSubTopicPartition);
-        unsubscriptionListener.call(this, pubSubTopicPartition);
+        PubSubTopic versionTopic = subscribedTopicPartitionToVersionTopic.remove(pubSubTopicPartition);
+        unsubscriptionListener.call(this, versionTopic, pubSubTopicPartition);
       }
       return pubSubTopicPartitionSet;
-    });
+    }, DEFAULT_MAX_WAIT_MS);
   }
 
   /**
@@ -179,40 +211,55 @@ class SharedKafkaConsumer implements PubSubConsumerAdapter {
    *
    * @param supplier which performs the unsubscription and returns a set of partitions which were unsubscribed
    */
-  protected synchronized void unSubscribeAction(Supplier<Set<PubSubTopicPartition>> supplier) {
+  protected synchronized void unSubscribeAction(Supplier<Set<PubSubTopicPartition>> supplier, long timeoutMs) {
     long currentPollTimes = pollTimes;
     long startTime = System.currentTimeMillis();
     Set<PubSubTopicPartition> topicPartitions = supplier.get();
+    updateCurrentAssignment(delegate.getAssignment());
+    waitAfterUnsubscribe(currentPollTimes, topicPartitions, timeoutMs);
     long elapsedTime = System.currentTimeMillis() - startTime;
-
     LOGGER.info(
         "Shared consumer {} unsubscribed {} partition(s): ({}) in {} ms",
-        this.getClass().getSimpleName(),
+        this,
         topicPartitions.size(),
         topicPartitions,
         elapsedTime);
-    updateCurrentAssignment(delegate.getAssignment());
-    waitAfterUnsubscribe(currentPollTimes, topicPartitions);
   }
 
-  protected void waitAfterUnsubscribe(long currentPollTimes, Set<PubSubTopicPartition> topicPartitions) {
+  protected void waitAfterUnsubscribe(
+      long currentPollTimes,
+      Set<PubSubTopicPartition> topicPartitions,
+      long timeoutMs) {
+    // This clause is only for unit test purposes, for when the timeout needs to be set to 0.
+    if (timeoutMsOverride != -1) {
+      timeoutMs = timeoutMsOverride;
+    }
+
     currentPollTimes++;
     waitingForPoll.set(true);
     // Wait for the next poll or maximum 10 seconds. Interestingly wait api does not provide any indication if wait
     // returned
     // due to timeout. So an explicit time check is necessary.
-    long timeoutMs = (time.getNanoseconds() / Time.NS_PER_MS) + nextPollTimeOutSeconds * Time.MS_PER_SECOND;
+    final long startTimeMs = time.getMilliseconds();
+    final long endTimeMs = startTimeMs + timeoutMs;
     try {
       while (currentPollTimes > pollTimes) {
-        long waitMs = timeoutMs - (time.getNanoseconds() / Time.NS_PER_MS);
+        final long waitMs = endTimeMs - time.getMilliseconds();
         if (waitMs <= 0) {
           LOGGER.warn(
               "Wait for poll request after unsubscribe topic partition(s) ({}) timed out after {} seconds",
               topicPartitions,
-              nextPollTimeOutSeconds);
+              TimeUnit.MILLISECONDS.toSeconds(timeoutMs));
           break;
         }
         wait(waitMs);
+      }
+      final long elapsedSeconds = TimeUnit.MILLISECONDS.toSeconds(getElapsedTimeFromMsToMs(startTimeMs));
+      if (elapsedSeconds > 15) {
+        LOGGER.warn(
+            "Wait for poll request after unsubscribe topic partition(s) ({}) took {} seconds",
+            topicPartitions,
+            elapsedSeconds);
       }
       // no action to take actually, just return;
     } catch (InterruptedException e) {
@@ -222,8 +269,8 @@ class SharedKafkaConsumer implements PubSubConsumerAdapter {
   }
 
   // Only for testing.
-  void setNextPollTimeoutSeconds(long nextPollTimeOutSeconds) {
-    this.nextPollTimeOutSeconds = nextPollTimeOutSeconds;
+  void setTimeoutMsOverride(long timeoutMsOverride) {
+    this.timeoutMsOverride = timeoutMsOverride;
   }
 
   // Only for testing.
@@ -244,12 +291,11 @@ class SharedKafkaConsumer implements PubSubConsumerAdapter {
   }
 
   @Override
-  public synchronized Map<PubSubTopicPartition, List<PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long>>> poll(
-      long timeoutMs) {
+  public synchronized Map<PubSubTopicPartition, List<DefaultPubSubMessage>> poll(long timeoutMs) {
     /**
      * Always invoke this method no matter whether the consumer have subscription or not. Therefore we could notify any
      * waiter who might be waiting for a invocation of poll to happen even if the consumer does not have subscription
-     * after calling {@link SharedKafkaConsumer#unSubscribe(String, int)}.
+     * after calling {@link SharedKafkaConsumer#unSubscribe(PubSubTopicPartition)}.
      */
     pollTimes++;
     if (waitingForPoll.get()) {
@@ -320,32 +366,78 @@ class SharedKafkaConsumer implements PubSubConsumerAdapter {
   }
 
   @Override
-  public Long offsetForTime(PubSubTopicPartition pubSubTopicPartition, long timestamp, Duration timeout) {
-    throw new UnsupportedOperationException("offsetForTime is not supported in SharedKafkaConsumer");
+  public PubSubPosition getPositionByTimestamp(
+      PubSubTopicPartition pubSubTopicPartition,
+      long timestamp,
+      Duration timeout) {
+    throw new UnsupportedOperationException("getPositionByTimestamp is not supported in SharedKafkaConsumer");
   }
 
   @Override
-  public Long offsetForTime(PubSubTopicPartition pubSubTopicPartition, long timestamp) {
-    throw new UnsupportedOperationException("offsetForTime is not supported in SharedKafkaConsumer");
+  public PubSubPosition getPositionByTimestamp(PubSubTopicPartition pubSubTopicPartition, long timestamp) {
+    throw new UnsupportedOperationException("getPositionByTimestamp is not supported in SharedKafkaConsumer");
   }
 
   @Override
-  public Long beginningOffset(PubSubTopicPartition partition, Duration timeout) {
-    throw new UnsupportedOperationException("beginningOffset is not supported in SharedKafkaConsumer");
+  public PubSubPosition beginningPosition(PubSubTopicPartition pubSubTopicPartition, Duration timeout) {
+    throw new UnsupportedOperationException("beginningPosition is not supported in SharedKafkaConsumer");
   }
 
   @Override
-  public Map<PubSubTopicPartition, Long> endOffsets(Collection<PubSubTopicPartition> partitions, Duration timeout) {
-    throw new UnsupportedOperationException("endOffsets is not supported in SharedKafkaConsumer");
+  public Map<PubSubTopicPartition, PubSubPosition> beginningPositions(
+      Collection<PubSubTopicPartition> partitions,
+      Duration timeout) {
+    throw new UnsupportedOperationException("beginningPositions is not supported in SharedKafkaConsumer");
   }
 
   @Override
-  public Long endOffset(PubSubTopicPartition pubSubTopicPartition) {
-    throw new UnsupportedOperationException("endOffset is not supported in SharedKafkaConsumer");
+  public Map<PubSubTopicPartition, PubSubPosition> endPositions(
+      Collection<PubSubTopicPartition> partitions,
+      Duration timeout) {
+    throw new UnsupportedOperationException("endPositions is not supported in SharedKafkaConsumer");
+  }
+
+  @Override
+  public PubSubPosition endPosition(PubSubTopicPartition pubSubTopicPartition) {
+    throw new UnsupportedOperationException("endPosition is not supported in SharedKafkaConsumer");
   }
 
   @Override
   public List<PubSubTopicPartitionInfo> partitionsFor(PubSubTopic topic) {
     throw new UnsupportedOperationException("partitionsFor is not supported in SharedKafkaConsumer");
+  }
+
+  @Override
+  public synchronized long comparePositions(
+      PubSubTopicPartition partition,
+      PubSubPosition position1,
+      PubSubPosition position2) {
+    return delegate.comparePositions(partition, position1, position2);
+  }
+
+  @Override
+  public synchronized long positionDifference(
+      PubSubTopicPartition partition,
+      PubSubPosition position1,
+      PubSubPosition position2) {
+    return delegate.positionDifference(partition, position1, position2);
+  }
+
+  @Override
+  public synchronized PubSubPosition decodePosition(
+      PubSubTopicPartition partition,
+      int positionTypeId,
+      ByteBuffer buffer) {
+    return delegate.decodePosition(partition, positionTypeId, buffer);
+  }
+
+  @Override
+  public synchronized PubSubPosition advancePosition(PubSubTopicPartition tp, PubSubPosition startInclusive, long n) {
+    return delegate.advancePosition(tp, startInclusive, n);
+  }
+
+  @Override
+  public String toString() {
+    return toString;
   }
 }

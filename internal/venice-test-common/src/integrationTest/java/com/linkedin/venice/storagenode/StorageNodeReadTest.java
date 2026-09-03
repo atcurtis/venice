@@ -118,8 +118,8 @@ public class StorageNodeReadTest {
     veniceWriter = IntegrationTestPushUtils
         .getVeniceWriterFactory(veniceCluster.getPubSubBrokerWrapper(), pubSubProducerAdapterFactory)
         .createVeniceWriter(
-            new VeniceWriterOptions.Builder(storeVersionName).setKeySerializer(keySerializer)
-                .setValueSerializer(valueSerializer)
+            new VeniceWriterOptions.Builder(storeVersionName).setKeyPayloadSerializer(keySerializer)
+                .setValuePayloadSerializer(valueSerializer)
                 .build());
     client = ClientFactory.getAndStartGenericAvroClient(
         ClientConfig.defaultGenericClientConfig(storeName).setVeniceURL(veniceCluster.getRandomRouterURL()));
@@ -340,8 +340,7 @@ public class StorageNodeReadTest {
     StringBuilder sb = new StringBuilder().append("http://")
         .append(serverAddress)
         .append("/")
-        .append(QueryAction.HEALTH.toString().toLowerCase())
-        .append("?f=b64");
+        .append(QueryAction.HEALTH.toString().toLowerCase());
     HttpGet getReq = new HttpGet(sb.toString());
     Future<HttpResponse> future = client.execute(getReq, null);
     return future.get();

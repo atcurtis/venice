@@ -2,35 +2,38 @@ package com.linkedin.venice.listener;
 
 import static com.linkedin.venice.read.RequestType.SINGLE_GET;
 import static com.linkedin.venice.router.api.VenicePathParser.TYPE_STORAGE;
+import static com.linkedin.venice.utils.TestUtils.DEFAULT_PUBSUB_CONTEXT_FOR_UNIT_TESTING;
 import static io.netty.handler.codec.http.HttpResponseStatus.BAD_REQUEST;
 import static io.netty.handler.codec.http.HttpResponseStatus.SERVICE_UNAVAILABLE;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyInt;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
-import static org.testng.Assert.assertEquals;
-import static org.testng.Assert.assertTrue;
+import static org.testng.Assert.*;
 
 import com.linkedin.davinci.compression.StorageEngineBackedCompressorFactory;
 import com.linkedin.davinci.config.VeniceServerConfig;
 import com.linkedin.davinci.kafka.consumer.PartitionConsumptionState;
 import com.linkedin.davinci.listener.response.AdminResponse;
 import com.linkedin.davinci.listener.response.MetadataResponse;
-import com.linkedin.davinci.listener.response.TopicPartitionIngestionContextResponse;
+import com.linkedin.davinci.listener.response.ReplicaIngestionResponse;
 import com.linkedin.davinci.storage.DiskHealthCheckService;
 import com.linkedin.davinci.storage.IngestionMetadataRetriever;
 import com.linkedin.davinci.storage.ReadMetadataRetriever;
 import com.linkedin.davinci.storage.StorageEngineRepository;
-import com.linkedin.davinci.store.AbstractStorageEngine;
+import com.linkedin.davinci.store.StorageEngine;
 import com.linkedin.davinci.store.record.ValueRecord;
 import com.linkedin.davinci.store.rocksdb.RocksDBServerConfig;
 import com.linkedin.venice.HttpConstants;
@@ -45,7 +48,9 @@ import com.linkedin.venice.compute.protocol.request.router.ComputeRouterRequestK
 import com.linkedin.venice.compute.protocol.response.ComputeResponseRecordV1;
 import com.linkedin.venice.exceptions.PersistenceFailureException;
 import com.linkedin.venice.exceptions.VeniceException;
-import com.linkedin.venice.grpc.GrpcErrorCodes;
+import com.linkedin.venice.guid.JavaUtilGuidV4Generator;
+import com.linkedin.venice.kafka.protocol.GUID;
+import com.linkedin.venice.kafka.protocol.state.StoreVersionState;
 import com.linkedin.venice.listener.grpc.GrpcRequestContext;
 import com.linkedin.venice.listener.grpc.handlers.GrpcStorageReadRequestHandler;
 import com.linkedin.venice.listener.grpc.handlers.VeniceServerGrpcHandler;
@@ -53,14 +58,18 @@ import com.linkedin.venice.listener.request.AdminRequest;
 import com.linkedin.venice.listener.request.ComputeRouterRequestWrapper;
 import com.linkedin.venice.listener.request.GetRouterRequest;
 import com.linkedin.venice.listener.request.HealthCheckRequest;
+import com.linkedin.venice.listener.request.HeartbeatRequest;
 import com.linkedin.venice.listener.request.MetadataFetchRequest;
 import com.linkedin.venice.listener.request.MultiGetRouterRequestWrapper;
 import com.linkedin.venice.listener.request.RouterRequest;
 import com.linkedin.venice.listener.request.TopicPartitionIngestionContextRequest;
+import com.linkedin.venice.listener.response.AbstractReadResponse;
 import com.linkedin.venice.listener.response.ComputeResponseWrapper;
 import com.linkedin.venice.listener.response.HttpShortcutResponse;
 import com.linkedin.venice.listener.response.MultiGetResponseWrapper;
-import com.linkedin.venice.listener.response.StorageResponseObject;
+import com.linkedin.venice.listener.response.MultiKeyResponseWrapper;
+import com.linkedin.venice.listener.response.SingleGetResponseWrapper;
+import com.linkedin.venice.listener.response.stats.AbstractReadResponseStats;
 import com.linkedin.venice.meta.PartitionerConfig;
 import com.linkedin.venice.meta.PartitionerConfigImpl;
 import com.linkedin.venice.meta.QueryAction;
@@ -74,24 +83,41 @@ import com.linkedin.venice.offsets.OffsetRecord;
 import com.linkedin.venice.partitioner.VenicePartitioner;
 import com.linkedin.venice.protocols.VeniceClientRequest;
 import com.linkedin.venice.protocols.VeniceServerResponse;
+import com.linkedin.venice.pubsub.PubSubContext;
+import com.linkedin.venice.pubsub.PubSubTopicPartitionImpl;
+import com.linkedin.venice.pubsub.PubSubTopicRepository;
+import com.linkedin.venice.pubsub.api.PubSubTopic;
+import com.linkedin.venice.pubsub.mock.SimplePartitioner;
 import com.linkedin.venice.read.RequestType;
 import com.linkedin.venice.read.protocol.request.router.MultiGetRouterRequestKeyV1;
 import com.linkedin.venice.read.protocol.response.MultiGetResponseRecordV1;
+import com.linkedin.venice.request.RequestHelper;
+import com.linkedin.venice.response.VeniceReadResponseStatus;
 import com.linkedin.venice.schema.AvroSchemaParseUtils;
 import com.linkedin.venice.schema.SchemaEntry;
 import com.linkedin.venice.schema.SchemaReader;
 import com.linkedin.venice.schema.avro.ReadAvroProtocolDefinition;
+import com.linkedin.venice.serialization.KeyWithChunkingSuffixSerializer;
 import com.linkedin.venice.serialization.VeniceKafkaSerializer;
 import com.linkedin.venice.serialization.avro.AvroProtocolDefinition;
+import com.linkedin.venice.serialization.avro.ChunkedValueManifestSerializer;
 import com.linkedin.venice.serialization.avro.VeniceAvroKafkaSerializer;
 import com.linkedin.venice.serializer.AvroSerializer;
 import com.linkedin.venice.serializer.RecordDeserializer;
 import com.linkedin.venice.serializer.RecordSerializer;
 import com.linkedin.venice.serializer.SerializerDeserializerFactory;
+import com.linkedin.venice.stats.ServerHttpRequestStats;
+import com.linkedin.venice.stats.dimensions.HttpResponseStatusCodeCategory;
+import com.linkedin.venice.stats.dimensions.HttpResponseStatusEnum;
+import com.linkedin.venice.stats.dimensions.VeniceResponseStatusCategory;
+import com.linkedin.venice.storage.protocol.ChunkId;
+import com.linkedin.venice.storage.protocol.ChunkedKeySuffix;
+import com.linkedin.venice.storage.protocol.ChunkedValueManifest;
 import com.linkedin.venice.streaming.StreamingUtils;
-import com.linkedin.venice.unit.kafka.SimplePartitioner;
-import com.linkedin.venice.utils.DataProviderUtils;
-import com.linkedin.venice.utils.Utils;
+import com.linkedin.venice.utils.ValueSize;
+import com.linkedin.venice.utils.concurrent.BlockingQueueType;
+import com.linkedin.venice.utils.concurrent.ThreadPoolFactory;
+import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.http.DefaultFullHttpRequest;
@@ -100,6 +126,7 @@ import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpVersion;
+import java.net.URI;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
@@ -115,6 +142,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.IntFunction;
 import org.apache.avro.Schema;
 import org.apache.avro.SchemaBuilder;
 import org.apache.avro.generic.GenericData;
@@ -127,6 +155,7 @@ import org.mockito.ArgumentCaptor;
 import org.testng.Assert;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeMethod;
+import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
 
@@ -145,9 +174,15 @@ public class StorageReadRequestHandlerTest {
   private final ChannelHandlerContext context = mock(ChannelHandlerContext.class);
   private final ArgumentCaptor<Object> argumentCaptor = ArgumentCaptor.forClass(Object.class);
   private final ThreadPoolExecutor executor = new InlineExecutor();
+  private final int numberOfExecutionThreads = Runtime.getRuntime().availableProcessors();
+  private final ThreadPoolExecutor parallelExecutor = ThreadPoolFactory.createThreadPool(
+      numberOfExecutionThreads,
+      this.getClass().getSimpleName(),
+      4096,
+      BlockingQueueType.LINKED_BLOCKING_QUEUE);
   private final Store store = mock(Store.class);
   private final Version version = mock(Version.class);
-  private final AbstractStorageEngine storageEngine = mock(AbstractStorageEngine.class);
+  private final StorageEngine storageEngine = mock(StorageEngine.class);
   private final StorageEngineRepository storageEngineRepository = mock(StorageEngineRepository.class);
   private final ReadOnlyStoreRepository storeRepository = mock(ReadOnlyStoreRepository.class);
   private final ReadOnlySchemaRepository schemaRepository = mock(ReadOnlySchemaRepository.class);
@@ -158,6 +193,12 @@ public class StorageReadRequestHandlerTest {
   private final ReadMetadataRetriever readMetadataRetriever = mock(ReadMetadataRetriever.class);
   private final VeniceServerConfig serverConfig = mock(VeniceServerConfig.class);
   private final VenicePartitioner partitioner = new SimplePartitioner();
+  private final ChunkedValueManifestSerializer chunkedValueManifestSerializer =
+      new ChunkedValueManifestSerializer(true);
+  private final KeyWithChunkingSuffixSerializer keyWithChunkingSuffixSerializer = new KeyWithChunkingSuffixSerializer();
+  private final PubSubTopicRepository topicRepository = new PubSubTopicRepository();
+
+  private PubSubContext pubSubContext;
 
   @BeforeMethod
   public void setUp() {
@@ -171,10 +212,12 @@ public class StorageReadRequestHandlerTest {
     doReturn(partitionerConfig).when(version).getPartitionerConfig();
 
     doReturn(storageEngine).when(storageEngineRepository).getLocalStorageEngine(any());
-    doReturn(new NoopCompressor()).when(compressorFactory).getCompressor(any(), any());
+    doReturn(true).when(storeRepository).isReadComputationEnabled(any());
+    doReturn(new NoopCompressor()).when(compressorFactory).getCompressor(any(), any(), anyInt());
 
     RocksDBServerConfig rocksDBServerConfig = mock(RocksDBServerConfig.class);
     doReturn(rocksDBServerConfig).when(serverConfig).getRocksDBServerConfig();
+    pubSubContext = DEFAULT_PUBSUB_CONTEXT_FOR_UNIT_TESTING;
   }
 
   @AfterMethod
@@ -192,28 +235,56 @@ public class StorageReadRequestHandlerTest {
         context);
   }
 
+  private enum ParallelQueryProcessing {
+    PARALLEL(true), SEQUENTIAL(false);
+
+    final boolean configValue;
+
+    ParallelQueryProcessing(boolean configValue) {
+      this.configValue = configValue;
+    }
+  }
+
+  @DataProvider(name = "storageReadRequestHandlerParams")
+  public Object[][] storageReadRequestHandlerParams() {
+    int smallRecordCount = numberOfExecutionThreads * 10;
+    int largeRecordCount = numberOfExecutionThreads * 100;
+    return new Object[][] { { ParallelQueryProcessing.SEQUENTIAL, smallRecordCount, ValueSize.SMALL_VALUE },
+        { ParallelQueryProcessing.SEQUENTIAL, smallRecordCount, ValueSize.LARGE_VALUE },
+        { ParallelQueryProcessing.SEQUENTIAL, largeRecordCount, ValueSize.SMALL_VALUE },
+        { ParallelQueryProcessing.SEQUENTIAL, largeRecordCount, ValueSize.LARGE_VALUE },
+        { ParallelQueryProcessing.PARALLEL, smallRecordCount, ValueSize.SMALL_VALUE },
+        { ParallelQueryProcessing.PARALLEL, smallRecordCount, ValueSize.LARGE_VALUE },
+        { ParallelQueryProcessing.PARALLEL, largeRecordCount, ValueSize.SMALL_VALUE },
+        { ParallelQueryProcessing.PARALLEL, largeRecordCount, ValueSize.LARGE_VALUE } };
+  }
+
+  @DataProvider(name = "computeRequestParams")
+  public Object[][] computeRequestParams() {
+    return new Object[][] { { false, false }, { false, true }, { true, false }, { true, true } };
+  }
+
   private StorageReadRequestHandler createStorageReadRequestHandler() {
-    return createStorageReadRequestHandler(false, 0);
+    return createStorageReadRequestHandler(false, MultiGetResponseWrapper::new);
   }
 
   private StorageReadRequestHandler createStorageReadRequestHandler(
       boolean parallelBatchGetEnabled,
-      int parallelBatchGetChunkSize) {
+      IntFunction<MultiGetResponseWrapper> multiGetResponseProvider) {
     return new StorageReadRequestHandler(
-        executor,
-        executor,
+        serverConfig,
+        parallelBatchGetEnabled ? parallelExecutor : executor,
+        parallelBatchGetEnabled ? parallelExecutor : executor,
         storageEngineRepository,
         storeRepository,
         schemaRepository,
         ingestionMetadataRetriever,
         readMetadataRetriever,
         healthCheckService,
-        false,
-        parallelBatchGetEnabled,
-        parallelBatchGetChunkSize,
-        serverConfig,
         compressorFactory,
-        Optional.empty());
+        Optional.empty(),
+        multiGetResponseProvider,
+        ComputeResponseWrapper::new);
   }
 
   @Test
@@ -228,13 +299,14 @@ public class StorageReadRequestHandlerTest {
     // [0]""/[1]"action"/[2]"store"/[3]"partition"/[4]"key"
     String uri = "/" + TYPE_STORAGE + "/test-topic_v1/" + partition + "/" + keyString;
     HttpRequest httpRequest = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, uri);
-    GetRouterRequest request = GetRouterRequest.parseGetHttpRequest(httpRequest);
+    GetRouterRequest request =
+        GetRouterRequest.parseGetHttpRequest(httpRequest, RequestHelper.getRequestParts(URI.create(httpRequest.uri())));
 
     StorageReadRequestHandler requestHandler = createStorageReadRequestHandler();
     requestHandler.channelRead(context, request);
 
     verify(context, times(1)).writeAndFlush(argumentCaptor.capture());
-    StorageResponseObject responseObject = (StorageResponseObject) argumentCaptor.getValue();
+    SingleGetResponseWrapper responseObject = (SingleGetResponseWrapper) argumentCaptor.getValue();
     assertEquals(responseObject.getValueRecord().getDataInBytes(), valueString.getBytes());
     assertEquals(responseObject.getValueRecord().getSchemaId(), schemaId);
   }
@@ -251,8 +323,15 @@ public class StorageReadRequestHandlerTest {
     assertEquals(healthCheckResponse.getStatus(), HttpResponseStatus.OK);
   }
 
-  @Test(dataProvider = "True-and-False", dataProviderClass = DataProviderUtils.class)
-  public void testMultiGetNotUsingKeyBytes(Boolean isParallel) throws Exception {
+  @Test(dataProvider = "storageReadRequestHandlerParams")
+  public void testParallelMultiGet(ParallelQueryProcessing parallel, int recordCount, ValueSize largeValue)
+      throws Exception {
+
+    doReturn(largeValue.config).when(version).isChunkingEnabled();
+    StoreVersionState svs = mock(StoreVersionState.class);
+    doReturn(largeValue.config).when(svs).getChunked();
+    doReturn(svs).when(storageEngine).getStoreVersionState();
+
     int schemaId = 1;
 
     // [0]""/[1]"storage"/[2]{$resourceName}
@@ -267,7 +346,11 @@ public class StorageReadRequestHandlerTest {
     String valuePrefix = "value_";
 
     Map<Integer, String> allValueStrings = new HashMap<>();
-    int recordCount = 10;
+    List<Integer> expectedKeySizes = new ArrayList<>();
+    List<Integer> expectedValueSizes = new ArrayList<>();
+    int chunkSize = recordCount / numberOfExecutionThreads;
+    GUID guid = new JavaUtilGuidV4Generator().getGuid();
+    int sequenceNumber = 0;
 
     // Prepare multiGet records belong to specific sub-partitions, if the router does not have the right logic to figure
     // out
@@ -275,13 +358,44 @@ public class StorageReadRequestHandlerTest {
     // considers the first byte of the key.
     for (int i = 0; i < recordCount; ++i) {
       MultiGetRouterRequestKeyV1 requestKey = new MultiGetRouterRequestKeyV1();
-      byte[] keyBytes = keySerializer.serialize(null, keyPrefix + i);
+      String keyString = keyPrefix + i;
+      byte[] keyBytes = keySerializer.serialize(null, keyString);
+      expectedKeySizes.add(keyBytes.length);
       requestKey.keyBytes = ByteBuffer.wrap(keyBytes);
       requestKey.keyIndex = i;
       requestKey.partitionId = 0;
       String valueString = valuePrefix + i;
-      byte[] valueBytes = ValueRecord.create(schemaId, valueString.getBytes()).serialize();
-      doReturn(valueBytes).when(storageEngine).get(0, ByteBuffer.wrap(keyBytes));
+      byte[] valueBytes;
+      if (largeValue.config) {
+        byte[] chunk1 = ValueRecord
+            .create(AvroProtocolDefinition.CHUNK.getCurrentProtocolVersion(), valueString.substring(0, 3).getBytes())
+            .serialize();
+        byte[] chunk2 = ValueRecord
+            .create(AvroProtocolDefinition.CHUNK.getCurrentProtocolVersion(), valueString.substring(3).getBytes())
+            .serialize();
+        List<ByteBuffer> keysWithChunkingSuffix = new ArrayList<>(2);
+        ByteBuffer chunk1KeyBytes = keyWithChunkingSuffixSerializer
+            .serializeChunkedKey(keyBytes, new ChunkedKeySuffix(new ChunkId(guid, 0, sequenceNumber++, 0), true));
+        ByteBuffer chunk2KeyBytes = keyWithChunkingSuffixSerializer
+            .serializeChunkedKey(keyBytes, new ChunkedKeySuffix(new ChunkId(guid, 0, sequenceNumber++, 1), true));
+        keysWithChunkingSuffix.add(chunk1KeyBytes);
+        keysWithChunkingSuffix.add(chunk2KeyBytes);
+        doReturn(chunk1).when(storageEngine).get(0, chunk1KeyBytes);
+        doReturn(chunk2).when(storageEngine).get(0, chunk2KeyBytes);
+        ChunkedValueManifest chunkedValueManifest =
+            new ChunkedValueManifest(keysWithChunkingSuffix, schemaId, valueString.length());
+        valueBytes = chunkedValueManifestSerializer.serialize("", chunkedValueManifest);
+      } else {
+        valueBytes = valueString.getBytes();
+      }
+      byte[] valueRecordContainerBytes = ValueRecord.create(
+          largeValue.config ? AvroProtocolDefinition.CHUNKED_VALUE_MANIFEST.getCurrentProtocolVersion() : schemaId,
+          valueBytes).serialize();
+      expectedValueSizes.add(largeValue.config ? valueString.getBytes().length : valueRecordContainerBytes.length);
+      if (largeValue.config) {
+        keyBytes = keyWithChunkingSuffixSerializer.serializeNonChunkedKey(keyBytes);
+      }
+      doReturn(valueRecordContainerBytes).when(storageEngine).get(0, ByteBuffer.wrap(keyBytes));
       allValueStrings.put(i, valueString);
       keys.add(requestKey);
     }
@@ -294,17 +408,25 @@ public class StorageReadRequestHandlerTest {
         .set(
             HttpConstants.VENICE_API_VERSION,
             ReadAvroProtocolDefinition.MULTI_GET_ROUTER_REQUEST_V1.getProtocolVersion());
-    MultiGetRouterRequestWrapper request = MultiGetRouterRequestWrapper.parseMultiGetHttpRequest(httpRequest);
+    MultiGetRouterRequestWrapper request = MultiGetRouterRequestWrapper
+        .parseMultiGetHttpRequest(httpRequest, RequestHelper.getRequestParts(URI.create(httpRequest.uri())));
 
-    StorageReadRequestHandler requestHandler = createStorageReadRequestHandler(isParallel, 10);
+    doReturn(parallel.configValue).when(serverConfig).isEnableParallelBatchGet();
+    doReturn(chunkSize).when(serverConfig).getParallelBatchGetChunkSize();
+
+    StorageReadRequestHandler requestHandler =
+        createStorageReadRequestHandler(parallel.configValue, MultiGetResponseWrapper::new);
     requestHandler.channelRead(context, request);
+    verify(context, timeout(10000)).writeAndFlush(argumentCaptor.capture());
 
-    verify(context, times(1)).writeAndFlush(argumentCaptor.capture());
-    MultiGetResponseWrapper multiGetResponseWrapper = (MultiGetResponseWrapper) argumentCaptor.getValue();
+    Object response = argumentCaptor.getValue();
+    assertTrue(response instanceof AbstractReadResponse, "The response should be castable to AbstractReadResponse.");
+    AbstractReadResponse multiGetResponseWrapper = (AbstractReadResponse) response;
     RecordDeserializer<MultiGetResponseRecordV1> deserializer =
         SerializerDeserializerFactory.getAvroSpecificDeserializer(MultiGetResponseRecordV1.class);
-    Iterable<MultiGetResponseRecordV1> values =
-        deserializer.deserializeObjects(multiGetResponseWrapper.getResponseBody().array());
+    byte[] responseBytes = new byte[multiGetResponseWrapper.getResponseBody().readableBytes()];
+    multiGetResponseWrapper.getResponseBody().getBytes(0, responseBytes);
+    Iterable<MultiGetResponseRecordV1> values = deserializer.deserializeObjects(responseBytes);
     Map<Integer, String> results = new HashMap<>();
     values.forEach(K -> {
       String valueString = new String(K.value.array(), StandardCharsets.UTF_8);
@@ -314,6 +436,31 @@ public class StorageReadRequestHandlerTest {
     for (int i = 0; i < recordCount; i++) {
       assertEquals(results.get(i), allValueStrings.get(i));
     }
+
+    ServerHttpRequestStats stats = mock(ServerHttpRequestStats.class);
+    multiGetResponseWrapper.getStatsRecorder()
+        .recordMetrics(
+            stats,
+            HttpResponseStatusEnum.OK,
+            HttpResponseStatusCodeCategory.SUCCESS,
+            VeniceResponseStatusCategory.SUCCESS);
+    if (largeValue.config) {
+      verify(stats).recordMultiChunkLargeValueCount(recordCount);
+    } else {
+      verify(stats, never()).recordMultiChunkLargeValueCount(anyInt());
+    }
+
+    ArgumentCaptor<Integer> valueSizeCaptor = ArgumentCaptor.forClass(Integer.class);
+    verify(stats, times(recordCount)).recordValueSizeInByte(
+        eq(HttpResponseStatusEnum.OK),
+        eq(HttpResponseStatusCodeCategory.SUCCESS),
+        eq(VeniceResponseStatusCategory.SUCCESS),
+        valueSizeCaptor.capture());
+    assertEquals(valueSizeCaptor.getAllValues(), expectedValueSizes);
+
+    ArgumentCaptor<Integer> keySizeCaptor = ArgumentCaptor.forClass(Integer.class);
+    verify(stats, times(recordCount)).recordKeySizeInByte(keySizeCaptor.capture());
+    assertEquals(keySizeCaptor.getAllValues(), expectedKeySizes);
   }
 
   @Test
@@ -327,7 +474,8 @@ public class StorageReadRequestHandlerTest {
     // [0]""/[1]"action"/[2]"store"/[3]"partition"/[4]"key"
     String uri = "/" + TYPE_STORAGE + "/" + topic + "/" + partition + "/" + keyString;
     HttpRequest httpRequest = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, uri);
-    GetRouterRequest request = GetRouterRequest.parseGetHttpRequest(httpRequest);
+    GetRouterRequest request =
+        GetRouterRequest.parseGetHttpRequest(httpRequest, RequestHelper.getRequestParts(URI.create(httpRequest.uri())));
 
     byte[] valueBytes = ValueRecord.create(schemaId, valueString.getBytes()).serialize();
     doReturn(valueBytes).when(storageEngine).get(partition, ByteBuffer.wrap(keyString.getBytes()));
@@ -355,7 +503,7 @@ public class StorageReadRequestHandlerTest {
     verify(context, times(1)).writeAndFlush(argumentCaptor.capture());
     HttpShortcutResponse shortcutResponse = (HttpShortcutResponse) argumentCaptor.getValue();
     assertEquals(shortcutResponse.getStatus(), HttpResponseStatus.INTERNAL_SERVER_ERROR);
-    assertEquals(shortcutResponse.getMessage(), exceptionMessage);
+    assertTrue(shortcutResponse.getMessage().contains(exceptionMessage));
 
     // Asserting that the exception got logged
     Assert.assertTrue(errorLogCount.get() > 0);
@@ -363,24 +511,29 @@ public class StorageReadRequestHandlerTest {
 
   @Test
   public void testAdminRequestsPassInStorageExecutionHandler() throws Exception {
-    String topic = "test_store_v1";
+    PubSubTopic topic = topicRepository.getTopic("test_store_v1");
     int expectedPartitionId = 12345;
 
     // [0]""/[1]"action"/[2]"store_version"/[3]"dump_ingestion_state"
     String uri =
         "/" + QueryAction.ADMIN.toString().toLowerCase() + "/" + topic + "/" + ServerAdminAction.DUMP_INGESTION_STATE;
     HttpRequest httpRequest = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, uri);
-    AdminRequest request = AdminRequest.parseAdminHttpRequest(httpRequest);
+    AdminRequest request = AdminRequest.parseAdminHttpRequest(httpRequest, URI.create(httpRequest.uri()));
 
     // Mock the AdminResponse from ingestion task
     AdminResponse expectedAdminResponse = new AdminResponse();
     PartitionConsumptionState state = new PartitionConsumptionState(
-        Utils.getReplicaId(topic, expectedPartitionId),
-        expectedPartitionId,
-        new OffsetRecord(AvroProtocolDefinition.PARTITION_STATE.getSerializer()),
-        false);
+        new PubSubTopicPartitionImpl(topic, expectedPartitionId),
+        new OffsetRecord(AvroProtocolDefinition.PARTITION_STATE.getSerializer(), pubSubContext),
+        pubSubContext,
+        false,
+        false,
+        false,
+        false,
+        null);
     expectedAdminResponse.addPartitionConsumptionState(state);
-    doReturn(expectedAdminResponse).when(ingestionMetadataRetriever).getConsumptionSnapshots(eq(topic), any());
+    doReturn(expectedAdminResponse).when(ingestionMetadataRetriever)
+        .getConsumptionSnapshots(eq(topic.getName()), any());
 
     StorageReadRequestHandler requestHandler = createStorageReadRequestHandler();
     requestHandler.channelRead(context, request);
@@ -402,32 +555,56 @@ public class StorageReadRequestHandlerTest {
     String uri = "/" + QueryAction.TOPIC_PARTITION_INGESTION_CONTEXT.toString().toLowerCase() + "/" + topic + "/"
         + topic + "/" + expectedPartitionId;
     HttpRequest httpRequest = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, uri);
-    TopicPartitionIngestionContextRequest request =
-        TopicPartitionIngestionContextRequest.parseGetHttpRequest(httpRequest);
+    TopicPartitionIngestionContextRequest request = TopicPartitionIngestionContextRequest
+        .parseGetHttpRequest(uri, RequestHelper.getRequestParts(URI.create(httpRequest.uri())));
 
     // Mock the TopicPartitionIngestionContextResponse from ingestion task
-    TopicPartitionIngestionContextResponse expectedTopicPartitionIngestionContextResponse =
-        new TopicPartitionIngestionContextResponse();
+    ReplicaIngestionResponse expectedReplicaIngestionResponse = new ReplicaIngestionResponse();
     String jsonStr = "{\n" + "\"kafkaUrl\" : {\n" + "  TP(topic: \"" + topic + "\", partition: " + expectedPartitionId
         + ") : {\n" + "      \"latestOffset\" : 0,\n" + "      \"offsetLag\" : 1,\n" + "      \"msgRate\" : 2.0,\n"
-        + "      \"byteRate\" : 4.0,\n" + "      \"consumerIdx\" : 6,\n"
-        + "      \"elapsedTimeSinceLastPollInMs\" : 7\n" + "    }\n" + "  }\n" + "}";
+        + "      \"byteRate\" : 6.0,\n" + "      \"consumerIdStr\" : \"consumer1\",\n"
+        + "      \"elapsedTimeSinceLastConsumerPollInMs\" : 7,\n"
+        + "      \"elapsedTimeSinceLastRecordForPartitionInMs\" : 8,\n"
+        + "      \"versionTopicName\" : \"test_store_v1\"\n" + "    }\n" + "  }\n" + "}";
     byte[] expectedTopicPartitionContext = jsonStr.getBytes();
-    expectedTopicPartitionIngestionContextResponse.setTopicPartitionIngestionContext(expectedTopicPartitionContext);
-    doReturn(expectedTopicPartitionIngestionContextResponse).when(ingestionMetadataRetriever)
+    expectedReplicaIngestionResponse.setPayload(expectedTopicPartitionContext);
+    doReturn(expectedReplicaIngestionResponse).when(ingestionMetadataRetriever)
         .getTopicPartitionIngestionContext(eq(topic), eq(topic), eq(expectedPartitionId));
 
     StorageReadRequestHandler requestHandler = createStorageReadRequestHandler();
     requestHandler.channelRead(context, request);
     verify(context, times(1)).writeAndFlush(argumentCaptor.capture());
-    TopicPartitionIngestionContextResponse topicPartitionIngestionContextResponse =
-        (TopicPartitionIngestionContextResponse) argumentCaptor.getValue();
-    String topicPartitionIngestionContextStr =
-        new String(topicPartitionIngestionContextResponse.getTopicPartitionIngestionContext());
+    ReplicaIngestionResponse replicaIngestionResponse = (ReplicaIngestionResponse) argumentCaptor.getValue();
+    String topicPartitionIngestionContextStr = new String(replicaIngestionResponse.getPayload());
     assertTrue(topicPartitionIngestionContextStr.contains(topic));
-    assertEquals(
-        topicPartitionIngestionContextResponse.getTopicPartitionIngestionContext(),
-        expectedTopicPartitionContext);
+    assertEquals(replicaIngestionResponse.getPayload(), expectedTopicPartitionContext);
+  }
+
+  @Test
+  public void testHeartbeatLagRequestsPassInStorageExecutionHandler() throws Exception {
+    String topic = "test_store_v1";
+    int expectedPartitionId = 12345;
+    boolean filterLag = true;
+    // [0]""/[1]"action"/[2]"optional topic filter"/[3]"optional partition filter"/[4]"optional lag filter"
+    String uri = "/" + QueryAction.HOST_HEARTBEAT_LAG.toString().toLowerCase() + "/" + topic + "/" + expectedPartitionId
+        + "/" + filterLag;
+    HttpRequest httpRequest = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, uri);
+    HeartbeatRequest request =
+        HeartbeatRequest.parseGetHttpRequest(uri, RequestHelper.getRequestParts(URI.create(httpRequest.uri())));
+    System.out.println(request.getTopic() + " " + request.getPartition() + " " + request.isFilterLagReplica());
+    // Mock the TopicPartitionIngestionContextResponse from heartbeat service
+    ReplicaIngestionResponse expectedReplicaIngestionResponse = new ReplicaIngestionResponse();
+    String jsonStr = "{}";
+    byte[] expectedTopicPartitionContext = jsonStr.getBytes();
+    expectedReplicaIngestionResponse.setPayload(expectedTopicPartitionContext);
+    doReturn(expectedReplicaIngestionResponse).when(ingestionMetadataRetriever)
+        .getHeartbeatLag(eq(topic), eq(expectedPartitionId), eq(filterLag));
+
+    StorageReadRequestHandler requestHandler = createStorageReadRequestHandler();
+    requestHandler.channelRead(context, request);
+    verify(context, times(1)).writeAndFlush(argumentCaptor.capture());
+    ReplicaIngestionResponse replicaIngestionResponse = (ReplicaIngestionResponse) argumentCaptor.getValue();
+    assertEquals(replicaIngestionResponse.getPayload(), expectedTopicPartitionContext);
   }
 
   @Test
@@ -440,7 +617,8 @@ public class StorageReadRequestHandlerTest {
     // [0]""/[1]"action"/[2]"store"
     String uri = "/" + QueryAction.METADATA.toString().toLowerCase() + "/" + storeName;
     HttpRequest httpRequest = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, uri);
-    MetadataFetchRequest testRequest = MetadataFetchRequest.parseGetHttpRequest(httpRequest);
+    MetadataFetchRequest testRequest =
+        MetadataFetchRequest.parseGetHttpRequest(uri, RequestHelper.getRequestParts(URI.create(httpRequest.uri())));
 
     // Mock the MetadataResponse from ingestion task
     MetadataResponse expectedMetadataResponse = new MetadataResponse();
@@ -450,7 +628,8 @@ public class StorageReadRequestHandlerTest {
         1,
         "test_partitioner_class",
         Collections.singletonMap("test_partitioner_param", "test_param"),
-        2);
+        2,
+        0);
     expectedMetadataResponse.setVersions(Collections.singletonList(1));
     expectedMetadataResponse.setVersionMetadata(versionProperties);
     expectedMetadataResponse.setKeySchema(keySchema);
@@ -478,9 +657,12 @@ public class StorageReadRequestHandlerTest {
     assertEquals(shortcutResponse.getMessage(), "Unrecognized object in StorageExecutionHandler");
   }
 
-  @Test(dataProvider = "True-and-False", dataProviderClass = DataProviderUtils.class)
-  public void testHandleComputeRequest(boolean readComputationEnabled) throws Exception {
+  @Test(dataProvider = "computeRequestParams")
+  public void testHandleComputeRequest(boolean readComputationEnabled, boolean parallelBatchGetEnabled)
+      throws Exception {
     doReturn(readComputationEnabled).when(storeRepository).isReadComputationEnabled(any());
+    doReturn(parallelBatchGetEnabled).when(serverConfig).isEnableParallelBatchGet();
+    doReturn(1).when(serverConfig).getParallelBatchGetChunkSize();
 
     String keyString = "test-key";
     String missingKeyString = "missing-test-key";
@@ -531,42 +713,59 @@ public class StorageReadRequestHandlerTest {
     ComputeRouterRequestKeyV1 missingKey =
         new ComputeRouterRequestKeyV1(1, ByteBuffer.wrap(missingKeyString.getBytes()), partition);
     doReturn(Arrays.asList(key, missingKey)).when(request).getKeys();
+    doReturn(2).when(request).getKeyCount();
 
-    StorageReadRequestHandler requestHandler = createStorageReadRequestHandler();
+    StorageReadRequestHandler requestHandler =
+        createStorageReadRequestHandler(parallelBatchGetEnabled, MultiGetResponseWrapper::new);
     requestHandler.channelRead(context, request);
 
-    verify(context, times(1)).writeAndFlush(argumentCaptor.capture());
+    verify(context, timeout(10000)).writeAndFlush(argumentCaptor.capture());
     if (!readComputationEnabled) {
       HttpShortcutResponse errorResponse = (HttpShortcutResponse) argumentCaptor.getValue();
       assertEquals(errorResponse.getStatus(), HttpResponseStatus.METHOD_NOT_ALLOWED);
     } else {
-      ComputeResponseWrapper computeResponse = (ComputeResponseWrapper) argumentCaptor.getValue();
+      AbstractReadResponse computeResponse = (AbstractReadResponse) argumentCaptor.getValue();
       assertEquals(computeResponse.isStreamingResponse(), request.isStreamingRequest());
-      assertEquals(computeResponse.getRecordCount(), keySet.size());
-      assertEquals(computeResponse.getMultiChunkLargeValueCount(), 0);
       assertEquals(computeResponse.getCompressionStrategy(), CompressionStrategy.NO_OP);
 
-      assertEquals(computeResponse.getDotProductCount(), 1);
-      assertEquals(computeResponse.getHadamardProductCount(), 1);
-      assertEquals(computeResponse.getCountOperatorCount(), 0);
-      assertEquals(computeResponse.getCosineSimilarityCount(), 0);
-
-      assertEquals(computeResponse.getValueSize(), valueBytes.length);
-
-      int expectedReadComputeOutputSize = 0;
       RecordDeserializer<ComputeResponseRecordV1> responseDeserializer =
           SerializerDeserializerFactory.getAvroSpecificDeserializer(ComputeResponseRecordV1.class);
-      for (ComputeResponseRecordV1 record: responseDeserializer
-          .deserializeObjects(computeResponse.getResponseBody().array())) {
+      ByteBuf responseBody = computeResponse.getResponseBody();
+      byte[] responseBytes = new byte[responseBody.readableBytes()];
+      responseBody.getBytes(0, responseBytes);
+      for (ComputeResponseRecordV1 record: responseDeserializer.deserializeObjects(responseBytes)) {
         if (record.getKeyIndex() < 0) {
           assertEquals(record.getValue(), StreamingUtils.EMPTY_BYTE_BUFFER);
         } else {
           assertEquals(record.getKeyIndex(), 0);
           Assert.assertNotEquals(record.getValue(), StreamingUtils.EMPTY_BYTE_BUFFER);
-          expectedReadComputeOutputSize += record.getValue().limit();
         }
       }
-      assertEquals(computeResponse.getReadComputeOutputSize(), expectedReadComputeOutputSize);
+
+      ServerHttpRequestStats stats = mock(ServerHttpRequestStats.class);
+      computeResponse.getStatsRecorder()
+          .recordMetrics(
+              stats,
+              HttpResponseStatusEnum.OK,
+              HttpResponseStatusCodeCategory.SUCCESS,
+              VeniceResponseStatusCategory.SUCCESS);
+      verify(stats).recordDotProductCount(1);
+      verify(stats).recordHadamardProductCount(1);
+      verify(stats, never()).recordMultiChunkLargeValueCount(anyInt());
+      verify(stats, never()).recordCountOperatorCount(anyInt());
+      verify(stats, never()).recordCosineSimilarityCount(anyInt());
+
+      verify(stats).recordValueSizeInByte(
+          HttpResponseStatusEnum.OK,
+          HttpResponseStatusCodeCategory.SUCCESS,
+          VeniceResponseStatusCategory.SUCCESS,
+          valueBytes.length);
+
+      ArgumentCaptor<Integer> keySizeCaptor = ArgumentCaptor.forClass(Integer.class);
+      verify(stats, times(2)).recordKeySizeInByte(keySizeCaptor.capture());
+      assertEquals(
+          keySizeCaptor.getAllValues(),
+          Arrays.asList(keyString.getBytes().length, missingKeyString.getBytes().length));
     }
   }
 
@@ -605,14 +804,14 @@ public class StorageReadRequestHandlerTest {
     requestHandler.channelRead(context, request);
     verify(storageEngine, times(1)).get(anyInt(), any(ByteBuffer.class));
     verify(context, times(1)).writeAndFlush(argumentCaptor.capture());
-    StorageResponseObject responseObject = (StorageResponseObject) argumentCaptor.getValue();
+    SingleGetResponseWrapper responseObject = (SingleGetResponseWrapper) argumentCaptor.getValue();
     assertTrue(responseObject.isFound());
     assertEquals(responseObject.getValueRecord().getDataInBytes(), valueString.getBytes());
 
     // After that first request, the original storage engine gets closed, and a second storage engine takes its place.
     when(storageEngine.get(anyInt(), any(ByteBuffer.class))).thenThrow(new PersistenceFailureException());
     when(storageEngine.isClosed()).thenReturn(true);
-    AbstractStorageEngine storageEngine2 = mock(AbstractStorageEngine.class);
+    StorageEngine storageEngine2 = mock(StorageEngine.class);
     when(storageEngine2.get(anyInt(), any(ByteBuffer.class))).thenReturn(valueRecord.serialize());
     doReturn(storageEngine2).when(storageEngineRepository).getLocalStorageEngine(any());
 
@@ -621,7 +820,7 @@ public class StorageReadRequestHandlerTest {
     verify(storageEngine, times(1)).get(anyInt(), any(ByteBuffer.class)); // No extra invocation
     verify(storageEngine2, times(1)).get(anyInt(), any(ByteBuffer.class)); // Good one
     verify(context, times(2)).writeAndFlush(argumentCaptor.capture());
-    responseObject = (StorageResponseObject) argumentCaptor.getValue();
+    responseObject = (SingleGetResponseWrapper) argumentCaptor.getValue();
     assertTrue(responseObject.isFound());
     assertEquals(responseObject.getValueRecord().getDataInBytes(), valueString.getBytes());
   }
@@ -639,7 +838,7 @@ public class StorageReadRequestHandlerTest {
     doNothing().when(mockNextHandler).processRequest(any());
     grpcReadRequestHandler.processRequest(ctx); // will cause np exception
 
-    assertEquals(builder.getErrorCode(), GrpcErrorCodes.INTERNAL_ERROR);
+    assertEquals(builder.getErrorCode(), VeniceReadResponseStatus.INTERNAL_ERROR.getCode());
     assertTrue(builder.getErrorMessage().contains("Internal Error"));
   }
 
@@ -692,6 +891,278 @@ public class StorageReadRequestHandlerTest {
     verify(context, times(2)).writeAndFlush(shortcutResponseArgumentCaptor.capture());
 
     Assert.assertEquals(shortcutResponseArgumentCaptor.getValue().getStatus(), BAD_REQUEST);
+  }
+
+  @Test
+  public void testSingleGetWithKeyNotFound() throws Exception {
+    String keyString = "missing-key";
+    int partition = 2;
+    doReturn(null).when(storageEngine).get(partition, ByteBuffer.wrap(keyString.getBytes()));
+
+    // [0]""/[1]"action"/[2]"store"/[3]"partition"/[4]"key"
+    String uri = "/" + TYPE_STORAGE + "/test-topic_v1/" + partition + "/" + keyString;
+    HttpRequest httpRequest = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, uri);
+    GetRouterRequest request =
+        GetRouterRequest.parseGetHttpRequest(httpRequest, RequestHelper.getRequestParts(URI.create(httpRequest.uri())));
+
+    StorageReadRequestHandler requestHandler = createStorageReadRequestHandler();
+    requestHandler.channelRead(context, request);
+
+    verify(context, times(1)).writeAndFlush(argumentCaptor.capture());
+    SingleGetResponseWrapper responseObject = (SingleGetResponseWrapper) argumentCaptor.getValue();
+    Assert.assertNull(responseObject.getValueRecord());
+    assertEquals(((AbstractReadResponseStats) responseObject.getStats()).getKeyNotFoundCount(), 1);
+  }
+
+  @Test
+  public void testMultiGetWithKeyNotFound() throws Exception {
+    int recordCount = 10;
+    int missingRecordCount = 3;
+    RecordSerializer<MultiGetRouterRequestKeyV1> serializer =
+        SerializerDeserializerFactory.getAvroGenericSerializer(MultiGetRouterRequestKeyV1.SCHEMA$);
+    List<MultiGetRouterRequestKeyV1> keys = new ArrayList<>();
+    String stringSchema = "\"string\"";
+    VeniceKafkaSerializer keySerializer = new VeniceAvroKafkaSerializer(stringSchema);
+
+    for (int i = 0; i < recordCount; ++i) {
+      MultiGetRouterRequestKeyV1 requestKey = new MultiGetRouterRequestKeyV1();
+      String keyString = "key_" + i;
+      byte[] keyBytes = keySerializer.serialize(null, keyString);
+      requestKey.keyBytes = ByteBuffer.wrap(keyBytes);
+      requestKey.keyIndex = i;
+      requestKey.partitionId = 0;
+
+      if (i < (recordCount - missingRecordCount)) {
+        String valueString = "value_" + i;
+        byte[] valueBytes = ValueRecord.create(1, valueString.getBytes()).serialize();
+        doReturn(valueBytes).when(storageEngine).get(eq(0), eq(requestKey.keyBytes));
+      } else {
+        doReturn(null).when(storageEngine).get(eq(0), eq(requestKey.keyBytes));
+      }
+      keys.add(requestKey);
+    }
+
+    String uri = "/" + TYPE_STORAGE + "/test-topic_v1";
+    FullHttpRequest httpRequest = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.POST, uri);
+    httpRequest.headers()
+        .set(
+            HttpConstants.VENICE_API_VERSION,
+            ReadAvroProtocolDefinition.MULTI_GET_ROUTER_REQUEST_V1.getProtocolVersion());
+    httpRequest.content().writeBytes(serializer.serializeObjects(keys));
+    MultiGetRouterRequestWrapper request = MultiGetRouterRequestWrapper
+        .parseMultiGetHttpRequest(httpRequest, RequestHelper.getRequestParts(URI.create(uri)));
+
+    StorageReadRequestHandler requestHandler = createStorageReadRequestHandler();
+    requestHandler.channelRead(context, request);
+
+    verify(context, timeout(1000).times(1)).writeAndFlush(argumentCaptor.capture());
+    MultiKeyResponseWrapper responseObject = (MultiKeyResponseWrapper) argumentCaptor.getValue();
+    assertEquals(((AbstractReadResponseStats) responseObject.getStats()).getKeyNotFoundCount(), missingRecordCount);
+  }
+
+  @Test
+  public void testComputeWithKeyNotFound() throws Exception {
+    int recordCount = 2;
+    int missingRecordCount = 1;
+
+    String valueSchemaStr = "{" + "  \"type\": \"record\"," + "  \"name\": \"User\"," + "  \"fields\": ["
+        + "    {\"name\": \"name\", \"type\": \"string\"}" + "  ]" + "}";
+    Schema valueSchema = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(valueSchemaStr);
+    SchemaEntry valueSchemaEntry = new SchemaEntry(1, valueSchema);
+    doReturn(valueSchemaEntry).when(schemaRepository).getValueSchema(any(), anyInt());
+
+    RecordSerializer<GenericRecord> valueSerializer =
+        SerializerDeserializerFactory.getAvroGenericSerializer(valueSchema);
+
+    String key1Str = "key_1";
+    ByteBuffer key1Bytes = ByteBuffer.wrap(key1Str.getBytes());
+    ComputeRouterRequestKeyV1 requestKey1 = new ComputeRouterRequestKeyV1(0, key1Bytes, 0);
+
+    String key2Str = "key_2";
+    ByteBuffer key2Bytes = ByteBuffer.wrap(key2Str.getBytes());
+    ComputeRouterRequestKeyV1 requestKey2 = new ComputeRouterRequestKeyV1(1, key2Bytes, 0);
+
+    List<ComputeRouterRequestKeyV1> keys = Arrays.asList(requestKey1, requestKey2);
+
+    GenericRecord value = new GenericData.Record(valueSchema);
+    value.put("name", "name_1");
+    byte[] valueBytes = ValueRecord.create(1, valueSerializer.serialize(value)).serialize();
+
+    byte[] key1BytesArray = key1Str.getBytes();
+
+    doAnswer(invocation -> {
+      byte[] bytes = invocation.getArgument(1);
+      if (Arrays.equals(bytes, key1BytesArray)) {
+        return valueBytes;
+      }
+      return null;
+    }).when(storageEngine).get(eq(0), any(byte[].class));
+
+    doAnswer(invocation -> {
+      byte[] bytes = invocation.getArgument(1);
+      if (Arrays.equals(bytes, key1BytesArray)) {
+        return ByteBuffer.wrap(valueBytes);
+      }
+      return null;
+    }).when(storageEngine).get(eq(0), any(byte[].class), any(ByteBuffer.class));
+
+    doAnswer(invocation -> {
+      ByteBuffer bb = invocation.getArgument(1);
+      if (bb != null && bb.equals(key1Bytes)) {
+        return valueBytes;
+      }
+      return null;
+    }).when(storageEngine).get(eq(0), any(ByteBuffer.class));
+
+    ComputeRequest computeRequest = new ComputeRequest();
+    computeRequest.setOperations(Collections.emptyList());
+    computeRequest.setResultSchemaStr(new org.apache.avro.util.Utf8(valueSchemaStr));
+
+    ComputeRouterRequestWrapper request = mock(ComputeRouterRequestWrapper.class);
+    doReturn(keys).when(request).getKeys();
+    doReturn(recordCount).when(request).getKeyCount();
+    doReturn("test-store_v1").when(request).getResourceName();
+    doReturn("test-store").when(request).getStoreName();
+    doReturn(RequestType.COMPUTE).when(request).getRequestType();
+    doReturn(computeRequest).when(request).getComputeRequest();
+    doReturn(1).when(request).getValueSchemaId();
+    doReturn(false).when(request).shouldRequestBeTerminatedEarly();
+    doReturn(false).when(request).isStreamingRequest();
+
+    StorageReadRequestHandler requestHandler = createStorageReadRequestHandler();
+    requestHandler.channelRead(context, request);
+
+    verify(context, timeout(1000).times(1)).writeAndFlush(argumentCaptor.capture());
+    MultiKeyResponseWrapper responseObject = (MultiKeyResponseWrapper) argumentCaptor.getValue();
+    assertEquals(((AbstractReadResponseStats) responseObject.getStats()).getKeyNotFoundCount(), missingRecordCount);
+  }
+
+  @Test
+  public void startKeyProfilingViaAdminApiThenStop() throws Exception {
+    String topic = "test_store_v1";
+    String storeName = "test_store";
+    int partition = 1;
+    int partitionCount = 4;
+
+    doReturn(store).when(storeRepository).getStoreOrThrow(storeName);
+    doReturn(partitionCount).when(store).getPartitionCount();
+    // The profiler resolves partition count via the targeted Version, not the Store-level default.
+    doReturn(partitionCount).when(version).getPartitionCount();
+
+    // Storage returns a hit for our key.
+    String keyString = "hot-key";
+    String valueString = "v";
+    int schemaId = 1;
+    byte[] valueBytes = ValueRecord.create(schemaId, valueString.getBytes()).serialize();
+    doReturn(valueBytes).when(storageEngine).get(partition, ByteBuffer.wrap(keyString.getBytes()));
+
+    StorageReadRequestHandler requestHandler = createStorageReadRequestHandler();
+    com.linkedin.venice.listener.profiler.KeyPartitionProfilerManager manager =
+        requestHandler.getKeyPartitionProfilerManager();
+    try {
+      // Step 1: send a KEY_PARTITION_PROFILER start request with duration=60s and topK=10.
+      String startUri = "/" + QueryAction.KEY_PARTITION_PROFILER.toString().toLowerCase() + "/" + topic
+          + "/start?duration=60&topK=10";
+      HttpRequest startHttp = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.POST, startUri);
+      com.linkedin.venice.listener.request.KeyPartitionProfilerRequest startReq =
+          com.linkedin.venice.listener.request.KeyPartitionProfilerRequest
+              .parseHttpRequest(startHttp, URI.create(startHttp.uri()));
+      requestHandler.channelRead(context, startReq);
+
+      verify(context, times(1)).writeAndFlush(argumentCaptor.capture());
+      AdminResponse startResp = (AdminResponse) argumentCaptor.getValue();
+      assertEquals(startResp.isError(), false, startResp.getMessage());
+      assertTrue(startResp.getMessage().contains("status=STARTED"), startResp.getMessage());
+      assertTrue(manager.isAnyProfilingActive(), "fast-path flag should flip after START");
+
+      // Step 2: send a handful of single-get reads that should all flow through the profiler.
+      reset(context);
+      ArgumentCaptor<Object> readCaptor = ArgumentCaptor.forClass(Object.class);
+      String getUri = "/" + TYPE_STORAGE + "/" + topic + "/" + partition + "/" + keyString;
+      for (int i = 0; i < 5; i++) {
+        HttpRequest getHttp = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, getUri);
+        GetRouterRequest getReq =
+            GetRouterRequest.parseGetHttpRequest(getHttp, RequestHelper.getRequestParts(URI.create(getHttp.uri())));
+        requestHandler.channelRead(context, getReq);
+      }
+      verify(context, times(5)).writeAndFlush(readCaptor.capture());
+
+      // Profiler should now show 5 requests, all in partition 1. The top-K Set isn't expected
+      // to have content here because all reads landed inside Phase 1 (warm-up) of a 60s
+      // session — top-K population is exercised in the unit tests where the profiler is
+      // constructed with a past startTimeMs.
+      com.linkedin.venice.listener.profiler.KeyPartitionProfiler profiler = manager.getProfiler(storeName);
+      assertTrue(profiler != null, "profiler should be active for " + storeName);
+      String json = profiler.toJson();
+      assertTrue(json.contains("\"totalRequests\":5"), json);
+      assertTrue(json.contains("\"partitionId\":1,\"count\":5"), json);
+
+      // Step 3: send a KEY_PARTITION_PROFILER stop request.
+      reset(context);
+      String stopUri = "/" + QueryAction.KEY_PARTITION_PROFILER.toString().toLowerCase() + "/" + topic + "/stop";
+      HttpRequest stopHttp = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.POST, stopUri);
+      com.linkedin.venice.listener.request.KeyPartitionProfilerRequest stopReq =
+          com.linkedin.venice.listener.request.KeyPartitionProfilerRequest
+              .parseHttpRequest(stopHttp, URI.create(stopHttp.uri()));
+      requestHandler.channelRead(context, stopReq);
+
+      ArgumentCaptor<Object> stopCaptor = ArgumentCaptor.forClass(Object.class);
+      verify(context, times(1)).writeAndFlush(stopCaptor.capture());
+      AdminResponse stopResp = (AdminResponse) stopCaptor.getValue();
+      assertEquals(stopResp.isError(), false, stopResp.getMessage());
+      assertTrue(stopResp.getMessage().contains("stopped active profiling session"), stopResp.getMessage());
+      assertTrue(!manager.isAnyProfilingActive(), "fast-path flag should clear after STOP");
+      assertNull(manager.getProfiler(storeName), null);
+    } finally {
+      manager.shutdown();
+    }
+  }
+
+  @Test
+  public void startKeyProfilingRejectsMissingDuration() throws Exception {
+    String topic = "test_store_v1";
+    StorageReadRequestHandler requestHandler = createStorageReadRequestHandler();
+    com.linkedin.venice.listener.profiler.KeyPartitionProfilerManager manager =
+        requestHandler.getKeyPartitionProfilerManager();
+    try {
+      String uri = "/" + QueryAction.KEY_PARTITION_PROFILER.toString().toLowerCase() + "/" + topic + "/start";
+      HttpRequest httpRequest = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.POST, uri);
+      com.linkedin.venice.listener.request.KeyPartitionProfilerRequest request =
+          com.linkedin.venice.listener.request.KeyPartitionProfilerRequest
+              .parseHttpRequest(httpRequest, URI.create(httpRequest.uri()));
+      requestHandler.channelRead(context, request);
+
+      verify(context, times(1)).writeAndFlush(argumentCaptor.capture());
+      AdminResponse response = (AdminResponse) argumentCaptor.getValue();
+      assertTrue(response.isError(), "missing duration should error");
+      assertTrue(response.getMessage().contains("duration"), response.getMessage());
+      assertTrue(!manager.isAnyProfilingActive(), "flag must not flip on rejection");
+    } finally {
+      manager.shutdown();
+    }
+  }
+
+  @Test
+  public void stopKeyProfilingWithNoActiveSessionReturnsError() throws Exception {
+    String topic = "test_store_v1";
+    StorageReadRequestHandler requestHandler = createStorageReadRequestHandler();
+    com.linkedin.venice.listener.profiler.KeyPartitionProfilerManager manager =
+        requestHandler.getKeyPartitionProfilerManager();
+    try {
+      String uri = "/" + QueryAction.KEY_PARTITION_PROFILER.toString().toLowerCase() + "/" + topic + "/stop";
+      HttpRequest httpRequest = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.POST, uri);
+      com.linkedin.venice.listener.request.KeyPartitionProfilerRequest request =
+          com.linkedin.venice.listener.request.KeyPartitionProfilerRequest
+              .parseHttpRequest(httpRequest, URI.create(httpRequest.uri()));
+      requestHandler.channelRead(context, request);
+
+      verify(context, times(1)).writeAndFlush(argumentCaptor.capture());
+      AdminResponse response = (AdminResponse) argumentCaptor.getValue();
+      assertTrue(response.isError(), "stop without active session should error");
+      assertTrue(response.getMessage().contains("no active profiling session"), response.getMessage());
+    } finally {
+      manager.shutdown();
+    }
   }
 
   private SchemaReader getMockSchemaReader(Schema keySchema, Schema valueSchema) {

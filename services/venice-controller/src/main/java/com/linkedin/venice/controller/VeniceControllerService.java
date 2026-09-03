@@ -16,7 +16,9 @@ import com.linkedin.venice.controller.lingeringjob.LingeringStoreVersionChecker;
 import com.linkedin.venice.controller.supersetschema.SupersetSchemaGenerator;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.kafka.protocol.KafkaMessageEnvelope;
+import com.linkedin.venice.meta.ValueSchemaCreatedListener;
 import com.linkedin.venice.pubsub.PubSubClientsFactory;
+import com.linkedin.venice.pubsub.PubSubPositionTypeRegistry;
 import com.linkedin.venice.pubsub.PubSubTopicRepository;
 import com.linkedin.venice.pubsub.api.PubSubMessageDeserializer;
 import com.linkedin.venice.schema.SchemaReader;
@@ -32,6 +34,7 @@ import io.tehuti.metrics.MetricsRepository;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.function.BiConsumer;
@@ -60,16 +63,23 @@ public class VeniceControllerService extends AbstractVeniceService {
       Optional<DynamicAccessController> accessController,
       Optional<AuthorizerService> authorizerService,
       D2Client d2Client,
+      Map<String, D2Client> d2Clients,
       Optional<ClientConfig> routerClientConfig,
       Optional<ICProvider> icProvider,
       Optional<SupersetSchemaGenerator> externalSupersetSchemaGenerator,
       PubSubTopicRepository pubSubTopicRepository,
-      PubSubClientsFactory pubSubClientsFactory) {
+      PubSubClientsFactory pubSubClientsFactory,
+      PubSubPositionTypeRegistry pubSubPositionTypeRegistry,
+      Optional<List<VeniceVersionLifecycleEventListener>> versionLifecycleEventListeners,
+      Optional<List<ValueSchemaCreatedListener>> valueSchemaCreatedListeners,
+      Optional<ExternalETLService> externalETLService) {
     this.multiClusterConfigs = multiClusterConfigs;
 
     DelegatingClusterLeaderInitializationRoutine initRoutineForPushJobDetailsSystemStore =
         new DelegatingClusterLeaderInitializationRoutine();
     DelegatingClusterLeaderInitializationRoutine initRoutineForHeartbeatSystemStore =
+        new DelegatingClusterLeaderInitializationRoutine();
+    DelegatingClusterLeaderInitializationRoutine initRoutineForParentControllerMetadataSystemStore =
         new DelegatingClusterLeaderInitializationRoutine();
 
     /**
@@ -80,6 +90,7 @@ public class VeniceControllerService extends AbstractVeniceService {
     if (!multiClusterConfigs.isParent()) {
       initRoutineForPushJobDetailsSystemStore.setAllowEmptyDelegateInitializationToSucceed();
       initRoutineForHeartbeatSystemStore.setAllowEmptyDelegateInitializationToSucceed();
+      initRoutineForParentControllerMetadataSystemStore.setAllowEmptyDelegateInitializationToSucceed();
     }
 
     VeniceHelixAdmin internalAdmin = new VeniceHelixAdmin(
@@ -87,12 +98,21 @@ public class VeniceControllerService extends AbstractVeniceService {
         metricsRepository,
         sslEnabled,
         d2Client,
+        d2Clients,
         sslConfig,
         accessController,
+        authorizerService,
         icProvider,
         pubSubTopicRepository,
         pubSubClientsFactory,
-        Arrays.asList(initRoutineForPushJobDetailsSystemStore, initRoutineForHeartbeatSystemStore));
+        pubSubPositionTypeRegistry,
+        Arrays.asList(
+            initRoutineForPushJobDetailsSystemStore,
+            initRoutineForHeartbeatSystemStore,
+            initRoutineForParentControllerMetadataSystemStore),
+        versionLifecycleEventListeners,
+        valueSchemaCreatedListeners,
+        externalETLService);
 
     if (multiClusterConfigs.isParent()) {
       this.admin = new VeniceParentHelixAdmin(
@@ -107,7 +127,9 @@ public class VeniceControllerService extends AbstractVeniceService {
           externalSupersetSchemaGenerator,
           pubSubTopicRepository,
           initRoutineForPushJobDetailsSystemStore,
-          initRoutineForHeartbeatSystemStore);
+          initRoutineForHeartbeatSystemStore,
+          initRoutineForParentControllerMetadataSystemStore,
+          metricsRepository);
       LOGGER.info("Controller works as a parent controller.");
     } else {
       this.admin = internalAdmin;
@@ -133,10 +155,12 @@ public class VeniceControllerService extends AbstractVeniceService {
      * consumes the admin topics.
      */
     String systemClusterName = multiClusterConfigs.getSystemSchemaClusterName();
-    VeniceControllerConfig systemStoreClusterConfig = multiClusterConfigs.getControllerConfig(systemClusterName);
+    VeniceControllerClusterConfig systemStoreClusterConfig = multiClusterConfigs.getControllerConfig(systemClusterName);
     newSchemaEncountered = (schemaId, schema) -> {
       LOGGER.info("Encountered a new KME value schema (id = {}), proceed to register", schemaId);
       try {
+        Optional<D2Client> regionD2Client =
+            Optional.ofNullable(d2Clients == null ? null : d2Clients.get(systemStoreClusterConfig.getRegionName()));
         ControllerClientBackedSystemSchemaInitializer schemaInitializer =
             new ControllerClientBackedSystemSchemaInitializer(
                 AvroProtocolDefinition.KAFKA_MESSAGE_ENVELOPE,
@@ -147,6 +171,7 @@ public class VeniceControllerService extends AbstractVeniceService {
                 ((VeniceHelixAdmin) admin).getSslFactory(),
                 systemStoreClusterConfig.getChildControllerUrl(systemStoreClusterConfig.getRegionName()),
                 systemStoreClusterConfig.getChildControllerD2ServiceName(),
+                regionD2Client,
                 systemStoreClusterConfig.getChildControllerD2ZkHost(systemStoreClusterConfig.getRegionName()),
                 systemStoreClusterConfig.isControllerEnforceSSLOnly());
 
@@ -170,17 +195,23 @@ public class VeniceControllerService extends AbstractVeniceService {
     PubSubMessageDeserializer pubSubMessageDeserializer = new PubSubMessageDeserializer(
         kafkaValueSerializer,
         new LandFillObjectPool<>(KafkaMessageEnvelope::new),
-        new LandFillObjectPool<>(KafkaMessageEnvelope::new));
+        new LandFillObjectPool<>(KafkaMessageEnvelope::new),
+        systemStoreClusterConfig.isProducerTimestampFallbackEnabled());
     for (String cluster: multiClusterConfigs.getClusters()) {
-      AdminConsumerService adminConsumerService = new AdminConsumerService(
-          internalAdmin,
-          multiClusterConfigs.getControllerConfig(cluster),
-          metricsRepository,
-          pubSubTopicRepository,
-          pubSubMessageDeserializer);
-      this.consumerServicesByClusters.put(cluster, adminConsumerService);
+      VeniceControllerClusterConfig clusterConfig = multiClusterConfigs.getControllerConfig(cluster);
+      if (clusterConfig.isMultiRegion()) {
+        // Enable admin channel consumption only for multi-region setups
+        AdminConsumerService adminConsumerService = new AdminConsumerService(
+            internalAdmin,
+            clusterConfig,
+            metricsRepository,
+            pubSubClientsFactory.getConsumerAdapterFactory(),
+            pubSubTopicRepository,
+            pubSubMessageDeserializer);
+        this.consumerServicesByClusters.put(cluster, adminConsumerService);
 
-      this.admin.setAdminConsumerService(cluster, adminConsumerService);
+        this.admin.setAdminConsumerService(cluster, adminConsumerService);
+      }
     }
 
   }
@@ -209,7 +240,9 @@ public class VeniceControllerService extends AbstractVeniceService {
   public boolean startInner() {
     for (String clusterName: multiClusterConfigs.getClusters()) {
       admin.initStorageCluster(clusterName);
-      consumerServicesByClusters.get(clusterName).start();
+      if (multiClusterConfigs.isMultiRegion()) {
+        consumerServicesByClusters.get(clusterName).start();
+      }
       LOGGER.info("started cluster: {}", clusterName);
     }
     LOGGER.info("Started Venice controller.");
@@ -226,10 +259,12 @@ public class VeniceControllerService extends AbstractVeniceService {
       // We don't need to lock resources here, as we will acquire the lock during the ST leader->standby, which would
       // prevent the partial updates.
       admin.stop(clusterName);
-      try {
-        consumerServicesByClusters.get(clusterName).stop();
-      } catch (Exception e) {
-        LOGGER.error("Got exception when stop AdminConsumerService", e);
+      if (multiClusterConfigs.isMultiRegion()) {
+        try {
+          consumerServicesByClusters.get(clusterName).stop();
+        } catch (Exception e) {
+          LOGGER.error("Got exception when stop AdminConsumerService", e);
+        }
       }
       LOGGER.info("Stopped cluster: {}", clusterName);
     }

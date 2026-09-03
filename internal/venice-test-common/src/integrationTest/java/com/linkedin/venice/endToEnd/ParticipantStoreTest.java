@@ -1,9 +1,5 @@
 package com.linkedin.venice.endToEnd;
 
-import static com.linkedin.venice.ConfigKeys.ADMIN_HELIX_MESSAGING_CHANNEL_ENABLED;
-import static com.linkedin.venice.ConfigKeys.PARTICIPANT_MESSAGE_CONSUMPTION_DELAY_MS;
-import static com.linkedin.venice.ConfigKeys.PARTICIPANT_MESSAGE_STORE_ENABLED;
-import static com.linkedin.venice.ConfigKeys.TOPIC_CLEANUP_SLEEP_INTERVAL_BETWEEN_TOPIC_LIST_FETCH_MS;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNotNull;
@@ -11,8 +7,7 @@ import static org.testng.Assert.assertNull;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.fail;
 
-import com.linkedin.d2.balancer.D2Client;
-import com.linkedin.venice.D2.D2ClientUtils;
+import com.linkedin.venice.ConfigKeys;
 import com.linkedin.venice.client.store.AvroSpecificStoreClient;
 import com.linkedin.venice.client.store.ClientConfig;
 import com.linkedin.venice.client.store.ClientFactory;
@@ -21,16 +16,13 @@ import com.linkedin.venice.controllerapi.ControllerClient;
 import com.linkedin.venice.controllerapi.ControllerResponse;
 import com.linkedin.venice.controllerapi.VersionCreationResponse;
 import com.linkedin.venice.exceptions.VeniceException;
-import com.linkedin.venice.integration.utils.D2TestUtils;
 import com.linkedin.venice.integration.utils.ServiceFactory;
 import com.linkedin.venice.integration.utils.VeniceClusterWrapper;
-import com.linkedin.venice.integration.utils.VeniceControllerCreateOptions;
-import com.linkedin.venice.integration.utils.VeniceControllerWrapper;
+import com.linkedin.venice.integration.utils.VeniceMultiRegionClusterCreateOptions;
 import com.linkedin.venice.integration.utils.VeniceRouterWrapper;
 import com.linkedin.venice.integration.utils.VeniceServerWrapper;
-import com.linkedin.venice.integration.utils.ZkServerWrapper;
-import com.linkedin.venice.meta.Store;
-import com.linkedin.venice.meta.StoreDataChangedListener;
+import com.linkedin.venice.integration.utils.VeniceTwoLayerMultiRegionMultiClusterWrapper;
+import com.linkedin.venice.meta.OfflinePushStrategy;
 import com.linkedin.venice.meta.StoreInfo;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.meta.VersionStatus;
@@ -46,7 +38,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.commons.io.IOUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -58,48 +49,38 @@ import org.testng.annotations.Test;
 public class ParticipantStoreTest {
   private static final Logger LOGGER = LogManager.getLogger(ParticipantStoreTest.class);
 
-  private VeniceClusterWrapper veniceClusterWrapper;
-  private VeniceControllerWrapper parentController;
-  private ZkServerWrapper parentZk;
+  private VeniceTwoLayerMultiRegionMultiClusterWrapper venice;
+  private VeniceClusterWrapper veniceLocalCluster;
+  private VeniceServerWrapper veniceServerWrapper;
+
   private ControllerClient controllerClient;
   private ControllerClient parentControllerClient;
   private String participantMessageStoreName;
-  private VeniceServerWrapper veniceServerWrapper;
-  private D2Client d2Client;
+  private String clusterName;
 
   @BeforeClass
   public void setUp() {
-    Properties controllerConfig = new Properties();
-    Properties serverFeatureProperties = new Properties();
-    Properties serverProperties = new Properties();
-    controllerConfig.setProperty(PARTICIPANT_MESSAGE_STORE_ENABLED, "true");
-    controllerConfig.setProperty(ADMIN_HELIX_MESSAGING_CHANNEL_ENABLED, "false");
-    // Disable topic cleanup since parent and child are sharing the same kafka cluster.
-    controllerConfig
-        .setProperty(TOPIC_CLEANUP_SLEEP_INTERVAL_BETWEEN_TOPIC_LIST_FETCH_MS, String.valueOf(Long.MAX_VALUE));
-    veniceClusterWrapper = ServiceFactory.getVeniceCluster(1, 0, 1, 1, 100000, false, false, controllerConfig);
-    d2Client = D2TestUtils.getAndStartD2Client(veniceClusterWrapper.getZk().getAddress());
-    serverFeatureProperties.put(
-        VeniceServerWrapper.CLIENT_CONFIG_FOR_CONSUMER,
-        ClientConfig.defaultGenericClientConfig("")
-            .setD2ServiceName(VeniceRouterWrapper.CLUSTER_DISCOVERY_D2_SERVICE_NAME)
-            .setD2Client(d2Client));
-    serverProperties.setProperty(PARTICIPANT_MESSAGE_CONSUMPTION_DELAY_MS, Long.toString(100));
-    veniceServerWrapper = veniceClusterWrapper.addVeniceServer(serverFeatureProperties, serverProperties);
-    parentZk = ServiceFactory.getZkServer();
-    parentController = ServiceFactory.getVeniceController(
-        new VeniceControllerCreateOptions.Builder(
-            veniceClusterWrapper.getClusterName(),
-            parentZk,
-            veniceClusterWrapper.getPubSubBrokerWrapper())
-                .childControllers(veniceClusterWrapper.getVeniceControllers().toArray(new VeniceControllerWrapper[0]))
-                .extraProperties(controllerConfig)
-                .build());
-    participantMessageStoreName =
-        VeniceSystemStoreUtils.getParticipantStoreNameForCluster(veniceClusterWrapper.getClusterName());
-    controllerClient = veniceClusterWrapper.getControllerClient();
-    parentControllerClient =
-        new ControllerClient(veniceClusterWrapper.getClusterName(), parentController.getControllerUrl());
+    Properties controllerProperties = new Properties();
+    controllerProperties
+        .setProperty(ConfigKeys.DEFAULT_OFFLINE_PUSH_STRATEGY, OfflinePushStrategy.WAIT_ALL_REPLICAS.name());
+    venice = ServiceFactory.getVeniceTwoLayerMultiRegionMultiClusterWrapper(
+        new VeniceMultiRegionClusterCreateOptions.Builder().numberOfRegions(1)
+            .numberOfClusters(1)
+            .numberOfParentControllers(1)
+            .numberOfChildControllers(1)
+            .numberOfServers(1)
+            .numberOfRouters(1)
+            .replicationFactor(1)
+            .parentControllerProperties(controllerProperties)
+            .childControllerProperties(controllerProperties)
+            .build());
+    clusterName = venice.getClusterNames()[0];
+    participantMessageStoreName = VeniceSystemStoreUtils.getParticipantStoreNameForCluster(clusterName);
+    veniceLocalCluster = venice.getChildRegions().get(0).getClusters().get(clusterName);
+    veniceServerWrapper = veniceLocalCluster.getVeniceServers().get(0);
+
+    controllerClient = new ControllerClient(clusterName, veniceLocalCluster.getAllControllersURLs());
+    parentControllerClient = new ControllerClient(clusterName, venice.getControllerConnectString());
     TestUtils.waitForNonDeterministicPushCompletion(
         Version.composeKafkaTopic(participantMessageStoreName, 1),
         controllerClient,
@@ -111,15 +92,10 @@ public class ParticipantStoreTest {
   public void cleanUp() {
     Utils.closeQuietlyWithErrorLogged(controllerClient);
     Utils.closeQuietlyWithErrorLogged(parentControllerClient);
-    Utils.closeQuietlyWithErrorLogged(parentController);
-    if (d2Client != null) {
-      D2ClientUtils.shutdownClient(d2Client);
-    }
-    IOUtils.closeQuietly(veniceClusterWrapper);
-    IOUtils.closeQuietly(parentZk);
+    IOUtils.closeQuietly(venice);
   }
 
-  // @Test(timeOut = 60 * Time.MS_PER_SECOND)
+  @Test(timeOut = 60 * Time.MS_PER_SECOND)
   // TODO: killed_push_jobs_count seems to be a broken metric in L/F (at least for participant stores)
   public void testParticipantStoreKill() {
     VersionCreationResponse versionCreationResponse = getNewStoreVersion(parentControllerClient, true);
@@ -129,35 +105,49 @@ public class ParticipantStoreTest {
       // Verify the push job is STARTED.
       assertEquals(controllerClient.queryJobStatus(topicName).getStatus(), ExecutionStatus.STARTED.toString());
     });
-    String metricPrefix = "." + veniceClusterWrapper.getClusterName() + "-participant_store_consumption_task";
-    double killedPushJobCount = veniceClusterWrapper.getVeniceServers()
+    String metricPrefix = "." + clusterName + "-participant_store_consumption_task";
+    // Capture initial metric value (may be > 0 if other tests ran before)
+    double initialKilledPushJobCount = veniceLocalCluster.getVeniceServers()
         .iterator()
         .next()
         .getMetricsRepository()
         .metrics()
         .get(metricPrefix + "--killed_push_jobs.Count")
         .value();
-    assertEquals(killedPushJobCount, 0.0);
     ControllerResponse response = parentControllerClient.killOfflinePushJob(topicName);
     assertFalse(response.isError());
     verifyKillMessageInParticipantStore(topicName, true);
-    TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, true, () -> {
+    String requestMetricExample =
+        VeniceSystemStoreUtils.getParticipantStoreNameForCluster(clusterName) + "--success_request_key_count.Avg";
+    TestUtils.waitForNonDeterministicAssertion(60, TimeUnit.SECONDS, true, () -> {
       // Poll job status to verify the job is indeed killed
       assertEquals(controllerClient.queryJobStatus(topicName).getStatus(), ExecutionStatus.ERROR.toString());
+
+      // Verify participant store consumption stats
+      // (not sure why these are flaky, but they are, so we're putting them in the non-deterministic assertion loop...)
+      VeniceServerWrapper serverWrapper = veniceLocalCluster.getVeniceServers().iterator().next();
+      Map<String, ? extends Metric> serverMetrics = serverWrapper.getMetricsRepository().metrics();
+      // Verify the metric increased by exactly 1.0 (delta-based checking for test isolation)
+      assertEquals(
+          getMetric(serverMetrics, metricPrefix + "--killed_push_jobs.Count").value(),
+          initialKilledPushJobCount + 1.0);
+      assertTrue(getMetric(serverMetrics, metricPrefix + "--kill_push_job_latency.Avg").value() > 0);
+
+      // Client metrics are in a separate metrics repository (cloned for participant store client)
+      Map<String, ? extends Metric> clientMetrics = serverWrapper.getVeniceServer()
+          .getKafkaStoreIngestionService()
+          .getParticipantStoreConsumptionTask()
+          .getClientConfig()
+          .getMetricsRepository()
+          .metrics();
+      assertTrue(getMetric(clientMetrics, ".venice-client_" + requestMetricExample).value() > 0);
     });
-    // Verify participant store consumption stats
-    String requestMetricExample =
-        VeniceSystemStoreUtils.getParticipantStoreNameForCluster(veniceClusterWrapper.getClusterName())
-            + "--success_request_key_count.Avg";
-    Map<String, ? extends Metric> metrics =
-        veniceClusterWrapper.getVeniceServers().iterator().next().getMetricsRepository().metrics();
-    assertEquals(metrics.get(metricPrefix + "--killed_push_jobs.Count").value(), 1.0);
-    assertTrue(metrics.get(metricPrefix + "--kill_push_job_latency.Avg").value() > 0);
-    // One from the server stats and the other from the client stats.
-    assertTrue(metrics.get("." + requestMetricExample).value() > 0);
-    // "." will be replaced by "_" in AbstractVeniceStats constructor to ensure Tahuti is able to parse metric name by
-    // ".".
-    assertTrue(metrics.get(".venice-client_" + requestMetricExample).value() > 0);
+  }
+
+  private static Metric getMetric(Map<String, ? extends Metric> metrics, String name) {
+    Metric metric = metrics.get(name);
+    assertNotNull(metric, "Metric '" + name + "' was not found!");
+    return metric;
   }
 
   @Test(timeOut = 60 * Time.MS_PER_SECOND)
@@ -178,10 +168,7 @@ public class ParticipantStoreTest {
     });
 
     // restart routers to discard in-memory throttler info
-    for (VeniceRouterWrapper router: veniceClusterWrapper.getVeniceRouters()) {
-      veniceClusterWrapper.stopVeniceRouter(router.getPort());
-      veniceClusterWrapper.restartVeniceRouter(router.getPort());
-    }
+    veniceLocalCluster.stopAndRestartAllVeniceRouters();
     // Verify still can read from participant stores.
     ParticipantMessageKey key = new ParticipantMessageKey();
     key.resourceName = topicName;
@@ -189,7 +176,7 @@ public class ParticipantStoreTest {
     try (AvroSpecificStoreClient<ParticipantMessageKey, ParticipantMessageValue> client =
         ClientFactory.getAndStartSpecificAvroClient(
             ClientConfig.defaultSpecificClientConfig(participantMessageStoreName, ParticipantMessageValue.class)
-                .setVeniceURL(veniceClusterWrapper.getRandomRouterURL()))) {
+                .setVeniceURL(veniceLocalCluster.getRandomRouterURL()))) {
       try {
         client.get(key).get();
       } catch (Exception e) {
@@ -241,21 +228,21 @@ public class ParticipantStoreTest {
     // Then we could verify whether the previous version receives a kill-job or not.
     verifyKillMessageInParticipantStore(topicNameForOnlineVersion, false);
 
-    veniceClusterWrapper.stopVeniceServer(veniceServerWrapper.getPort());
+    veniceLocalCluster.stopVeniceServer(veniceServerWrapper.getPort());
     // Ensure the partition assignment is 0 before restarting the server
     TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, true, true, () -> {
-      VeniceRouterWrapper routerWrapper = veniceClusterWrapper.getRandomVeniceRouter();
+      VeniceRouterWrapper routerWrapper = veniceLocalCluster.getRandomVeniceRouter();
       assertFalse(routerWrapper.getRoutingDataRepository().containsKafkaTopic(topicNameForOnlineVersion));
 
     });
 
-    veniceClusterWrapper.restartVeniceServer(veniceServerWrapper.getPort());
+    veniceLocalCluster.restartVeniceServer(veniceServerWrapper.getPort());
     int expectedOnlineReplicaCount = versionCreationResponseForOnlineVersion.getReplicas();
     TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, () -> {
       for (int p = 0; p < versionCreationResponseForOnlineVersion.getPartitions(); p++) {
         try {
           assertEquals(
-              veniceClusterWrapper.getRandomVeniceRouter()
+              veniceLocalCluster.getRandomVeniceRouter()
                   .getRoutingDataRepository()
                   .getReadyToServeInstances(topicNameForOnlineVersion, p)
                   .size(),
@@ -284,40 +271,6 @@ public class ParticipantStoreTest {
     verifyKillMessageInParticipantStore(topicNameForOnlineVersion, true);
   }
 
-  static class TestListener implements StoreDataChangedListener {
-    AtomicInteger creationCount = new AtomicInteger(0);
-    AtomicInteger changeCount = new AtomicInteger(0);
-    AtomicInteger deletionCount = new AtomicInteger(0);
-
-    @Override
-    public void handleStoreCreated(Store store) {
-      creationCount.incrementAndGet();
-    }
-
-    @Override
-    public void handleStoreDeleted(String storeName) {
-      deletionCount.incrementAndGet();
-    }
-
-    @Override
-    public void handleStoreChanged(Store store) {
-      LOGGER.info("Received handleStoreChanged: {}", store);
-      changeCount.incrementAndGet();
-    }
-
-    public int getCreationCount() {
-      return creationCount.get();
-    }
-
-    public int getChangeCount() {
-      return changeCount.get();
-    }
-
-    public int getDeletionCount() {
-      return deletionCount.get();
-    }
-  }
-
   private void verifyKillMessageInParticipantStore(String topic, boolean shouldPresent) {
     // Verify the kill push message is in the participant message store.
     ParticipantMessageKey key = new ParticipantMessageKey();
@@ -326,7 +279,7 @@ public class ParticipantStoreTest {
     try (AvroSpecificStoreClient<ParticipantMessageKey, ParticipantMessageValue> client =
         ClientFactory.getAndStartSpecificAvroClient(
             ClientConfig.defaultSpecificClientConfig(participantMessageStoreName, ParticipantMessageValue.class)
-                .setVeniceURL(veniceClusterWrapper.getRandomRouterURL()))) {
+                .setVeniceURL(veniceLocalCluster.getRandomRouterURL()))) {
       TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, true, () -> {
         try {
           if (shouldPresent) {

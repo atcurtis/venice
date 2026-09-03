@@ -1,7 +1,10 @@
 package com.linkedin.venice;
 
 import static com.linkedin.venice.kafka.protocol.enums.MessageType.PUT;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -24,14 +27,21 @@ import com.linkedin.venice.kafka.protocol.Put;
 import com.linkedin.venice.kafka.protocol.enums.ControlMessageType;
 import com.linkedin.venice.kafka.protocol.enums.MessageType;
 import com.linkedin.venice.message.KafkaKey;
+import com.linkedin.venice.meta.PartitionerConfig;
 import com.linkedin.venice.meta.StoreInfo;
-import com.linkedin.venice.meta.Version;
+import com.linkedin.venice.partitioner.DefaultVenicePartitioner;
 import com.linkedin.venice.pubsub.ImmutablePubSubMessage;
+import com.linkedin.venice.pubsub.PubSubPositionDeserializer;
 import com.linkedin.venice.pubsub.PubSubTopicPartitionImpl;
 import com.linkedin.venice.pubsub.PubSubTopicRepository;
+import com.linkedin.venice.pubsub.PubSubUtil;
+import com.linkedin.venice.pubsub.adapter.kafka.common.ApacheKafkaOffsetPosition;
 import com.linkedin.venice.pubsub.adapter.kafka.consumer.ApacheKafkaConsumerAdapter;
-import com.linkedin.venice.pubsub.api.PubSubMessage;
+import com.linkedin.venice.pubsub.api.DefaultPubSubMessage;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
+import com.linkedin.venice.pubsub.api.PubSubSymbolicPosition;
 import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
+import com.linkedin.venice.utils.Utils;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -50,27 +60,27 @@ public class TestAdminToolConsumption {
   @Test
   void testAdminToolAdminMessageConsumption() {
     int assignedPartition = 0;
-    String topic = Version.composeRealTimeTopic(STORE_NAME);
+    String topic = Utils.composeRealTimeTopic(STORE_NAME);
     PubSubTopicPartition pubSubTopicPartition =
         new PubSubTopicPartitionImpl(pubSubTopicRepository.getTopic(topic), assignedPartition);
     int adminMessageNum = 10;
     int dumpedMessageNum = 2;
-    List<PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long>> pubSubMessageList =
+    List<DefaultPubSubMessage> pubSubMessageList =
         prepareAdminPubSubMessageList(STORE_NAME, pubSubTopicPartition, adminMessageNum);
-    Map<PubSubTopicPartition, List<PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long>>> messagesMap = new HashMap<>();
+    Map<PubSubTopicPartition, List<DefaultPubSubMessage>> messagesMap = new HashMap<>();
     messagesMap.put(pubSubTopicPartition, pubSubMessageList);
     ApacheKafkaConsumerAdapter apacheKafkaConsumer = mock(ApacheKafkaConsumerAdapter.class);
     when(apacheKafkaConsumer.poll(anyLong())).thenReturn(messagesMap, Collections.EMPTY_MAP);
-    List<DumpAdminMessages.AdminOperationInfo> adminOperationInfos =
-        DumpAdminMessages.dumpAdminMessages(apacheKafkaConsumer, "cluster1", 0, dumpedMessageNum);
-    Assert.assertEquals(adminOperationInfos.size(), dumpedMessageNum);
+    int processedCount = DumpAdminMessages
+        .dumpAdminMessages(apacheKafkaConsumer, "cluster1", ApacheKafkaOffsetPosition.of(0L), dumpedMessageNum);
+    Assert.assertEquals(processedCount, dumpedMessageNum);
   }
 
-  private List<PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long>> prepareAdminPubSubMessageList(
+  private List<DefaultPubSubMessage> prepareAdminPubSubMessageList(
       String storeName,
       PubSubTopicPartition pubSubTopicPartition,
       int messageNum) {
-    List<PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long>> pubSubMessageList = new ArrayList<>();
+    List<DefaultPubSubMessage> pubSubMessageList = new ArrayList<>();
     for (int i = 0; i < messageNum; i++) {
       String keyString = "test";
       byte[] serializedKey = TopicMessageFinder.serializeKey(keyString, SCHEMA_STRING);
@@ -98,35 +108,78 @@ public class TestAdminToolConsumption {
       adminMessage.operationType = AdminMessageType.STORE_CREATION.getValue();
       adminMessage.payloadUnion = storeCreation;
       adminMessage.executionId = 1;
-      deserializer.serialize(adminMessage);
-      byte[] putValueBytes = deserializer.serialize(adminMessage);
+      byte[] putValueBytes =
+          deserializer.serialize(adminMessage, AdminOperationSerializer.LATEST_SCHEMA_ID_FOR_ADMIN_OPERATION);
       put.putValue = ByteBuffer.wrap(putValueBytes);
       put.replicationMetadataPayload = ByteBuffer.allocate(0);
       messageEnvelope.payloadUnion = put;
-      PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> pubSubMessage =
-          new ImmutablePubSubMessage<>(kafkaKey, messageEnvelope, pubSubTopicPartition, 0, 0, 20);
+      DefaultPubSubMessage pubSubMessage = new ImmutablePubSubMessage(
+          kafkaKey,
+          messageEnvelope,
+          pubSubTopicPartition,
+          ApacheKafkaOffsetPosition.of(0),
+          0,
+          20);
       pubSubMessageList.add(pubSubMessage);
     }
     return pubSubMessageList;
   }
 
   @Test
-  public void testAdminToolConsumption() {
+  void testDumpAdminMessagesRetriesOnInitialEmptyPolls() {
+    int assignedPartition = 0;
+    String topic = Utils.composeRealTimeTopic(STORE_NAME);
+    PubSubTopicPartition pubSubTopicPartition =
+        new PubSubTopicPartitionImpl(pubSubTopicRepository.getTopic(topic), assignedPartition);
+    List<DefaultPubSubMessage> pubSubMessageList = prepareAdminPubSubMessageList(STORE_NAME, pubSubTopicPartition, 5);
+    Map<PubSubTopicPartition, List<DefaultPubSubMessage>> messagesMap = new HashMap<>();
+    messagesMap.put(pubSubTopicPartition, pubSubMessageList);
 
-    String topic = Version.composeRealTimeTopic(STORE_NAME);
+    // Simulate Xinfra consumer warmup: first 3 polls return empty, then data arrives
+    ApacheKafkaConsumerAdapter consumer = mock(ApacheKafkaConsumerAdapter.class);
+    when(consumer.poll(anyLong())).thenReturn(
+        Collections.emptyMap(), // poll 1: empty (warmup)
+        Collections.emptyMap(), // poll 2: empty (warmup)
+        Collections.emptyMap(), // poll 3: empty (warmup)
+        messagesMap, // poll 4: data arrives
+        Collections.emptyMap()); // poll 5: end of topic
+
+    int processedCount = DumpAdminMessages.dumpAdminMessages(consumer, "cluster1", ApacheKafkaOffsetPosition.of(0L), 5);
+    Assert.assertEquals(processedCount, 5, "Should process all messages after initial empty polls during warmup");
+  }
+
+  @Test
+  void testDumpAdminMessagesStopsAfterExhaustingRetries() {
+    // All polls return empty — should stop after INITIAL_EMPTY_POLL_RETRIES
+    ApacheKafkaConsumerAdapter consumer = mock(ApacheKafkaConsumerAdapter.class);
+    when(consumer.poll(anyLong())).thenReturn(Collections.emptyMap());
+
+    int processedCount =
+        DumpAdminMessages.dumpAdminMessages(consumer, "cluster1", ApacheKafkaOffsetPosition.of(0L), 100);
+    Assert.assertEquals(processedCount, 0, "Should process 0 messages when topic is empty");
+  }
+
+  @Test
+  public void testAdminToolConsumption() {
     ControllerClient controllerClient = mock(ControllerClient.class);
     SchemaResponse schemaResponse = mock(SchemaResponse.class);
     when(schemaResponse.getSchemaStr()).thenReturn(SCHEMA_STRING);
     when(controllerClient.getKeySchema(STORE_NAME)).thenReturn(schemaResponse);
     StoreResponse storeResponse = mock(StoreResponse.class);
-    StoreInfo storeInfo = mock(StoreInfo.class);
+    StoreInfo storeInfo = mock(StoreInfo.class, RETURNS_DEEP_STUBS);
     when(storeInfo.getPartitionCount()).thenReturn(2);
     when(controllerClient.getStore(STORE_NAME)).thenReturn(storeResponse);
     when(storeResponse.getStore()).thenReturn(storeInfo);
+    when(storeInfo.getHybridStoreConfig().getRealTimeTopicName()).thenReturn(Utils.composeRealTimeTopic(STORE_NAME));
+    PartitionerConfig partitionerConfig = mock(PartitionerConfig.class);
+    when(storeInfo.getPartitionerConfig()).thenReturn(partitionerConfig);
+    when(partitionerConfig.getPartitionerClass()).thenReturn(DefaultVenicePartitioner.class.getName());
+    when(partitionerConfig.getPartitionerParams()).thenReturn(new HashMap<>());
+    String topic = storeInfo.getHybridStoreConfig().getRealTimeTopicName();
 
     int assignedPartition = 0;
-    long startOffset = 0;
-    long endOffset = 1;
+    ApacheKafkaOffsetPosition startPosition = ApacheKafkaOffsetPosition.of(0L);
+    ApacheKafkaOffsetPosition endPosition = ApacheKafkaOffsetPosition.of(1L);
     long progressInterval = 1;
     String keyString = "test";
     byte[] serializedKey = TopicMessageFinder.serializeKey(keyString, SCHEMA_STRING);
@@ -153,11 +206,21 @@ public class TestAdminToolConsumption {
     messageEnvelope2.payloadUnion = delete;
     PubSubTopicPartition pubSubTopicPartition =
         new PubSubTopicPartitionImpl(pubSubTopicRepository.getTopic(topic), assignedPartition);
-    PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> pubSubMessage1 =
-        new ImmutablePubSubMessage<>(kafkaKey, messageEnvelope, pubSubTopicPartition, 0, 0, 20);
-    PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> pubSubMessage2 =
-        new ImmutablePubSubMessage<>(kafkaKey, messageEnvelope2, pubSubTopicPartition, 1, 0, 10);
-    KafkaKey kafkaControlMessageKey = new KafkaKey(MessageType.CONTROL_MESSAGE, null);
+    DefaultPubSubMessage pubSubMessage1 = new ImmutablePubSubMessage(
+        kafkaKey,
+        messageEnvelope,
+        pubSubTopicPartition,
+        ApacheKafkaOffsetPosition.of(0),
+        0,
+        20);
+    DefaultPubSubMessage pubSubMessage2 = new ImmutablePubSubMessage(
+        kafkaKey,
+        messageEnvelope2,
+        pubSubTopicPartition,
+        ApacheKafkaOffsetPosition.of(1),
+        0,
+        10);
+    KafkaKey kafkaControlMessageKey = new KafkaKey(MessageType.CONTROL_MESSAGE, new byte[0]);
     EndOfPush endOfPush = new EndOfPush();
     KafkaMessageEnvelope kafkaMessageEnvelope = new KafkaMessageEnvelope();
     kafkaMessageEnvelope.messageType = MessageType.CONTROL_MESSAGE.getValue();
@@ -170,47 +233,80 @@ public class TestAdminToolConsumption {
     kafkaMessageEnvelope.producerMetadata.messageSequenceNumber = 0;
     kafkaMessageEnvelope.producerMetadata.segmentNumber = 0;
     kafkaMessageEnvelope.producerMetadata.producerGUID = new GUID();
-    PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> pubSubMessage3 =
-        new ImmutablePubSubMessage<>(kafkaControlMessageKey, kafkaMessageEnvelope, pubSubTopicPartition, 2, 0, 20);
+    DefaultPubSubMessage pubSubMessage3 = new ImmutablePubSubMessage(
+        kafkaControlMessageKey,
+        kafkaMessageEnvelope,
+        pubSubTopicPartition,
+        ApacheKafkaOffsetPosition.of(2),
+        0,
+        20);
 
-    List<PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long>> pubSubMessageList = new ArrayList<>();
+    List<DefaultPubSubMessage> pubSubMessageList = new ArrayList<>();
     pubSubMessageList.add(pubSubMessage1);
     pubSubMessageList.add(pubSubMessage2);
     pubSubMessageList.add(pubSubMessage3);
-    Map<PubSubTopicPartition, List<PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long>>> messagesMap = new HashMap<>();
+    Map<PubSubTopicPartition, List<DefaultPubSubMessage>> messagesMap = new HashMap<>();
     messagesMap.put(pubSubTopicPartition, pubSubMessageList);
     ApacheKafkaConsumerAdapter apacheKafkaConsumer = mock(ApacheKafkaConsumerAdapter.class);
     when(apacheKafkaConsumer.poll(anyLong())).thenReturn(messagesMap, Collections.EMPTY_MAP);
     long startTimestamp = 10;
     long endTimestamp = 20;
-    when(apacheKafkaConsumer.offsetForTime(pubSubTopicPartition, startTimestamp)).thenReturn(startOffset);
-    when(apacheKafkaConsumer.offsetForTime(pubSubTopicPartition, endTimestamp)).thenReturn(endOffset);
-    when(apacheKafkaConsumer.endOffset(pubSubTopicPartition)).thenReturn(endOffset);
+    when(apacheKafkaConsumer.getPositionByTimestamp(pubSubTopicPartition, startTimestamp)).thenReturn(startPosition);
+    when(apacheKafkaConsumer.getPositionByTimestamp(pubSubTopicPartition, endTimestamp)).thenReturn(endPosition);
+    doAnswer(invocation -> {
+      PubSubTopicPartition partition = invocation.getArgument(0);
+      PubSubPosition position1 = invocation.getArgument(1);
+      PubSubPosition position2 = invocation.getArgument(2);
+      return PubSubUtil.computeOffsetDelta(partition, position1, position2, apacheKafkaConsumer);
+    }).when(apacheKafkaConsumer).positionDifference(pubSubTopicPartition, startPosition, endPosition);
+    doAnswer(invocation -> {
+      PubSubTopicPartition partition = invocation.getArgument(0);
+      PubSubPosition position1 = invocation.getArgument(1);
+      PubSubPosition position2 = invocation.getArgument(2);
+      return PubSubUtil.computeOffsetDelta(partition, position1, position2, apacheKafkaConsumer);
+    }).when(apacheKafkaConsumer)
+        .comparePositions(any(PubSubTopicPartition.class), any(PubSubPosition.class), any(PubSubPosition.class));
+
     long messageCount = TopicMessageFinder
         .find(controllerClient, apacheKafkaConsumer, topic, keyString, startTimestamp, endTimestamp, progressInterval);
-    Assert.assertEquals(messageCount, endOffset - startOffset);
+    Assert.assertEquals(messageCount, endPosition.getInternalOffset() - startPosition.getInternalOffset());
 
-    when(apacheKafkaConsumer.poll(anyLong())).thenReturn(messagesMap, new HashMap<>());
+    when(apacheKafkaConsumer.poll(anyLong())).thenReturn(messagesMap, Collections.EMPTY_MAP);
+    when(apacheKafkaConsumer.endPosition(pubSubTopicPartition)).thenReturn(endPosition);
+    long messageCountNoEndOffset = TopicMessageFinder.find(
+        controllerClient,
+        apacheKafkaConsumer,
+        topic,
+        keyString,
+        startTimestamp,
+        Long.MAX_VALUE,
+        progressInterval);
+    Assert.assertEquals(messageCountNoEndOffset, endPosition.getInternalOffset() - startPosition.getInternalOffset());
 
-    when(apacheKafkaConsumer.poll(anyLong())).thenReturn(messagesMap, new HashMap<>());
-    ControlMessageDumper controlMessageDumper =
-        new ControlMessageDumper(apacheKafkaConsumer, topic, 0, 0, pubSubMessageList.size());
+    when(apacheKafkaConsumer.poll(anyLong())).thenReturn(messagesMap, Collections.EMPTY_MAP);
+    ControlMessageDumper controlMessageDumper = new ControlMessageDumper(
+        apacheKafkaConsumer,
+        topic,
+        0,
+        PubSubSymbolicPosition.EARLIEST,
+        pubSubMessageList.size());
     Assert.assertEquals(controlMessageDumper.fetch().display(), 1);
 
-    when(apacheKafkaConsumer.poll(anyLong())).thenReturn(messagesMap, new HashMap<>());
+    when(apacheKafkaConsumer.poll(anyLong())).thenReturn(messagesMap, Collections.EMPTY_MAP);
     int consumedMessageCount = pubSubMessageList.size() - 1;
     KafkaTopicDumper kafkaTopicDumper = new KafkaTopicDumper(
         controllerClient,
         apacheKafkaConsumer,
-        topic,
-        assignedPartition,
-        0,
-        2,
+        pubSubTopicPartition,
         "",
         3,
         true,
         false,
-        false);
-    Assert.assertEquals(kafkaTopicDumper.fetchAndProcess(), consumedMessageCount);
+        false,
+        false,
+        PubSubPositionDeserializer.DEFAULT_DESERIALIZER);
+    ApacheKafkaOffsetPosition p0 = ApacheKafkaOffsetPosition.of(0);
+    ApacheKafkaOffsetPosition p1 = ApacheKafkaOffsetPosition.of(1);
+    Assert.assertEquals(kafkaTopicDumper.fetchAndProcess(p0, p1, 2), consumedMessageCount - 1);
   }
 }

@@ -3,7 +3,7 @@ package com.linkedin.davinci.kafka.consumer;
 import static com.linkedin.davinci.kafka.consumer.LeaderFollowerStateType.LEADER;
 import static com.linkedin.venice.utils.RedundantExceptionFilter.getRedundantExceptionFilter;
 
-import com.linkedin.davinci.store.AbstractStorageEngine;
+import com.linkedin.davinci.store.StorageEngine;
 import com.linkedin.davinci.utils.StoragePartitionDiskUsage;
 import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.StoreDataChangedListener;
@@ -11,8 +11,12 @@ import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.meta.VersionStatus;
 import com.linkedin.venice.offsets.OffsetRecord;
 import com.linkedin.venice.utils.RedundantExceptionFilter;
+import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import com.linkedin.venice.utils.locks.AutoCloseableLock;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
@@ -54,7 +58,7 @@ public class StorageUtilizationManager implements StoreDataChangedListener {
   private static final RedundantExceptionFilter REDUNDANT_LOGGING_FILTER = getRedundantExceptionFilter();
 
   private final Map<Integer, PartitionConsumptionState> partitionConsumptionStateMap;
-  private final AbstractStorageEngine storageEngine;
+  private final StorageEngine storageEngine;
   private final Function<Integer, StoragePartitionDiskUsage> storagePartitionDiskUsageFunctionConstructor;
   private final String versionTopic;
   private final String storeName;
@@ -64,6 +68,7 @@ public class StorageUtilizationManager implements StoreDataChangedListener {
   private final Set<Integer> pausedPartitions;
   private final boolean isHybridQuotaEnabledInServer;
   private final boolean isServerCalculateQuotaUsageBasedOnPartitionsAssignmentEnabled;
+  private final boolean isSeparateRealtimeTopicEnabled;
   private final IngestionNotificationDispatcher ingestionNotificationDispatcher;
   private final TopicPartitionConsumerFunction pausePartition;
   private final TopicPartitionConsumerFunction resumePartition;
@@ -89,20 +94,21 @@ public class StorageUtilizationManager implements StoreDataChangedListener {
    *              is handled in {@link #handleStoreChanged(Store)}.
    */
   public StorageUtilizationManager(
-      AbstractStorageEngine storageEngine,
+      StorageEngine storageEngine,
       Store store,
       String versionTopic,
       int partitionCount,
       Map<Integer, PartitionConsumptionState> partitionConsumptionStateMap,
       boolean isHybridQuotaEnabledInServer,
       boolean isServerCalculateQuotaUsageBasedOnPartitionsAssignmentEnabled,
+      boolean isSeparateRealtimeTopicEnabled,
       IngestionNotificationDispatcher ingestionNotificationDispatcher,
       TopicPartitionConsumerFunction pausePartition,
       TopicPartitionConsumerFunction resumePartition) {
     this.partitionConsumptionStateMap = partitionConsumptionStateMap;
     this.storageEngine = storageEngine;
     this.storagePartitionDiskUsageFunctionConstructor =
-        partition -> new StoragePartitionDiskUsage(partition, storageEngine);
+        partition -> new StoragePartitionDiskUsage(() -> getUsageForPartition(partition));
     this.storeName = store.getName();
     this.versionTopic = versionTopic;
     if (partitionCount <= 0) {
@@ -115,12 +121,21 @@ public class StorageUtilizationManager implements StoreDataChangedListener {
     this.isHybridQuotaEnabledInServer = isHybridQuotaEnabledInServer;
     this.isServerCalculateQuotaUsageBasedOnPartitionsAssignmentEnabled =
         isServerCalculateQuotaUsageBasedOnPartitionsAssignmentEnabled;
+    this.isSeparateRealtimeTopicEnabled = isSeparateRealtimeTopicEnabled;
     this.ingestionNotificationDispatcher = ingestionNotificationDispatcher;
     this.pausePartition = pausePartition;
     this.resumePartition = resumePartition;
     setStoreQuota(store);
     Version version = store.getVersion(storeVersion);
     versionIsOnline = isVersionOnline(version);
+  }
+
+  private long getUsageForPartition(int partition) {
+    try {
+      return this.storageEngine.getPartitionOrThrow(partition).getPartitionSizeInBytes();
+    } catch (Exception e) {
+      return 0;
+    }
   }
 
   @Override
@@ -173,9 +188,10 @@ public class StorageUtilizationManager implements StoreDataChangedListener {
     versionIsOnline = isVersionOnline(version);
     if (this.storeQuotaInBytes != store.getStorageQuotaInByte() || !store.isHybridStoreDiskQuotaEnabled()) {
       LOGGER.info(
-          "Store: {} changed, updated quota from {} to {} and store quota is {}enabled, "
+          "Store: {} changed, updated quota in: versionTopic: {} from: {} to: {} and store quota is {}enabled, "
               + "so we reset the store quota and resume all partitions.",
           this.storeName,
+          this.versionTopic,
           this.storeQuotaInBytes,
           store.getStorageQuotaInByte(),
           store.isHybridStoreDiskQuotaEnabled() ? "" : "not ");
@@ -200,7 +216,7 @@ public class StorageUtilizationManager implements StoreDataChangedListener {
   }
 
   public void initPartition(int partition) {
-    partitionConsumptionSizeMap.put(partition, new StoragePartitionDiskUsage(partition, storageEngine));
+    partitionConsumptionSizeMap.put(partition, new StoragePartitionDiskUsage(() -> getUsageForPartition(partition)));
   }
 
   public void removePartition(int partition) {
@@ -248,7 +264,6 @@ public class StorageUtilizationManager implements StoreDataChangedListener {
 
     storagePartitionDiskUsage.add(additionalRecordSizeUsed);
 
-    String consumingTopic = getConsumingTopic(pcs);
     /**
      * Check if the current partition violates the partition-level quota.
      * It's possible to pause an already-paused partition or resume an un-paused partition. The reason that
@@ -275,24 +290,39 @@ public class StorageUtilizationManager implements StoreDataChangedListener {
        * but the notification to storage node gets delayed, the quota exceeding issue will put this partition of current version to be ERROR,
        * which will break the production.
        */
-      pausePartition(partition, consumingTopic);
-      String msgIdentifier = consumingTopic + "_" + partition + "_quota_exceeded";
-      // Log quota exceeded info only once a minute per partition.
-      boolean shouldLogQuotaExceeded = !REDUNDANT_LOGGING_FILTER.isRedundantException(msgIdentifier);
-      if (shouldLogQuotaExceeded) {
-        LOGGER.info(
-            "Quota exceeded for store {} partition {}, paused this partition. {}",
-            storeName,
-            partition,
-            versionTopic);
+      for (String consumingTopic: getConsumingTopics(pcs)) {
+        boolean isPartitionPaused = false;
+        if (Version.isIncrementalPushTopic(consumingTopic)) {
+          // We do not pause consumption from real time topics. The intent of this is that we still should drain
+          // the messages which have been submitted to the queue as best as we are able to. Ideally our mechanisms
+          // which kill the producer upstream have kicked in within a timely manner. We don't give the same preferential
+          // treatment to incremental push jobs as those have a lower priority and if we pause ingestion the job will
+          // at some point terminate.
+          pausePartition(partition, consumingTopic);
+          isPartitionPaused = true;
+        }
+        String msgIdentifier = consumingTopic + "_" + partition + "_quota_exceeded";
+        // Log quota exceeded info only once a minute per partition.
+        boolean shouldLogQuotaExceeded =
+            !REDUNDANT_LOGGING_FILTER.isRedundantException(msgIdentifier) && isPartitionPaused;
+        if (shouldLogQuotaExceeded) {
+          LOGGER.info(
+              "Quota exceeded for store version {} partition {}, paused this partition. Partition disk usage: {} >= partition quota: {}",
+              versionTopic,
+              partition,
+              storagePartitionDiskUsage.getUsage(),
+              diskQuotaPerPartition);
+        }
       }
-    } else { /** we have free space for this partition */
+    } else {
       /**
-       *  Paused partitions could be resumed
+       *  We have free space for this partition, paused partitions could be resumed
        */
       ingestionNotificationDispatcher.reportQuotaNotViolated(pcs);
       if (isPartitionPausedIngestion(partition)) {
-        resumePartition(partition, consumingTopic);
+        for (String consumingTopic: getConsumingTopics(pcs)) {
+          resumePartition(partition, consumingTopic);
+        }
         LOGGER.info("Quota available for store {} partition {}, resumed this partition.", storeName, partition);
       }
     }
@@ -313,19 +343,26 @@ public class StorageUtilizationManager implements StoreDataChangedListener {
    * partition without affecting partition subscription
    */
   private void pausePartition(int partition, String consumingTopic) {
-    pausePartition.execute(consumingTopic, partition);
-    this.pausedPartitions.add(partition);
+    // Only record the partition as quota-paused if the underlying consumer was actually paused.
+    // The lambda may no-op if a higher-priority pause source (e.g. store-level IngestionPauseMode)
+    // already owns the consumer; recording it as paused anyway would desynchronize this manager
+    // from real consumer state.
+    if (pausePartition.execute(consumingTopic, partition)) {
+      this.pausedPartitions.add(partition);
+    }
   }
 
   private void resumePartition(int partition, String consumingTopic) {
-    resumePartition.execute(consumingTopic, partition);
-    this.pausedPartitions.remove(partition);
+    if (resumePartition.execute(consumingTopic, partition)) {
+      this.pausedPartitions.remove(partition);
+    }
   }
 
   private void resumeAllPartitions() {
     partitionConsumptionStateMap.forEach((key, value) -> {
-      String consumingTopic = getConsumingTopic(value);
-      resumePartition(key, consumingTopic);
+      for (String consumingTopic: getConsumingTopics(value)) {
+        resumePartition(key, consumingTopic);
+      }
     });
   }
 
@@ -336,15 +373,21 @@ public class StorageUtilizationManager implements StoreDataChangedListener {
   /**
    * Check the topic which is currently consumed topic for this partition
    */
-  private String getConsumingTopic(PartitionConsumptionState pcs) {
-    String consumingTopic = versionTopic;
+  private List<String> getConsumingTopics(PartitionConsumptionState pcs) {
+    List<String> consumingTopics = Collections.singletonList(versionTopic);
+
     if (pcs.getLeaderFollowerState().equals(LEADER)) {
       OffsetRecord offsetRecord = pcs.getOffsetRecord();
       if (offsetRecord.getLeaderTopic() != null) {
-        consumingTopic = offsetRecord.getLeaderTopic();
+        consumingTopics = new ArrayList<>();
+        consumingTopics.add(offsetRecord.getLeaderTopic());
+        // For separate RT topic enabled SIT, we should include separate RT topic, if leader topic is a RT topic.
+        if (isSeparateRealtimeTopicEnabled && Version.isRealTimeTopic(offsetRecord.getLeaderTopic())) {
+          consumingTopics.add(Utils.getSeparateRealTimeTopicName(offsetRecord.getLeaderTopic()));
+        }
       }
     }
-    return consumingTopic;
+    return consumingTopics;
   }
 
   protected boolean isPartitionPausedIngestion(int partition) {
@@ -378,8 +421,7 @@ public class StorageUtilizationManager implements StoreDataChangedListener {
       if (partitionCount == 0) {
         return 0.;
       }
-      quota *= partitionConsumptionSizeMap.size();
-      quota /= partitionCount;
+      quota = diskQuotaPerPartition * partitionConsumptionSizeMap.size();
     }
 
     long usage = 0;

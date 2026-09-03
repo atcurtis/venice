@@ -1,29 +1,62 @@
 package com.linkedin.venice.utils;
 
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertThrows;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.expectThrows;
 import static org.testng.Assert.fail;
 
+import com.linkedin.venice.exceptions.ErrorType;
 import com.linkedin.venice.exceptions.VeniceException;
+import com.linkedin.venice.exceptions.VeniceHttpException;
+import com.linkedin.venice.meta.HybridStoreConfig;
+import com.linkedin.venice.meta.ReadOnlyStoreRepository;
+import com.linkedin.venice.meta.Store;
+import com.linkedin.venice.meta.StoreInfo;
+import com.linkedin.venice.meta.StoreVersionInfo;
+import com.linkedin.venice.meta.Version;
+import com.linkedin.venice.meta.VersionStatus;
+import com.linkedin.venice.pubsub.PubSubTopicImpl;
+import com.linkedin.venice.pubsub.PubSubTopicPartitionImpl;
+import com.linkedin.venice.pubsub.PubSubTopicRepository;
+import com.linkedin.venice.pubsub.api.PubSubTopic;
+import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
+import com.linkedin.venice.serialization.avro.AvroProtocolDefinition;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.text.ParseException;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
+import org.apache.avro.Schema;
+import org.apache.http.HttpStatus;
 import org.testng.Assert;
+import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
+import org.testng.collections.Lists;
 
 
 /**
  * Test cases for Venice {@link Utils}
  */
 public class UtilsTest {
+  final static String STORE_NAME = "TestStore";
+
   @Test
   public void testGetHelixNodeIdentifier() {
     int port = 1234;
@@ -37,6 +70,8 @@ public class UtilsTest {
         Utils.getHelixNodeIdentifier(fixedHostname, 1234),
         fixedHostname + "_" + port,
         "Identifier is not the valid format required by Helix.");
+    long memSize = Utils.getOSMemorySize();
+    assertTrue(memSize > 0);
   }
 
   @Test
@@ -65,7 +100,7 @@ public class UtilsTest {
   public void testGetDebugInfo() {
     Map<CharSequence, CharSequence> debugInfo = Utils.getDebugInfo();
     debugInfo.forEach((k, v) -> System.out.println(k + ": " + v));
-    Assert.assertFalse(debugInfo.isEmpty(), "debugInfo should not be empty.");
+    assertFalse(debugInfo.isEmpty(), "debugInfo should not be empty.");
     // N.B.: The "version" entry is not available in unit tests because of the way the classpath is built...
     String[] expectedKeys = { "path", "host", "pid", "user", "JDK major version" };
     assertTrue(
@@ -142,14 +177,14 @@ public class UtilsTest {
     Path filePath = Files.createTempFile(null, null);
     Path nonExistingPath = Paths.get(Utils.getUniqueTempPath());
     assertTrue(Utils.directoryExists(directoryPath.toString()));
-    Assert.assertFalse(Utils.directoryExists(filePath.toString()));
-    Assert.assertFalse(Utils.directoryExists(nonExistingPath.toString()));
+    assertFalse(Utils.directoryExists(filePath.toString()));
+    assertFalse(Utils.directoryExists(nonExistingPath.toString()));
     Files.delete(directoryPath);
     Files.delete(filePath);
   }
 
   @Test
-  public void testIterateOnMapOfLists() throws Exception {
+  public void testIterateOnMapOfLists() {
     Map<String, List<Integer>> mapOfLists = new HashMap<>();
     mapOfLists.put("list1", new ArrayList<>());
     mapOfLists.put("list2", Arrays.asList(1, 2, 3));
@@ -167,11 +202,11 @@ public class UtilsTest {
 
   @Test
   public void testParseMap() {
-    Map expectedMap = new HashMap<>();
+    Map<String, String> expectedMap = new HashMap<>();
     expectedMap.put("a", "b");
 
     assertEquals(Utils.parseJsonMapFromString("", "test_field").size(), 0);
-    Map validMap = Utils.parseJsonMapFromString("{\"a\":\"b\"}", "test_field");
+    Map<String, String> validMap = Utils.parseJsonMapFromString("{\"a\":\"b\"}", "test_field");
     assertEquals(validMap, expectedMap);
 
     VeniceException e = expectThrows(VeniceException.class, () -> Utils.parseJsonMapFromString("a=b", "test_field"));
@@ -181,6 +216,441 @@ public class UtilsTest {
 
   @Test
   public void testSanitizingStringForLogger() {
-    Assert.assertEquals(Utils.getSanitizedStringForLogger(".abc.123."), "_abc_123_");
+    assertEquals(Utils.getSanitizedStringForLogger(".abc.123."), "_abc_123_");
+  }
+
+  @Test
+  public void testParseCommaSeparatedStringToSet() {
+    Assert.assertTrue(Utils.parseCommaSeparatedStringToSet(null).isEmpty());
+    Assert.assertTrue(Utils.parseCommaSeparatedStringToSet("").isEmpty());
+
+    Set<String> set = Utils.parseCommaSeparatedStringToSet("a,b,c");
+    assertEquals(set.size(), 3);
+    Assert.assertTrue(set.contains("a"));
+    Assert.assertTrue(set.contains("b"));
+    Assert.assertTrue(set.contains("c"));
+
+    Set<String> setWithSpaces = Utils.parseCommaSeparatedStringToSet("a, b, c");
+    assertEquals(setWithSpaces.size(), 3);
+    Assert.assertTrue(setWithSpaces.contains("a"));
+    Assert.assertTrue(setWithSpaces.contains("b"));
+    Assert.assertTrue(setWithSpaces.contains("c"));
+  }
+
+  @Test
+  public void testParseCommaSeparatedStringToList() {
+    Assert.assertTrue(Utils.parseCommaSeparatedStringToList(null).isEmpty());
+    Assert.assertTrue(Utils.parseCommaSeparatedStringToList("").isEmpty());
+
+    List<String> list = Utils.parseCommaSeparatedStringToList("a,b,c");
+    assertEquals(list.size(), 3);
+    assertEquals(list.get(0), "a");
+    assertEquals(list.get(1), "b");
+    assertEquals(list.get(2), "c");
+
+    List<String> stringList = Utils.parseCommaSeparatedStringToList("a, b, c");
+    assertEquals(stringList.size(), 3);
+    assertEquals(list.get(0), "a");
+    assertEquals(list.get(1), "b");
+    assertEquals(list.get(2), "c");
+  }
+
+  @Test
+  public void testResolveKafkaUrlForSepTopic() {
+    String originalKafkaUrl = "localhost:12345";
+    String originalKafkaUrlForSep = "localhost:12345_sep";
+    assertEquals(Utils.resolveKafkaUrlForSepTopic(""), "");
+    assertEquals(Utils.resolveKafkaUrlForSepTopic(originalKafkaUrlForSep), originalKafkaUrl);
+    assertEquals(Utils.resolveKafkaUrlForSepTopic(originalKafkaUrl), originalKafkaUrl);
+  }
+
+  @Test
+  void testGetRealTimeTopicNames() {
+    String storeName = "StoreName";
+    Store mockStore = mock(Store.class);
+    List<Version> mockVersions = new ArrayList<>();
+    mockVersions.add(mock(Version.class));
+    mockVersions.add(mock(Version.class));
+    mockVersions.add(mock(Version.class));
+    HybridStoreConfig mockHybridConfig = mock(HybridStoreConfig.class);
+
+    when(mockStore.getName()).thenReturn(storeName);
+    when(mockStore.getVersions()).thenReturn(mockVersions);
+    when(mockStore.getCurrentVersion()).thenReturn(1);
+    when(mockStore.getHybridStoreConfig()).thenReturn(mockHybridConfig);
+    when(mockVersions.get(0).getStoreName()).thenReturn(storeName);
+    when(mockVersions.get(1).getStoreName()).thenReturn(storeName);
+    when(mockVersions.get(2).getStoreName()).thenReturn(storeName);
+    when(mockVersions.get(0).isHybrid()).thenReturn(true);
+    when(mockVersions.get(1).isHybrid()).thenReturn(true);
+    when(mockVersions.get(2).isHybrid()).thenReturn(true);
+    when(mockVersions.get(0).getHybridStoreConfig()).thenReturn(mockHybridConfig);
+    when(mockVersions.get(1).getHybridStoreConfig()).thenReturn(mockHybridConfig);
+    when(mockVersions.get(2).getHybridStoreConfig()).thenReturn(mockHybridConfig);
+
+    when(mockHybridConfig.getRealTimeTopicName()).thenReturn("StoreName_v1_rt", "StoreName_v2_rt", "StoreName_v3_rt");
+
+    Set<String> result = Utils.getAllRealTimeTopicNames(mockStore);
+    assertEquals(result, new HashSet<>(Arrays.asList("StoreName_v1_rt", "StoreName_v2_rt", "StoreName_v3_rt")));
+  }
+
+  @Test
+  void testGetRealTimeTopicNameWithStore() {
+    Store mockStore = mock(Store.class);
+    List<Version> mockVersions = Collections.singletonList(mock(Version.class));
+    HybridStoreConfig mockHybridConfig = mock(HybridStoreConfig.class);
+
+    when(mockStore.getName()).thenReturn(STORE_NAME);
+    when(mockStore.getVersions()).thenReturn(mockVersions);
+    when(mockStore.getCurrentVersion()).thenReturn(1);
+    when(mockStore.getHybridStoreConfig()).thenReturn(mockHybridConfig);
+
+    when(mockHybridConfig.getRealTimeTopicName()).thenReturn("RealTimeTopic");
+
+    String result = Utils.getRealTimeTopicName(mockStore);
+    assertEquals(result, "RealTimeTopic");
+  }
+
+  @Test
+  void testGetRealTimeTopicNameWithStoreInfo() {
+    StoreInfo mockStoreInfo = mock(StoreInfo.class);
+    List<Version> mockVersions = Collections.singletonList(mock(Version.class));
+    HybridStoreConfig mockHybridConfig = mock(HybridStoreConfig.class);
+
+    when(mockStoreInfo.getName()).thenReturn(STORE_NAME);
+    when(mockStoreInfo.getVersions()).thenReturn(mockVersions);
+    when(mockStoreInfo.getCurrentVersion()).thenReturn(1);
+    when(mockStoreInfo.getHybridStoreConfig()).thenReturn(mockHybridConfig);
+
+    when(mockHybridConfig.getRealTimeTopicName()).thenReturn("RealTimeTopic");
+
+    String result = Utils.getRealTimeTopicName(mockStoreInfo);
+    assertEquals(result, "RealTimeTopic");
+  }
+
+  @Test
+  void testGetRealTimeTopicNameWithHybridConfig() {
+    HybridStoreConfig mockHybridConfig = mock(HybridStoreConfig.class);
+
+    when(mockHybridConfig.getRealTimeTopicName()).thenReturn("RealTimeTopic");
+    String result = Utils.getRealTimeTopicName("TestStore", Collections.EMPTY_LIST, 1, mockHybridConfig);
+
+    assertEquals(result, "RealTimeTopic");
+  }
+
+  @Test
+  void testGetRealTimeTopicNameWithoutHybridConfig() {
+    String result = Utils.getRealTimeTopicName(STORE_NAME, Collections.EMPTY_LIST, 0, null);
+    assertEquals(result, STORE_NAME + Version.REAL_TIME_TOPIC_SUFFIX);
+  }
+
+  @Test
+  void testGetRealTimeTopicNameWithConflictingVersions() {
+    Version mockVersion1 = mock(Version.class);
+    Version mockVersion2 = mock(Version.class);
+    HybridStoreConfig mockConfig1 = mock(HybridStoreConfig.class);
+    HybridStoreConfig mockConfig2 = mock(HybridStoreConfig.class);
+
+    when(mockVersion1.isHybrid()).thenReturn(true);
+    when(mockVersion2.isHybrid()).thenReturn(true);
+    when(mockVersion1.getHybridStoreConfig()).thenReturn(mockConfig1);
+    when(mockVersion2.getHybridStoreConfig()).thenReturn(mockConfig2);
+    when(mockConfig1.getRealTimeTopicName()).thenReturn("RealTimeTopic1");
+    when(mockConfig2.getRealTimeTopicName()).thenReturn("RealTimeTopic2");
+
+    String result = Utils.getRealTimeTopicName(STORE_NAME, Lists.newArrayList(mockVersion1, mockVersion2), 1, null);
+    assertTrue(result.equals("RealTimeTopic1") || result.equals("RealTimeTopic2"));
+  }
+
+  @Test
+  void testGetRealTimeTopicNameWithHybridVersion() {
+    Version mockVersion = mock(Version.class);
+    HybridStoreConfig mockHybridConfig = mock(HybridStoreConfig.class);
+    String expectedRealTimeTopicName = Utils.composeRealTimeTopic(STORE_NAME, 1);
+
+    when(mockVersion.isHybrid()).thenReturn(true);
+    when(mockVersion.getHybridStoreConfig()).thenReturn(mockHybridConfig);
+    when(mockVersion.getStoreName()).thenReturn(STORE_NAME);
+    when(mockHybridConfig.getRealTimeTopicName()).thenReturn(expectedRealTimeTopicName);
+
+    String result = Utils.getRealTimeTopicName(mockVersion);
+    assertEquals(result, expectedRealTimeTopicName);
+  }
+
+  @Test
+  void testGetRealTimeTopicNameWithNonHybridVersion() {
+    // Mocking the Version object
+    Version mockVersion = mock(Version.class);
+
+    // Mock setup to trigger the exception path
+    when(mockVersion.isHybrid()).thenReturn(false);
+    when(mockVersion.getStoreName()).thenReturn(STORE_NAME);
+    String result = Utils.getRealTimeTopicName(mockVersion);
+    assertEquals(result, STORE_NAME + Version.REAL_TIME_TOPIC_SUFFIX);
+  }
+
+  @Test
+  public void testParseDateTimeToEpoch() throws Exception {
+    // Case 1: Valid Input
+    String dateTimePst = "2024-12-02 15:30:00";
+    String dateTimeUtc = "2024-12-02 23:30:00";
+    String format = "yyyy-MM-dd HH:mm:ss";
+    String timeZone = "America/Los_Angeles";
+    long expectedEpoch = 1733182200000L;
+
+    long epochTime = Utils.parseDateTimeToEpoch(dateTimePst, format, timeZone);
+    assertEquals(epochTime, expectedEpoch, "The epoch time does not match the expected value.");
+
+    // Case 2: Invalid Date Format
+    assertThrows(ParseException.class, () -> Utils.parseDateTimeToEpoch("2024-12-02T15:30:00", format, timeZone));
+
+    // Case 3: Invalid Time Zone; fallback to GMT
+    long gmtEpochTime = Utils.parseDateTimeToEpoch(dateTimeUtc, format, "InvalidTimeZone");
+    assertEquals(gmtEpochTime, expectedEpoch, "The epoch time does not match the expected value for GMT.");
+
+    // Case 4: Different Time Zone
+    String utcTimeZone = "UTC";
+    long utcEpochTime = Utils.parseDateTimeToEpoch(dateTimeUtc, format, utcTimeZone);
+    assertEquals(utcEpochTime, expectedEpoch, "The epoch time does not match the expected value for UTC.");
+  }
+
+  @Test
+  public void testIsSeparateTopicRegion() {
+    Assert.assertTrue(Utils.isSeparateTopicRegion("dc-0_sep"));
+    assertFalse(Utils.isSeparateTopicRegion("dc-0"));
+  }
+
+  @Test
+  public void testCalculateTopicHashCode() {
+    String store = "test_store";
+    PubSubTopicRepository pubSubTopicRepository = new PubSubTopicRepository();
+    PubSubTopic rt = pubSubTopicRepository.getTopic(Utils.composeRealTimeTopic(store));
+    PubSubTopic sepRt = pubSubTopicRepository.getTopic(Utils.getSeparateRealTimeTopicName(rt.getName()));
+    Assert.assertEquals(Utils.calculateTopicHashCode(rt), Utils.calculateTopicHashCode(sepRt));
+  }
+
+  @Test
+  public void testGetLeaderTopicFromPubSubTopic() {
+    PubSubTopicRepository pubSubTopicRepository = new PubSubTopicRepository();
+    String store = "test_store";
+    PubSubTopic versionTopic = pubSubTopicRepository.getTopic(Version.composeKafkaTopic(store, 1));
+    PubSubTopic realTimeTopic = pubSubTopicRepository.getTopic(Utils.composeRealTimeTopic(store));
+    PubSubTopic separateRealTimeTopic =
+        pubSubTopicRepository.getTopic(Utils.getSeparateRealTimeTopicName(realTimeTopic.getName()));
+    Assert.assertEquals(Utils.resolveLeaderTopicFromPubSubTopic(pubSubTopicRepository, versionTopic), versionTopic);
+    Assert.assertEquals(Utils.resolveLeaderTopicFromPubSubTopic(pubSubTopicRepository, realTimeTopic), realTimeTopic);
+    Assert.assertEquals(
+        Utils.resolveLeaderTopicFromPubSubTopic(pubSubTopicRepository, separateRealTimeTopic),
+        realTimeTopic);
+  }
+
+  @Test
+  public void testGetSeparateRtPartitionFromLeaderTopic() {
+    PubSubTopicRepository pubSubTopicRepository = new PubSubTopicRepository();
+    String pubSubAddress = "pubsub_address";
+    String pubSubAddressSeparateRt = pubSubAddress + Utils.SEPARATE_TOPIC_SUFFIX;
+    PubSubTopic realTimeTopic = pubSubTopicRepository.getTopic(Utils.composeRealTimeTopic("store"));
+    PubSubTopicPartition leaderTopicPartition = new PubSubTopicPartitionImpl(realTimeTopic, 0);
+    PubSubTopicPartition separateRtTopicPartition = new PubSubTopicPartitionImpl(
+        new PubSubTopicImpl(realTimeTopic.getName() + Utils.SEPARATE_TOPIC_SUFFIX),
+        leaderTopicPartition.getPartitionNumber());
+    Assert.assertEquals(
+        Utils.createPubSubTopicPartitionFromLeaderTopicPartition(pubSubAddress, leaderTopicPartition),
+        leaderTopicPartition);
+    Assert.assertEquals(
+        Utils.createPubSubTopicPartitionFromLeaderTopicPartition(pubSubAddressSeparateRt, leaderTopicPartition),
+        separateRtTopicPartition);
+  }
+
+  @DataProvider(name = "booleanParsingData")
+  public Object[][] booleanParsingData() {
+    return new Object[][] {
+        // Valid cases
+        { "true", "testField", true }, // Valid "true"
+        { "false", "testField", false }, // Valid "false"
+        { "TRUE", "testField", true }, // Valid case-insensitive "TRUE"
+        { "FALSE", "testField", false }, // Valid case-insensitive "FALSE"
+
+        // Invalid cases
+        { "notABoolean", "testField", null }, // Invalid string
+        { "123", "testField", null }, // Non-boolean numeric string
+        { "", "testField", null }, // Empty string
+        { null, "testField", null }, // Null input
+    };
+  }
+
+  @DataProvider(name = "booleanOrFalseParsingData")
+  public Object[][] booleanOrFalseParsingData() {
+    return new Object[][] {
+        // Valid cases
+        { "true", "testField", true }, // Valid "true"
+        { "false", "testField", false }, // Valid "false"
+        { "TRUE", "testField", true }, // Valid case-insensitive "TRUE"
+        { "FALSE", "testField", false }, // Valid case-insensitive "FALSE"
+        { null, "testField", false }, // Null input
+
+        // Invalid cases
+        { "notABoolean", "testField", null }, // Invalid string
+        { "123", "testField", null }, // Non-boolean numeric string
+        { "", "testField", null }, // Empty string
+    };
+  }
+
+  @Test(dataProvider = "booleanParsingData")
+  public void testParseBooleanOrThrow(String value, String fieldName, Boolean expectedResult) {
+    if (expectedResult != null) {
+      // For valid cases
+      boolean result = Utils.parseBooleanOrThrow(value, fieldName);
+      assertEquals(result, (boolean) expectedResult, "Parsed boolean value does not match expected value.");
+      return;
+    }
+    VeniceHttpException e = expectThrows(VeniceHttpException.class, () -> Utils.parseBooleanOrThrow(value, fieldName));
+    assertEquals(e.getHttpStatusCode(), HttpStatus.SC_BAD_REQUEST, "Invalid status code.");
+    if (value == null) {
+      assertEquals(e.getMessage(), "Http Status 400 - testField must be a boolean, but value is null.");
+    } else {
+      assertEquals(
+          e.getMessage(),
+          "Http Status 400 - testField must be a boolean, but value: " + value + " is invalid.");
+    }
+    assertEquals(e.getErrorType(), ErrorType.BAD_REQUEST);
+  }
+
+  @Test(dataProvider = "booleanOrFalseParsingData")
+  public void testParseBooleanOrFalse(String value, String fieldName, Boolean expectedResult) {
+    // For valid cases
+    if (expectedResult != null) {
+      boolean result = Utils.parseBooleanOrFalse(value, fieldName);
+      assertEquals(result, (boolean) expectedResult, "Parsed boolean value does not match expected value.");
+      return;
+    }
+    // For invalid cases
+    VeniceHttpException e = expectThrows(VeniceHttpException.class, () -> Utils.parseBooleanOrThrow(value, fieldName));
+    assertEquals(e.getHttpStatusCode(), HttpStatus.SC_BAD_REQUEST, "Invalid status code.");
+    assertEquals(e.getMessage(), "Http Status 400 - testField must be a boolean, but value: " + value + " is invalid.");
+    assertEquals(e.getErrorType(), ErrorType.BAD_REQUEST);
+  }
+
+  @DataProvider(name = "integerParsingData")
+  public Object[][] integerParsingData() {
+    return new Object[][] { { null, 10, 10, false }, // null -> default
+        { "", 20, 20, false }, // empty -> default
+        { "42", 0, 42, false }, // normal integer
+        { "-7", 1, -7, false }, // negative integer
+        { "notAnInt", 5, 0, true } // invalid -> exception
+    };
+  }
+
+  @Test(dataProvider = "integerParsingData")
+  public void testParseIntOrDefault(String value, int defaultValue, int expected, boolean expectException) {
+    final String fieldName = "testField";
+
+    if (expectException) {
+      try {
+        Utils.parseIntOrDefault(value, fieldName, defaultValue);
+        fail("VeniceHttpException expected for value: " + value);
+      } catch (VeniceHttpException ex) {
+        assertEquals(ex.getErrorType(), ErrorType.BAD_REQUEST);
+        assertEquals(ex.getHttpStatusCode(), HttpStatus.SC_BAD_REQUEST, "Invalid status code.");
+        assertTrue(ex.getMessage().contains(fieldName));
+        assertTrue(ex.getMessage().contains(value));
+      }
+    } else {
+      int actual = Utils.parseIntOrDefault(value, fieldName, defaultValue);
+      assertEquals(actual, expected, "Returned value did not match expectation for input '" + value + '\'');
+    }
+  }
+
+  @Test
+  public void testGetAllSchemasFromResources() {
+
+    // Protocols to test
+    AvroProtocolDefinition[] avroProtocolDefinitions = new AvroProtocolDefinition[] {
+        AvroProtocolDefinition.KAFKA_MESSAGE_ENVELOPE, AvroProtocolDefinition.PARTITION_STATE,
+        AvroProtocolDefinition.STORE_VERSION_STATE, AvroProtocolDefinition.SERVER_METADATA_RESPONSE,
+        AvroProtocolDefinition.SERVER_STORE_PROPERTIES_PAYLOAD, AvroProtocolDefinition.METADATA_SYSTEM_SCHEMA_STORE,
+        AvroProtocolDefinition.PUSH_STATUS_SYSTEM_SCHEMA_STORE };
+
+    for (AvroProtocolDefinition avroProtocolDefinition: avroProtocolDefinitions) {
+      Map<Integer, Schema> schemaMap = Utils.getAllSchemasFromResources(avroProtocolDefinition);
+
+      Assert.assertNotNull(schemaMap, avroProtocolDefinition.getClassName());
+      Assert.assertNotEquals(schemaMap.size(), 0, avroProtocolDefinition.getClassName());
+      if (avroProtocolDefinition.currentProtocolVersion.isPresent()) {
+        Assert.assertEquals(
+            schemaMap.get(avroProtocolDefinition.currentProtocolVersion.get()),
+            avroProtocolDefinition.getCurrentProtocolVersionSchema(),
+            avroProtocolDefinition.getClassName());
+      }
+    }
+  }
+
+  @Test
+  public void testWaitStoreVersion() {
+    ReadOnlyStoreRepository storeRepository = mock(ReadOnlyStoreRepository.class);
+    String storeName = "foo";
+    String badStoreName = "bar";
+
+    Store store = mock(Store.class);
+    Version version = mock(Version.class);
+    doReturn(new StoreVersionInfo(store, version)).when(storeRepository).waitVersion(eq(storeName), eq(1), any());
+    doReturn(new StoreVersionInfo(store, null)).when(storeRepository).waitVersion(eq(storeName), eq(2), any());
+    doReturn(new StoreVersionInfo(null, null)).when(storeRepository).waitVersion(eq(badStoreName), anyInt(), any());
+    Assert.assertThrows(
+        () -> Utils.waitStoreVersionOrThrow(Version.composeKafkaTopic(badStoreName, 123), storeRepository));
+    Assert.assertThrows(() -> Utils.waitStoreVersionOrThrow(Version.composeKafkaTopic(storeName, 2), storeRepository));
+    StoreVersionInfo storeVersionInfo =
+        Utils.waitStoreVersionOrThrow(Version.composeKafkaTopic(storeName, 1), storeRepository);
+    Assert.assertEquals(storeVersionInfo.getStore(), store);
+    Assert.assertEquals(storeVersionInfo.getVersion(), version);
+  }
+
+  @Test
+  public void testIsFutureVersionReady() {
+    ReadOnlyStoreRepository storeRepository = mock(ReadOnlyStoreRepository.class);
+    String storeName = "testIsFutureVersionReady";
+    String resource = "testIsFutureVersionReady_v1";
+
+    // Setup store and version
+    Store store = mock(Store.class);
+    Version version = mock(Version.class);
+    doReturn(version).when(store).getVersion(anyInt());
+    doReturn(store).when(storeRepository).getStoreOrThrow(storeName);
+    doReturn(0).when(store).getCurrentVersion();
+    doReturn(VersionStatus.PUSHED).when(version).getStatus();
+
+    boolean ready = Utils.isFutureVersionReady(resource, storeRepository);
+    Assert.assertTrue(ready);
+  }
+
+  @Test
+  public void testGetCurrentTimeInNanosForSeeding() {
+    // Capture time before and after the call
+    long beforeMs = System.currentTimeMillis();
+    long nanoTime = Utils.getCurrentTimeInNanosForSeeding();
+    long afterMs = System.currentTimeMillis();
+
+    // Verify the returned value is in nanoseconds (should be much larger than milliseconds)
+    assertTrue(nanoTime > 0, "Nano time should be positive");
+    assertTrue(nanoTime > beforeMs, "Nano time should be larger than millisecond time");
+
+    // Verify the conversion is approximately correct
+    long beforeNs = beforeMs * Time.NS_PER_MS;
+    long afterNs = afterMs * Time.NS_PER_MS;
+    assertTrue(nanoTime >= beforeNs, "Nano time should be >= time before call");
+    assertTrue(nanoTime <= afterNs, "Nano time should be <= time after call");
+
+    // Verify multiple calls return increasing values
+    long nanoTime1 = Utils.getCurrentTimeInNanosForSeeding();
+    Utils.sleep(1); // Sleep for 1ms to ensure time advances
+    long nanoTime2 = Utils.getCurrentTimeInNanosForSeeding();
+    assertTrue(
+        nanoTime2 >= nanoTime1,
+        "Second call should return >= value than first call: " + nanoTime2 + " vs " + nanoTime1);
+
+    // Verify the magnitude is reasonable (should be in the order of 10^15 or higher for current epoch)
+    assertTrue(
+        nanoTime > 1_000_000_000_000_000L,
+        "Nano time should be in the order of 10^15 or higher for current epoch");
   }
 }

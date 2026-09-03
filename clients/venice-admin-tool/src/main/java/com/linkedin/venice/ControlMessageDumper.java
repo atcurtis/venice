@@ -7,13 +7,18 @@ import com.linkedin.venice.kafka.protocol.KafkaMessageEnvelope;
 import com.linkedin.venice.kafka.protocol.ProducerMetadata;
 import com.linkedin.venice.kafka.protocol.enums.ControlMessageType;
 import com.linkedin.venice.kafka.protocol.enums.MessageType;
-import com.linkedin.venice.message.KafkaKey;
 import com.linkedin.venice.pubsub.PubSubTopicPartitionImpl;
 import com.linkedin.venice.pubsub.PubSubTopicRepository;
+import com.linkedin.venice.pubsub.api.DefaultPubSubMessage;
 import com.linkedin.venice.pubsub.api.PubSubConsumerAdapter;
-import com.linkedin.venice.pubsub.api.PubSubMessage;
+import com.linkedin.venice.pubsub.api.PubSubMessageHeader;
+import com.linkedin.venice.pubsub.api.PubSubMessageHeaders;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
 import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
 import com.linkedin.venice.utils.Utils;
+import com.linkedin.venice.writer.LeaderCompleteState;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -23,23 +28,38 @@ import java.util.Map;
 
 
 public class ControlMessageDumper {
-  private Map<GUID, List<PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long>>> producerToRecords = new HashMap<>();
+  /** Cap on inline display of the ~16 KB Avro envelope schema carried in the {@code vtp} header. */
+  static final int VTP_DISPLAY_CHAR_LIMIT = 200;
+
+  private Map<GUID, List<DefaultPubSubMessage>> producerToRecords = new HashMap<>();
   private PubSubConsumerAdapter consumer;
   private int messageCount;
+  private boolean logHeaders;
   private int COUNTDOWN = 3; // TODO: make this configurable
 
   public ControlMessageDumper(
       PubSubConsumerAdapter consumer,
       String topic,
       int partitionNumber,
-      int startingOffset,
+      PubSubPosition startingPosition,
       int messageCount) {
+    this(consumer, topic, partitionNumber, startingPosition, messageCount, false);
+  }
+
+  public ControlMessageDumper(
+      PubSubConsumerAdapter consumer,
+      String topic,
+      int partitionNumber,
+      PubSubPosition startingPosition,
+      int messageCount,
+      boolean logHeaders) {
     this.consumer = consumer;
     this.messageCount = messageCount;
+    this.logHeaders = logHeaders;
     PubSubTopicRepository pubSubTopicRepository = new PubSubTopicRepository();
     PubSubTopicPartition partition =
         new PubSubTopicPartitionImpl(pubSubTopicRepository.getTopic(topic), partitionNumber);
-    consumer.subscribe(partition, startingOffset - 1);
+    consumer.subscribe(partition, startingPosition, true);
   }
 
   /**
@@ -52,14 +72,12 @@ public class ControlMessageDumper {
     int currentMessageCount = 0;
 
     do {
-      Map<PubSubTopicPartition, List<PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long>>> records =
-          consumer.poll(1000); // up to 1 second
+      Map<PubSubTopicPartition, List<DefaultPubSubMessage>> records = consumer.poll(1000); // up to 1 second
       int recordsCount = records.values().stream().mapToInt(List::size).sum();
-      Iterator<PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long>> recordsIterator =
-          Utils.iterateOnMapOfLists(records);
+      Iterator<DefaultPubSubMessage> recordsIterator = Utils.iterateOnMapOfLists(records);
       while (recordsIterator.hasNext() && currentMessageCount < messageCount) {
         currentMessageCount++;
-        PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> record = recordsIterator.next();
+        DefaultPubSubMessage record = recordsIterator.next();
         KafkaMessageEnvelope envelope = record.getValue();
 
         if (MessageType.valueOf(envelope) == MessageType.CONTROL_MESSAGE) {
@@ -81,14 +99,13 @@ public class ControlMessageDumper {
   public int display() {
     int i = 1;
     int totalMessages = 0;
-    for (Map.Entry<GUID, List<PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long>>> entry: producerToRecords
-        .entrySet()) {
+    for (Map.Entry<GUID, List<DefaultPubSubMessage>> entry: producerToRecords.entrySet()) {
       GUID producerGUID = entry.getKey();
       System.out.println(String.format("\nproducer %d: %s", i++, producerGUID));
 
-      List<PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long>> records = entry.getValue();
+      List<DefaultPubSubMessage> records = entry.getValue();
       totalMessages += records.size();
-      for (PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> record: records) {
+      for (DefaultPubSubMessage record: records) {
         KafkaMessageEnvelope envelope = record.getValue();
         ProducerMetadata metadata = envelope.producerMetadata;
 
@@ -96,12 +113,20 @@ public class ControlMessageDumper {
           ControlMessage msg = (ControlMessage) envelope.payloadUnion;
           ControlMessageType msgType = ControlMessageType.valueOf(msg);
           System.out.println();
-          System.out.println("offset: " + record.getOffset());
+          System.out.println("offset: " + record.getPosition());
           System.out.println("segment: " + metadata.segmentNumber);
           System.out.println("sequence number: " + metadata.messageSequenceNumber);
           System.out.println("timestamp1: " + metadata.messageTimestamp);
           System.out.println("timestamp2: " + record.getPubSubMessageTime());
           System.out.println(msgType);
+
+          PubSubMessageHeaders headers = logHeaders ? record.getPubSubMessageHeaders() : null;
+          if (headers != null && !headers.isEmpty()) {
+            System.out.println("headers:");
+            for (PubSubMessageHeader header: headers) {
+              System.out.println("  " + header.key() + " = " + formatHeaderValue(header.key(), header.value()));
+            }
+          }
 
           if (msgType == ControlMessageType.END_OF_SEGMENT) {
             EndOfSegment end = (EndOfSegment) msg.controlMessageUnion;
@@ -112,5 +137,54 @@ public class ControlMessageDumper {
       }
     }
     return totalMessages;
+  }
+
+  /**
+   * Decode {@link PubSubMessageHeaders} values into the schema each well-known Venice header carries.
+   * Falls back to long-decoded (for 8-byte values) or raw byte-array text for unknown keys.
+   */
+  static String formatHeaderValue(String key, byte[] value) {
+    if (value == null) {
+      return "null";
+    }
+    switch (key) {
+      case PubSubMessageHeaders.VENICE_PARTITION_RECORD_COUNT_HEADER:
+        if (value.length == Long.BYTES) {
+          long count = ByteBuffer.wrap(value).getLong();
+          return count == PubSubMessageHeaders.PRC_HEADER_UNAVAILABLE_SENTINEL
+              ? count + " (unavailable)"
+              : Long.toString(count);
+        }
+        break;
+      case PubSubMessageHeaders.EXECUTION_ID_KEY:
+        if (value.length == Long.BYTES) {
+          return Long.toString(ByteBuffer.wrap(value).getLong());
+        }
+        break;
+      case PubSubMessageHeaders.VENICE_LEADER_COMPLETION_STATE_HEADER:
+        if (value.length == 1) {
+          try {
+            return LeaderCompleteState.valueOf(value[0]).name();
+          } catch (RuntimeException e) {
+            return "unknown(" + value[0] + ")";
+          }
+        }
+        break;
+      case PubSubMessageHeaders.VENICE_VIEW_PARTITIONS_MAP_HEADER:
+        return new String(value, StandardCharsets.UTF_8);
+      case PubSubMessageHeaders.VENICE_TRANSPORT_PROTOCOL_HEADER:
+        String vtp = new String(value, StandardCharsets.UTF_8);
+        if (vtp.length() > VTP_DISPLAY_CHAR_LIMIT) {
+          return vtp.substring(0, VTP_DISPLAY_CHAR_LIMIT) + "... (avro envelope schema, " + value.length
+              + " bytes total)";
+        }
+        return vtp;
+      default:
+        break;
+    }
+    if (value.length == Long.BYTES) {
+      return ByteBuffer.wrap(value).getLong() + " (long)";
+    }
+    return Arrays.toString(value);
   }
 }

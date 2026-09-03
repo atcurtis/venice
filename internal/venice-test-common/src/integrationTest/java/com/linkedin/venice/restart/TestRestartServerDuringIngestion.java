@@ -1,9 +1,9 @@
 package com.linkedin.venice.restart;
 
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.MULTI_REGION;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.VENICE_DISCOVER_URL_PROP;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.VENICE_STORE_NAME_PROP;
+import static com.linkedin.venice.ConfigKeys.MULTI_REGION;
 import static com.linkedin.venice.utils.TestUtils.generateInput;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_DISCOVER_URL_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_STORE_NAME_PROP;
 
 import com.linkedin.avroutil1.compatibility.AvroCompatibilityHelper;
 import com.linkedin.venice.ConfigKeys;
@@ -14,11 +14,12 @@ import com.linkedin.venice.controllerapi.ControllerClient;
 import com.linkedin.venice.controllerapi.VersionCreationResponse;
 import com.linkedin.venice.integration.utils.PubSubBrokerWrapper;
 import com.linkedin.venice.integration.utils.ServiceFactory;
+import com.linkedin.venice.integration.utils.VeniceClusterCreateOptions;
 import com.linkedin.venice.integration.utils.VeniceClusterWrapper;
-import com.linkedin.venice.integration.utils.VeniceRouterWrapper;
 import com.linkedin.venice.integration.utils.VeniceServerWrapper;
 import com.linkedin.venice.meta.PersistenceType;
 import com.linkedin.venice.meta.RoutingDataRepository;
+import com.linkedin.venice.meta.StoreInfo;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.pubsub.PubSubProducerAdapterFactory;
 import com.linkedin.venice.pushmonitor.ExecutionStatus;
@@ -73,8 +74,16 @@ public abstract class TestRestartServerDuringIngestion {
     int numberOfRouter = 1;
     int replicaFactor = 1;
     int partitionSize = 1000;
-    cluster = ServiceFactory
-        .getVeniceCluster(numberOfController, 0, numberOfRouter, replicaFactor, partitionSize, false, false);
+    VeniceClusterCreateOptions options =
+        new VeniceClusterCreateOptions.Builder().numberOfControllers(numberOfController)
+            .numberOfServers(0)
+            .numberOfRouters(numberOfRouter)
+            .replicationFactor(replicaFactor)
+            .partitionSize(partitionSize)
+            .sslToStorageNodes(false)
+            .sslToKafka(false)
+            .build();
+    cluster = ServiceFactory.getVeniceCluster(options);
     pubSubProducerAdapterFactory =
         cluster.getPubSubBrokerWrapper().getPubSubClientsFactory().getProducerAdapterFactory();
 
@@ -90,6 +99,7 @@ public abstract class TestRestartServerDuringIngestion {
   public void testIngestionRecovery() throws ExecutionException, InterruptedException {
     // Create a store
     String stringSchemaStr = "\"string\"";
+    StoreInfo storeInfo;
     AvroSerializer serializer = new AvroSerializer(AvroCompatibilityHelper.parse(stringSchemaStr));
     AvroGenericDeserializer deserializer =
         new AvroGenericDeserializer(Schema.parse(stringSchemaStr), Schema.parse(stringSchemaStr));
@@ -120,11 +130,14 @@ public abstract class TestRestartServerDuringIngestion {
               Optional.empty(),
               false,
               -1));
+      storeInfo = TestUtils.assertCommand(controllerClient.getStore(storeName)).getStore();
     }
+
     String topic = versionCreationResponse.getKafkaTopic();
     PubSubBrokerWrapper pubSubBrokerWrapper = cluster.getPubSubBrokerWrapper();
     VeniceWriterFactory veniceWriterFactory =
         IntegrationTestPushUtils.getVeniceWriterFactory(pubSubBrokerWrapper, pubSubProducerAdapterFactory);
+
     try (VeniceWriter<byte[], byte[], byte[]> veniceWriter =
         veniceWriterFactory.createVeniceWriter(new VeniceWriterOptions.Builder(topic).build())) {
       veniceWriter.broadcastStartOfPush(true, Collections.emptyMap());
@@ -169,7 +182,7 @@ public abstract class TestRestartServerDuringIngestion {
        * the only server just gets restarted. Restart all routers to get the fresh state of
        * the cluster.
        */
-      restartAllRouters();
+      cluster.stopAndRestartAllVeniceRouters();
 
       try (AvroGenericStoreClient<String, CharSequence> storeClient = ClientFactory.getAndStartGenericAvroClient(
           ClientConfig.defaultGenericClientConfig(storeName)
@@ -195,7 +208,7 @@ public abstract class TestRestartServerDuringIngestion {
         cur = 0;
 
         try (VeniceWriter<byte[], byte[], byte[]> streamingWriter = veniceWriterFactory
-            .createVeniceWriter(new VeniceWriterOptions.Builder(Version.composeRealTimeTopic(storeName)).build())) {
+            .createVeniceWriter(new VeniceWriterOptions.Builder(Utils.getRealTimeTopicName(storeInfo)).build())) {
           for (Map.Entry<byte[], byte[]> entry: unsortedInputRecords.entrySet()) {
             if (restartPointSetForUnsortedInput.contains(++cur)) {
               // Restart server
@@ -220,7 +233,7 @@ public abstract class TestRestartServerDuringIngestion {
             Assert.assertTrue(routingDataRepository.getReadyToServeInstances(topic, partition).size() > 0);
           }
         });
-        restartAllRouters();
+        cluster.stopAndRestartAllVeniceRouters();
         TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, true, () -> {
           // Verify all the key/value pairs
           for (Map.Entry<byte[], byte[]> entry: unsortedInputRecords.entrySet()) {
@@ -292,13 +305,6 @@ public abstract class TestRestartServerDuringIngestion {
               .getOffLinePushStatus(cluster.getClusterName(), topic)
               .getExecutionStatus()
               .equals(ExecutionStatus.COMPLETED));
-    }
-  }
-
-  private void restartAllRouters() {
-    for (VeniceRouterWrapper router: cluster.getVeniceRouters()) {
-      cluster.stopVeniceRouter(router.getPort());
-      cluster.restartVeniceRouter(router.getPort());
     }
   }
 }

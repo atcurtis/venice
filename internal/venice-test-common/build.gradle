@@ -1,3 +1,5 @@
+import groovy.json.JsonSlurper
+import groovy.json.JsonOutput
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
@@ -36,7 +38,6 @@ configurations {
     }
   }
   implementation {
-    exclude group: 'org.apache.kafka'
     exclude group: 'org.mortbay.jetty', module: 'servlet-api'
   }
   integrationTestImplementation.extendsFrom testImplementation
@@ -68,7 +69,7 @@ dependencies {
   implementation project(':internal:venice-common')
   implementation project(':services:venice-controller')
   implementation project(':services:venice-router')
-  implementation project(':clients:venice-samza')
+  implementation project(':integrations:venice-samza')
   implementation project(':clients:venice-producer')
   implementation project(':internal:venice-client-common')
   implementation project(':services:venice-server')
@@ -76,6 +77,20 @@ dependencies {
   implementation project(':internal:alpini:netty4:alpini-netty4-base')
   implementation project(':internal:alpini:router:alpini-router-api')
   implementation project(':internal:alpini:router:alpini-router-base')
+
+  implementation('org.apache.helix:helix-core:1.4.1:jdk8') {
+    exclude group: 'org.apache.helix'
+  }
+  implementation('org.apache.helix:helix-common:1.4.1:jdk8')  {
+    exclude group: 'org.apache.helix'
+  }
+  implementation('org.apache.helix:zookeeper-api:1.4.1:jdk8') {
+    exclude group: 'org.apache.helix'
+  }
+  implementation('org.apache.helix:metadata-store-directory-common:1.4.1:jdk8') {
+    exclude group: 'org.apache.helix'
+  }
+  implementation('org.apache.helix:metrics-common:1.4.1:jdk8')
 
   implementation libraries.avroUtilCompatHelper
   implementation libraries.avroUtilFastserde
@@ -85,7 +100,6 @@ dependencies {
   implementation (libraries.hadoopCommon) {
     exclude group: 'javax.servlet'
   }
-  implementation libraries.helix
   implementation libraries.httpAsyncClient
   implementation libraries.javax
   implementation libraries.kafka
@@ -95,7 +109,18 @@ dependencies {
   implementation libraries.rocksdbjni
   implementation libraries.samzaApi
   implementation libraries.spark
+  implementation (libraries.apacheSparkSql) {
+    exclude group: 'org.apache.avro', module: 'avro-mapred'
+    exclude group: 'org.apache.hadoop', module: 'hadoop-client-runtime'
+    exclude group: 'org.apache.hadoop', module: 'hadoop-client-api'
+    exclude group: 'org.apache.avro'
+    exclude group: 'org.apache.logging.log4j'
+  }
+  implementation libraries.antlr4
+  implementation libraries.antlr4Runtime
   implementation libraries.testng
+  implementation libraries.zstd
+  implementation libraries.openTelemetryTestSdk
 
   implementation (libraries.mapreduceClientJobClient) {
     exclude group: 'org.apache.avro'
@@ -106,6 +131,7 @@ dependencies {
   testImplementation project(':internal:venice-common').sourceSets.test.output
   testImplementation libraries.log4j2core
   testImplementation libraries.log4j2api
+  testImplementation libraries.kafkaClients
 
   jmhAnnotationProcessor 'org.openjdk.jmh:jmh-generator-annprocess:' + jmh.jmhVersion.get()
   jmhImplementation project(path: ':internal:venice-test-common', configuration: 'integrationTestUtils')
@@ -117,76 +143,30 @@ def integrationTestConfigs = {
   testClassesDirs = sourceSets.integrationTest.output.classesDirs
   forkEvery = Integer.parseInt(project.properties.get('integrationTest.forkEvery', "$forkEvery"))
   maxParallelForks = Integer.parseInt(project.properties.get('integrationTest.maxParallelForks', "$maxParallelForks"))
+
+  // Set heap size to 8GB for integration tests
+  minHeapSize = '4g'
+  maxHeapSize = '8g'
+
+  // Disable JaCoCo for integration tests
+  jacoco {
+    enabled = false
+  }
 }
 
-def integrationTestBuckets = [
-  "A": [
-      "com.linkedin.davinci.*",
-      "com.linkedin.venice.endToEnd.DaVinciClient*"],
-  "B": [
-      "com.linkedin.venice.endToEnd.DaVinciCluster*",
-      "com.linkedin.venice.endToEnd.DaVinciCompute*",
-      "com.linkedin.venice.endToEnd.DaVinciLive*"],
-  "C": [
-      "com.linkedin.venice.endToEnd.ActiveActive*"],
-  "D": [
-      "com.linkedin.venice.endToEnd.TestActiveActive*",
-      "com.linkedin.venice.endToEnd.TestChangelogConsumer",
-      "com.linkedin.venice.endToEnd.TestBootstrappingChangelogConsumer"],
-  "E": [
-      "com.linkedin.venice.helix.*",
-      "com.linkedin.venice.helixrebalance.*"],
-  "F": [
-      "com.linkedin.venice.fastclient.*"],
-  "G": [
-      "com.linkedin.venice.endToEnd.TestEmptyPush",
-      "com.linkedin.venice.router.*",
-      "com.linkedin.venice.ingestionHeartbeat.*"],
-  "H": [
-      "com.linkedin.venice.server.*",
-      "com.linkedin.venice.storagenode.*",
-      "com.linkedin.venice.restart.*"],
-  "I": [
-      "com.linkedin.venice.endToEnd.TestStoreMigration",
-      "com.linkedin.venice.endToEnd.TestStuckConsumerRepair",
-      "com.linkedin.venice.endToEnd.TestSuperSetSchemaRegistration",
-      "com.linkedin.venice.endToEnd.TestTopicWiseSharedConsumerPoolResilience",
-      "com.linkedin.venice.endToEnd.TestUnusedValueSchemaCleanup"
-  ],
-  "J": [
-      "com.linkedin.venice.hadoop.*",
-      "com.linkedin.venice.endToEnd.TestVson*",
-      "com.linkedin.venice.endToEnd.Push*"],
-  "K": [
-      "com.linkedin.venice.endToEnd.TestPushJob*"],
-  "L": [
-      "com.linkedin.venice.endToEnd.TestBatch*"],
-  "M": [
-      "com.linkedin.venice.kafka.*",
-      "com.linkedin.venice.samza.*",
-      "com.linkedin.venice.writer.*",
-      "com.linkedin.venice.endToEnd.PartialUpdateTest",
-      "com.linkedin.venice.endToEnd.TestWritePathComputation",
-      "com.linkedin.venice.endToEnd.WriteComputeWithActiveActiveReplicationTest"],
-  "N": [
-      "com.linkedin.venice.endToEnd.StoragePersona*",
-      "com.linkedin.venice.endToEnd.TestStoreUpdateStoragePersona",
-      "com.linkedin.venice.persona.*",
-      "com.linkedin.venice.pubsub.*"],
-  "O": [
-      "com.linkedin.venice.endToEnd.TestHybrid*"],
-  "P": [
-      "com.linkedin.venice.controller.server.*",
-      "com.linkedin.venice.controller.kafka.consumer.*",
-      "com.linkedin.venice.controller.migration.*",
-      "com.linkedin.venice.controller.AdminTool*",
-      "com.linkedin.venice.controller.VeniceParentHelixAdminTest"],
-  "Q": [
-      "com.linkedin.venice.controller.Test*"]
-]
+def shardAssignmentsFile = new File(projectDir, "test-shard-assignments.json")
+if (!shardAssignmentsFile.exists()) {
+  throw new GradleException("Missing test-shard-assignments.json in ${projectDir}. Run './gradlew generateGHCI' or 'git checkout' the file.")
+}
+def shardAssignments = new JsonSlurper().parse(shardAssignmentsFile)
+def integrationTestBuckets = shardAssignments.shards as Map<String, List<String>>
 
 integrationTestBuckets.each { name, patterns ->
-  task "integrationTest${name}" (type: Test) {
+  task "integrationTests_${name}" (type: Test) {
+    ext {
+      suiteStartTimes = new java.util.concurrent.ConcurrentHashMap<String, Long>()
+      timingResults = Collections.synchronizedList([])
+    }
     filter {
       patterns.each { pattern ->
         includeTestsMatching pattern
@@ -197,10 +177,34 @@ integrationTestBuckets.each { name, patterns ->
       excludeGroups 'flaky'
       listeners = ['com.linkedin.venice.testng.VeniceSuiteListener', 'com.linkedin.venice.testng.VeniceTestListener']
     }
+    beforeSuite { descriptor ->
+      if (descriptor.name.startsWith("com.linkedin")) {
+        suiteStartTimes.put(descriptor.name, System.currentTimeMillis())
+      }
+    }
+    afterSuite { descriptor, result ->
+      if (descriptor.name.startsWith("com.linkedin")) {
+        def startTime = suiteStartTimes.remove(descriptor.name)
+        def durationSeconds = startTime != null ? (System.currentTimeMillis() - startTime) / 1000.0 : 0.0
+        println "Test Suite ${descriptor.name} completed (${result.getResultType()}) in ${durationSeconds} s"
+        timingResults << [name: descriptor.name, durationSeconds: durationSeconds, result: result.getResultType().toString()]
+      }
+      if (descriptor.parent == null) {
+        def timingDir = new File(buildDir, "test-timings")
+        timingDir.mkdirs()
+        def timingFile = new File(timingDir, "integrationTests_${name}.json")
+        def snapshot = new ArrayList(timingResults)
+        timingFile.text = JsonOutput.prettyPrint(JsonOutput.toJson([shard: name, suites: snapshot]))
+      }
+    }
   }
 }
 
-task integrationTestZ(type: Test) {
+task integrationTests_99(type: Test) {
+  ext {
+    suiteStartTimes = new java.util.concurrent.ConcurrentHashMap<String, Long>()
+    timingResults = Collections.synchronizedList([])
+  }
   filter {
     integrationTestBuckets.each { name, patterns ->
       patterns.each { pattern ->
@@ -208,12 +212,37 @@ task integrationTestZ(type: Test) {
       }
     }
   }
-
   configure integrationTestConfigs
   useTestNG {
     excludeGroups 'flaky'
     listeners = ['com.linkedin.venice.testng.VeniceSuiteListener', 'com.linkedin.venice.testng.VeniceTestListener']
   }
+  beforeSuite { descriptor ->
+    if (descriptor.name.startsWith("com.linkedin")) {
+      suiteStartTimes.put(descriptor.name, System.currentTimeMillis())
+    }
+  }
+  afterSuite { descriptor, result ->
+    if (descriptor.name.startsWith("com.linkedin")) {
+      def startTime = suiteStartTimes.remove(descriptor.name)
+      def durationSeconds = startTime != null ? (System.currentTimeMillis() - startTime) / 1000.0 : 0.0
+      println "Test Suite ${descriptor.name} completed (${result.getResultType()}) in ${durationSeconds} s"
+      timingResults << [name: descriptor.name, durationSeconds: durationSeconds, result: result.getResultType().toString()]
+    }
+    if (descriptor.parent == null) {
+      def timingDir = new File(buildDir, "test-timings")
+      timingDir.mkdirs()
+      def timingFile = new File(timingDir, "integrationTests_99.json")
+      def snapshot = new ArrayList(timingResults)
+      timingFile.text = JsonOutput.prettyPrint(JsonOutput.toJson([shard: "99", suites: snapshot]))
+    }
+  }
+}
+
+def getFileContent(String targetDir, String fileName) {
+  def file = new File(targetDir, fileName)
+  def filePath = Paths.get(file.getPath())
+  return new String(Files.readAllBytes(filePath))
 }
 
 task generateGHCI() {
@@ -221,15 +250,14 @@ task generateGHCI() {
   def targetFile = new File(targetDir, "VeniceCI-E2ETests.yml")
   def targetFilePath = Paths.get(targetFile.getPath())
 
-  def paramFile = new File(targetDir, "gh-ci-parameterized-flow.txt")
-  def paramFilePath = Paths.get(paramFile.getPath())
-  def paramFileContent = new String(Files.readAllBytes(paramFilePath))
+  def paramFileContent = getFileContent(targetDir, "gh-ci-parameterized-flow.txt")
+  def completionFileContent = getFileContent(targetDir, "gh-ci-completion-flow.txt")
 
   targetFile.delete()
   targetFile.createNewFile()
 
   append(targetFilePath, "# Auto-generated file. Do not edit manually!\n#\n")
-  append(targetFilePath, "# To alter these flows, edit:\n#\n#     internal/venice-test-common/build.gradle\n#\n")
+  append(targetFilePath, "# To alter these flows, edit:\n#\n#     internal/venice-test-common/build.gradle\n#     internal/venice-test-common/test-shard-assignments.json\n#\n")
   append(targetFilePath, "# To regenerate, run:\n#\n#     ./gradlew generateGHCI\n\n")
 
   append(targetFilePath, "name: E2ETests\n\n")
@@ -238,41 +266,33 @@ task generateGHCI() {
 
   def jobs = []
 
-  def common = "--continue --no-daemon "
-
-  def integTestGradleArgs = common + "-DforkEvery=1 -DmaxParallelForks=1 integrationTest"
+  def integrationTestTimeout = 15 // minutes
   integrationTestBuckets.each { name, patterns ->
-    def flowName = "IntegrationTests" + name
+    def flowName = "IntegrationTests_" + name
     jobs << flowName
-    appendToGHCI(paramFileContent, targetFilePath, flowName, 120, integTestGradleArgs + name)
+    appendToGHCI(paramFileContent, targetFilePath, flowName, integrationTestTimeout, name)
   }
-  def otherTest = "IntegrationTestsZ"
-  appendToGHCI(paramFileContent, targetFilePath, otherTest, 120, integTestGradleArgs + "Z")
+  def otherTest = "IntegrationTests_99"
+  appendToGHCI(paramFileContent, targetFilePath, otherTest, integrationTestTimeout, "99")
   jobs << otherTest
 
   // define a job that depends others to manage the status check
-  appendToGHCI(paramFileContent, targetFilePath, "E2ETestsCompletion", 120, "clean", jobs)
+  appendToGHCI(completionFileContent, targetFilePath, "E2ETestsFailureAlert", 20, "null", jobs)
 
   def finalDestinationPath = Paths.get(rootDir.getPath() + "/.github/workflows/VeniceCI-E2ETests.yml")
   Files.move(targetFilePath, finalDestinationPath, StandardCopyOption.REPLACE_EXISTING)
 }
 
-def appendToGHCI(String paramFileContent, Path targetFilePath, String flowName, int timeOut, String gradleArguments, ArrayList dependency=null, String conditional=null) {
+def appendToGHCI(String paramFileContent, Path targetFilePath, String flowName, int timeOut, String shardNumber, ArrayList dependency=null) {
   String postProcessing = paramFileContent
       .replace("\$FlowName", flowName)
       .replace("\$TimeOut", Integer.toString(timeOut))
-      .replace("\$GradleArguments", gradleArguments)
+      .replace("\$ShardNumber", shardNumber)
 
   if (dependency == null) {
     postProcessing = postProcessing.replace("    needs: \$Dependency\n", "")
   } else {
     postProcessing = postProcessing.replace("\$Dependency", dependency.toString())
-  }
-
-  if (conditional == null) {
-    postProcessing = postProcessing.replace("    if: \$Conditional\n", "")
-  } else {
-    postProcessing = postProcessing.replace("\$Conditional", conditional.toString())
   }
 
   append(targetFilePath, postProcessing)

@@ -10,28 +10,34 @@ import static com.linkedin.venice.pushmonitor.ExecutionStatus.START_OF_INCREMENT
 import static com.linkedin.venice.pushmonitor.ExecutionStatus.TOPIC_SWITCH_RECEIVED;
 import static com.linkedin.venice.pushmonitor.ExecutionStatus.isIncrementalPushStatus;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.util.List;
 import org.testng.Assert;
 import org.testng.annotations.Test;
 
 
 public class ReplicaStatusTest {
-  private String instanceId = "testInstance";
+  private static final String INSTANCE_ID = "testInstance";
 
   @Test
   public void testCreateReplicaStatus() {
-    ReplicaStatus replicaStatus = new ReplicaStatus(instanceId);
-    Assert.assertEquals(replicaStatus.getInstanceId(), instanceId);
+    ReplicaStatus replicaStatus = new ReplicaStatus(INSTANCE_ID);
+    Assert.assertEquals(replicaStatus.getInstanceId(), INSTANCE_ID);
     Assert.assertEquals(replicaStatus.getCurrentStatus(), STARTED);
+    // getCurrentProgress() is deprecated and always returns 0 for backward compatibility
     Assert.assertEquals(replicaStatus.getCurrentProgress(), 0);
   }
 
   private void testStatusesUpdate(ExecutionStatus from, ExecutionStatus... statuses) {
     for (ExecutionStatus status: statuses) {
-      ReplicaStatus replicaStatus = new ReplicaStatus(instanceId);
+      ReplicaStatus replicaStatus = new ReplicaStatus(INSTANCE_ID);
       replicaStatus.setCurrentStatus(from);
       replicaStatus.updateStatus(status);
-      Assert.assertEquals(replicaStatus.getCurrentStatus(), status);
+      if (isIncrementalPushStatus(status)) {
+        Assert.assertEquals(replicaStatus.getCurrentStatus(), from);
+      } else {
+        Assert.assertEquals(replicaStatus.getCurrentStatus(), status);
+      }
     }
   }
 
@@ -76,7 +82,7 @@ public class ReplicaStatusTest {
 
   @Test
   public void testStatusHistory() {
-    ReplicaStatus replicaStatus = new ReplicaStatus(instanceId);
+    ReplicaStatus replicaStatus = new ReplicaStatus(INSTANCE_ID);
     replicaStatus.updateStatus(STARTED);
     replicaStatus.updateStatus(PROGRESS);
     replicaStatus.updateStatus(COMPLETED);
@@ -90,16 +96,16 @@ public class ReplicaStatusTest {
 
   @Test
   public void testStatusHistoryTooLong() {
-    ReplicaStatus replicaStatus = new ReplicaStatus(instanceId);
+    ReplicaStatus replicaStatus = new ReplicaStatus(INSTANCE_ID);
     for (int i = 0; i < ReplicaStatus.MAX_HISTORY_LENGTH * 2; i++) {
       replicaStatus.updateStatus(STARTED);
     }
-    Assert.assertEquals(replicaStatus.getStatusHistory().size(), replicaStatus.MAX_HISTORY_LENGTH);
+    Assert.assertEquals(replicaStatus.getStatusHistory().size(), ReplicaStatus.MAX_HISTORY_LENGTH);
   }
 
   @Test
   public void testStatusHistorySaveLastValidStatus() {
-    ReplicaStatus replicaStatus = new ReplicaStatus(instanceId);
+    ReplicaStatus replicaStatus = new ReplicaStatus(INSTANCE_ID);
     replicaStatus.updateStatus(COMPLETED);
     replicaStatus.updateStatus(START_OF_INCREMENTAL_PUSH_RECEIVED);
     for (int i = 0; i <= ReplicaStatus.MAX_HISTORY_LENGTH + 1; i++) {
@@ -108,28 +114,31 @@ public class ReplicaStatusTest {
     replicaStatus.updateStatus(COMPLETED);
     replicaStatus.updateStatus(END_OF_INCREMENTAL_PUSH_RECEIVED);
 
-    Assert.assertEquals(replicaStatus.getStatusHistory().size(), replicaStatus.MAX_HISTORY_LENGTH);
+    Assert.assertEquals(replicaStatus.getStatusHistory().size(), ReplicaStatus.MAX_HISTORY_LENGTH);
     Assert.assertEquals(replicaStatus.getStatusHistory().get(0).getStatus(), START_OF_INCREMENTAL_PUSH_RECEIVED);
     Assert.assertEquals(
-        replicaStatus.getStatusHistory().get(replicaStatus.MAX_HISTORY_LENGTH - 1).getStatus(),
+        replicaStatus.getStatusHistory().get(ReplicaStatus.MAX_HISTORY_LENGTH - 1).getStatus(),
         END_OF_INCREMENTAL_PUSH_RECEIVED);
     Assert.assertEquals(
-        replicaStatus.getStatusHistory().get(replicaStatus.MAX_HISTORY_LENGTH - 2).getStatus(),
+        replicaStatus.getStatusHistory().get(ReplicaStatus.MAX_HISTORY_LENGTH - 2).getStatus(),
         COMPLETED);
   }
 
   @Test
   public void testIncrementalPushStatesGotRemovedFirst() {
-    ReplicaStatus replicaStatus = new ReplicaStatus(instanceId);
+    ReplicaStatus replicaStatus = new ReplicaStatus(INSTANCE_ID);
     replicaStatus.updateStatus(STARTED);
     replicaStatus.updateStatus(END_OF_PUSH_RECEIVED);
     replicaStatus.updateStatus(COMPLETED);
 
     for (int i = 0; i < ReplicaStatus.MAX_HISTORY_LENGTH; i++) {
       replicaStatus.updateStatus(START_OF_INCREMENTAL_PUSH_RECEIVED, "testInc1");
+      Assert.assertEquals(replicaStatus.getCurrentStatus(), COMPLETED);
     }
     replicaStatus.updateStatus(END_OF_INCREMENTAL_PUSH_RECEIVED, "testInc1");
+    Assert.assertEquals(replicaStatus.getCurrentStatus(), COMPLETED);
     replicaStatus.updateStatus(TOPIC_SWITCH_RECEIVED);
+    Assert.assertEquals(replicaStatus.getCurrentStatus(), TOPIC_SWITCH_RECEIVED);
 
     // since we are adding another inc push and the max length is reached, the previous inc push status should be
     // removed.
@@ -153,7 +162,7 @@ public class ReplicaStatusTest {
 
   @Test
   public void testCurrentIncPushVersionStatusGotSaved() {
-    ReplicaStatus replicaStatus = new ReplicaStatus(instanceId);
+    ReplicaStatus replicaStatus = new ReplicaStatus(INSTANCE_ID);
     // update (max length + 1) statuses to the replica status history
     replicaStatus.updateStatus(STARTED);
     for (int i = 0; i < ReplicaStatus.MAX_HISTORY_LENGTH; i++) {
@@ -161,13 +170,13 @@ public class ReplicaStatusTest {
     }
     // Inc push statuses which share the current inc push version would be saved.
     List<StatusSnapshot> statusHistory = replicaStatus.getStatusHistory();
-    Assert.assertEquals(statusHistory.size(), replicaStatus.MAX_HISTORY_LENGTH);
+    Assert.assertEquals(statusHistory.size(), ReplicaStatus.MAX_HISTORY_LENGTH);
     statusHistory.forEach((i) -> Assert.assertTrue(isIncrementalPushStatus(i.getStatus())));
   }
 
   @Test
   public void testStatusHistoryWithLotsOfProgressStatus() {
-    ReplicaStatus replicaStatus = new ReplicaStatus(instanceId);
+    ReplicaStatus replicaStatus = new ReplicaStatus(INSTANCE_ID);
     replicaStatus.updateStatus(STARTED);
     for (int i = 0; i < ReplicaStatus.MAX_HISTORY_LENGTH * 2; i++) {
       replicaStatus.updateStatus(PROGRESS);
@@ -177,5 +186,30 @@ public class ReplicaStatusTest {
         replicaStatus.getStatusHistory().size(),
         2,
         "PROGRESS should be added into history if the previous status is also PROGRESS.");
+  }
+
+  @Test
+  public void testBackwardCompatibilityForCurrentProgressField() throws Exception {
+    ObjectMapper mapper = new ObjectMapper();
+
+    // Test deserialization of old JSON that contains currentProgress field
+    String oldJsonWithCurrentProgress =
+        "{\"instanceId\":\"testInstance\",\"currentStatus\":\"STARTED\",\"currentProgress\":100,\"incrementalPushVersion\":\"\",\"statusHistory\":[]}";
+    ReplicaStatus deserializedStatus = mapper.readValue(oldJsonWithCurrentProgress, ReplicaStatus.class);
+
+    // Verify that deserialization works and currentProgress is ignored
+    Assert.assertEquals(deserializedStatus.getInstanceId(), INSTANCE_ID);
+    Assert.assertEquals(deserializedStatus.getCurrentStatus(), STARTED);
+    Assert.assertEquals(deserializedStatus.getCurrentProgress(), 0); // Always returns 0 now
+
+    // Test serialization - currentProgress should not be included in new JSON
+    String newJson = mapper.writeValueAsString(deserializedStatus);
+    Assert.assertFalse(newJson.contains("currentProgress"), "currentProgress should not be serialized in new JSON");
+
+    // Test that new JSON can be deserialized correctly
+    ReplicaStatus reDeserializedStatus = mapper.readValue(newJson, ReplicaStatus.class);
+    Assert.assertEquals(reDeserializedStatus.getInstanceId(), INSTANCE_ID);
+    Assert.assertEquals(reDeserializedStatus.getCurrentStatus(), STARTED);
+    Assert.assertEquals(reDeserializedStatus.getCurrentProgress(), 0);
   }
 }

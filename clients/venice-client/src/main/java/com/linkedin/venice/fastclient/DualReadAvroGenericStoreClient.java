@@ -137,15 +137,11 @@ public class DualReadAvroGenericStoreClient<K, V> extends DelegatingAvroStoreCli
    * TODO both super.get(key) and super.get(ctx,key) fetches non map for vsonClient for the first request.
    *  Needs to be investigated */
   @Override
-  protected CompletableFuture<V> get(GetRequestContext requestContext, K key) throws VeniceClientException {
+  protected CompletableFuture<V> get(GetRequestContext<K> requestContext, K key) throws VeniceClientException {
     /**
      * If a user calls {@link batchGet}, the {@link batchGet} would trigger a dual read on the thin-client and
-     * fast-client. If internally, batch get gets executed through a series of single gets, we shouldn't trigger dual
-     * reads on the internal {@link get} calls.
+     * fast-client.
      */
-    if (requestContext.isTriggeredByBatchGet) {
-      return super.get(requestContext, key);
-    }
     return dualExecute(() -> super.get(requestContext, key), () -> thinClient.get(key), clientStatsForSingleGet);
   }
 

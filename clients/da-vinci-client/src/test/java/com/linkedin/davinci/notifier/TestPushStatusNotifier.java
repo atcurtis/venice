@@ -1,26 +1,66 @@
 package com.linkedin.davinci.notifier;
 
+import static com.linkedin.davinci.config.VeniceServerConfig.IncrementalPushStatusWriteMode.DUAL;
+import static com.linkedin.davinci.config.VeniceServerConfig.IncrementalPushStatusWriteMode.PUSH_STATUS_SYSTEM_STORE_ONLY;
+import static com.linkedin.davinci.config.VeniceServerConfig.IncrementalPushStatusWriteMode.ZOOKEEPER_ONLY;
+import static com.linkedin.venice.pushmonitor.ExecutionStatus.END_OF_INCREMENTAL_PUSH_RECEIVED;
+import static com.linkedin.venice.pushmonitor.ExecutionStatus.START_OF_INCREMENTAL_PUSH_RECEIVED;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.*;
+import static org.mockito.Mockito.anyString;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
+import com.linkedin.davinci.config.VeniceServerConfig.IncrementalPushStatusWriteMode;
 import com.linkedin.venice.helix.HelixPartitionStatusAccessor;
 import com.linkedin.venice.meta.ReadOnlyStoreRepository;
 import com.linkedin.venice.meta.Store;
+import com.linkedin.venice.pubsub.adapter.kafka.common.ApacheKafkaOffsetPosition;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
 import com.linkedin.venice.pushmonitor.ExecutionStatus;
 import com.linkedin.venice.pushmonitor.OfflinePushAccessor;
 import com.linkedin.venice.pushstatushelper.PushStatusStoreWriter;
+import java.util.ArrayList;
+import java.util.List;
 import org.apache.helix.HelixException;
+import org.testng.annotations.BeforeMethod;
+import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
 
 public class TestPushStatusNotifier {
+  public static final String INSTANCE_ID = "instance1";
+  private OfflinePushAccessor offlinePushAccessor;
+  private HelixPartitionStatusAccessor helixPartitionStatusAccessor;
+  private PushStatusStoreWriter pushStatusStoreWriter;
+  private ReadOnlyStoreRepository storeRepository;
+  private PushStatusNotifier notifier;
+  private static final String STORE_NAME = "test_store";
+  private static final int STORE_VERSION = 1;
+  private static final String TOPIC = "test_store_v1";
+  private static final int PARTITION_ID = 1;
+  private static final ApacheKafkaOffsetPosition POSITION_12345 = ApacheKafkaOffsetPosition.of(12345L);
+  private static final String MESSAGE = "Test Message";
+
+  @BeforeMethod
+  public void setUp() {
+    offlinePushAccessor = mock(OfflinePushAccessor.class);
+    helixPartitionStatusAccessor = mock(HelixPartitionStatusAccessor.class);
+    pushStatusStoreWriter = mock(PushStatusStoreWriter.class);
+    storeRepository = mock(ReadOnlyStoreRepository.class);
+    Store store = mock(Store.class);
+    when(store.isDaVinciPushStatusStoreEnabled()).thenReturn(true);
+    when(storeRepository.getStoreOrThrow(any())).thenReturn(store);
+  }
+
   @Test
   public void testCompleteCVUpdate() {
-    OfflinePushAccessor offlinePushAccessor = mock(OfflinePushAccessor.class);
-    HelixPartitionStatusAccessor helixPartitionStatusAccessor = mock(HelixPartitionStatusAccessor.class);
-    PushStatusStoreWriter pushStatusStoreWriter = mock(PushStatusStoreWriter.class);
     ReadOnlyStoreRepository storeRepository = mock(ReadOnlyStoreRepository.class);
     String topic = "abc_v1";
     String host = "localhost";
@@ -30,24 +70,153 @@ public class TestPushStatusNotifier {
         helixPartitionStatusAccessor,
         pushStatusStoreWriter,
         storeRepository,
-        host);
-    statusNotifier.completed(topic, 1, 1, "");
-    verify(offlinePushAccessor, times(1)).updateReplicaStatus(topic, 1, host, ExecutionStatus.COMPLETED, 1, "");
+        host,
+        DUAL);
+
+    PubSubPosition p1 = ApacheKafkaOffsetPosition.of(1L);
+
+    statusNotifier.completed(topic, 1, p1, "");
+    verify(offlinePushAccessor, times(1)).updateReplicaStatus(topic, 1, host, ExecutionStatus.COMPLETED, "");
 
     doThrow(HelixException.class).when(helixPartitionStatusAccessor)
         .updateReplicaStatus(any(), anyInt(), eq(ExecutionStatus.COMPLETED));
-    statusNotifier.completed(topic, 1, 1, "");
-    verify(offlinePushAccessor, never()).updateReplicaStatus(topic, 1, "host", ExecutionStatus.COMPLETED, 1, "");
+    statusNotifier.completed(topic, 1, p1, "");
+    verify(offlinePushAccessor, never()).updateReplicaStatus(topic, 1, "host", ExecutionStatus.COMPLETED, "");
 
     doReturn(mock(Store.class)).when(storeRepository).getStoreOrThrow(any());
-    statusNotifier.startOfIncrementalPushReceived(topic, 1, 1, "");
-    statusNotifier.endOfIncrementalPushReceived(topic, 1, 1, "");
-    statusNotifier.quotaNotViolated(topic, 1, 1, "");
-    statusNotifier.quotaViolated(topic, 1, 1, "");
-    statusNotifier.restarted(topic, 1, 1, "");
-    statusNotifier.topicSwitchReceived(topic, 1, 1, "");
+    statusNotifier.startOfIncrementalPushReceived(topic, 1, p1, "");
+    statusNotifier.endOfIncrementalPushReceived(topic, 1, p1, "");
+    statusNotifier.quotaNotViolated(topic, 1, p1, "");
+    statusNotifier.quotaViolated(topic, 1, p1, "");
+    statusNotifier.restarted(topic, 1, p1, "");
+    statusNotifier.topicSwitchReceived(topic, 1, p1, "");
     statusNotifier.started(topic, 1, "");
-    statusNotifier.endOfPushReceived(topic, 1, 1, "");
-    statusNotifier.progress(topic, 1, 1, "");
+    statusNotifier.endOfPushReceived(topic, 1, p1, "");
+    statusNotifier.progress(topic, 1, p1, "");
+  }
+
+  @DataProvider(name = "pushStatusWriteModes")
+  public Object[][] pushStatusWriteModes() {
+    return new Object[][] { { ZOOKEEPER_ONLY, true, false }, { PUSH_STATUS_SYSTEM_STORE_ONLY, false, true },
+        { DUAL, true, true } };
+  }
+
+  @Test(dataProvider = "pushStatusWriteModes")
+  public void testStartOfIncrementalPushReceived(
+      IncrementalPushStatusWriteMode mode,
+      boolean expectZookeeper,
+      boolean expectPushStatusStore) {
+
+    notifier = new PushStatusNotifier(
+        offlinePushAccessor,
+        helixPartitionStatusAccessor,
+        pushStatusStoreWriter,
+        storeRepository,
+        "instance1",
+        mode);
+
+    notifier.startOfIncrementalPushReceived(TOPIC, PARTITION_ID, POSITION_12345, MESSAGE);
+
+    if (expectZookeeper) {
+      verify(offlinePushAccessor, times(1))
+          .updateReplicaStatus(TOPIC, PARTITION_ID, INSTANCE_ID, START_OF_INCREMENTAL_PUSH_RECEIVED, MESSAGE);
+    } else {
+      verify(offlinePushAccessor, never())
+          .updateReplicaStatus(anyString(), anyInt(), anyString(), any(ExecutionStatus.class), anyString());
+    }
+
+    if (expectPushStatusStore) {
+      verify(pushStatusStoreWriter, times(1)).writePushStatus(
+          eq(STORE_NAME),
+          eq(STORE_VERSION),
+          eq(PARTITION_ID),
+          eq(START_OF_INCREMENTAL_PUSH_RECEIVED),
+          any(),
+          any());
+    } else {
+      verify(pushStatusStoreWriter, never())
+          .writePushStatus(anyString(), anyInt(), anyInt(), any(ExecutionStatus.class), any());
+    }
+  }
+
+  @Test(dataProvider = "pushStatusWriteModes")
+  public void testEndOfIncrementalPushReceived(
+      IncrementalPushStatusWriteMode mode,
+      boolean expectZookeeper,
+      boolean expectPushStatusStore) {
+
+    notifier = new PushStatusNotifier(
+        offlinePushAccessor,
+        helixPartitionStatusAccessor,
+        pushStatusStoreWriter,
+        storeRepository,
+        INSTANCE_ID,
+        mode);
+
+    notifier.endOfIncrementalPushReceived(TOPIC, PARTITION_ID, POSITION_12345, MESSAGE);
+
+    if (expectZookeeper) {
+      verify(offlinePushAccessor, times(1))
+          .updateReplicaStatus(TOPIC, PARTITION_ID, INSTANCE_ID, END_OF_INCREMENTAL_PUSH_RECEIVED, MESSAGE);
+    } else {
+      verify(offlinePushAccessor, never())
+          .updateReplicaStatus(anyString(), anyInt(), anyString(), any(ExecutionStatus.class), anyString());
+    }
+
+    if (expectPushStatusStore) {
+      verify(pushStatusStoreWriter, times(1)).writePushStatus(
+          eq(STORE_NAME),
+          eq(STORE_VERSION),
+          eq(PARTITION_ID),
+          eq(END_OF_INCREMENTAL_PUSH_RECEIVED),
+          any(),
+          any());
+    } else {
+      verify(pushStatusStoreWriter, never())
+          .writePushStatus(anyString(), anyInt(), anyInt(), any(ExecutionStatus.class), any());
+    }
+  }
+
+  @Test(dataProvider = "pushStatusWriteModes")
+  public void testBatchEndOfIncrementalPushReceived(
+      IncrementalPushStatusWriteMode mode,
+      boolean expectZookeeper,
+      boolean expectPushStatusStore) {
+
+    notifier = new PushStatusNotifier(
+        offlinePushAccessor,
+        helixPartitionStatusAccessor,
+        pushStatusStoreWriter,
+        storeRepository,
+        INSTANCE_ID,
+        mode);
+
+    List<String> incPushVersions = new ArrayList<>();
+    incPushVersions.add("inc_push_version_1");
+    incPushVersions.add("inc_push_version_2");
+    incPushVersions.add("inc_push_version_3");
+    incPushVersions.add("inc_push_version_4");
+
+    notifier.batchEndOfIncrementalPushReceived(TOPIC, PARTITION_ID, POSITION_12345, incPushVersions);
+
+    if (expectZookeeper) {
+      verify(offlinePushAccessor, times(1))
+          .batchUpdateReplicaIncPushStatus(TOPIC, PARTITION_ID, INSTANCE_ID, incPushVersions);
+    } else {
+      verify(offlinePushAccessor, never()).batchUpdateReplicaIncPushStatus(anyString(), anyInt(), anyString(), any());
+    }
+
+    if (expectPushStatusStore) {
+      verify(pushStatusStoreWriter, times(4)).writePushStatus(
+          eq(STORE_NAME),
+          eq(STORE_VERSION),
+          eq(PARTITION_ID),
+          eq(END_OF_INCREMENTAL_PUSH_RECEIVED),
+          any(),
+          any());
+    } else {
+      verify(pushStatusStoreWriter, never())
+          .writePushStatus(anyString(), anyInt(), anyInt(), any(ExecutionStatus.class), any());
+    }
   }
 }

@@ -8,12 +8,11 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.linkedin.davinci.stats.AggKafkaConsumerServiceStats;
-import com.linkedin.venice.kafka.protocol.KafkaMessageEnvelope;
-import com.linkedin.venice.message.KafkaKey;
 import com.linkedin.venice.pubsub.PubSubTopicPartitionImpl;
 import com.linkedin.venice.pubsub.PubSubTopicRepository;
+import com.linkedin.venice.pubsub.api.DefaultPubSubMessage;
 import com.linkedin.venice.pubsub.api.PubSubConsumerAdapter;
-import com.linkedin.venice.pubsub.api.PubSubMessage;
+import com.linkedin.venice.pubsub.api.PubSubSymbolicPosition;
 import com.linkedin.venice.pubsub.api.PubSubTopic;
 import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
 import com.linkedin.venice.utils.SystemTime;
@@ -23,6 +22,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import org.testng.Assert;
 import org.testng.annotations.BeforeMethod;
@@ -48,16 +48,17 @@ public class SharedKafkaConsumerTest {
   public void testSubscriptionEmptyPoll() {
     PubSubTopic nonExistingTopic1 = pubSubTopicRepository.getTopic("nonExistingTopic1_v3");
 
-    SharedKafkaConsumer sharedConsumer = new SharedKafkaConsumer(consumer, stats, () -> {}, (c, tp) -> {});
+    SharedKafkaConsumer sharedConsumer =
+        new SharedKafkaConsumer(consumer, stats, () -> {}, (c, vt, tp) -> {}, "region1", 1);
 
     Set<PubSubTopicPartition> assignmentReturnedConsumer = new HashSet<>();
     PubSubTopicPartition nonExistentPubSubTopicPartition = new PubSubTopicPartitionImpl(nonExistingTopic1, 1);
     assignmentReturnedConsumer.add(nonExistentPubSubTopicPartition);
     when(consumer.getAssignment()).thenReturn(assignmentReturnedConsumer);
-    sharedConsumer.subscribe(nonExistingTopic1, nonExistentPubSubTopicPartition, -1);
+    sharedConsumer
+        .subscribe(nonExistingTopic1, nonExistentPubSubTopicPartition, PubSubSymbolicPosition.EARLIEST, false);
 
-    Map<PubSubTopicPartition, List<PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long>>> pubSubMessagesReturnedByConsumer =
-        new HashMap<>();
+    Map<PubSubTopicPartition, List<DefaultPubSubMessage>> pubSubMessagesReturnedByConsumer = new HashMap<>();
     doReturn(pubSubMessagesReturnedByConsumer).when(consumer).poll(anyLong());
 
     sharedConsumer.poll(1000);
@@ -72,7 +73,7 @@ public class SharedKafkaConsumerTest {
 
   private void setUpSharedConsumer() {
     consumerAdapter = mock(PubSubConsumerAdapter.class);
-    AggKafkaConsumerServiceStats stats = mock(AggKafkaConsumerServiceStats.class);
+    stats = mock(AggKafkaConsumerServiceStats.class);
     Runnable assignmentChangeListener = mock(Runnable.class);
     SharedKafkaConsumer.UnsubscriptionListener unsubscriptionListener =
         mock(SharedKafkaConsumer.UnsubscriptionListener.class);
@@ -82,7 +83,9 @@ public class SharedKafkaConsumerTest {
         stats,
         assignmentChangeListener,
         unsubscriptionListener,
-        new SystemTime());
+        new SystemTime(),
+        "region1",
+        1);
     topicPartitions = new HashSet<>();
     topicPartitions.add(mock(PubSubTopicPartition.class));
   }
@@ -91,13 +94,11 @@ public class SharedKafkaConsumerTest {
   public void testWaitAfterUnsubscribe() {
     setUpSharedConsumer();
     Supplier<Set<PubSubTopicPartition>> supplier = () -> topicPartitions;
-
-    long poolTimesBeforeUnsubscribe = sharedKafkaConsumer.getPollTimes();
-    sharedKafkaConsumer.setNextPollTimeoutSeconds(1);
-    sharedKafkaConsumer.unSubscribeAction(supplier);
+    long pollTimesBeforeUnsubscribe = sharedKafkaConsumer.getPollTimes();
+    sharedKafkaConsumer.unSubscribeAction(supplier, TimeUnit.SECONDS.toMillis(1));
 
     // This is to test that if the poll time is not incremented when the consumer is unsubscribed the correct log can
     // be found in the logs.
-    Assert.assertEquals(poolTimesBeforeUnsubscribe, sharedKafkaConsumer.getPollTimes());
+    Assert.assertEquals(pollTimesBeforeUnsubscribe, sharedKafkaConsumer.getPollTimes());
   }
 }

@@ -5,8 +5,10 @@ import com.linkedin.venice.ConfigKeys;
 import com.linkedin.venice.controllerapi.UpdateStoreQueryParams;
 import com.linkedin.venice.controllerapi.VersionCreationResponse;
 import com.linkedin.venice.integration.utils.ServiceFactory;
+import com.linkedin.venice.integration.utils.VeniceClusterCreateOptions;
 import com.linkedin.venice.integration.utils.VeniceClusterWrapper;
 import com.linkedin.venice.integration.utils.VeniceServerWrapper;
+import com.linkedin.venice.meta.OfflinePushStrategy;
 import com.linkedin.venice.pushmonitor.ExecutionStatus;
 import com.linkedin.venice.utils.TestUtils;
 import com.linkedin.venice.utils.Time;
@@ -45,8 +47,20 @@ public class LeaderFollowerThreadPoolTest {
     int numOfController = 1;
     int numOfServers = 0;
     int numOfRouters = 1;
-    cluster = ServiceFactory
-        .getVeniceCluster(numOfController, numOfServers, numOfRouters, replicaFactor, partitionSize, false, false);
+
+    Properties extraProperties = new Properties();
+    extraProperties.put(ConfigKeys.DEFAULT_OFFLINE_PUSH_STRATEGY, OfflinePushStrategy.WAIT_ALL_REPLICAS.name());
+    extraProperties.put(ConfigKeys.OFFLINE_JOB_START_TIMEOUT_MS, 30_000);
+    VeniceClusterCreateOptions options = new VeniceClusterCreateOptions.Builder().numberOfControllers(numOfController)
+        .numberOfServers(numOfServers)
+        .numberOfRouters(numOfRouters)
+        .replicationFactor(replicaFactor)
+        .partitionSize(partitionSize)
+        .sslToStorageNodes(false)
+        .sslToKafka(false)
+        .extraProperties(extraProperties)
+        .build();
+    cluster = ServiceFactory.getVeniceCluster(options);
   }
 
   @AfterMethod

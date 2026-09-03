@@ -5,12 +5,11 @@ import com.linkedin.venice.fastclient.transport.TransportClientResponseForRoute;
 import com.linkedin.venice.utils.LatencyUtils;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -36,6 +35,9 @@ public abstract class MultiKeyRequestContext<K, V> extends RequestContext {
   private final AtomicLong firstResponseReceivedTS;
   private final AtomicReference<Throwable> partialResponseException;
 
+  /**
+   * Tracking the assigned replicas per partition
+   */
   private Map<Integer, Set<String>> routesForPartition;
 
   final int numKeysInRequest;
@@ -44,12 +46,16 @@ public abstract class MultiKeyRequestContext<K, V> extends RequestContext {
   final boolean isPartialSuccessAllowed;
   private boolean completed;
 
-  MultiKeyRequestContext(int numKeysInRequest, boolean isPartialSuccessAllowed) {
+  private int fanoutSize;
+
+  private Set<K> keys;
+
+  public MultiKeyRequestContext(int numKeysInRequest, boolean isPartialSuccessAllowed) {
     this.routeRequests = new VeniceConcurrentHashMap<>();
     this.firstRequestSentTS = new AtomicLong(-1);
     this.firstResponseReceivedTS = new AtomicLong(-1);
     this.partialResponseException = new AtomicReference<>();
-    this.routesForPartition = new HashMap<>();
+    this.routesForPartition = new VeniceConcurrentHashMap<>();
     this.numKeysInRequest = numKeysInRequest;
     this.numKeysCompleted = new AtomicInteger();
     this.retryContext = null;
@@ -57,13 +63,21 @@ public abstract class MultiKeyRequestContext<K, V> extends RequestContext {
     this.completed = false;
   }
 
-  void addKey(String route, K key, byte[] serializedKey, int partitionId) {
-    Validate.notNull(route);
-    routeRequests.computeIfAbsent(route, r -> new RouteRequestContext<>()).addKeyInfo(key, serializedKey, partitionId);
-    routesForPartition.computeIfAbsent(partitionId, (k) -> new HashSet<>()).add(route);
+  public void setKeys(Set<K> keys) {
+    this.keys = keys;
   }
 
-  Set<String> getRoutes() {
+  public Set<K> getKeys() {
+    return this.keys;
+  }
+
+  public void addKey(String route, K key, byte[] serializedKey, int partitionId) {
+    Validate.notNull(route);
+    routeRequests.computeIfAbsent(route, r -> new RouteRequestContext<>()).addKeyInfo(key, serializedKey, partitionId);
+    routesForPartition.computeIfAbsent(partitionId, (k) -> ConcurrentHashMap.newKeySet()).add(route);
+  }
+
+  public Set<String> getRoutes() {
     return routeRequests.keySet();
   }
 
@@ -83,6 +97,9 @@ public abstract class MultiKeyRequestContext<K, V> extends RequestContext {
   }
 
   void complete() {
+    if (completed) {
+      return;
+    }
     completed = true;
     // Roll up route stats into overall stats
     long decompressionTimeNS = 0;
@@ -103,6 +120,16 @@ public abstract class MultiKeyRequestContext<K, V> extends RequestContext {
     if (firstRequestSentTS.get() != -1 && firstResponseReceivedTS.get() != -1) {
       requestSubmissionToResponseHandlingTime = firstResponseReceivedTS.get() - firstRequestSentTS.get();
     }
+  }
+
+  protected void copyStateToRetryRequestContext(MultiKeyRequestContext<K, V> retryContext) {
+    retryContext.currentVersion = this.currentVersion;
+    retryContext.routeRequestMap = this.routeRequestMap;
+    // Used to bypass the route chosen by the original request when routing the retry request.
+    retryContext.setRoutesForPartitionMapping(this.getRoutesForPartitionMapping());
+    // Used to choose a different helix group id in retry request.
+    retryContext.helixGroupId = this.helixGroupId;
+    retryContext.retryRequest = true;
   }
 
   void recordDecompressionTime(String routeId, long latencyInNS) {
@@ -142,8 +169,12 @@ public abstract class MultiKeyRequestContext<K, V> extends RequestContext {
     return Optional.ofNullable(partialResponseException.get());
   }
 
-  void setPartialResponseException(Throwable exception) {
+  void setPartialResponseExceptionIfNull(Throwable exception) {
     this.partialResponseException.compareAndSet(null, exception);
+  }
+
+  void setPartialResponseException(Throwable exception) {
+    this.partialResponseException.set(exception);
   }
 
   /* Utility validation methods */
@@ -164,7 +195,26 @@ public abstract class MultiKeyRequestContext<K, V> extends RequestContext {
   }
 
   public void setRoutesForPartitionMapping(Map<Integer, Set<String>> routesForPartition) {
-    this.routesForPartition = routesForPartition;
+    // Defensive copy to maintain thread-safety: convert incoming map to concurrent structures
+    // This is critical for retry scenarios where the source map might not be concurrent
+    this.routesForPartition = new VeniceConcurrentHashMap<>();
+    if (routesForPartition != null) {
+      for (Map.Entry<Integer, Set<String>> entry: routesForPartition.entrySet()) {
+        Set<String> concurrentSet = ConcurrentHashMap.newKeySet();
+        if (entry.getValue() != null) {
+          concurrentSet.addAll(entry.getValue());
+        }
+        this.routesForPartition.put(entry.getKey(), concurrentSet);
+      }
+    }
+  }
+
+  public void setFanoutSize(int fanoutSize) {
+    this.fanoutSize = fanoutSize;
+  }
+
+  public int getFanoutSize() {
+    return fanoutSize;
   }
 
   /**
@@ -209,6 +259,11 @@ public abstract class MultiKeyRequestContext<K, V> extends RequestContext {
       return serializedKey;
     }
 
+    /**
+     * Get the partition id for this key info.
+     *
+     * @return the partition id
+     */
     public int getPartitionId() {
       return partitionId;
     }

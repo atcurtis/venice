@@ -1,21 +1,29 @@
 package com.linkedin.venice.controller.kafka.protocol.serializer;
 
 import com.linkedin.avroutil1.compatibility.AvroCompatibilityHelper;
+import com.linkedin.venice.annotation.VisibleForTesting;
+import com.linkedin.venice.controller.VeniceHelixAdmin;
 import com.linkedin.venice.controller.kafka.protocol.admin.AdminOperation;
-import com.linkedin.venice.exceptions.VeniceMessageException;
+import com.linkedin.venice.exceptions.VeniceProtocolException;
+import com.linkedin.venice.helix.HelixReadOnlyZKSharedSchemaRepository;
 import com.linkedin.venice.serialization.avro.AvroProtocolDefinition;
 import com.linkedin.venice.utils.Utils;
+import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.ByteBuffer;
 import java.util.HashMap;
 import java.util.Map;
 import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericDatumReader;
+import org.apache.avro.generic.GenericDatumWriter;
+import org.apache.avro.generic.GenericRecord;
+import org.apache.avro.io.BinaryDecoder;
 import org.apache.avro.io.Decoder;
-import org.apache.avro.io.DecoderFactory;
 import org.apache.avro.io.Encoder;
 import org.apache.avro.specific.SpecificDatumReader;
-import org.apache.avro.specific.SpecificDatumWriter;
 
 
 public class AdminOperationSerializer {
@@ -23,38 +31,108 @@ public class AdminOperationSerializer {
   public static final int LATEST_SCHEMA_ID_FOR_ADMIN_OPERATION =
       AvroProtocolDefinition.ADMIN_OPERATION.getCurrentProtocolVersion();
 
-  private static SpecificDatumWriter<AdminOperation> SPECIFIC_DATUM_WRITER =
-      new SpecificDatumWriter<>(AdminOperation.getClassSchema());
-  /** Used to generate decoders. */
-  private static final DecoderFactory DECODER_FACTORY = new DecoderFactory();
+  public static final Schema LATEST_SCHEMA = AdminOperation.getClassSchema();
 
   private static final Map<Integer, Schema> PROTOCOL_MAP = initProtocolMap();
 
-  public byte[] serialize(AdminOperation object) {
-    try {
-      ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
-      Encoder encoder = AvroCompatibilityHelper.newBinaryEncoder(byteArrayOutputStream, true, null);
-      SPECIFIC_DATUM_WRITER.write(object, encoder);
-      encoder.flush();
+  private static final String ADMIN_OPERATION_SYSTEM_STORE_NAME =
+      AvroProtocolDefinition.ADMIN_OPERATION.getSystemStoreName();
 
-      return byteArrayOutputStream.toByteArray();
+  /**
+   * Cache for schemas downloaded from system store schema repository.
+   * This map is separate from PROTOCOL_MAP to distinguish between built-in schemas and downloaded schemas.
+   * Built-in schemas are initialized at startup and are immutable.
+   * Downloaded schemas are downloaded from system store schema repository, and are mutable.
+   */
+  private static final Map<Integer, Schema> cacheSchemaMapFromSystemStore = new VeniceConcurrentHashMap<>();
+
+  /**
+   * Serialize AdminOperation object to bytes[] with the writer schema
+   * @param object AdminOperation object
+   * @param targetSchemaId writer schema id that we will refer to for serialization and deserialization
+   *
+   * <p>
+   * If targetSchemaId equals LATEST_SCHEMA_ID_FOR_ADMIN_OPERATION, return the bytes[] from the first serialization.
+   * Otherwise, serialize the object to the writer schema (lower version).
+   * </p>
+   *
+   * <p>
+   * This involves:
+   * <ol>
+   *   <li>Serializing the object to a GenericRecord with the latest schema.</li>
+   *   <li>Deserializing it to a GenericRecord with the writer schema.</li>
+   *   <li>Serializing it to bytes.</li>
+   * </ol>
+   * </p>
+   * <p>
+   * This process ensures the object is serialized to the lower schema version.
+   * The normal serialization process may fail (ClassCastException) due to:
+   * <ul>
+   *   <li>Differences in field types</li>
+   *   <li>New fields added in the middle of the schema instead of at the end</li>
+   * </ul>
+   * </p>
+   */
+  public byte[] serialize(AdminOperation object, int targetSchemaId) {
+    byte[] serializedBytes = serialize(object, LATEST_SCHEMA, LATEST_SCHEMA_ID_FOR_ADMIN_OPERATION);
+
+    // If writerSchema is the latest schema, we can return the serialized bytes directly.
+    if (targetSchemaId == LATEST_SCHEMA_ID_FOR_ADMIN_OPERATION) {
+      return serializedBytes;
+    }
+
+    // Get the writer schema.
+    Schema targetSchema = getSchema(targetSchemaId);
+
+    // If writer schema is not the latest schema, we need to deserialize the serialized bytes to GenericRecord with
+    // the writer schema, then serialize it to bytes with the writer schema.
+    try {
+      GenericDatumReader<GenericRecord> datumReader = new GenericDatumReader<>(LATEST_SCHEMA, targetSchema);
+      InputStream in = new ByteArrayInputStream(serializedBytes);
+      BinaryDecoder decoder = AvroCompatibilityHelper.newBinaryDecoder(in, true, null);
+      GenericRecord genericRecord = datumReader.read(null, decoder);
+      return serialize(genericRecord, targetSchema, targetSchemaId);
     } catch (IOException e) {
-      throw new VeniceMessageException("Failed to encode message: " + object.toString(), e);
+      throw new VeniceProtocolException(
+          "Could not deserialize bytes back into GenericRecord object with reader version: " + targetSchema,
+          e);
     }
   }
 
   public AdminOperation deserialize(ByteBuffer byteBuffer, int writerSchemaId) {
-    if (!PROTOCOL_MAP.containsKey(writerSchemaId)) {
-      throw new VeniceMessageException("Writer schema: " + writerSchemaId + " doesn't exist");
-    }
-    SpecificDatumReader<AdminOperation> reader =
-        new SpecificDatumReader<>(PROTOCOL_MAP.get(writerSchemaId), AdminOperation.getClassSchema());
+    Schema writerSchema = getSchema(writerSchemaId);
+    SpecificDatumReader<AdminOperation> reader = new SpecificDatumReader<>(writerSchema, LATEST_SCHEMA);
     Decoder decoder = AvroCompatibilityHelper
         .newBinaryDecoder(byteBuffer.array(), byteBuffer.position(), byteBuffer.remaining(), null);
     try {
       return reader.read(null, decoder);
     } catch (IOException e) {
-      throw new VeniceMessageException("Could not deserialize bytes back into AdminOperation object", e);
+      throw new VeniceProtocolException(
+          "Could not deserialize bytes back into AdminOperation object with schema id: " + writerSchemaId,
+          e);
+    }
+  }
+
+  /**
+   * Validate the AdminOperation message against the target schema for serialization compatibility.
+   * @throws VeniceProtocolException if the message does not conform to the target schema.
+   */
+  public void validate(AdminOperation message, int targetSchemaId) {
+    // We don't support serialization to future schema versions.
+    // Fail fast in this case.
+    if (targetSchemaId > LATEST_SCHEMA_ID_FOR_ADMIN_OPERATION) {
+      throw new VeniceProtocolException(
+          "Target schema id: " + targetSchemaId + " is greater than the latest schema id: "
+              + LATEST_SCHEMA_ID_FOR_ADMIN_OPERATION + ". We don't support serialization to future schema versions.");
+    }
+
+    Schema targetSchema = getSchema(targetSchemaId);
+    try {
+      SemanticDetector.traverseAndValidate(message, LATEST_SCHEMA, targetSchema, "AdminOperation", null);
+    } catch (VeniceProtocolException e) {
+      throw new VeniceProtocolException(
+          String.format("Current schema version: %s. New semantic is being used. %s", targetSchemaId, e.getMessage()),
+          e);
     }
   }
 
@@ -66,7 +144,78 @@ public class AdminOperationSerializer {
       }
       return protocolSchemaMap;
     } catch (IOException e) {
-      throw new VeniceMessageException("Could not initialize " + AdminOperationSerializer.class.getSimpleName(), e);
+      throw new VeniceProtocolException("Could not initialize " + AdminOperationSerializer.class.getSimpleName(), e);
     }
+  }
+
+  /**
+   * Get schema by schema id from either built-in protocol map or system store schema repository cache.
+   */
+  public Schema getSchema(int schemaId) {
+    if (PROTOCOL_MAP.containsKey(schemaId)) {
+      return PROTOCOL_MAP.get(schemaId);
+    }
+    if (cacheSchemaMapFromSystemStore.containsKey(schemaId)) {
+      return cacheSchemaMapFromSystemStore.get(schemaId);
+    }
+
+    throw new VeniceProtocolException("Admin operation schema version: " + schemaId + " doesn't exist");
+  }
+
+  /**
+   * Download schema from system store schema repository and add it to the protocol map if not already present.
+   * @throws VeniceProtocolException if the schema could not be found in the system store schema repository.
+   */
+  public void fetchAndStoreSchemaIfAbsent(VeniceHelixAdmin admin, int schemaId) {
+    // No need to download if the schema is already available.
+    if (PROTOCOL_MAP.containsKey(schemaId) || cacheSchemaMapFromSystemStore.containsKey(schemaId)) {
+      return;
+    }
+    HelixReadOnlyZKSharedSchemaRepository zkSharedSchemaRepository = admin.getReadOnlyZKSharedSchemaRepository();
+
+    boolean schemaExists = zkSharedSchemaRepository.hasValueSchema(ADMIN_OPERATION_SYSTEM_STORE_NAME, schemaId);
+
+    Schema schema = null;
+    if (schemaExists) {
+      schema = zkSharedSchemaRepository.getValueSchema(ADMIN_OPERATION_SYSTEM_STORE_NAME, schemaId).getSchema();
+    }
+
+    if (schema == null) {
+      String msg = "Failed to fetch schema id: " + schemaId + " from system store schema repository"
+          + (schemaExists ? " even though it exists." : " as it does not exist.");
+      throw new VeniceProtocolException(msg);
+    }
+
+    // Add the downloaded schema to the cache map
+    cacheSchemaMapFromSystemStore.put(schemaId, schema);
+  }
+
+  /**
+   * Serialize the object by writer schema
+   */
+  private <T> byte[] serialize(T object, Schema writerSchema, int writerSchemaId) {
+    try {
+      GenericDatumWriter<T> datumWriter = new GenericDatumWriter<>(writerSchema);
+      ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
+      Encoder encoder = AvroCompatibilityHelper.newBinaryEncoder(byteArrayOutputStream, true, null);
+      datumWriter.write(object, encoder);
+      encoder.flush();
+      return byteArrayOutputStream.toByteArray();
+    } catch (IOException e) {
+      throw new VeniceProtocolException(
+          "Could not serialize object: " + object.getClass().getTypeName() + " with writer schema id: "
+              + writerSchemaId,
+          e);
+    }
+  }
+
+  @VisibleForTesting
+  public void addSchema(int schemaId, Schema schema) {
+    cacheSchemaMapFromSystemStore.put(schemaId, schema);
+  }
+
+  @VisibleForTesting
+  public void removeSchema(int schemaId) {
+    cacheSchemaMapFromSystemStore.remove(schemaId);
   }
 }

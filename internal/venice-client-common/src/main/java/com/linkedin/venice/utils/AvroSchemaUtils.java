@@ -13,6 +13,7 @@ import com.linkedin.avroutil1.compatibility.AvroSchemaVerifier;
 import com.linkedin.avroutil1.compatibility.AvroVersion;
 import com.linkedin.venice.exceptions.InvalidVeniceSchemaException;
 import com.linkedin.venice.exceptions.VeniceException;
+import com.linkedin.venice.schema.SchemaData;
 import com.linkedin.venice.schema.SchemaEntry;
 import java.io.IOException;
 import java.util.ArrayList;
@@ -174,6 +175,12 @@ public class AvroSchemaUtils {
     return Schema.parse(schemaOb.toString());
   }
 
+  public static boolean compareSchema(Schema s1, Schema s2) {
+    String canonicalSchema1 = AvroCompatibilityHelper.toParsingForm(s1);
+    String canonicalSchema2 = AvroCompatibilityHelper.toParsingForm(s2);
+    return canonicalSchema2.equals(canonicalSchema1);
+  }
+
   /**
    * Compares two schema with possible re-ordering of the fields. Otherwise, If compares every field at every level.
    * @param s1
@@ -200,6 +207,16 @@ public class AvroSchemaUtils {
         return compareSchemaUnion(s1.getTypes(), s2.getTypes());
       case ENUM:
         return compareSchemaEnum(s1.getEnumSymbols(), s2.getEnumSymbols());
+      case INT:
+      case LONG:
+      case FLOAT:
+      case DOUBLE:
+      case BOOLEAN:
+      case BYTES:
+      case NULL:
+        // Primitive types cannot differ structurally; any inequality is due to custom properties only
+        // (e.g. "li.data.proto.numberFieldType"). Treat them as equal for schema comparison purposes.
+        return true;
       default:
         throw new VeniceException("Schema compare not supported for " + s1.toString());
     }
@@ -262,10 +279,9 @@ public class AvroSchemaUtils {
       validateTwoSchemasAreFullyCompatible(tmpSupersetSchema, valueSchema);
       largestSchemaID = Math.max(largestSchemaID, valueSchemaEntry.getId());
       /**
-       * Note that superset schema should be the second parameter. For the reason, please refer to the Javadoc of the
-       * {@link AvroSchemaUtils#generateSuperSetSchema} method.
+       * Current superset schema should be the first parameter, and the incoming value schema is the 2nd parameter.
        */
-      tmpSupersetSchema = AvroSupersetSchemaUtils.generateSuperSetSchema(valueSchema, tmpSupersetSchema);
+      tmpSupersetSchema = AvroSupersetSchemaUtils.generateSupersetSchema(tmpSupersetSchema, valueSchema);
     }
     final Schema supersetSchema = tmpSupersetSchema;
 
@@ -478,5 +494,33 @@ public class AvroSchemaUtils {
    */
   public static boolean isUnresolvedUnionExceptionAvailable() {
     return AvroCompatibilityHelperCommon.getRuntimeAvroVersion().laterThan(AvroVersion.AVRO_1_4);
+  }
+
+  public static int getSchemaIdCanonicalMatch(Collection<SchemaEntry> schemas, SchemaEntry schemaEntry) {
+    List<SchemaEntry> canonicalizedMatches = AvroSchemaUtils.filterCanonicalizedSchemas(schemaEntry, schemas);
+    int schemaId = SchemaData.INVALID_VALUE_SCHEMA_ID;
+    if (!canonicalizedMatches.isEmpty()) {
+      if (canonicalizedMatches.size() == 1) {
+        schemaId = canonicalizedMatches.iterator().next().getId();
+      } else {
+        List<SchemaEntry> exactMatches = AvroSchemaUtils.filterSchemas(schemaEntry, canonicalizedMatches);
+        if (exactMatches.isEmpty()) {
+          schemaId = getSchemaEntryWithLargestId(canonicalizedMatches).getId();
+        } else {
+          schemaId = getSchemaEntryWithLargestId(exactMatches).getId();
+        }
+      }
+    }
+    return schemaId;
+  }
+
+  private static SchemaEntry getSchemaEntryWithLargestId(Collection<SchemaEntry> schemas) {
+    SchemaEntry largestIdSchema = schemas.iterator().next();
+    for (SchemaEntry schema: schemas) {
+      if (schema.getId() > largestIdSchema.getId()) {
+        largestIdSchema = schema;
+      }
+    }
+    return largestIdSchema;
   }
 }

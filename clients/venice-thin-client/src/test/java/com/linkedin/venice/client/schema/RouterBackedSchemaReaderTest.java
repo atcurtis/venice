@@ -15,7 +15,6 @@ import com.linkedin.venice.controllerapi.SchemaResponse;
 import com.linkedin.venice.controllerapi.VersionCreationResponse;
 import com.linkedin.venice.helix.StoreJSONSerializer;
 import com.linkedin.venice.meta.BufferReplayPolicy;
-import com.linkedin.venice.meta.DataReplicationPolicy;
 import com.linkedin.venice.meta.HybridStoreConfig;
 import com.linkedin.venice.meta.HybridStoreConfigImpl;
 import com.linkedin.venice.meta.OfflinePushStrategy;
@@ -161,14 +160,14 @@ public class RouterBackedSchemaReaderTest {
       Mockito.verify(mockClient, Mockito.timeout(TIMEOUT).times(2)).getRaw(Mockito.anyString());
       Schema cachedSchema = schemaReader.getValueSchema(3);
       Assert.assertNull(cachedSchema);
-      Mockito.verify(mockClient, Mockito.timeout(TIMEOUT).times(2)).getRaw(Mockito.anyString());
+      Mockito.verify(mockClient, Mockito.timeout(TIMEOUT).times(3)).getRaw(Mockito.anyString());
 
       Schema newSchema = schemaReader.getValueSchema(1);
       Assert.assertEquals(newSchema.toString(), VALUE_SCHEMA_1.toString());
-      Mockito.verify(mockClient, Mockito.timeout(TIMEOUT).times(2)).getRaw(Mockito.anyString());
+      Mockito.verify(mockClient, Mockito.timeout(TIMEOUT).times(3)).getRaw(Mockito.anyString());
 
       Assert.assertEquals(schemaReader.getLatestValueSchema().toString(), VALUE_SCHEMA_2.toString());
-      Mockito.verify(mockClient, Mockito.timeout(TIMEOUT).times(4)).getRaw(Mockito.anyString());
+      Mockito.verify(mockClient, Mockito.timeout(TIMEOUT).times(5)).getRaw(Mockito.anyString());
     }
   }
 
@@ -248,6 +247,44 @@ public class RouterBackedSchemaReaderTest {
   }
 
   @Test
+  public void testRefreshValueSchema() throws IOException, ExecutionException, InterruptedException {
+    AbstractAvroStoreClient storeClient = getMockStoreClient(true);
+
+    try (SchemaReader schemaReader =
+        new RouterBackedSchemaReader(() -> storeClient, Optional.empty(), Optional.empty(), Duration.ofSeconds(10))) {
+      // Initial state should have schemas 1 and 2
+      Assert.assertEquals(schemaReader.getLatestValueSchemaId().intValue(), 2);
+
+      // Configure mocks to return schemas 1, 2, 3, and 4 with schema 3 as superset
+      configureSchemaResponseMocks(
+          storeClient,
+          Arrays.asList(VALUE_SCHEMA_1, VALUE_SCHEMA_2, VALUE_SCHEMA_3, VALUE_SCHEMA_4),
+          3, // superset schema ID
+          Arrays.asList(UPDATE_SCHEMA_1, UPDATE_SCHEMA_2, UPDATE_SCHEMA_3, UPDATE_SCHEMA_4),
+          true,
+          0);
+
+      // Without force refresh, should still see the old latest schema (2) due to 10s refresh interval
+      Assert.assertEquals(schemaReader.getLatestValueSchemaId(false).intValue(), 2);
+      Assert.assertEquals(schemaReader.getLatestValueSchema(), VALUE_SCHEMA_2);
+
+      // With force refresh, should get the superset schema (3)
+      Assert.assertEquals(schemaReader.getLatestValueSchemaId(true).intValue(), 3);
+      Assert.assertEquals(schemaReader.getLatestValueSchema(), VALUE_SCHEMA_3);
+
+      // Verify that subsequent calls without force refresh still return the updated schema
+      Assert.assertEquals(schemaReader.getLatestValueSchemaId().intValue(), 3);
+      Assert.assertEquals(schemaReader.getLatestValueSchema(), VALUE_SCHEMA_3);
+
+      // Verify individual schema access
+      Assert.assertEquals(schemaReader.getValueSchema(1), VALUE_SCHEMA_1);
+      Assert.assertEquals(schemaReader.getValueSchema(2), VALUE_SCHEMA_2);
+      Assert.assertEquals(schemaReader.getValueSchema(3), VALUE_SCHEMA_3);
+      Assert.assertEquals(schemaReader.getValueSchema(4), VALUE_SCHEMA_4);
+    }
+  }
+
+  @Test
   public void testRefreshValueAndUpdateSchemas() throws IOException, ExecutionException, InterruptedException {
     AbstractAvroStoreClient storeClient = getMockStoreClient(true);
 
@@ -311,7 +348,7 @@ public class RouterBackedSchemaReaderTest {
        * 1. Fetch value schemas on start up, which takes 2 + 1 = 3 individual call.
        * 2. Fetch update schemas in one of the futures
        */
-      Mockito.verify(storeClient, Mockito.timeout(TIMEOUT).times(4)).getRaw(Mockito.anyString());
+      Mockito.verify(storeClient, Mockito.timeout(TIMEOUT).times(5)).getRaw(Mockito.anyString());
     }
   }
 
@@ -369,7 +406,7 @@ public class RouterBackedSchemaReaderTest {
       Mockito.verify(mockClient, Mockito.timeout(TIMEOUT).times(3)).getRaw(Mockito.anyString());
       Assert.assertNotNull(schemaReader.getLatestValueSchema());
       // Should not be checked again
-      Mockito.verify(mockClient, Mockito.timeout(TIMEOUT).times(3)).getRaw(Mockito.anyString());
+      Mockito.verify(mockClient, Mockito.timeout(TIMEOUT).times(4)).getRaw(Mockito.anyString());
     }
   }
 
@@ -386,7 +423,7 @@ public class RouterBackedSchemaReaderTest {
         0);
 
     try (SchemaReader schemaReader = new RouterBackedSchemaReader(() -> mockClient)) {
-      Assert.assertNull(schemaReader.getLatestValueSchema());
+      Assert.assertThrows(VeniceClientException.class, () -> schemaReader.getLatestValueSchema());
       Mockito.verify(mockClient, Mockito.timeout(TIMEOUT).times(1)).getRaw(Mockito.anyString());
     }
   }
@@ -497,12 +534,7 @@ public class RouterBackedSchemaReaderTest {
     Version version = new VersionImpl(storeName, 1, "test-job-id");
     version.setPartitionCount(partitionCount);
 
-    HybridStoreConfig hybridStoreConfig = new HybridStoreConfigImpl(
-        1000,
-        1000,
-        -1,
-        DataReplicationPolicy.ACTIVE_ACTIVE,
-        BufferReplayPolicy.REWIND_FROM_EOP);
+    HybridStoreConfig hybridStoreConfig = new HybridStoreConfigImpl(1000, 1000, -1, BufferReplayPolicy.REWIND_FROM_EOP);
 
     ZKStore store = new ZKStore(
         storeName,
@@ -530,7 +562,7 @@ public class RouterBackedSchemaReaderTest {
     versionCreationResponse.setPartitionerClass(partitionerConfig.getPartitionerClass());
     versionCreationResponse.setPartitionerParams(partitionerConfig.getPartitionerParams());
     versionCreationResponse.setKafkaBootstrapServers("localhost:9092");
-    versionCreationResponse.setKafkaTopic(Version.composeRealTimeTopic(storeName));
+    versionCreationResponse.setKafkaTopic(Utils.getRealTimeTopicName(store));
     versionCreationResponse.setEnableSSL(false);
 
     CompletableFuture<byte[]> requestTopicFuture = mock(CompletableFuture.class);

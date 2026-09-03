@@ -1,13 +1,24 @@
+plugins {
+  id 'com.github.johnrengelman.shadow'
+}
+
 dependencies {
   // For helix-based metadata impl, and this will be removed before onboarding any customers.
   implementation project(':internal:venice-common')
 
-  implementation (libraries.helix) {
-    // Helix pulls in an ancient version of the zkclient, which lacks some APIs and clashes with Kafka's dependency
-    exclude group: 'com.github.sgroschupf'
-    // Helix use zk 3.6.9, which introduce netty 3.10 and will fail our test.
-    exclude module: 'zookeeper'
+  implementation('org.apache.helix:helix-core:1.4.1:jdk8') {
+    exclude group: 'org.apache.helix'
   }
+  implementation('org.apache.helix:helix-common:1.4.1:jdk8')  {
+    exclude group: 'org.apache.helix'
+  }
+  implementation('org.apache.helix:zookeeper-api:1.4.1:jdk8') {
+    exclude group: 'org.apache.helix'
+  }
+  implementation('org.apache.helix:metadata-store-directory-common:1.4.1:jdk8') {
+    exclude group: 'org.apache.helix'
+  }
+  implementation('org.apache.helix:metrics-common:1.4.1:jdk8')
 
   implementation project(':clients:da-vinci-client')
   implementation project(':services:venice-router')
@@ -25,8 +36,34 @@ dependencies {
   testImplementation project(':internal:venice-common')
   testImplementation project(':internal:venice-test-common')
   testImplementation libraries.kafkaClients
+  testImplementation libraries.openTelemetryTestSdk
+}
+
+shadowJar {
+  mergeServiceFiles()
+}
+
+artifacts {
+  archives shadowJar
+}
+
+jar {
+  manifest {
+    attributes = [
+        'Implementation-Title': 'Venice Fast Client',
+        'Implementation-Version': project.version,
+        'Main-Class': 'com.linkedin.venice.fastclient.FastClientQueryTool'
+    ]
+  }
 }
 
 ext {
   jacocoCoverageThreshold = 0.53
+}
+
+checkerFramework {
+  extraJavacArgs = ['-Xmaxerrs', '256']
+  checkers = ['org.checkerframework.checker.nullness.NullnessChecker']
+  skipCheckerFramework = true
+  excludeTests = true
 }

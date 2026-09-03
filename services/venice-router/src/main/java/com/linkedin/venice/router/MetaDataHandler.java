@@ -8,7 +8,6 @@ import static com.linkedin.venice.controllerapi.ControllerApiConstants.NAME;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PARTITIONERS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORE_PARTITION;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORE_VERSION;
-import static com.linkedin.venice.meta.DataReplicationPolicy.ACTIVE_ACTIVE;
 import static com.linkedin.venice.meta.DataReplicationPolicy.NON_AGGREGATE;
 import static com.linkedin.venice.router.api.RouterResourceType.TYPE_ALL_VALUE_SCHEMA_IDS;
 import static com.linkedin.venice.router.api.RouterResourceType.TYPE_CURRENT_VERSION;
@@ -29,24 +28,23 @@ import static io.netty.handler.codec.http.HttpResponseStatus.OK;
 import static io.netty.handler.codec.http.HttpResponseStatus.UNAUTHORIZED;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.linkedin.venice.blobtransfer.BlobPeersDiscoveryResponse;
 import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.controllerapi.CurrentVersionResponse;
 import com.linkedin.venice.controllerapi.D2ServiceDiscoveryResponse;
 import com.linkedin.venice.controllerapi.LeaderControllerResponse;
 import com.linkedin.venice.controllerapi.MultiSchemaIdResponse;
 import com.linkedin.venice.controllerapi.MultiSchemaResponse;
+import com.linkedin.venice.controllerapi.MultiStoreResponse;
 import com.linkedin.venice.controllerapi.SchemaResponse;
 import com.linkedin.venice.controllerapi.VersionCreationResponse;
 import com.linkedin.venice.exceptions.ErrorType;
-import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.exceptions.VeniceHttpException;
 import com.linkedin.venice.exceptions.VeniceNoHelixResourceException;
 import com.linkedin.venice.helix.HelixCustomizedViewOfflinePushRepository;
 import com.linkedin.venice.helix.HelixHybridStoreQuotaRepository;
 import com.linkedin.venice.helix.StoreJSONSerializer;
 import com.linkedin.venice.helix.SystemStoreJSONSerializer;
-import com.linkedin.venice.meta.DataReplicationPolicy;
-import com.linkedin.venice.meta.HybridStoreConfig;
 import com.linkedin.venice.meta.PartitionerConfig;
 import com.linkedin.venice.meta.ReadOnlySchemaRepository;
 import com.linkedin.venice.meta.ReadOnlyStoreConfigRepository;
@@ -55,12 +53,12 @@ import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.StoreConfig;
 import com.linkedin.venice.meta.SystemStore;
 import com.linkedin.venice.meta.Version;
+import com.linkedin.venice.pushmonitor.ExecutionStatus;
 import com.linkedin.venice.pushmonitor.HybridStoreQuotaStatus;
 import com.linkedin.venice.pushstatushelper.PushStatusStoreReader;
 import com.linkedin.venice.router.api.RouterResourceType;
 import com.linkedin.venice.router.api.VenicePathParserHelper;
 import com.linkedin.venice.router.api.VeniceVersionFinder;
-import com.linkedin.venice.routerapi.BlobDiscoveryResponse;
 import com.linkedin.venice.routerapi.HybridStoreQuotaStatusResponse;
 import com.linkedin.venice.routerapi.PushStatusResponse;
 import com.linkedin.venice.routerapi.ReplicaState;
@@ -68,15 +66,19 @@ import com.linkedin.venice.routerapi.ResourceStateResponse;
 import com.linkedin.venice.schema.SchemaData;
 import com.linkedin.venice.schema.SchemaEntry;
 import com.linkedin.venice.schema.writecompute.DerivedSchemaEntry;
+import com.linkedin.venice.stats.D2Stats;
 import com.linkedin.venice.utils.ExceptionUtils;
 import com.linkedin.venice.utils.ObjectMapperFactory;
 import com.linkedin.venice.utils.RedundantExceptionFilter;
+import com.linkedin.venice.utils.Utils;
+import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.handler.codec.http.HttpRequest;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.util.ReferenceCountUtil;
+import io.tehuti.metrics.MetricsRepository;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.security.cert.CertificateExpiredException;
@@ -88,6 +90,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.stream.Collectors;
 import org.apache.commons.lang.StringUtils;
 import org.apache.logging.log4j.LogManager;
@@ -138,15 +141,15 @@ public class MetaDataHandler extends SimpleChannelInboundHandler<HttpRequest> {
   static final String REQUEST_TOPIC_ERROR_CURRENT_VERSION_NOT_HYBRID =
       "Online writes are only supported for stores with a current version capable of receiving hybrid writes.";
   static final String REQUEST_TOPIC_ERROR_UNSUPPORTED_REPLICATION_POLICY =
-      "Online writes are only supported for hybrid stores that have " + ACTIVE_ACTIVE + " or " + NON_AGGREGATE
-          + " data replication policy.";
+      "Online writes are only supported for hybrid stores that either have Active-Active replication enabled or "
+          + NON_AGGREGATE + " data replication policy when Active-Active replication is disabled.";
   static final String REQUEST_TOPIC_ERROR_FORMAT_UNSUPPORTED_PARTITIONER =
       "Expected partitioner class %s cannot be found.";
 
   static final String REQUEST_ERROR_STORE_NOT_FOUND_IN_CLUSTER = "Store: %s could not be found in cluster: %s";
 
   static final String REQUEST_BLOB_DISCOVERY_ERROR_INVALID_SETTINGS =
-      "Blob Discovery: blob transfer is not enabled or store: %s is not a batch-only store";
+      "Blob Discovery: blob transfer is not enabled for store: %s";
 
   static final String REQUEST_BLOB_DISCOVERY_MISSING_QUERY_PARAMS =
       "Blob Discovery: missing storeName:%s, storeVersion:%s, or storePartition:%s";
@@ -154,6 +157,8 @@ public class MetaDataHandler extends SimpleChannelInboundHandler<HttpRequest> {
   static final String REQUEST_BLOB_DISCOVERY_ERROR_PUSH_STORE =
       "Blob Discovery: failed to get the live node hostNames for store:%s version:%s partition:%s";
   private final VeniceVersionFinder veniceVersionFinder;
+  private final MetricsRepository metricsRepository;
+  private final Map<String, D2Stats> d2StatsMap = new VeniceConcurrentHashMap<>();
 
   public MetaDataHandler(
       HelixCustomizedViewOfflinePushRepository routingDataRepository,
@@ -168,7 +173,8 @@ public class MetaDataHandler extends SimpleChannelInboundHandler<HttpRequest> {
       String kafkaBootstrapServers,
       boolean isSslToKafka,
       VeniceVersionFinder versionFinder,
-      PushStatusStoreReader pushStatusStoreReader) {
+      PushStatusStoreReader pushStatusStoreReader,
+      MetricsRepository metricsRepository) {
     super();
     this.routingDataRepository = routingDataRepository;
     this.schemaRepo = schemaRepo;
@@ -183,6 +189,7 @@ public class MetaDataHandler extends SimpleChannelInboundHandler<HttpRequest> {
     this.isSslToKafka = isSslToKafka;
     this.veniceVersionFinder = versionFinder;
     this.pushStatusStoreReader = pushStatusStoreReader;
+    this.metricsRepository = metricsRepository;
   }
 
   @Override
@@ -254,6 +261,10 @@ public class MetaDataHandler extends SimpleChannelInboundHandler<HttpRequest> {
         case TYPE_BLOB_DISCOVERY:
           handleBlobDiscovery(ctx, helper, req);
           break;
+        case TYPE_STORES:
+          // URI: /stores
+          handleStoresLookup(ctx);
+          break;
         default:
           // SimpleChannelInboundHandler automatically releases the request after channelRead0 is done.
           // since we're passing it on to the next handler, we need to retain an extra reference.
@@ -268,12 +279,21 @@ public class MetaDataHandler extends SimpleChannelInboundHandler<HttpRequest> {
   private void handleControllerLookup(ChannelHandlerContext ctx) throws IOException {
     LeaderControllerResponse responseObject = new LeaderControllerResponse();
     responseObject.setCluster(clusterName);
-    responseObject.setUrl(routingDataRepository.getLeaderController().getUrl());
+    // todo find if controller is using SSL
+    // one way to do that is to use controller D2 service announcement details
+    responseObject.setUrl(routingDataRepository.getLeaderController().getUrl(false));
     LOGGER.info(
         "For cluster: {}, the leader controller url: {}, last refreshed at {}",
         responseObject.getCluster(),
         responseObject.getUrl(),
         routingDataRepository.getLeaderControllerChangeTimeMs());
+    setupResponseAndFlush(OK, OBJECT_MAPPER.writeValueAsBytes(responseObject), true, ctx);
+  }
+
+  private void handleStoresLookup(ChannelHandlerContext ctx) throws IOException {
+    MultiStoreResponse responseObject = new MultiStoreResponse();
+    Set<String> storeNames = storeConfigRepo.getStores(false);
+    responseObject.setStores(storeNames.toArray(new String[0]));
     setupResponseAndFlush(OK, OBJECT_MAPPER.writeValueAsBytes(responseObject), true, ctx);
   }
 
@@ -311,13 +331,23 @@ public class MetaDataHandler extends SimpleChannelInboundHandler<HttpRequest> {
         responseObject.setSuperSetSchemaId(superSetSchemaId);
       }
       Collection<SchemaEntry> valueSchemaEntries = schemaRepo.getValueSchemas(storeName);
-      int schemaNum = valueSchemaEntries.size();
+      int schemaNum = (int) valueSchemaEntries.stream().filter(schemaEntry -> schemaEntry.getId() > 0).count();
       MultiSchemaResponse.Schema[] schemas = new MultiSchemaResponse.Schema[schemaNum];
+      int index = 0;
       for (SchemaEntry entry: valueSchemaEntries) {
         int schemaId = entry.getId();
-        schemas[schemaId - 1] = new MultiSchemaResponse.Schema();
-        schemas[schemaId - 1].setId(schemaId);
-        schemas[schemaId - 1].setSchemaStr(entry.getSchema().toString());
+        if (schemaId < 1) {
+          LOGGER.warn(
+              "Got an invalid schema id ({}) for store {} in handleValueSchemaLookup; will not include this in the {}.",
+              entry.getId(),
+              storeName,
+              responseObject.getClass().getSimpleName());
+          continue;
+        }
+        schemas[index] = new MultiSchemaResponse.Schema();
+        schemas[index].setId(schemaId);
+        schemas[index].setSchemaStr(entry.getSchema().toString());
+        index++;
       }
       responseObject.setSchemas(schemas);
       setupResponseAndFlush(OK, OBJECT_MAPPER.writeValueAsBytes(responseObject), true, ctx);
@@ -383,6 +413,14 @@ public class MetaDataHandler extends SimpleChannelInboundHandler<HttpRequest> {
     }
     Set<Integer> schemaIdSet = new HashSet<>();
     for (SchemaEntry entry: schemaRepo.getValueSchemas(storeName)) {
+      if (entry.getId() < 1) {
+        LOGGER.warn(
+            "Got an invalid schema id ({}) for store {} in handleValueSchemaIdsLookup; will not include this in the {}.",
+            entry.getId(),
+            storeName,
+            responseObject.getClass().getSimpleName());
+        continue;
+      }
       schemaIdSet.add(entry.getId());
     }
     responseObject.setSchemaIdSet(schemaIdSet);
@@ -451,8 +489,11 @@ public class MetaDataHandler extends SimpleChannelInboundHandler<HttpRequest> {
     checkResourceName(
         storeName,
         "/" + TYPE_CLUSTER_DISCOVERY + "/${storeName} or /" + TYPE_CLUSTER_DISCOVERY + "?store_name=${storeName}");
+
+    D2Stats d2Stats = d2StatsMap.computeIfAbsent(storeName, name -> new D2Stats(metricsRepository, name));
     Optional<StoreConfig> config = storeConfigRepo.getStoreConfig(storeName);
     if (!config.isPresent() || StringUtils.isEmpty(config.get().getCluster())) {
+      d2Stats.recordStoreDiscoveryFailure();
       String errorMsg = "Cluster for store: " + storeName + " doesn't exist";
       setupErrorD2DiscoveryResponseAndFlush(NOT_FOUND, errorMsg, ctx);
       return;
@@ -460,6 +501,7 @@ public class MetaDataHandler extends SimpleChannelInboundHandler<HttpRequest> {
     String clusterName = config.get().getCluster();
     String d2Service = getD2ServiceByClusterName(clusterName);
     if (StringUtils.isEmpty(d2Service)) {
+      d2Stats.recordStoreDiscoveryFailure();
       String errorMsg = "D2 service for store: " + storeName + " doesn't exist";
       setupErrorD2DiscoveryResponseAndFlush(NOT_FOUND, errorMsg, ctx);
       return;
@@ -473,6 +515,7 @@ public class MetaDataHandler extends SimpleChannelInboundHandler<HttpRequest> {
     responseObject.setZkAddress(zkAddress);
     responseObject.setKafkaBootstrapServers(kafkaBootstrapServers);
     setupResponseAndFlush(OK, OBJECT_MAPPER.writeValueAsBytes(responseObject), true, ctx);
+    d2Stats.recordStoreDiscoverySuccess();
   }
 
   private void setupErrorD2DiscoveryResponseAndFlush(
@@ -508,11 +551,10 @@ public class MetaDataHandler extends SimpleChannelInboundHandler<HttpRequest> {
    * Handles the discovery of blob transfer nodes based on store settings.
    * Retrieves host names for live DVC nodes ready to transfer blobs.
    * Only returns host names from nodes that have completed a full push and are active.
-   *
+   * Queries partition level firstly, if emtpy/fail, queries version level.
    * @return a response with a list of host names for live DVC nodes; returns an empty list if no live nodes are found or if conditions are not met
    */
-  private void handleBlobDiscovery(ChannelHandlerContext ctx, VenicePathParserHelper helper, HttpRequest request)
-      throws IOException {
+  private void handleBlobDiscovery(ChannelHandlerContext ctx, VenicePathParserHelper helper, HttpRequest request) {
 
     // i.e. /blob_discovery?store_name=storeName&store_version=22&store_partition=2
     Map<String, String> queryParams = helper.extractQueryParameters(request);
@@ -535,36 +577,152 @@ public class MetaDataHandler extends SimpleChannelInboundHandler<HttpRequest> {
       return;
     }
 
-    if (!store.isBlobTransferEnabled() || store.isHybrid()) {
+    if (!store.isBlobTransferEnabled()) {
       byte[] errBody = (String.format(REQUEST_BLOB_DISCOVERY_ERROR_INVALID_SETTINGS, storeName)).getBytes();
       setupResponseAndFlush(FORBIDDEN, errBody, false, ctx);
       return;
     }
 
-    BlobDiscoveryResponse response = new BlobDiscoveryResponse();
     try {
-      // gets the instances for a FULL_PUSH for the store's version and partitionId
-      // gets the instance's hostnames from its keys & filter to include only live instances
-      Map<CharSequence, Integer> instances = pushStatusStoreReader.getPartitionStatus(
-          storeName,
-          Integer.parseInt(storeVersion),
-          Integer.parseInt(storePartition),
-          Optional.empty());
-      List<String> liveNodeHostNames = instances.entrySet()
-          .stream()
-          .map(Map.Entry::getKey)
-          .map(CharSequence::toString)
-          .filter(instanceHostName -> pushStatusStoreReader.isInstanceAlive(storeName, instanceHostName))
-          .collect(Collectors.toList());
-      response.setLiveNodeNames(liveNodeHostNames);
-    } catch (VeniceException e) {
+      int versionInt = Integer.parseInt(storeVersion);
+      int partitionInt = Integer.parseInt(storePartition);
+
+      // 1. firstly, query the partition level status.
+      CompletableFuture<Map<CharSequence, Integer>> partitionStatusFuture =
+          pushStatusStoreReader.getPartitionOrVersionStatusAsync(
+              storeName,
+              versionInt,
+              partitionInt,
+              Optional.empty(),
+              Optional.empty(),
+              false);
+      // 2. handle the partition level response.
+      partitionStatusFuture.whenComplete((partitionLevelInstances, partitionThrowable) -> {
+        try {
+          // case 1: partition level throw exception, then query at version level.
+          String replicaId = Utils.getReplicaId(storeName, versionInt, partitionInt);
+          if (partitionThrowable != null) {
+            LOGGER.error(
+                "Failed to get partition status for replica: {}, will try version-level",
+                replicaId,
+                partitionThrowable);
+
+            queryVersionLevelPushStatus(ctx, storeName, storeVersion, storePartition, versionInt, partitionInt);
+          } else if (partitionLevelInstances == null || partitionLevelInstances.isEmpty()) {
+            // case 2: partition level return empty/null instances, then query at version level.
+            LOGGER.info("No partition instances found for replica: {}, will try version-level", replicaId);
+
+            queryVersionLevelPushStatus(ctx, storeName, storeVersion, storePartition, versionInt, partitionInt);
+          } else {
+            // case 3: partition level return instances, then check if all instances are completed.
+            extractCompleteInstancesFromPushStatusResponse(
+                ctx,
+                storeName,
+                storeVersion,
+                storePartition,
+                partitionLevelInstances,
+                false);
+          }
+        } catch (Exception e) {
+          byte[] errBody =
+              (String.format(REQUEST_BLOB_DISCOVERY_ERROR_PUSH_STORE, storeName, storeVersion, storePartition))
+                  .getBytes();
+          setupResponseAndFlush(INTERNAL_SERVER_ERROR, errBody, false, ctx);
+        }
+      });
+    } catch (Exception e) {
       byte[] errBody =
           (String.format(REQUEST_BLOB_DISCOVERY_ERROR_PUSH_STORE, storeName, storeVersion, storePartition)).getBytes();
       setupResponseAndFlush(INTERNAL_SERVER_ERROR, errBody, false, ctx);
-      return;
+    }
+  }
+
+  /**
+   * A helper function to extract the completed instances from the push status response.
+   */
+  private void extractCompleteInstancesFromPushStatusResponse(
+      ChannelHandlerContext ctx,
+      String storeName,
+      String storeVersion,
+      String storePartition,
+      Map<CharSequence, Integer> instances,
+      boolean isVersionLevelPushReportResult) throws Exception {
+    String pushReportLevelType = isVersionLevelPushReportResult ? "version" : "partition";
+    String replicaId = Utils.getReplicaId(storeName, Integer.parseInt(storeVersion), Integer.parseInt(storePartition));
+
+    BlobPeersDiscoveryResponse response = new BlobPeersDiscoveryResponse();
+
+    List<String> readyToServeNodeHostNames = instances.entrySet()
+        .stream()
+        .filter(entry -> entry.getValue() == ExecutionStatus.COMPLETED.getValue())
+        .map(Map.Entry::getKey)
+        .map(CharSequence::toString)
+        .collect(Collectors.toList());
+
+    if (!readyToServeNodeHostNames.isEmpty()) {
+      LOGGER.info(
+          "{} ready to serve nodes were found for replica: {} from {} level push report",
+          readyToServeNodeHostNames.size(),
+          replicaId,
+          pushReportLevelType);
+    } else {
+      LOGGER.info(
+          "No ready to serve nodes found for replica: {} from {} level push report",
+          replicaId,
+          pushReportLevelType);
     }
 
+    response.setDiscoveryResult(readyToServeNodeHostNames);
     setupResponseAndFlush(OK, OBJECT_MAPPER.writeValueAsBytes(response), true, ctx);
+  }
+
+  /**
+   * A helper function to query the version level push status.
+   */
+  private void queryVersionLevelPushStatus(
+      ChannelHandlerContext ctx,
+      String storeName,
+      String storeVersion,
+      String storePartition,
+      int versionInt,
+      int partitionInt) {
+    // Query version-level status
+    CompletableFuture<Map<CharSequence, Integer>> versionStatusFuture =
+        pushStatusStoreReader.getPartitionOrVersionStatusAsync(
+            storeName,
+            versionInt,
+            partitionInt,
+            Optional.empty(),
+            Optional.empty(),
+            true);
+
+    String replicaId = Utils.getReplicaId(storeName, versionInt, partitionInt);
+    versionStatusFuture.whenComplete((versionLevelInstances, throwable) -> {
+      try {
+        if (throwable != null) {
+          LOGGER.error("Failed to get version status for replica: {}", replicaId, throwable);
+
+          byte[] errBody =
+              (String.format(REQUEST_BLOB_DISCOVERY_ERROR_PUSH_STORE, storeName, storeVersion, storePartition))
+                  .getBytes();
+          setupResponseAndFlush(INTERNAL_SERVER_ERROR, errBody, false, ctx);
+          return;
+        }
+
+        extractCompleteInstancesFromPushStatusResponse(
+            ctx,
+            storeName,
+            storeVersion,
+            storePartition,
+            versionLevelInstances,
+            true);
+      } catch (Exception e) {
+        byte[] errBody =
+            (String.format(REQUEST_BLOB_DISCOVERY_ERROR_PUSH_STORE, storeName, storeVersion, storePartition))
+                .getBytes();
+        setupResponseAndFlush(INTERNAL_SERVER_ERROR, errBody, false, ctx);
+      }
+    });
   }
 
   private void handleResourceStateLookup(ChannelHandlerContext ctx, VenicePathParserHelper helper) throws IOException {
@@ -646,13 +804,14 @@ public class MetaDataHandler extends SimpleChannelInboundHandler<HttpRequest> {
       throws IOException {
     String storeName = helper.getResourceName();
     checkResourceName(storeName, "/" + TYPE_STREAM_HYBRID_STORE_QUOTA + "/${storeName}");
-    if (!storeConfigRepo.getStoreConfig(storeName).isPresent()) {
+    Store store = storeRepository.getStore(storeName);
+    if (!storeConfigRepo.getStoreConfig(storeName).isPresent() || store == null) {
       byte[] errBody = ("Cannot fetch the hybrid store quota status for store: " + storeName + " because the store: "
           + storeName + " cannot be found").getBytes();
       setupResponseAndFlush(NOT_FOUND, errBody, false, ctx);
       return;
     }
-    String topicName = Version.composeKafkaTopic(storeName, storeRepository.getStore(storeName).getCurrentVersion());
+    String topicName = Version.composeKafkaTopic(storeName, store.getCurrentVersion());
     prepareHybridStoreQuotaStatusResponse(topicName, ctx);
   }
 
@@ -727,26 +886,11 @@ public class MetaDataHandler extends SimpleChannelInboundHandler<HttpRequest> {
       return;
     }
 
-    final HybridStoreConfig hybridStoreConfig;
     if (currentVersion.isUseVersionLevelHybridConfig()) {
       if (currentVersion.getHybridStoreConfig() == null) {
         setupResponseAndFlush(BAD_REQUEST, REQUEST_TOPIC_ERROR_CURRENT_VERSION_NOT_HYBRID.getBytes(), false, ctx);
         return;
       }
-      hybridStoreConfig = currentVersion.getHybridStoreConfig();
-    } else {
-      hybridStoreConfig = store.getHybridStoreConfig();
-    }
-
-    /**
-     * Only allow router request_topic for hybrid stores that have data replication policy:
-     * 1. NON_AGGREGATE
-     * 2. ACTIVE_ACTIVE
-     */
-    DataReplicationPolicy dataReplicationPolicy = hybridStoreConfig.getDataReplicationPolicy();
-    if (!dataReplicationPolicy.equals(NON_AGGREGATE) && !dataReplicationPolicy.equals(ACTIVE_ACTIVE)) {
-      setupResponseAndFlush(BAD_REQUEST, REQUEST_TOPIC_ERROR_UNSUPPORTED_REPLICATION_POLICY.getBytes(), false, ctx);
-      return;
     }
 
     // Retrieve partitioner config from the store
@@ -773,7 +917,7 @@ public class MetaDataHandler extends SimpleChannelInboundHandler<HttpRequest> {
     responseObject.setCluster(clusterName);
     responseObject.setName(storeName);
     responseObject.setPartitions(currentVersion.getPartitionCount());
-    responseObject.setKafkaTopic(Version.composeRealTimeTopic(storeName));
+    responseObject.setKafkaTopic(Utils.getRealTimeTopicName(store));
 
     // RT topic only supports NO_OP compression
     responseObject.setCompressionStrategy(CompressionStrategy.NO_OP);

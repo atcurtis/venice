@@ -1,8 +1,11 @@
 package com.linkedin.venice.fastclient.utils;
 
+import static org.mockito.Mockito.mock;
+
 import com.google.common.collect.Sets;
 import com.linkedin.common.callback.Callback;
 import com.linkedin.common.util.None;
+import com.linkedin.d2.balancer.D2Client;
 import com.linkedin.data.ByteString;
 import com.linkedin.r2.message.RequestContext;
 import com.linkedin.r2.message.rest.RestException;
@@ -19,6 +22,8 @@ import com.linkedin.venice.fastclient.ClientConfig;
 import com.linkedin.venice.fastclient.factory.ClientFactory;
 import com.linkedin.venice.fastclient.meta.AbstractClientRoutingStrategy;
 import com.linkedin.venice.fastclient.meta.AbstractStoreMetadata;
+import com.linkedin.venice.fastclient.meta.InstanceHealthMonitor;
+import com.linkedin.venice.fastclient.meta.InstanceHealthMonitorConfig;
 import com.linkedin.venice.read.protocol.request.router.MultiGetRouterRequestKeyV1;
 import com.linkedin.venice.read.protocol.response.MultiGetResponseRecordV1;
 import com.linkedin.venice.schema.writecompute.DerivedSchemaEntry;
@@ -94,7 +99,8 @@ public class TestClientSimulator implements Client {
   public final RecordDeserializer<Utf8> keyDeserializer;
   public final RecordSerializer<MultiGetResponseRecordV1> multiGetResponseSerializer;
   public final RecordDeserializer<MultiGetRouterRequestKeyV1> multiGetRequestDeserializer;
-  private boolean speculativeQueryEnabled = false;
+  private final D2Client mockD2Client = mock(D2Client.class);
+  private final String dummyD2Discovery = "testD2Endpoint";
   private Map<String, String> keyValues = new HashMap<>(); // all keys in the simulation
   private Map<String, String> requestedKeyValues = new HashMap<>(); // subset/all of keyValues are a part of requests
   private Map<String, Integer> keysToPartitions = new HashMap<>();
@@ -102,19 +108,14 @@ public class TestClientSimulator implements Client {
   private Map<Integer, List<String>> partitionToReplicas = new HashMap<>();
   private boolean longTailRetryEnabledForSingleGet = false;
   private int longTailRetryThresholdForSingleGetInMicroseconds = 0;
-  private boolean longTailRetryEnabledForBatchGet = false;
-  private int longTailRetryThresholdForBatchGetInMicroSeconds = 0;
+  private String longTailRangeBasedRetryThresholdForBatchGetInMilliSeconds = null;
 
   private int expectedValueSchemaId = 1;
 
   private static class UnitTestRoutingStrategy extends AbstractClientRoutingStrategy {
     @Override
-    public List<String> getReplicas(long requestId, List<String> replicas, int requiredReplicaCount) {
-      List<String> retReplicas = new ArrayList<>();
-      for (int i = 0; i < requiredReplicaCount && i < replicas.size(); i++) {
-        retReplicas.add(replicas.get(i));
-      }
-      return retReplicas;
+    public String getReplicas(long requestId, int groupId, List<String> replicas) {
+      return replicas.isEmpty() ? null : replicas.get(0);
     }
   }
 
@@ -281,11 +282,6 @@ public class TestClientSimulator implements Client {
 
   }
 
-  /*public TestClientSimulator setKeysToPartitions(Map<String, Integer> keysToPartitions) {
-    this.keysToPartitions = keysToPartitions;
-    return this;
-  }*/
-
   public TestClientSimulator assignRouteToPartitions(String route, int... partitions) {
     Set<Integer> partitionSet = this.routeToPartitions.computeIfAbsent(route, r -> new HashSet<>());
     for (int partition: partitions) {
@@ -293,11 +289,6 @@ public class TestClientSimulator implements Client {
     }
     return this;
   }
-
-  /*public TestClientSimulator setRouteToPartitions(Map<String, Set<Integer>> routeToPartitions) {
-    this.routeToPartitions = routeToPartitions;
-    return this;
-  }*/
 
   public Map<String, String> getKeyValues() {
     return keyValues;
@@ -308,7 +299,7 @@ public class TestClientSimulator implements Client {
     return requestedKeyValues;
   }
 
-  /** Mock the return replica list in the method {@link AbstractStoreMetadata#getReplicas}
+  /** Mock the return replica list in the method {@text AbstractStoreMetadata#getReplicas}
    * created inside {@link TestClientSimulator#getFastClient} */
   public TestClientSimulator expectReplicaRequestForPartitionAndRespondWithReplicas(
       int partitionId,
@@ -495,12 +486,6 @@ public class TestClientSimulator implements Client {
     return simulatorCompleteFuture;
   }
 
-  // TODO need to add tests for this
-  public TestClientSimulator setSpeculativeQueryEnabled(boolean speculativeQueryEnabled) {
-    this.speculativeQueryEnabled = speculativeQueryEnabled;
-    return this;
-  }
-
   public TestClientSimulator setLongTailRetryEnabledForSingleGet(boolean longTailRetryEnabledForSingleGet) {
     this.longTailRetryEnabledForSingleGet = longTailRetryEnabledForSingleGet;
     return this;
@@ -512,14 +497,9 @@ public class TestClientSimulator implements Client {
     return this;
   }
 
-  public TestClientSimulator setLongTailRetryEnabledForBatchGet(boolean longTailRetryEnabledForBatchGet) {
-    this.longTailRetryEnabledForBatchGet = longTailRetryEnabledForBatchGet;
-    return this;
-  }
-
-  public TestClientSimulator setLongTailRetryThresholdForBatchGetInMicroSeconds(
-      int longTailRetryThresholdForBatchGetInMicroSeconds) {
-    this.longTailRetryThresholdForBatchGetInMicroSeconds = longTailRetryThresholdForBatchGetInMicroSeconds;
+  public TestClientSimulator setLongTailRangeBasedRetryThresholdForBatchGetInMilliSeconds(
+      String longTailRetryThresholdForBatchGetConfig) {
+    this.longTailRangeBasedRetryThresholdForBatchGetInMilliSeconds = longTailRetryThresholdForBatchGetConfig;
     return this;
   }
 
@@ -530,23 +510,36 @@ public class TestClientSimulator implements Client {
     clientConfigBuilder.setStoreName(UNIT_TEST_STORE_NAME);
     clientConfigBuilder.setR2Client(this);
     clientConfigBuilder.setMetricsRepository(new MetricsRepository());
-    clientConfigBuilder.setSpeculativeQueryEnabled(speculativeQueryEnabled);
-    if (longTailRetryEnabledForBatchGet) {
-      clientConfigBuilder.setLongTailRetryEnabledForBatchGet(true);
-      clientConfigBuilder
-          .setLongTailRetryThresholdForBatchGetInMicroSeconds(longTailRetryThresholdForBatchGetInMicroSeconds);
-    }
     if (longTailRetryEnabledForSingleGet) {
       clientConfigBuilder.setLongTailRetryEnabledForSingleGet(true);
       clientConfigBuilder
           .setLongTailRetryThresholdForSingleGetInMicroSeconds(longTailRetryThresholdForSingleGetInMicroseconds);
     }
 
+    if (longTailRangeBasedRetryThresholdForBatchGetInMilliSeconds != null) {
+      clientConfigBuilder.setLongTailRangeBasedRetryThresholdForBatchGetInMilliSeconds(
+          longTailRangeBasedRetryThresholdForBatchGetInMilliSeconds);
+    }
+
     // TODO: need to add tests for simulating dual read
     clientConfigBuilder.setDualReadEnabled(false);
+    clientConfigBuilder.setD2Client(mockD2Client);
+    clientConfigBuilder.setClusterDiscoveryD2Service(dummyD2Discovery);
+    clientConfigBuilder.setInstanceHealthMonitor(
+        new InstanceHealthMonitor(
+            InstanceHealthMonitorConfig.builder()
+                .setClient(this)
+                .setRoutingRequestDefaultTimeoutMS(30000) // 30s, longer time out for test
+                .build()));
+
     clientConfig = clientConfigBuilder.build();
 
     AbstractStoreMetadata metadata = new AbstractStoreMetadata(clientConfig) {
+      @Override
+      public String getClusterName() {
+        return "test-cluster";
+      }
+
       @Override
       public int getCurrentStoreVersion() {
         return 1;

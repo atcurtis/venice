@@ -1,12 +1,12 @@
 package com.linkedin.venice.listener;
 
-import static com.linkedin.venice.grpc.GrpcUtils.*;
-import static com.linkedin.venice.listener.ServerHandlerUtils.*;
+import static com.linkedin.venice.listener.ServerHandlerUtils.extractClientCert;
 import static io.grpc.Metadata.ASCII_STRING_MARSHALLER;
 import static io.grpc.Metadata.Key;
 
 import com.linkedin.venice.acl.StaticAccessController;
 import com.linkedin.venice.acl.VeniceComponent;
+import com.linkedin.venice.grpc.GrpcUtils;
 import com.linkedin.venice.protocols.VeniceClientRequest;
 import com.linkedin.venice.utils.NettyUtils;
 import io.grpc.ForwardingServerCallListener;
@@ -16,6 +16,7 @@ import io.grpc.ServerCall;
 import io.grpc.ServerCallHandler;
 import io.grpc.ServerInterceptor;
 import io.grpc.Status;
+import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.SimpleChannelInboundHandler;
@@ -65,11 +66,24 @@ public class ServerAclHandler extends SimpleChannelInboundHandler<HttpRequest> i
    */
   @Override
   public void channelRead0(ChannelHandlerContext ctx, HttpRequest req) throws SSLPeerUnverifiedException {
-    X509Certificate clientCert = extractClientCert(ctx);
+    Channel originalChannel = ServerHandlerUtils.getOriginalChannel(ctx);
+    if (originalChannel == null) {
+      LOGGER.error("Got a non-ssl request on what should be an ssl only port: {}", req.uri());
+      NettyUtils.setupResponseAndFlush(HttpResponseStatus.FORBIDDEN, new byte[0], false, ctx);
+      return;
+    }
     String method = req.method().name();
+    /**
+     * Server ACL check is typically against static ACL, so once the access is confirmed,
+     * we don't need to update it again per connection.
+     */
+    Boolean accessApproved = originalChannel.attr(SERVER_ACL_APPROVED_ATTRIBUTE_KEY).get();
+    if (accessApproved == null) {
+      X509Certificate clientCert = extractClientCert(ctx);
 
-    boolean accessApproved = accessController.hasAccess(clientCert, VeniceComponent.SERVER, method);
-    ctx.channel().attr(SERVER_ACL_APPROVED_ATTRIBUTE_KEY).set(accessApproved);
+      accessApproved = accessController.hasAccess(clientCert, VeniceComponent.SERVER.getName(), method);
+      originalChannel.attr(SERVER_ACL_APPROVED_ATTRIBUTE_KEY).set(accessApproved);
+    }
     if (accessApproved || !failOnAccessRejection) {
       ReferenceCountUtil.retain(req);
       ctx.fireChannelRead(req);
@@ -91,6 +105,13 @@ public class ServerAclHandler extends SimpleChannelInboundHandler<HttpRequest> i
     return new ForwardingServerCallListener.SimpleForwardingServerCallListener<ReqT>(next.startCall(call, headers)) {
       @Override
       public void onMessage(ReqT message) {
+        // The component-level (router) ACL model only applies to read-service requests, which arrive as
+        // VeniceClientRequest. Other gRPC services (e.g. the ingestion monitor) use different message types;
+        // pass those through so they are neither mis-cast nor rejected by the read-service ACL.
+        if (!(message instanceof VeniceClientRequest)) {
+          super.onMessage(message);
+          return;
+        }
         String method = ((VeniceClientRequest) message).getMethod();
         String clientAddr =
             Objects.requireNonNull(call.getAttributes().get(Grpc.TRANSPORT_ATTR_REMOTE_ADDR)).toString();
@@ -98,8 +119,8 @@ public class ServerAclHandler extends SimpleChannelInboundHandler<HttpRequest> i
 
         boolean accessApproved = false;
         try {
-          X509Certificate clientCert = extractGrpcClientCert(call);
-          accessApproved = accessController.hasAccess(clientCert, VeniceComponent.SERVER, method);
+          X509Certificate clientCert = GrpcUtils.extractGrpcClientCert(call);
+          accessApproved = accessController.hasAccess(clientCert, VeniceComponent.SERVER.getName(), method);
           headers.put(accessApprovedKey, Boolean.toString(accessApproved));
         } catch (SSLPeerUnverifiedException e) {
           LOGGER.error("Failed to extract ssl session from the incoming request", e);

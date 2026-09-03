@@ -1,9 +1,8 @@
 package com.linkedin.davinci.kafka.consumer;
 
 import com.linkedin.davinci.ingestion.consumption.ConsumedDataReceiver;
-import com.linkedin.venice.kafka.protocol.KafkaMessageEnvelope;
-import com.linkedin.venice.message.KafkaKey;
-import com.linkedin.venice.pubsub.api.PubSubMessage;
+import com.linkedin.venice.pubsub.api.DefaultPubSubMessage;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
 import com.linkedin.venice.pubsub.api.PubSubTopic;
 import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
 import com.linkedin.venice.service.AbstractVeniceService;
@@ -21,7 +20,11 @@ public abstract class AbstractKafkaConsumerService extends AbstractVeniceService
 
   public abstract void unsubscribeAll(PubSubTopic versionTopic);
 
-  public abstract void unSubscribe(PubSubTopic versionTopic, PubSubTopicPartition pubSubTopicPartition);
+  public void unSubscribe(PubSubTopic versionTopic, PubSubTopicPartition pubSubTopicPartition) {
+    unSubscribe(versionTopic, pubSubTopicPartition, SharedKafkaConsumer.DEFAULT_MAX_WAIT_MS);
+  }
+
+  public abstract void unSubscribe(PubSubTopic versionTopic, PubSubTopicPartition pubSubTopicPartition, long timeoutMs);
 
   public abstract void batchUnsubscribe(PubSubTopic versionTopic, Set<PubSubTopicPartition> topicPartitionsToUnSub);
 
@@ -30,17 +33,25 @@ public abstract class AbstractKafkaConsumerService extends AbstractVeniceService
   public abstract long getMaxElapsedTimeMSSinceLastPollInConsumerPool();
 
   public abstract void startConsumptionIntoDataReceiver(
-      PubSubTopicPartition topicPartition,
-      long lastReadOffset,
-      ConsumedDataReceiver<List<PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long>>> consumedDataReceiver);
-
-  public abstract long getOffsetLagBasedOnMetrics(PubSubTopic versionTopic, PubSubTopicPartition pubSubTopicPartition);
+      PartitionReplicaIngestionContext partitionReplicaIngestionContext,
+      PubSubPosition lastReadPosition,
+      ConsumedDataReceiver<List<DefaultPubSubMessage>> consumedDataReceiver,
+      boolean inclusive);
 
   public abstract long getLatestOffsetBasedOnMetrics(
       PubSubTopic versionTopic,
       PubSubTopicPartition pubSubTopicPartition);
 
-  public abstract Map<PubSubTopicPartition, TopicPartitionIngestionInfo> getIngestionInfoFromConsumer(
+  /**
+   * This is for providing ingestion related information for a specific topic partition from the implementation of this class.
+   * @param respectRedundantLoggingFilter here is to guide if we need to prepare the info map, set to true when calling from
+   *                                      heartbeat monitoring to enable rate-limiting; set to false for admin commands
+   *                                      or tests where all info is needed.
+   */
+  public abstract Map<PubSubTopicPartition, TopicPartitionIngestionInfo> getIngestionInfoFor(
       PubSubTopic versionTopic,
-      PubSubTopicPartition pubSubTopicPartition);
+      PubSubTopicPartition pubSubTopicPartition,
+      boolean respectRedundantLoggingFilter);
+
+  public abstract Map<PubSubTopicPartition, Long> getStaleTopicPartitions(long thresholdTimestamp);
 }

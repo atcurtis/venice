@@ -2,14 +2,18 @@ package com.linkedin.venice.integration.utils;
 
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_AUTO_MATERIALIZE_DAVINCI_PUSH_STATUS_SYSTEM_STORE;
 import static com.linkedin.venice.ConfigKeys.CONTROLLER_AUTO_MATERIALIZE_META_SYSTEM_STORE;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUSH_RETRY_COOLDOWN_MS;
 import static com.linkedin.venice.ConfigKeys.LOCAL_REGION_NAME;
 import static com.linkedin.venice.integration.utils.VeniceClusterWrapperConstants.DEFAULT_DELAYED_TO_REBALANCE_MS;
 import static com.linkedin.venice.integration.utils.VeniceClusterWrapperConstants.DEFAULT_MAX_NUMBER_OF_PARTITIONS;
+import static com.linkedin.venice.integration.utils.VeniceClusterWrapperConstants.DEFAULT_NUMBER_OF_CONTROLLERS;
 import static com.linkedin.venice.integration.utils.VeniceClusterWrapperConstants.DEFAULT_NUMBER_OF_PARTITIONS;
 import static com.linkedin.venice.integration.utils.VeniceClusterWrapperConstants.DEFAULT_PARENT_DATA_CENTER_REGION_NAME;
 import static com.linkedin.venice.integration.utils.VeniceClusterWrapperConstants.DEFAULT_PARTITION_SIZE_BYTES;
 import static com.linkedin.venice.integration.utils.VeniceClusterWrapperConstants.DEFAULT_REPLICATION_FACTOR;
 
+import com.linkedin.d2.balancer.D2Client;
+import com.linkedin.venice.acl.DynamicAccessController;
 import com.linkedin.venice.authorization.AuthorizerService;
 import java.util.Arrays;
 import java.util.Map;
@@ -19,6 +23,7 @@ import java.util.stream.Collectors;
 
 
 public class VeniceControllerCreateOptions {
+  private final boolean multiRegion;
   private final boolean isParent;
   private final boolean sslToKafka;
   private final boolean d2Enabled;
@@ -26,43 +31,54 @@ public class VeniceControllerCreateOptions {
   private final int partitionSize;
   private final int numberOfPartitions;
   private final int maxNumberOfPartitions;
-  private final int minActiveReplica;
+  private final int numberOfControllers;
   private final long rebalanceDelayMs;
   private final String[] clusterNames;
   private final Map<String, String> clusterToD2;
   private final Map<String, String> clusterToServerD2;
   private final VeniceControllerWrapper[] childControllers;
   private final ZkServerWrapper zkServer;
+  private final String veniceZkBasePath;
   private final PubSubBrokerWrapper kafkaBroker;
   private final Properties extraProperties;
   private final AuthorizerService authorizerService;
   private final String regionName;
+  private final DynamicAccessController dynamicAccessController;
+
+  private final Map<String, D2Client> d2Clients;
 
   private VeniceControllerCreateOptions(Builder builder) {
+    multiRegion = builder.multiRegion;
     sslToKafka = builder.sslToKafka;
     d2Enabled = builder.d2Enabled;
     replicationFactor = builder.replicationFactor;
     partitionSize = builder.partitionSize;
     numberOfPartitions = builder.numberOfPartitions;
     maxNumberOfPartitions = builder.maxNumberOfPartitions;
-    minActiveReplica = builder.minActiveReplica;
+    numberOfControllers = builder.numberOfControllers;
     rebalanceDelayMs = builder.rebalanceDelayMs;
     clusterNames = builder.clusterNames;
     clusterToD2 = builder.clusterToD2;
     clusterToServerD2 = builder.clusterToServerD2;
     childControllers = builder.childControllers;
     zkServer = builder.zkServer;
+    veniceZkBasePath = builder.veniceZkBasePath;
     kafkaBroker = builder.kafkaBroker;
     extraProperties = builder.extraProperties;
     authorizerService = builder.authorizerService;
     isParent = builder.childControllers != null && builder.childControllers.length != 0;
     regionName = builder.regionName;
+    dynamicAccessController = builder.dynamicAccessController;
+    d2Clients = builder.d2Clients;
   }
 
   @Override
   public String toString() {
     return new StringBuilder().append("regionName:")
         .append(regionName)
+        .append(", ")
+        .append("multiRegion:")
+        .append(multiRegion)
         .append(", ")
         .append("isParent:")
         .append(isParent)
@@ -82,8 +98,8 @@ public class VeniceControllerCreateOptions {
         .append("maxNumberOfPartitions:")
         .append(maxNumberOfPartitions)
         .append(", ")
-        .append("minActiveReplica:")
-        .append(minActiveReplica)
+        .append("numberOfControllers:")
+        .append(numberOfControllers)
         .append(", ")
         .append("rebalanceDelayMs:")
         .append(rebalanceDelayMs)
@@ -93,6 +109,9 @@ public class VeniceControllerCreateOptions {
         .append(", ")
         .append("zkAddress:")
         .append(zkServer.getAddress())
+        .append(", ")
+        .append("veniceZkBasePath:")
+        .append(veniceZkBasePath)
         .append(", ")
         .append("kafkaBroker:")
         .append(kafkaBroker == null ? "null" : kafkaBroker.getAddress())
@@ -111,6 +130,8 @@ public class VeniceControllerCreateOptions {
         .append(", ")
         .append("childControllers:")
         .append(getAddressesOfChildControllers())
+        .append("d2Clients:")
+        .append(d2Clients)
         .toString();
   }
 
@@ -122,6 +143,10 @@ public class VeniceControllerCreateOptions {
         .map(VeniceControllerWrapper::getControllerUrl)
         .collect(Collectors.toList())
         .toString();
+  }
+
+  public boolean isMultiRegion() {
+    return multiRegion;
   }
 
   public boolean isParent() {
@@ -152,8 +177,8 @@ public class VeniceControllerCreateOptions {
     return maxNumberOfPartitions;
   }
 
-  public int getMinActiveReplica() {
-    return minActiveReplica;
+  public int getNumberOfControllers() {
+    return numberOfControllers;
   }
 
   public long getRebalanceDelayMs() {
@@ -166,6 +191,10 @@ public class VeniceControllerCreateOptions {
 
   public String getZkAddress() {
     return zkServer.getAddress();
+  }
+
+  public String getVeniceZkBasePath() {
+    return veniceZkBasePath;
   }
 
   public Map<String, String> getClusterToD2() {
@@ -192,22 +221,31 @@ public class VeniceControllerCreateOptions {
     return authorizerService;
   }
 
+  public DynamicAccessController getDynamicAccessController() {
+    return dynamicAccessController;
+  }
+
   public String getRegionName() {
     return regionName;
   }
 
+  public Map<String, D2Client> getD2Clients() {
+    return d2Clients;
+  }
+
   public static class Builder {
+    private boolean multiRegion = false;
     private final String[] clusterNames;
     private final ZkServerWrapper zkServer;
+    private String veniceZkBasePath = "/";
     private final PubSubBrokerWrapper kafkaBroker;
     private boolean sslToKafka = false;
     private boolean d2Enabled = false;
-    private boolean isMinActiveReplicaSet = false;
     private int replicationFactor = DEFAULT_REPLICATION_FACTOR;
     private int partitionSize = DEFAULT_PARTITION_SIZE_BYTES;
     private int numberOfPartitions = DEFAULT_NUMBER_OF_PARTITIONS;
     private int maxNumberOfPartitions = DEFAULT_MAX_NUMBER_OF_PARTITIONS;
-    private int minActiveReplica;
+    private int numberOfControllers = DEFAULT_NUMBER_OF_CONTROLLERS;
     private long rebalanceDelayMs = DEFAULT_DELAYED_TO_REBALANCE_MS;
     private Map<String, String> clusterToD2 = null;
     private Map<String, String> clusterToServerD2 = null;
@@ -215,16 +253,41 @@ public class VeniceControllerCreateOptions {
     private Properties extraProperties = new Properties();
     private AuthorizerService authorizerService;
     private String regionName;
+    private DynamicAccessController dynamicAccessController;
+    private Map<String, D2Client> d2Clients;
 
-    public Builder(String[] clusterNames, ZkServerWrapper zkServer, PubSubBrokerWrapper kafkaBroker) {
+    public Builder(
+        String[] clusterNames,
+        ZkServerWrapper zkServer,
+        PubSubBrokerWrapper kafkaBroker,
+        Map<String, D2Client> d2Clients) {
       this.clusterNames = Objects.requireNonNull(clusterNames, "clusterNames cannot be null when creating controller");
       this.zkServer = Objects.requireNonNull(zkServer, "ZkServerWrapper cannot be null when creating controller");
       this.kafkaBroker =
           Objects.requireNonNull(kafkaBroker, "KafkaBrokerWrapper cannot be null when creating controller");
+      this.d2Clients = d2Clients;
     }
 
-    public Builder(String clusterName, ZkServerWrapper zkServer, PubSubBrokerWrapper kafkaBroker) {
-      this(new String[] { clusterName }, zkServer, kafkaBroker);
+    public Builder(
+        String clusterName,
+        ZkServerWrapper zkServer,
+        PubSubBrokerWrapper kafkaBroker,
+        Map<String, D2Client> d2Clients) {
+      this(new String[] { clusterName }, zkServer, kafkaBroker, d2Clients);
+    }
+
+    public Builder multiRegion(boolean multiRegion) {
+      this.multiRegion = multiRegion;
+      return this;
+    }
+
+    public Builder veniceZkBasePath(String veniceZkBasePath) {
+      if (veniceZkBasePath == null || !veniceZkBasePath.startsWith("/")) {
+        throw new IllegalArgumentException("Venice Zk base path must start with /");
+      }
+
+      this.veniceZkBasePath = veniceZkBasePath;
+      return this;
     }
 
     public Builder sslToKafka(boolean sslToKafka) {
@@ -252,14 +315,13 @@ public class VeniceControllerCreateOptions {
       return this;
     }
 
-    public Builder maxNumberOfPartitions(int maxNumberOfPartitions) {
-      this.maxNumberOfPartitions = maxNumberOfPartitions;
+    public Builder numberOfControllers(int numberOfControllers) {
+      this.numberOfControllers = numberOfControllers;
       return this;
     }
 
-    public Builder minActiveReplica(int minActiveReplica) {
-      this.minActiveReplica = minActiveReplica;
-      this.isMinActiveReplicaSet = true;
+    public Builder maxNumberOfPartitions(int maxNumberOfPartitions) {
+      this.maxNumberOfPartitions = maxNumberOfPartitions;
       return this;
     }
 
@@ -298,11 +360,16 @@ public class VeniceControllerCreateOptions {
       return this;
     }
 
+    public Builder dynamicAccessController(DynamicAccessController dynamicAccessController) {
+      this.dynamicAccessController = dynamicAccessController;
+      return this;
+    }
+
     private void verifyAndAddParentControllerSpecificDefaults() {
-      if (!isMinActiveReplicaSet) {
-        minActiveReplica = replicationFactor > 1 ? replicationFactor - 1 : replicationFactor;
-      }
       extraProperties.setProperty(LOCAL_REGION_NAME, DEFAULT_PARENT_DATA_CENTER_REGION_NAME);
+      if (!extraProperties.containsKey(CONTROLLER_PUSH_RETRY_COOLDOWN_MS)) {
+        extraProperties.setProperty(CONTROLLER_PUSH_RETRY_COOLDOWN_MS, "0");
+      }
       if (!extraProperties.containsKey(CONTROLLER_AUTO_MATERIALIZE_META_SYSTEM_STORE)) {
         extraProperties.setProperty(CONTROLLER_AUTO_MATERIALIZE_META_SYSTEM_STORE, "true");
       }
@@ -315,12 +382,6 @@ public class VeniceControllerCreateOptions {
       }
     }
 
-    private void verifyAndAddChildControllerSpecificDefaults() {
-      if (!isMinActiveReplicaSet) {
-        minActiveReplica = replicationFactor;
-      }
-    }
-
     private void addDefaults() {
       if (extraProperties == null) {
         extraProperties = new Properties();
@@ -328,8 +389,6 @@ public class VeniceControllerCreateOptions {
 
       if (childControllers != null && childControllers.length != 0) {
         verifyAndAddParentControllerSpecificDefaults();
-      } else {
-        verifyAndAddChildControllerSpecificDefaults();
       }
 
       if (regionName == null || regionName.isEmpty()) {

@@ -4,11 +4,11 @@ import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_PLA
 import static com.linkedin.venice.ConfigKeys.SERVER_OPTIMIZE_DATABASE_FOR_BACKUP_VERSION_ENABLED;
 import static com.linkedin.venice.ConfigKeys.SERVER_OPTIMIZE_DATABASE_FOR_BACKUP_VERSION_NO_READ_THRESHOLD_SECONDS;
 import static com.linkedin.venice.ConfigKeys.SERVER_OPTIMIZE_DATABASE_SERVICE_SCHEDULE_INTERNAL_SECONDS;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.VENICE_STORE_NAME_PROP;
 import static com.linkedin.venice.utils.IntegrationTestPushUtils.createStoreForJob;
 import static com.linkedin.venice.utils.IntegrationTestPushUtils.defaultVPJProps;
 import static com.linkedin.venice.utils.TestWriteUtils.DEFAULT_USER_DATA_RECORD_COUNT;
 import static com.linkedin.venice.utils.TestWriteUtils.getTempDataDirectory;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_STORE_NAME_PROP;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertTrue;
@@ -20,6 +20,7 @@ import com.linkedin.venice.controllerapi.ControllerClient;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.hadoop.VenicePushJob;
 import com.linkedin.venice.integration.utils.ServiceFactory;
+import com.linkedin.venice.integration.utils.VeniceClusterCreateOptions;
 import com.linkedin.venice.integration.utils.VeniceClusterWrapper;
 import com.linkedin.venice.integration.utils.VeniceServerWrapper;
 import com.linkedin.venice.utils.TestUtils;
@@ -52,7 +53,16 @@ public class TestBackupVersionDatabaseOptimization {
     extraProperties.setProperty(SERVER_OPTIMIZE_DATABASE_SERVICE_SCHEDULE_INTERNAL_SECONDS, "1");
     extraProperties.setProperty(SERVER_OPTIMIZE_DATABASE_FOR_BACKUP_VERSION_NO_READ_THRESHOLD_SECONDS, "3");
 
-    venice = ServiceFactory.getVeniceCluster(1, 2, 1, 2, 1000000, false, false, extraProperties);
+    VeniceClusterCreateOptions options = new VeniceClusterCreateOptions.Builder().numberOfControllers(1)
+        .numberOfServers(2)
+        .numberOfRouters(1)
+        .replicationFactor(2)
+        .partitionSize(1000000)
+        .sslToStorageNodes(false)
+        .sslToKafka(false)
+        .extraProperties(extraProperties)
+        .build();
+    venice = ServiceFactory.getVeniceCluster(options);
   }
 
   @AfterClass(alwaysRun = true)
@@ -132,18 +142,25 @@ public class TestBackupVersionDatabaseOptimization {
       // Verify whether the backup version database optimization happens or not.
       VeniceServerWrapper serverWrapper = venice.getVeniceServers().get(0);
       MetricsRepository metricsRepository = serverWrapper.getMetricsRepository();
-      Metric optimizationMetric = metricsRepository
-          .getMetric(".BackupVersionOptimizationService--backup_version_database_optimization.OccurrenceRate");
-      Metric rocksdbMetric = metricsRepository.getMetric(".RocksDBMemoryStats--rocksdb.num-immutable-mem-table.Gauge");
 
       // N.B.: The optimization is performed by a periodic background task, so it cannot be expected to have already
-      // completed as soon as we get here.
+      // completed as soon as we get here. Fetch the metric handle inside the assertion lambda — the Tehuti sensor is
+      // registered lazily on first per-store recording, so getMetric(...) returns null until the first optimization
+      // fires.
       TestUtils.waitForNonDeterministicAssertion(10, TimeUnit.SECONDS, true, () -> {
+        Metric optimizationMetric = metricsRepository
+            .getMetric(".BackupVersionOptimizationService--backup_version_database_optimization.OccurrenceRate");
+        assertNotNull(
+            optimizationMetric,
+            "Backup version optimization Tehuti sensor should be registered after the first optimization");
         assertTrue(optimizationMetric.value() > 0, "Backup version database optimization should happen");
         /**
          * This assertion is used to make sure {@link com.linkedin.davinci.stats.RocksDBMemoryStats} won't crash after
          * reopening the backup version.
          */
+        Metric rocksdbMetric =
+            metricsRepository.getMetric(".RocksDBMemoryStats--rocksdb.num-immutable-mem-table.Gauge");
+        assertNotNull(rocksdbMetric, "RocksDBMemoryStats num-immutable-mem-table gauge must be registered");
         rocksdbMetric.value();
       });
     }

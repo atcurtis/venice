@@ -5,7 +5,11 @@ import com.linkedin.davinci.config.VeniceStoreVersionConfig;
 import com.linkedin.davinci.helix.LeaderFollowerPartitionStateModel;
 import com.linkedin.davinci.notifier.VeniceNotifier;
 import com.linkedin.davinci.stats.AggVersionedIngestionStats;
-import com.linkedin.davinci.storage.IngestionMetadataRetriever;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
+import com.linkedin.venice.stats.dimensions.VeniceIngestionFailureReason;
+import com.linkedin.venice.writer.VeniceWriterFactory;
+import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 
@@ -13,13 +17,15 @@ import java.util.concurrent.CompletableFuture;
 /**
  * An interface for Store Ingestion Service for Venice.
  */
-public interface StoreIngestionService extends IngestionMetadataRetriever {
+public interface StoreIngestionService {
   /**
    * Starts consuming messages from Kafka Partition corresponding to Venice Partition.
-   * @param veniceStore Venice Store for the partition.
-   * @param partitionId Venice partition's id.
+   *
+   * @param veniceStore    Venice Store for the partition.
+   * @param partitionId    Venice partition's id.
+   * @param pubSubPosition
    */
-  void startConsumption(VeniceStoreVersionConfig veniceStore, int partitionId);
+  void startConsumption(VeniceStoreVersionConfig veniceStore, int partitionId, Optional<PubSubPosition> pubSubPosition);
 
   /**
    * Stops consuming messages from Kafka Partition corresponding to Venice Partition.
@@ -94,6 +100,11 @@ public interface StoreIngestionService extends IngestionMetadataRetriever {
   void recordIngestionFailure(String storeName);
 
   /**
+   * Records an ingestion failure with version-level OTel metrics including the failure reason dimension.
+   */
+  void recordIngestionFailure(String storeName, int version, VeniceIngestionFailureReason reason);
+
+  /**
    * Get AggVersionedStorageIngestionStats
    * @return an instance of {@link AggVersionedIngestionStats}
    */
@@ -102,4 +113,22 @@ public interface StoreIngestionService extends IngestionMetadataRetriever {
   StoreIngestionTask getStoreIngestionTask(String topic);
 
   VeniceConfigLoader getVeniceConfigLoader();
+
+  VeniceWriterFactory getVeniceWriterFactory();
+
+  Optional<PubSubPosition> getPubSubPosition(
+      VeniceStoreVersionConfig veniceStore,
+      int partitionId,
+      Map<Integer, Long> timestampMap,
+      Map<Integer, PubSubPosition> pubSubPosition);
+
+  default void registerBlobTransferDisabled(String storeName) {
+  }
+
+  default void unregisterBlobTransferDisabled(String storeName) {
+  }
+
+  default boolean isBlobTransferDisabledForStore(String storeName) {
+    return false;
+  }
 }

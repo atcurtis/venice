@@ -2,6 +2,7 @@ package com.linkedin.venice.listener;
 
 import com.linkedin.davinci.compression.StorageEngineBackedCompressorFactory;
 import com.linkedin.davinci.config.VeniceServerConfig;
+import com.linkedin.davinci.kafka.consumer.KafkaStoreIngestionService;
 import com.linkedin.davinci.storage.DiskHealthCheckService;
 import com.linkedin.davinci.storage.IngestionMetadataRetriever;
 import com.linkedin.davinci.storage.ReadMetadataRetriever;
@@ -12,6 +13,7 @@ import com.linkedin.venice.cleaner.ResourceReadUsageTracker;
 import com.linkedin.venice.grpc.VeniceGrpcServer;
 import com.linkedin.venice.grpc.VeniceGrpcServerConfig;
 import com.linkedin.venice.helix.HelixCustomizedViewOfflinePushRepository;
+import com.linkedin.venice.listener.grpc.VeniceIngestionMonitorServiceImpl;
 import com.linkedin.venice.listener.grpc.VeniceReadServiceImpl;
 import com.linkedin.venice.listener.grpc.handlers.VeniceServerGrpcRequestProcessor;
 import com.linkedin.venice.meta.ReadOnlySchemaRepository;
@@ -26,10 +28,12 @@ import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.ServerChannel;
+import io.netty.channel.WriteBufferWaterMark;
 import io.netty.channel.epoll.EpollEventLoopGroup;
 import io.netty.channel.epoll.EpollServerSocketChannel;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.util.concurrent.DefaultThreadFactory;
 import io.tehuti.metrics.MetricsRepository;
 import java.util.List;
 import java.util.Optional;
@@ -53,6 +57,7 @@ public class ListenerService extends AbstractVeniceService {
   private final int port;
   private final int grpcPort;
   private VeniceGrpcServer grpcServer;
+  private VeniceIngestionMonitorServiceImpl ingestionMonitorService;
   private final boolean isGrpcEnabled;
   private final VeniceServerConfig serverConfig;
   private final ThreadPoolExecutor executor;
@@ -62,10 +67,6 @@ public class ListenerService extends AbstractVeniceService {
 
   // TODO: move netty config to a config file
   private static int nettyBacklogSize = 1000;
-
-  private StorageReadRequestHandler storageReadRequestHandler;
-
-  private boolean isDaVinciClient;
 
   public ListenerService(
       StorageEngineRepository storageEngineRepository,
@@ -81,7 +82,8 @@ public class ListenerService extends AbstractVeniceService {
       Optional<DynamicAccessController> storeAccessController,
       DiskHealthCheckService diskHealthService,
       StorageEngineBackedCompressorFactory compressorFactory,
-      Optional<ResourceReadUsageTracker> resourceReadUsageTracker) {
+      Optional<ResourceReadUsageTracker> resourceReadUsageTracker,
+      Optional<KafkaStoreIngestionService> kafkaStoreIngestionService) {
 
     this.serverConfig = serverConfig;
     this.port = serverConfig.getListenerPort();
@@ -104,8 +106,8 @@ public class ListenerService extends AbstractVeniceService {
       this.sslHandshakeExecutor = createThreadPool(
           serverConfig.getSslHandshakeThreadPoolSize(),
           "SSLHandShakeThread",
-          serverConfig.getSslHandshakeQueueCapacity());
-      new ThreadPoolStats(metricsRepository, this.sslHandshakeExecutor, "ssl_handshake_thread_pool");
+          serverConfig.getSslHandshakeQueueCapacity(),
+          Thread.NORM_PRIORITY);
     }
 
     StorageReadRequestHandler requestHandler = createRequestHandler(
@@ -117,13 +119,8 @@ public class ListenerService extends AbstractVeniceService {
         ingestionMetadataRetriever,
         readMetadataRetriever,
         diskHealthService,
-        serverConfig.isComputeFastAvroEnabled(),
-        serverConfig.isEnableParallelBatchGet(),
-        serverConfig.getParallelBatchGetChunkSize(),
         compressorFactory,
         resourceReadUsageTracker);
-
-    storageReadRequestHandler = requestHandler;
 
     HttpChannelInitializer channelInitializer = new HttpChannelInitializer(
         storeMetadataRepository,
@@ -134,15 +131,17 @@ public class ListenerService extends AbstractVeniceService {
         serverConfig,
         routerAccessController,
         storeAccessController,
-        requestHandler);
+        requestHandler,
+        storageEngineRepository);
 
     Class<? extends ServerChannel> serverSocketChannelClass = NioServerSocketChannel.class;
     boolean epollEnabled = serverConfig.isRestServiceEpollEnabled();
     if (epollEnabled) {
       try {
-        bossGroup = new EpollEventLoopGroup(1);
-        workerGroup = new EpollEventLoopGroup(serverConfig.getNettyWorkerThreadCount()); // if 0, defaults to 2*cpu
-                                                                                         // count
+        bossGroup = new EpollEventLoopGroup(1, new DefaultThreadFactory("Venice-Rest-Listener-Epoll-Boss"));
+        workerGroup = new EpollEventLoopGroup( // if 0, defaults to 2*cpu count
+            serverConfig.getNettyWorkerThreadCount(),
+            new DefaultThreadFactory("Venice-Rest-Listener-Epoll-Worker"));
         serverSocketChannelClass = EpollServerSocketChannel.class;
         LOGGER.info("Epoll is enabled in Server Rest Service");
       } catch (LinkageError error) {
@@ -151,8 +150,10 @@ public class ListenerService extends AbstractVeniceService {
       }
     }
     if (!epollEnabled) {
-      bossGroup = new NioEventLoopGroup(1);
-      workerGroup = new NioEventLoopGroup(serverConfig.getNettyWorkerThreadCount()); // if 0, defaults to 2*cpu count
+      bossGroup = new NioEventLoopGroup(1, new DefaultThreadFactory("Venice-Rest-Listener-Nio-Boss"));
+      workerGroup = new NioEventLoopGroup( // if 0, defaults to 2*cpu count
+          serverConfig.getNettyWorkerThreadCount(),
+          new DefaultThreadFactory("Venice-Rest-Listener-Nio-Worker"));
       serverSocketChannelClass = NioServerSocketChannel.class;
     }
     bootstrap = new ServerBootstrap();
@@ -162,7 +163,14 @@ public class ListenerService extends AbstractVeniceService {
         .option(ChannelOption.SO_BACKLOG, nettyBacklogSize)
         .childOption(ChannelOption.SO_KEEPALIVE, true)
         .option(ChannelOption.SO_REUSEADDR, true)
-        .childOption(ChannelOption.TCP_NODELAY, true);
+        .childOption(ChannelOption.TCP_NODELAY, true)
+        // A higher buffer watermark will allow more data write for a given channel and it would be useful for H2,
+        // as H2 works with a smaller number of connections.
+        .childOption(
+            ChannelOption.WRITE_BUFFER_WATER_MARK,
+            new WriteBufferWaterMark(
+                WriteBufferWaterMark.DEFAULT.low(),
+                serverConfig.getChannelOptionWriteBufferHighBytes()));
 
     if (isGrpcEnabled && grpcServer == null) {
       List<ServerInterceptor> interceptors = channelInitializer.initGrpcInterceptors();
@@ -170,9 +178,14 @@ public class ListenerService extends AbstractVeniceService {
       grpcExecutor = createThreadPool(serverConfig.getGrpcWorkerThreadCount(), "GrpcWorkerThread", nettyBacklogSize);
 
       VeniceGrpcServerConfig.Builder grpcServerBuilder = new VeniceGrpcServerConfig.Builder().setPort(grpcPort)
-          .setService(new VeniceReadServiceImpl(requestProcessor))
+          .addService(new VeniceReadServiceImpl(requestProcessor))
           .setExecutor(grpcExecutor)
           .setInterceptors(interceptors);
+
+      kafkaStoreIngestionService.ifPresent(service -> {
+        ingestionMonitorService = new VeniceIngestionMonitorServiceImpl(service);
+        grpcServerBuilder.addService(ingestionMonitorService);
+      });
 
       sslFactory.ifPresent(grpcServerBuilder::setSslFactory);
 
@@ -212,6 +225,9 @@ public class ListenerService extends AbstractVeniceService {
     bossGroup.shutdownGracefully();
     shutdown.sync();
 
+    if (ingestionMonitorService != null) {
+      ingestionMonitorService.close();
+    }
     if (grpcServer != null) {
       LOGGER.info("Stopping gRPC service on port {}", grpcPort);
       grpcServer.stop();
@@ -219,8 +235,22 @@ public class ListenerService extends AbstractVeniceService {
   }
 
   protected ThreadPoolExecutor createThreadPool(int threadCount, String threadNamePrefix, int capacity) {
-    return ThreadPoolFactory
-        .createThreadPool(threadCount, threadNamePrefix, capacity, serverConfig.getBlockingQueueType());
+    return ThreadPoolFactory.createThreadPool(
+        threadCount,
+        threadNamePrefix,
+        serverConfig.getLogContext(),
+        capacity,
+        serverConfig.getBlockingQueueType());
+  }
+
+  protected ThreadPoolExecutor createThreadPool(int threadCount, String threadNamePrefix, int capacity, int priority) {
+    return ThreadPoolFactory.createThreadPool(
+        threadCount,
+        threadNamePrefix,
+        serverConfig.getLogContext(),
+        capacity,
+        serverConfig.getBlockingQueueType(),
+        priority);
   }
 
   protected StorageReadRequestHandler createRequestHandler(
@@ -232,12 +262,10 @@ public class ListenerService extends AbstractVeniceService {
       IngestionMetadataRetriever ingestionMetadataRetriever,
       ReadMetadataRetriever readMetadataRetriever,
       DiskHealthCheckService diskHealthService,
-      boolean fastAvroEnabled,
-      boolean parallelBatchGetEnabled,
-      int parallelBatchGetChunkSize,
       StorageEngineBackedCompressorFactory compressorFactory,
       Optional<ResourceReadUsageTracker> resourceReadUsageTracker) {
     return new StorageReadRequestHandler(
+        serverConfig,
         executor,
         computeExecutor,
         storageEngineRepository,
@@ -246,10 +274,6 @@ public class ListenerService extends AbstractVeniceService {
         ingestionMetadataRetriever,
         readMetadataRetriever,
         diskHealthService,
-        fastAvroEnabled,
-        parallelBatchGetEnabled,
-        parallelBatchGetChunkSize,
-        serverConfig,
         compressorFactory,
         resourceReadUsageTracker);
   }

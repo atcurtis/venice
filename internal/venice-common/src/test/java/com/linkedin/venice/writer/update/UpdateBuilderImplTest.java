@@ -4,35 +4,29 @@ import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertNull;
 import static org.testng.Assert.assertTrue;
 
-import com.linkedin.alpini.io.IOUtils;
 import com.linkedin.avroutil1.compatibility.AvroCompatibilityHelper;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.schema.writecompute.WriteComputeSchemaConverter;
 import com.linkedin.venice.serialization.avro.VeniceAvroKafkaSerializer;
 import com.linkedin.venice.serializer.VeniceSerializationException;
-import java.nio.charset.StandardCharsets;
+import com.linkedin.venice.utils.TestUtils;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 import org.testng.Assert;
 import org.testng.annotations.Test;
 
 
 public class UpdateBuilderImplTest {
-  private static final Logger LOGGER = LogManager.getLogger(UpdateBuilderImplTest.class);
-  private static final Schema VALUE_SCHEMA =
-      AvroCompatibilityHelper.parse(loadFileAsString("TestWriteComputeBuilder.avsc"));
+  private static final Schema VALUE_SCHEMA = AvroCompatibilityHelper.parse(TestUtils.loadFileAsString("PersonV1.avsc"));
   private static final Schema EVOLVED_VALUE_SCHEMA =
-      AvroCompatibilityHelper.parse(loadFileAsString("TestEvolvedWriteComputeBuilder.avsc"));
+      AvroCompatibilityHelper.parse(TestUtils.loadFileAsString("PersonV2.avsc"));
   private static final Schema UPDATE_SCHEMA =
       WriteComputeSchemaConverter.getInstance().convertFromValueRecordSchema(VALUE_SCHEMA);
   private static final Schema EVOLVED_UPDATE_SCHEMA =
@@ -120,6 +114,27 @@ public class UpdateBuilderImplTest {
     GenericRecord recordMapMergeRecord = (GenericRecord) updateRecord.get("recordMap");
     Assert.assertEquals(recordMapMergeRecord.get("mapUnion"), expectedRecordMapToAdd);
     Assert.assertEquals(recordMapMergeRecord.get("mapDiff"), Collections.emptyList());
+  }
+
+  @Test
+  public void testUpdateEvolvedSubfieldRemoveFromListFieldAdaptsSchema() {
+    UpdateBuilder builder = new UpdateBuilderImpl(UPDATE_SCHEMA);
+
+    List<GenericRecord> writeRecordArrayToRemove = new ArrayList<>();
+    writeRecordArrayToRemove.add(createEvolvedRecordForListField(1, "testName"));
+
+    List<GenericRecord> expectedRecordArrayToRemove = new ArrayList<>();
+    expectedRecordArrayToRemove.add(createRecordForListField(1));
+
+    builder.setNewFieldValue("name", "Lebron James");
+    builder.setElementsToRemoveFromListField("recordArray", writeRecordArrayToRemove);
+
+    GenericRecord updateRecord = builder.build();
+
+    Assert.assertTrue(updateRecord.get("recordArray") instanceof GenericRecord);
+    GenericRecord listMergeRecord = (GenericRecord) updateRecord.get("recordArray");
+    Assert.assertEquals(listMergeRecord.get("setUnion"), Collections.emptyList());
+    Assert.assertEquals(listMergeRecord.get("setDiff"), expectedRecordArrayToRemove);
   }
 
   @Test
@@ -471,16 +486,5 @@ public class UpdateBuilderImplTest {
   private GenericRecord createFieldNoOpRecord(String fieldName) {
     Schema noOpSchema = UPDATE_SCHEMA.getField(fieldName).schema().getTypes().get(0);
     return new GenericData.Record(noOpSchema);
-  }
-
-  private static String loadFileAsString(String fileName) {
-    try {
-      return IOUtils.toString(
-          Objects.requireNonNull(Thread.currentThread().getContextClassLoader().getResourceAsStream(fileName)),
-          StandardCharsets.UTF_8);
-    } catch (Exception e) {
-      LOGGER.error(e);
-      return null;
-    }
   }
 }

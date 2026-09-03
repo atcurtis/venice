@@ -1,104 +1,78 @@
 package com.linkedin.venice.hadoop.input.kafka;
 
+import com.linkedin.venice.pubsub.api.PubSubPosition;
+import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
+import com.linkedin.venice.vpj.pubsub.input.PubSubPartitionSplit;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 import org.apache.hadoop.mapred.InputSplit;
-import org.apache.kafka.common.TopicPartition;
 
 
 /**
  * We borrowed some idea from the open-sourced attic-crunch lib:
  * https://github.com/apache/attic-crunch/blob/master/crunch-kafka/src/main/java/org/apache/crunch/kafka/record/KafkaInputSplit.java
  *
- * InputSplit that represent retrieving data from a single {@link TopicPartition} between the specified start
+ * InputSplit that represent retrieving data from a single {@link PubSubTopicPartition} between the specified start
  * and end offsets.
  */
 public class KafkaInputSplit implements InputSplit {
-  private long startingOffset;
-  private long endingOffset;
-  private TopicPartition topicPartition;
+  private PubSubPartitionSplit split;
 
-  /**
-   * Nullary Constructor for creating the instance inside the Mapper instance.
-   */
+  /** Nullary constructor for Hadoop to instantiate reflectively. */
   public KafkaInputSplit() {
   }
 
   /**
-   * Constructs an input split for the provided {@param topic} and {@param partition} restricting data to be between
-   * the {@param startingOffset} and {@param endingOffset}
-   *
-   * @param topic          the topic for the split
-   * @param partition      the partition for the topic
-   * @param startingOffset the start of the split
-   * @param endingOffset   the end of the split
+   * Original constructor signature, now wiring through to PubSubPartitionSplit.
    */
-  public KafkaInputSplit(String topic, int partition, long startingOffset, long endingOffset) {
-    this.startingOffset = startingOffset;
-    this.endingOffset = endingOffset;
-    topicPartition = new TopicPartition(topic, partition);
+  public KafkaInputSplit(PubSubPartitionSplit pubSubPartitionSplit) {
+    this.split = pubSubPartitionSplit;
+  }
+
+  public PubSubTopicPartition getTopicPartition() {
+    return split.getPubSubTopicPartition();
+  }
+
+  public PubSubPosition getStartingOffset() {
+    return split.getStartPubSubPosition();
+  }
+
+  public PubSubPosition getEndingOffset() {
+    return split.getEndPubSubPosition();
+  }
+
+  public long getNumberOfRecords() {
+    return split.getNumberOfRecords();
   }
 
   @Override
-  public long getLength() throws IOException {
-    // This is just used as a hint for size of bytes so it is already inaccurate.
-    return startingOffset > 0 ? endingOffset - startingOffset : endingOffset;
+  public long getLength() {
+    return split.getNumberOfRecords();
   }
 
   @Override
-  public String[] getLocations() throws IOException {
+  public String[] getLocations() {
     // Leave empty since data locality not really an issue.
     return new String[0];
   }
 
-  /**
-   * Returns the topic and partition for the split
-   *
-   * @return the topic and partition for the split
-   */
-  public TopicPartition getTopicPartition() {
-    return topicPartition;
-  }
-
-  /**
-   * Returns the starting offset for the split
-   *
-   * @return the starting offset for the split
-   */
-  public long getStartingOffset() {
-    return startingOffset;
-  }
-
-  /**
-   * Returns the ending offset for the split
-   *
-   * @return the ending offset for the split
-   */
-  public long getEndingOffset() {
-    return endingOffset;
+  @Override
+  public void write(DataOutput out) throws IOException {
+    split.writeTo(out);
   }
 
   @Override
-  public void write(DataOutput dataOutput) throws IOException {
-    dataOutput.writeUTF(topicPartition.topic());
-    dataOutput.writeInt(topicPartition.partition());
-    dataOutput.writeLong(startingOffset);
-    dataOutput.writeLong(endingOffset);
+  public void readFields(DataInput in) throws IOException {
+    this.split = PubSubPartitionSplit.readFrom(in);
   }
 
-  @Override
-  public void readFields(DataInput dataInput) throws IOException {
-    String topic = dataInput.readUTF();
-    int partition = dataInput.readInt();
-    startingOffset = dataInput.readLong();
-    endingOffset = dataInput.readLong();
-
-    topicPartition = new TopicPartition(topic, partition);
+  PubSubPartitionSplit getSplit() {
+    return split;
   }
 
   @Override
   public String toString() {
-    return getTopicPartition() + " Start: " + startingOffset + " End: " + endingOffset;
+    return getTopicPartition() + " Start: " + getStartingOffset() + " End: " + getEndingOffset();
   }
 }

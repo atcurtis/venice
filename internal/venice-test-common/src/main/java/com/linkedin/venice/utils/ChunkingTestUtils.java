@@ -1,7 +1,5 @@
 package com.linkedin.venice.utils;
 
-import static com.linkedin.venice.kafka.protocol.enums.MessageType.*;
-
 import com.linkedin.venice.kafka.protocol.Delete;
 import com.linkedin.venice.kafka.protocol.GUID;
 import com.linkedin.venice.kafka.protocol.KafkaMessageEnvelope;
@@ -11,7 +9,8 @@ import com.linkedin.venice.kafka.protocol.Update;
 import com.linkedin.venice.kafka.protocol.enums.MessageType;
 import com.linkedin.venice.message.KafkaKey;
 import com.linkedin.venice.pubsub.ImmutablePubSubMessage;
-import com.linkedin.venice.pubsub.api.PubSubMessage;
+import com.linkedin.venice.pubsub.adapter.kafka.common.ApacheKafkaOffsetPosition;
+import com.linkedin.venice.pubsub.api.DefaultPubSubMessage;
 import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
 import com.linkedin.venice.serialization.KeyWithChunkingSuffixSerializer;
 import com.linkedin.venice.serialization.avro.AvroProtocolDefinition;
@@ -19,6 +18,7 @@ import com.linkedin.venice.serialization.avro.ChunkedValueManifestSerializer;
 import com.linkedin.venice.storage.protocol.ChunkId;
 import com.linkedin.venice.storage.protocol.ChunkedKeySuffix;
 import com.linkedin.venice.storage.protocol.ChunkedValueManifest;
+import com.linkedin.venice.writer.VeniceWriter;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 
@@ -55,12 +55,6 @@ public final class ChunkingTestUtils {
     return chunkedKeySuffix;
   }
 
-  public static ByteBuffer prependSchemaId(byte[] valueBytes, int schemaId) {
-    ByteBuffer prependedValueBytes = ByteUtils.enlargeByteBufferForIntHeader(ByteBuffer.wrap(valueBytes));
-    prependedValueBytes.putInt(0, schemaId);
-    return prependedValueBytes;
-  }
-
   public static KafkaMessageEnvelope createKafkaMessageEnvelope(
       MessageType messageType,
       int segmentNumber,
@@ -75,7 +69,7 @@ public final class ChunkingTestUtils {
     return messageEnvelope;
   }
 
-  public static PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> createChunkedRecord(
+  public static DefaultPubSubMessage createChunkedRecord(
       byte[] serializedKey,
       int firstSegmentNumber,
       int firstSequenceNumber,
@@ -87,28 +81,35 @@ public final class ChunkingTestUtils {
     ChunkedKeySuffix chunkKeySuffix = createChunkedKeySuffix(firstSegmentNumber, firstSequenceNumber, chunkIndex);
     ByteBuffer chunkKeyWithSuffix =
         KEY_WITH_CHUNKING_SUFFIX_SERIALIZER.serializeChunkedKey(serializedKey, chunkKeySuffix);
-    KafkaKey kafkaKey = new KafkaKey(PUT, ByteUtils.extractByteArray(chunkKeyWithSuffix));
-    KafkaMessageEnvelope messageEnvelope = createKafkaMessageEnvelope(PUT, firstSegmentNumber, newSequenceNumber);
+    KafkaKey kafkaKey = new KafkaKey(MessageType.PUT, ByteUtils.extractByteArray(chunkKeyWithSuffix));
+    KafkaMessageEnvelope messageEnvelope =
+        createKafkaMessageEnvelope(MessageType.PUT, firstSegmentNumber, newSequenceNumber);
 
     Put put = new Put();
     put.schemaId = AvroProtocolDefinition.CHUNK.getCurrentProtocolVersion();
-    byte[] valueBytes = createChunkBytes(chunkIndex * CHUNK_LENGTH, CHUNK_LENGTH);
-    put.putValue = prependSchemaId(valueBytes, put.schemaId);
-    put.replicationMetadataPayload = ByteBuffer.allocate(10);
+    ByteBuffer valueBytes = ByteBuffer.wrap(createChunkBytes(chunkIndex * CHUNK_LENGTH, CHUNK_LENGTH));
+    put.putValue = ByteUtils.prependIntHeaderToByteBuffer(valueBytes, put.schemaId);
+    put.replicationMetadataPayload = VeniceWriter.EMPTY_BYTE_BUFFER;
     messageEnvelope.payloadUnion = put;
-    return new ImmutablePubSubMessage<>(kafkaKey, messageEnvelope, pubSubTopicPartition, newOffset, 0, 20);
+    return new ImmutablePubSubMessage(
+        kafkaKey,
+        messageEnvelope,
+        pubSubTopicPartition,
+        ApacheKafkaOffsetPosition.of(newOffset),
+        0,
+        20);
   }
 
-  public static PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> createChunkValueManifestRecord(
+  public static DefaultPubSubMessage createChunkValueManifestRecord(
       byte[] serializedKey,
-      PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> firstMessage,
+      DefaultPubSubMessage firstMessage,
       int numberOfChunks,
       PubSubTopicPartition pubSubTopicPartition) {
-    long newOffset = firstMessage.getOffset() + numberOfChunks;
+    long newOffset = firstMessage.getPosition().getNumericOffset() + numberOfChunks;
     byte[] chunkKeyWithSuffix = KEY_WITH_CHUNKING_SUFFIX_SERIALIZER.serializeNonChunkedKey(serializedKey);
-    KafkaKey kafkaKey = new KafkaKey(PUT, chunkKeyWithSuffix);
+    KafkaKey kafkaKey = new KafkaKey(MessageType.PUT, chunkKeyWithSuffix);
     KafkaMessageEnvelope messageEnvelope = createKafkaMessageEnvelope(
-        PUT,
+        MessageType.PUT,
         firstMessage.getValue().getProducerMetadata().segmentNumber,
         firstMessage.getValue().getProducerMetadata().messageSequenceNumber + numberOfChunks);
 
@@ -118,23 +119,39 @@ public final class ChunkingTestUtils {
     manifest.schemaId = AvroProtocolDefinition.CHUNKED_VALUE_MANIFEST.getCurrentProtocolVersion();
     manifest.size = numberOfChunks * CHUNK_LENGTH;
     manifest.keysWithChunkIdSuffix.add(ByteBuffer.wrap(firstMessage.getKey().getKey()));
-    byte[] valueBytes = chunkedValueManifestSerializer.serialize(manifest).array();
+    ByteBuffer putValueBytes = chunkedValueManifestSerializer.serialize(manifest);
 
     Put put = new Put();
     put.schemaId = AvroProtocolDefinition.CHUNKED_VALUE_MANIFEST.getCurrentProtocolVersion();
-    put.putValue = prependSchemaId(valueBytes, put.schemaId);
-    put.replicationMetadataPayload = ByteBuffer.allocate(10);
+    put.putValue = ByteUtils.prependIntHeaderToByteBuffer(putValueBytes, put.schemaId);
+    put.replicationMetadataPayload = VeniceWriter.EMPTY_BYTE_BUFFER;
     messageEnvelope.payloadUnion = put;
-    return new ImmutablePubSubMessage<>(kafkaKey, messageEnvelope, pubSubTopicPartition, newOffset, 0, 20);
+    return new ImmutablePubSubMessage(
+        kafkaKey,
+        messageEnvelope,
+        pubSubTopicPartition,
+        ApacheKafkaOffsetPosition.of(newOffset),
+        0,
+        20);
   }
 
-  public static PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> createDeleteRecord(
+  public static ByteBuffer createReplicationMetadataPayload(int size) {
+    ChunkedValueManifestSerializer chunkedRmdManifestSerializer = new ChunkedValueManifestSerializer(true);
+    ChunkedValueManifest chunkedRmdManifest = new ChunkedValueManifest();
+    chunkedRmdManifest.keysWithChunkIdSuffix = new ArrayList<>(1);
+    chunkedRmdManifest.schemaId = AvroProtocolDefinition.CHUNKED_VALUE_MANIFEST.getCurrentProtocolVersion();
+    chunkedRmdManifest.size = size;
+    ByteBuffer putValueBytes = chunkedRmdManifestSerializer.serialize(chunkedRmdManifest);
+    return ByteUtils.prependIntHeaderToByteBuffer(putValueBytes, chunkedRmdManifest.schemaId);
+  }
+
+  public static DefaultPubSubMessage createDeleteRecord(
       byte[] serializedKey,
       byte[] serializedRmd,
       PubSubTopicPartition pubSubTopicPartition) {
     byte[] chunkKeyWithSuffix = KEY_WITH_CHUNKING_SUFFIX_SERIALIZER.serializeNonChunkedKey(serializedKey);
-    KafkaKey kafkaKey = new KafkaKey(DELETE, chunkKeyWithSuffix);
-    KafkaMessageEnvelope messageEnvelope = createKafkaMessageEnvelope(DELETE, 0, 0);
+    KafkaKey kafkaKey = new KafkaKey(MessageType.DELETE, chunkKeyWithSuffix);
+    KafkaMessageEnvelope messageEnvelope = createKafkaMessageEnvelope(MessageType.DELETE, 0, 0);
 
     Delete delete = new Delete();
     delete.schemaId = 1;
@@ -143,17 +160,23 @@ public final class ChunkingTestUtils {
       delete.replicationMetadataVersionId = 1;
     }
     messageEnvelope.payloadUnion = delete;
-    return new ImmutablePubSubMessage<>(kafkaKey, messageEnvelope, pubSubTopicPartition, 1, 0, 20);
+    return new ImmutablePubSubMessage(
+        kafkaKey,
+        messageEnvelope,
+        pubSubTopicPartition,
+        ApacheKafkaOffsetPosition.of(1),
+        0,
+        20);
   }
 
-  public static PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> createPutRecord(
+  public static DefaultPubSubMessage createPutRecord(
       byte[] serializedKey,
       byte[] serializedValue,
       byte[] serializedRmd,
       PubSubTopicPartition pubSubTopicPartition) {
     byte[] chunkKeyWithSuffix = KEY_WITH_CHUNKING_SUFFIX_SERIALIZER.serializeNonChunkedKey(serializedKey);
-    KafkaKey kafkaKey = new KafkaKey(PUT, chunkKeyWithSuffix);
-    KafkaMessageEnvelope messageEnvelope = createKafkaMessageEnvelope(PUT, 0, 0);
+    KafkaKey kafkaKey = new KafkaKey(MessageType.PUT, chunkKeyWithSuffix);
+    KafkaMessageEnvelope messageEnvelope = createKafkaMessageEnvelope(MessageType.PUT, 0, 0);
 
     Put put = new Put();
     put.schemaId = 1;
@@ -163,22 +186,34 @@ public final class ChunkingTestUtils {
       put.replicationMetadataVersionId = 1;
     }
     messageEnvelope.payloadUnion = put;
-    return new ImmutablePubSubMessage<>(kafkaKey, messageEnvelope, pubSubTopicPartition, 1, 0, serializedValue.length);
+    return new ImmutablePubSubMessage(
+        kafkaKey,
+        messageEnvelope,
+        pubSubTopicPartition,
+        ApacheKafkaOffsetPosition.of(1),
+        0,
+        serializedValue.length);
   }
 
-  public static PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> createUpdateRecord(
+  public static DefaultPubSubMessage createUpdateRecord(
       byte[] serializedKey,
       byte[] serializedValue,
       PubSubTopicPartition pubSubTopicPartition) {
     byte[] chunkKeyWithSuffix = KEY_WITH_CHUNKING_SUFFIX_SERIALIZER.serializeNonChunkedKey(serializedKey);
-    KafkaKey kafkaKey = new KafkaKey(UPDATE, chunkKeyWithSuffix);
-    KafkaMessageEnvelope messageEnvelope = createKafkaMessageEnvelope(UPDATE, 0, 0);
+    KafkaKey kafkaKey = new KafkaKey(MessageType.UPDATE, chunkKeyWithSuffix);
+    KafkaMessageEnvelope messageEnvelope = createKafkaMessageEnvelope(MessageType.UPDATE, 0, 0);
 
     Update update = new Update();
     update.schemaId = 1;
     update.updateValue = ByteBuffer.wrap(serializedValue);
     update.updateSchemaId = 1;
     messageEnvelope.payloadUnion = update;
-    return new ImmutablePubSubMessage<>(kafkaKey, messageEnvelope, pubSubTopicPartition, 1, 0, serializedValue.length);
+    return new ImmutablePubSubMessage(
+        kafkaKey,
+        messageEnvelope,
+        pubSubTopicPartition,
+        ApacheKafkaOffsetPosition.of(1),
+        0,
+        serializedValue.length);
   }
 }

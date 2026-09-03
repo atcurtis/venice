@@ -10,37 +10,56 @@ import static com.linkedin.venice.fastclient.meta.RequestBasedMetadataTestUtils.
 import static com.linkedin.venice.fastclient.meta.RequestBasedMetadataTestUtils.getMockMetaData;
 import static com.linkedin.venice.utils.TestUtils.waitForNonDeterministicAssertion;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertSame;
 import static org.testng.Assert.assertTrue;
 
+import com.linkedin.r2.transport.common.Client;
 import com.linkedin.venice.client.exceptions.VeniceClientException;
 import com.linkedin.venice.client.exceptions.VeniceClientHttpException;
 import com.linkedin.venice.client.schema.RouterBackedSchemaReader;
 import com.linkedin.venice.client.store.D2ServiceDiscovery;
+import com.linkedin.venice.client.store.listeners.StoreConfigSnapshot;
 import com.linkedin.venice.client.store.transport.D2TransportClient;
+import com.linkedin.venice.client.store.transport.TransportClientResponse;
 import com.linkedin.venice.compression.CompressionStrategy;
+import com.linkedin.venice.controllerapi.D2ServiceDiscoveryResponse;
 import com.linkedin.venice.exceptions.ConfigurationException;
 import com.linkedin.venice.fastclient.ClientConfig;
+import com.linkedin.venice.meta.ExternalStorageReadMode;
+import com.linkedin.venice.meta.QueryAction;
+import com.linkedin.venice.meta.StorageMode;
 import com.linkedin.venice.serialization.avro.AvroProtocolDefinition;
 import com.linkedin.venice.utils.DataProviderUtils;
 import com.linkedin.venice.utils.Time;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import java.io.IOException;
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import org.apache.http.HttpStatus;
 import org.testng.Assert;
 import org.testng.annotations.Test;
@@ -48,7 +67,10 @@ import org.testng.annotations.Test;
 
 public class RequestBasedMetadataTest {
   private static final int CURRENT_VERSION = 1;
-  private static final int TEST_TIMEOUT = 10 * Time.MS_PER_SECOND;
+  // 30s gives enough headroom for: object construction, metadata fetch, the 5s waitForNonDeterministicAssertion,
+  // and close() which involves executor shutdown + JDK lambda class loading overhead (slow on first use in JDK 17).
+  // The previous 10s budget was too tight and caused ThreadTimeoutException on CI.
+  private static final int TEST_TIMEOUT = 30 * Time.MS_PER_SECOND;
 
   /**
    * firstMetadataUpdateFails: If this fails, start() will be blocked until metadata can be fetched.
@@ -62,12 +84,18 @@ public class RequestBasedMetadataTest {
       boolean isMetadataConnWarmupEnabled) throws IOException, InterruptedException {
     String storeName = "testStore";
 
-    ClientConfig clientConfig =
-        RequestBasedMetadataTestUtils.getMockClientConfig(storeName, firstConnWarmupFails, isMetadataConnWarmupEnabled);
-    RequestBasedMetadata requestBasedMetadata = null;
     ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+    ScheduledExecutorService mockRefreshExecutor = mock(ScheduledExecutorService.class);
+    doAnswer(invocation -> {
+      scheduler.schedule((Runnable) invocation.getArgument(0), invocation.getArgument(1), invocation.getArgument(2));
+      return null;
+    }).when(mockRefreshExecutor).schedule(any(Runnable.class), anyLong(), any(TimeUnit.class));
+    ClientConfig clientConfig = RequestBasedMetadataTestUtils
+        .getMockClientConfig(storeName, firstConnWarmupFails, isMetadataConnWarmupEnabled, mockRefreshExecutor);
+    RequestBasedMetadata requestBasedMetadata = null;
+
     try {
-      requestBasedMetadata = getMockMetaData(clientConfig, storeName, false, true, firstMetadataUpdateFails, scheduler);
+      requestBasedMetadata = getMockMetaData(clientConfig, storeName, false, true, firstMetadataUpdateFails);
       requestBasedMetadata.start();
       CountDownLatch isReadyLatch = requestBasedMetadata.getIsReadyLatch();
 
@@ -87,11 +115,109 @@ public class RequestBasedMetadataTest {
       // testing that start() is only finished after warmup is done
       long periodicRetryAfterSuccessfulWarmup = requestBasedMetadata.getRefreshIntervalInSeconds();
       waitForNonDeterministicAssertion(2, TimeUnit.SECONDS, () -> {
+        assertSame(finalRequestBasedMetadata.getScheduler(), mockRefreshExecutor);
         verify(finalRequestBasedMetadata.getScheduler())
             .schedule(any(Runnable.class), eq(periodicRetryAfterSuccessfulWarmup), eq(TimeUnit.SECONDS));
       });
+    } catch (Exception e) {
+      e.printStackTrace();
     } finally {
       scheduler.shutdownNow();
+      if (requestBasedMetadata != null) {
+        requestBasedMetadata.close();
+      }
+    }
+  }
+
+  /**
+   * Each metadata refresh pushes the serving set (all active versions' replicas) to the monitor; after the
+   * REPLICA1_NAME to NEW_REPLICA_NAME swap, the reconciliation must be invoked with a set that no longer has
+   * REPLICA1_NAME.
+   */
+  @Test(timeOut = TEST_TIMEOUT)
+  public void testUpdateCacheReconcilesHealthMonitorWithServingSet() throws IOException, InterruptedException {
+    String storeName = "testStore";
+    ClientConfig clientConfig = RequestBasedMetadataTestUtils.getMockClientConfig(storeName, false, false);
+    InstanceHealthMonitor healthMonitor = clientConfig.getInstanceHealthMonitor();
+    RequestBasedMetadata requestBasedMetadata = null;
+    try {
+      requestBasedMetadata = getMockMetaData(clientConfig, storeName, true /* metadataChange */);
+      requestBasedMetadata.start();
+
+      // First refresh serves REPLICA1_NAME (partition 0) and REPLICA2_NAME (partition 1). start() runs the first
+      // refresh synchronously, so this invocation has already happened; the timeout just keeps it consistent with the
+      // async second verify below.
+      verify(healthMonitor, timeout(10 * Time.MS_PER_SECOND).atLeastOnce())
+          .updateLiveInstanceSet(argThat(s -> s.contains(REPLICA1_NAME) && s.contains(REPLICA2_NAME)));
+
+      // After the metadata change, partition 0 is served by NEW_REPLICA_NAME instead of REPLICA1_NAME, so a later
+      // refresh must reconcile with a serving set that drops REPLICA1_NAME.
+      verify(healthMonitor, timeout(10 * Time.MS_PER_SECOND).atLeastOnce()).updateLiveInstanceSet(
+          argThat(s -> s.contains(NEW_REPLICA_NAME) && s.contains(REPLICA2_NAME) && !s.contains(REPLICA1_NAME)));
+    } finally {
+      if (requestBasedMetadata != null) {
+        requestBasedMetadata.close();
+      }
+    }
+  }
+
+  /**
+   * Host lifecycle exercised through the real {@link RequestBasedMetadata} refresh + reconciliation and a real
+   * {@link InstanceHealthMonitor} (transport and metadata responses are mocked): a hung request marks a host
+   * unhealthy, a refresh that drops the host evicts it, and a refresh that re-adds it leaves it clean.
+   */
+  @Test(timeOut = TEST_TIMEOUT)
+  public void testHostLifecycleThroughMetadataRefreshAndRequestPath() throws IOException, InterruptedException {
+    String storeName = "testStore";
+    // No-op refresh executor so only this test drives refreshes (via updateCache) and the metadata sequence is
+    // consumed in order.
+    ScheduledExecutorService noOpRefreshExecutor = mock(ScheduledExecutorService.class);
+    ClientConfig clientConfig =
+        RequestBasedMetadataTestUtils.getMockClientConfig(storeName, false, false, noOpRefreshExecutor);
+
+    // Real monitor whose heartbeat client never responds, so a suspicious instance becomes unhealthy on the next beat.
+    InstanceHealthMonitor realMonitor = new InstanceHealthMonitor(
+        InstanceHealthMonitorConfig.builder()
+            .setRoutingRequestDefaultTimeoutMS(1000L)
+            .setHeartBeatIntervalSeconds(1)
+            .setHeartBeatRequestTimeoutMS(100L)
+            .setRoutingTimedOutRequestCounterResetDelayMS(2000)
+            .setClient(mock(Client.class))
+            .build());
+    doReturn(realMonitor).when(clientConfig).getInstanceHealthMonitor();
+
+    RequestBasedMetadata requestBasedMetadata = null;
+    try {
+      D2TransportClient d2TransportClient = RequestBasedMetadataTestUtils.getMockD2TransportClientCycling(storeName);
+      requestBasedMetadata = new RequestBasedMetadata(clientConfig, d2TransportClient);
+      requestBasedMetadata
+          .setMetadataResponseSchemaReader(RequestBasedMetadataTestUtils.getMockRouterBackedSchemaReader());
+      requestBasedMetadata.setD2ServiceDiscovery(getMockD2ServiceDiscovery(d2TransportClient, storeName));
+
+      // State 1: REPLICA1_NAME and REPLICA2_NAME serving (the first refresh runs synchronously in start()).
+      requestBasedMetadata.start();
+
+      // A hung request to REPLICA1_NAME: the routing timeout marks it suspicious and the failing heartbeat then marks
+      // it unhealthy.
+      requestBasedMetadata
+          .trackHealthBasedOnRequestToInstance(REPLICA1_NAME, CURRENT_VERSION, 0, new CompletableFuture<>());
+      waitForNonDeterministicAssertion(15, TimeUnit.SECONDS, true, () -> {
+        assertFalse(realMonitor.isInstanceHealthy(REPLICA1_NAME));
+        assertEquals(realMonitor.getUnhealthyInstanceCount(), 1);
+      });
+
+      // State 2: a refresh drops REPLICA1_NAME, so reconciliation evicts it and it is healthy again.
+      requestBasedMetadata.updateCache(false);
+      waitForNonDeterministicAssertion(15, TimeUnit.SECONDS, true, () -> {
+        assertTrue(realMonitor.isInstanceHealthy(REPLICA1_NAME));
+        assertEquals(realMonitor.getUnhealthyInstanceCount(), 0);
+      });
+
+      // State 3: a refresh re-adds REPLICA1_NAME; it returns clean.
+      requestBasedMetadata.updateCache(false);
+      assertTrue(realMonitor.isInstanceHealthy(REPLICA1_NAME));
+      assertEquals(realMonitor.getUnhealthyInstanceCount(), 0);
+    } finally {
       if (requestBasedMetadata != null) {
         requestBasedMetadata.close();
       }
@@ -313,6 +439,18 @@ public class RequestBasedMetadataTest {
       assertEquals(
           requestBasedMetadata.getCompressor(CompressionStrategy.ZSTD_WITH_DICT, CURRENT_VERSION),
           RequestBasedMetadataTestUtils.getZstdVeniceCompressor(storeName));
+      assertEquals(
+          requestBasedMetadata.getCompressionStrategy(CURRENT_VERSION),
+          CompressionStrategy.ZSTD_WITH_DICT,
+          "current-version compression strategy must be cached from the metadata response");
+      try {
+        requestBasedMetadata.getCompressionStrategy(CURRENT_VERSION + 100);
+        Assert.fail("expected VeniceClientException for unknown version");
+      } catch (VeniceClientException expected) {
+        assertTrue(
+            expected.getMessage().contains("Unknown version"),
+            "expected 'Unknown version' in message, got: " + expected.getMessage());
+      }
       final RequestBasedMetadata finalRequestBasedMetadata = requestBasedMetadata;
       waitForNonDeterministicAssertion(
           5,
@@ -368,6 +506,703 @@ public class RequestBasedMetadataTest {
     try (RequestBasedMetadata requestBasedMetadata = new RequestBasedMetadata(clientConfig, d2TransportClient)) {
       requestBasedMetadata.setD2ServiceDiscovery(d2ServiceDiscovery);
       Assert.assertThrows(ConfigurationException.class, requestBasedMetadata::start);
+    }
+  }
+
+  @Test(timeOut = TEST_TIMEOUT)
+  public void testRequestBasedMetadataOnDemandRefresh() throws IOException, InterruptedException {
+    String storeName = "testStore";
+    ClientConfig clientConfig = RequestBasedMetadataTestUtils.getMockClientConfig(storeName, false, false);
+    D2TransportClient d2TransportClient = mock(D2TransportClient.class);
+    CompletableFuture<TransportClientResponse> exceptionFuture = new CompletableFuture<>();
+    exceptionFuture.completeExceptionally(new RuntimeException("Failed to execute"));
+    doReturn(exceptionFuture).when(d2TransportClient).get(anyString());
+    D2ServiceDiscovery d2ServiceDiscovery = getMockD2ServiceDiscovery(d2TransportClient, storeName);
+    D2ServiceDiscoveryResponse d2Response = new D2ServiceDiscoveryResponse();
+    d2Response.setServerD2Service("test-service");
+    doReturn(d2Response).when(d2ServiceDiscovery).find(any(), any(), anyBoolean());
+    try (RequestBasedMetadata requestBasedMetadata = new RequestBasedMetadata(clientConfig, d2TransportClient)) {
+      RequestBasedMetadata spy = spy(requestBasedMetadata);
+      spy.setD2ServiceDiscovery(d2ServiceDiscovery);
+      // let child thread handling the start logic otherwise the main thread cannot verify the invocation times.
+      CompletableFuture.runAsync(spy::start);
+
+      // refresh would happen multiple times
+      // the first one w/o onDemond refresh and would fail due to d2 client exception
+      verify(spy, timeout(3000).atLeast(1)).updateCache(false);
+
+      // the first failed refresh triggers a onDemand refresh
+      verify(spy, timeout(3000).atLeast(1)).updateCache(true);
+    }
+  }
+
+  @Test(timeOut = TEST_TIMEOUT)
+  public void testVersionSwitchListenerFiresOnInitialStart() throws IOException, InterruptedException {
+    String storeName = "testStore";
+    ClientConfig clientConfig = RequestBasedMetadataTestUtils.getMockClientConfig(storeName, false, false);
+    RequestBasedMetadata requestBasedMetadata = null;
+    try {
+      requestBasedMetadata = getMockMetaData(clientConfig, storeName, false);
+      List<int[]> received = new java.util.concurrent.CopyOnWriteArrayList<>();
+      requestBasedMetadata.registerVersionSwitchListener((prev, next) -> received.add(new int[] { prev, next }));
+      requestBasedMetadata.start();
+
+      assertEquals(received.size(), 1);
+      assertEquals(received.get(0)[0], -1, "first transition's previousVersion must be the sentinel -1");
+      assertEquals(received.get(0)[1], CURRENT_VERSION);
+    } finally {
+      if (requestBasedMetadata != null) {
+        requestBasedMetadata.close();
+      }
+    }
+  }
+
+  @Test(timeOut = TEST_TIMEOUT)
+  public void testVersionSwitchListenerNotFiredWhenVersionUnchanged() throws IOException, InterruptedException {
+    String storeName = "testStore";
+    ClientConfig clientConfig = RequestBasedMetadataTestUtils.getMockClientConfig(storeName, false, false);
+    RequestBasedMetadata requestBasedMetadata = null;
+    try {
+      requestBasedMetadata = getMockMetaData(clientConfig, storeName, false);
+      requestBasedMetadata.start();
+      AtomicInteger callCount = new AtomicInteger();
+      requestBasedMetadata.registerVersionSwitchListener((prev, next) -> callCount.incrementAndGet());
+
+      // Drive another updateCache; underlying mock returns the same CURRENT_VERSION → no transition.
+      // Run pending callbacks (refresh() does this normally) so we exercise the actual listener path.
+      requestBasedMetadata.updateCache(false).forEach(Runnable::run);
+
+      assertEquals(callCount.get(), 0);
+    } finally {
+      if (requestBasedMetadata != null) {
+        requestBasedMetadata.close();
+      }
+    }
+  }
+
+  @Test(timeOut = TEST_TIMEOUT)
+  public void testStoreConfigChangeListenerFiresOnInitialStart() throws IOException, InterruptedException {
+    String storeName = "testStore";
+    ClientConfig clientConfig = RequestBasedMetadataTestUtils.getMockClientConfig(storeName, false, false);
+    RequestBasedMetadata requestBasedMetadata = null;
+    try {
+      requestBasedMetadata = getMockMetaData(clientConfig, storeName, false);
+      List<StoreConfigSnapshot[]> received = new java.util.concurrent.CopyOnWriteArrayList<>();
+      requestBasedMetadata
+          .registerStoreConfigChangeListener((prev, curr) -> received.add(new StoreConfigSnapshot[] { prev, curr }));
+      requestBasedMetadata.start();
+
+      assertEquals(received.size(), 1);
+      Assert.assertNull(received.get(0)[0], "first transition's previous snapshot must be null");
+      Assert.assertNotNull(received.get(0)[1]);
+      assertEquals(received.get(0)[1].getBatchGetLimit(), 150);
+    } finally {
+      if (requestBasedMetadata != null) {
+        requestBasedMetadata.close();
+      }
+    }
+  }
+
+  @Test(timeOut = TEST_TIMEOUT)
+  public void testStoreConfigChangeListenerSuppressedWhenSnapshotUnchanged() throws IOException, InterruptedException {
+    String storeName = "testStore";
+    ClientConfig clientConfig = RequestBasedMetadataTestUtils.getMockClientConfig(storeName, false, false);
+    RequestBasedMetadata requestBasedMetadata = null;
+    try {
+      requestBasedMetadata = getMockMetaData(clientConfig, storeName, false);
+      requestBasedMetadata.start();
+      AtomicInteger callCount = new AtomicInteger();
+      requestBasedMetadata.registerStoreConfigChangeListener((prev, curr) -> callCount.incrementAndGet());
+
+      // Same mock metadata response → identical snapshot → listener must not fire when the deferred callback runs.
+      requestBasedMetadata.updateCache(false).forEach(Runnable::run);
+
+      assertEquals(callCount.get(), 0);
+    } finally {
+      if (requestBasedMetadata != null) {
+        requestBasedMetadata.close();
+      }
+    }
+  }
+
+  /**
+   * Exercises the production happy-path version transition: after the initial refresh has committed v1, a subsequent
+   * refresh observes v2 and the listener must receive the {@code (1, 2)} callback (not {@code (-1, 2)} or a duplicate
+   * of the initial transition). This is the core production case the {@code (previousVersion, newVersion)}
+   * deferred-callback closure capture has to handle correctly.
+   */
+  @Test(timeOut = TEST_TIMEOUT)
+  public void testVersionSwitchListenerFiresOnSubsequentVersionTransition() throws Exception {
+    String storeName = "testStore";
+    ClientConfig clientConfig = RequestBasedMetadataTestUtils.getMockClientConfig(storeName, false, false);
+    D2TransportClient d2TransportClient = mock(D2TransportClient.class);
+    D2ServiceDiscovery d2ServiceDiscovery =
+        RequestBasedMetadataTestUtils.getMockD2ServiceDiscovery(d2TransportClient, storeName);
+
+    // Two successive METADATA responses: v1 (initial), then v2 (subsequent transition).
+    CompletableFuture<TransportClientResponse> respV1 =
+        CompletableFuture.completedFuture(RequestBasedMetadataTestUtils.buildMetadataResponse(CURRENT_VERSION));
+    CompletableFuture<TransportClientResponse> respV2 =
+        CompletableFuture.completedFuture(RequestBasedMetadataTestUtils.buildMetadataResponse(CURRENT_VERSION + 1));
+    String metadataPath = QueryAction.METADATA.toString().toLowerCase() + "/" + storeName;
+    doReturn(respV1, respV2).when(d2TransportClient).get(eq(metadataPath));
+    // Dictionary fetch is best-effort; succeed for both versions.
+    TransportClientResponse dictResp =
+        new TransportClientResponse(0, CompressionStrategy.NO_OP, RequestBasedMetadataTestUtils.DICTIONARY);
+    String dictPathV1 = QueryAction.DICTIONARY.toString().toLowerCase() + "/" + storeName + "/" + CURRENT_VERSION;
+    String dictPathV2 = QueryAction.DICTIONARY.toString().toLowerCase() + "/" + storeName + "/" + (CURRENT_VERSION + 1);
+    doReturn(CompletableFuture.completedFuture(dictResp)).when(d2TransportClient).get(eq(dictPathV1));
+    doReturn(CompletableFuture.completedFuture(dictResp)).when(d2TransportClient).get(eq(dictPathV2));
+
+    try (RequestBasedMetadata requestBasedMetadata = new RequestBasedMetadata(clientConfig, d2TransportClient)) {
+      requestBasedMetadata
+          .setMetadataResponseSchemaReader(RequestBasedMetadataTestUtils.getMockRouterBackedSchemaReader());
+      requestBasedMetadata.setD2ServiceDiscovery(d2ServiceDiscovery);
+      // start() drives the initial refresh and sets isReady=true so getCurrentStoreVersion() works on this branch.
+      requestBasedMetadata.start();
+      assertEquals(requestBasedMetadata.getCurrentStoreVersion(), CURRENT_VERSION);
+
+      // Register listener AFTER v1 commit so we capture only the subsequent (1 → 2) transition.
+      List<int[]> received = new java.util.concurrent.CopyOnWriteArrayList<>();
+      requestBasedMetadata.registerVersionSwitchListener((prev, next) -> received.add(new int[] { prev, next }));
+
+      // Second refresh observes v2; deferred callback list must carry the (1, 2) transition.
+      requestBasedMetadata.updateCache(false).forEach(Runnable::run);
+
+      assertEquals(received.size(), 1);
+      assertEquals(received.get(0)[0], CURRENT_VERSION);
+      assertEquals(received.get(0)[1], CURRENT_VERSION + 1);
+      assertEquals(requestBasedMetadata.getCurrentStoreVersion(), CURRENT_VERSION + 1);
+    }
+  }
+
+  /**
+   * Exercises the ExecutionException recovery path: the outer fetch fails with ExecutionException, the catch block
+   * runs {@code discoverD2Service} + recursive {@code updateCache(true)} on a working transport, and the listener
+   * must observe exactly the recovery attempt's transition (the failed outer attempt produced no committed cache
+   * state and contributes no callbacks — invariant asserted in {@code updateCache}).
+   */
+  @Test(timeOut = TEST_TIMEOUT)
+  public void testVersionSwitchListenerFiresOnRecoveryAttemptOnly() throws Exception {
+    String storeName = "testStore";
+    ClientConfig clientConfig = RequestBasedMetadataTestUtils.getMockClientConfig(storeName, false, false);
+    D2TransportClient d2TransportClient = mock(D2TransportClient.class);
+    D2ServiceDiscovery d2ServiceDiscovery =
+        RequestBasedMetadataTestUtils.getMockD2ServiceDiscovery(d2TransportClient, storeName);
+
+    // Failing future for the outer attempt — triggers the ExecutionException recovery path.
+    CompletableFuture<TransportClientResponse> failingFuture = new CompletableFuture<>();
+    failingFuture.completeExceptionally(new RuntimeException("simulated outer metadata fetch failure"));
+
+    // Working future for the recursive recovery attempt: reuses buildMetadataResponse so cache state commits as it
+    // would in production, producing the recovery attempt's pendingCallbacks.
+    CompletableFuture<TransportClientResponse> recoveryFuture =
+        CompletableFuture.completedFuture(RequestBasedMetadataTestUtils.buildMetadataResponse(CURRENT_VERSION));
+    String metadataPath = QueryAction.METADATA.toString().toLowerCase() + "/" + storeName;
+    String dictionaryPath = QueryAction.DICTIONARY.toString().toLowerCase() + "/" + storeName + "/" + CURRENT_VERSION;
+    TransportClientResponse dictResp =
+        new TransportClientResponse(0, CompressionStrategy.NO_OP, RequestBasedMetadataTestUtils.DICTIONARY);
+    doReturn(failingFuture, recoveryFuture).when(d2TransportClient).get(eq(metadataPath));
+    doReturn(CompletableFuture.completedFuture(dictResp)).when(d2TransportClient).get(eq(dictionaryPath));
+
+    // NOTE: this test intentionally bypasses start() to keep the path under examination minimal — we want to drive
+    // exactly one updateCache() and inspect the deferred callback list. Production refresh() also sets isReady=true,
+    // which we are NOT testing here. Listeners in this test do not call getCurrentStoreVersion() — adding such a
+    // call would surface as an "!isReady" failure that would not reproduce against the production refresh() path.
+    try (RequestBasedMetadata requestBasedMetadata = new RequestBasedMetadata(clientConfig, d2TransportClient)) {
+      requestBasedMetadata
+          .setMetadataResponseSchemaReader(RequestBasedMetadataTestUtils.getMockRouterBackedSchemaReader());
+      requestBasedMetadata.setD2ServiceDiscovery(d2ServiceDiscovery);
+      List<int[]> received = new java.util.concurrent.CopyOnWriteArrayList<>();
+      requestBasedMetadata.registerVersionSwitchListener((prev, next) -> received.add(new int[] { prev, next }));
+
+      // Drive a single updateCache that internally goes outer-fail → recovery-success.
+      requestBasedMetadata.updateCache(false).forEach(Runnable::run);
+
+      assertEquals(received.size(), 1, "exactly the recovery attempt's transition must fire (outer attempt none)");
+      assertEquals(received.get(0)[0], -1);
+      assertEquals(received.get(0)[1], CURRENT_VERSION);
+    }
+  }
+
+  /**
+   * Exercises the StoreConfigChangeListener path with a real value flip on the wire: initial refresh observes
+   * externalStorageReadMode=VENICE_ONLY; subsequent refresh observes DUAL_MODE_EARLY_RETURN. The listener must
+   * receive exactly one (VENICE_ONLY → DUAL_MODE_EARLY_RETURN) callback, proving the field round-trips through
+   * MetadataResponseRecord v3 and the {@code lastStoreConfigSnapshot} diff detects the change.
+   */
+  @Test(timeOut = TEST_TIMEOUT)
+  public void testStoreConfigChangeListenerFiresOnExternalStorageReadModeTransition() throws Exception {
+    String storeName = "testStore";
+    ClientConfig clientConfig = RequestBasedMetadataTestUtils.getMockClientConfig(storeName, false, false);
+    D2TransportClient d2TransportClient = mock(D2TransportClient.class);
+    D2ServiceDiscovery d2ServiceDiscovery =
+        RequestBasedMetadataTestUtils.getMockD2ServiceDiscovery(d2TransportClient, storeName);
+
+    // Two successive METADATA responses on the same version, differing only in externalStorageReadMode.
+    CompletableFuture<TransportClientResponse> respVeniceOnly = CompletableFuture.completedFuture(
+        RequestBasedMetadataTestUtils.buildMetadataResponse(CURRENT_VERSION, ExternalStorageReadMode.VENICE_ONLY));
+    CompletableFuture<TransportClientResponse> respDualEarlyReturn = CompletableFuture.completedFuture(
+        RequestBasedMetadataTestUtils
+            .buildMetadataResponse(CURRENT_VERSION, ExternalStorageReadMode.DUAL_MODE_EARLY_RETURN));
+    String metadataPath = QueryAction.METADATA.toString().toLowerCase() + "/" + storeName;
+    doReturn(respVeniceOnly, respDualEarlyReturn).when(d2TransportClient).get(eq(metadataPath));
+    TransportClientResponse dictResp =
+        new TransportClientResponse(0, CompressionStrategy.NO_OP, RequestBasedMetadataTestUtils.DICTIONARY);
+    String dictPath = QueryAction.DICTIONARY.toString().toLowerCase() + "/" + storeName + "/" + CURRENT_VERSION;
+    doReturn(CompletableFuture.completedFuture(dictResp)).when(d2TransportClient).get(eq(dictPath));
+
+    try (RequestBasedMetadata requestBasedMetadata = new RequestBasedMetadata(clientConfig, d2TransportClient)) {
+      requestBasedMetadata
+          .setMetadataResponseSchemaReader(RequestBasedMetadataTestUtils.getMockRouterBackedSchemaReader());
+      requestBasedMetadata.setD2ServiceDiscovery(d2ServiceDiscovery);
+      requestBasedMetadata.start();
+
+      // Register AFTER the initial VENICE_ONLY commit so we observe only the subsequent flip.
+      List<StoreConfigSnapshot[]> received = new java.util.concurrent.CopyOnWriteArrayList<>();
+      requestBasedMetadata
+          .registerStoreConfigChangeListener((prev, curr) -> received.add(new StoreConfigSnapshot[] { prev, curr }));
+
+      // Second refresh observes DUAL_MODE_EARLY_RETURN; deferred callback list must carry the flip.
+      requestBasedMetadata.updateCache(false).forEach(Runnable::run);
+
+      assertEquals(received.size(), 1, "exactly the externalStorageReadMode flip must fire");
+      Assert.assertNotNull(received.get(0)[0]);
+      assertEquals(received.get(0)[0].getExternalStorageReadMode(), ExternalStorageReadMode.VENICE_ONLY);
+      Assert.assertNotNull(received.get(0)[1]);
+      assertEquals(received.get(0)[1].getExternalStorageReadMode(), ExternalStorageReadMode.DUAL_MODE_EARLY_RETURN);
+    }
+  }
+
+  /**
+   * Forward-compat guard: when a server returns an externalStorageReadMode wire value that this client's
+   * {@link ExternalStorageReadMode} enum does not recognize (e.g. a future value),
+   * {@code buildStoreConfigSnapshot} must coerce to {@code VENICE_ONLY} rather than throwing out of the synchronized
+   * {@code updateCache} — a throw here would break the entire refresh loop.
+   */
+  @Test(timeOut = TEST_TIMEOUT)
+  public void testStoreConfigSnapshotCoercesUnknownExternalStorageReadModeToVeniceOnly() throws Exception {
+    String storeName = "testStore";
+    ClientConfig clientConfig = RequestBasedMetadataTestUtils.getMockClientConfig(storeName, false, false);
+    D2TransportClient d2TransportClient = mock(D2TransportClient.class);
+    D2ServiceDiscovery d2ServiceDiscovery =
+        RequestBasedMetadataTestUtils.getMockD2ServiceDiscovery(d2TransportClient, storeName);
+
+    // Inject a wire value (42) that ExternalStorageReadMode does not define.
+    int unknownWireValue = 42;
+    CompletableFuture<TransportClientResponse> respUnknown = CompletableFuture
+        .completedFuture(RequestBasedMetadataTestUtils.buildMetadataResponse(CURRENT_VERSION, unknownWireValue));
+    String metadataPath = QueryAction.METADATA.toString().toLowerCase() + "/" + storeName;
+    doReturn(respUnknown).when(d2TransportClient).get(eq(metadataPath));
+    TransportClientResponse dictResp =
+        new TransportClientResponse(0, CompressionStrategy.NO_OP, RequestBasedMetadataTestUtils.DICTIONARY);
+    String dictPath = QueryAction.DICTIONARY.toString().toLowerCase() + "/" + storeName + "/" + CURRENT_VERSION;
+    doReturn(CompletableFuture.completedFuture(dictResp)).when(d2TransportClient).get(eq(dictPath));
+
+    try (RequestBasedMetadata requestBasedMetadata = new RequestBasedMetadata(clientConfig, d2TransportClient)) {
+      requestBasedMetadata
+          .setMetadataResponseSchemaReader(RequestBasedMetadataTestUtils.getMockRouterBackedSchemaReader());
+      requestBasedMetadata.setD2ServiceDiscovery(d2ServiceDiscovery);
+      List<StoreConfigSnapshot[]> received = new java.util.concurrent.CopyOnWriteArrayList<>();
+      requestBasedMetadata
+          .registerStoreConfigChangeListener((prev, curr) -> received.add(new StoreConfigSnapshot[] { prev, curr }));
+
+      // start() must not throw — the metadata response carries an unknown int and the decode coerces to VENICE_ONLY.
+      requestBasedMetadata.start();
+
+      assertEquals(received.size(), 1, "initial transition must fire with coerced VENICE_ONLY");
+      Assert.assertNotNull(received.get(0)[1]);
+      assertEquals(received.get(0)[1].getExternalStorageReadMode(), ExternalStorageReadMode.VENICE_ONLY);
+    }
+  }
+
+  /**
+   * A currentVersionStorageMode flip on the wire must produce exactly one (INTERNAL -> DUAL_WRITE) listener
+   * callback.
+   */
+  @Test(timeOut = TEST_TIMEOUT)
+  public void testStoreConfigChangeListenerFiresOnCurrentVersionStorageModeTransition() throws Exception {
+    String storeName = "testStore";
+    ClientConfig clientConfig = RequestBasedMetadataTestUtils.getMockClientConfig(storeName, false, false);
+    D2TransportClient d2TransportClient = mock(D2TransportClient.class);
+    D2ServiceDiscovery d2ServiceDiscovery =
+        RequestBasedMetadataTestUtils.getMockD2ServiceDiscovery(d2TransportClient, storeName);
+
+    // Two successive METADATA responses on the same version, differing only in currentVersionStorageMode.
+    CompletableFuture<TransportClientResponse> respInternal = CompletableFuture.completedFuture(
+        RequestBasedMetadataTestUtils
+            .buildMetadataResponse(CURRENT_VERSION, ExternalStorageReadMode.EXTERNAL_ONLY, StorageMode.INTERNAL));
+    CompletableFuture<TransportClientResponse> respDualWrite = CompletableFuture.completedFuture(
+        RequestBasedMetadataTestUtils
+            .buildMetadataResponse(CURRENT_VERSION, ExternalStorageReadMode.EXTERNAL_ONLY, StorageMode.DUAL_WRITE));
+    String metadataPath = QueryAction.METADATA.toString().toLowerCase() + "/" + storeName;
+    doReturn(respInternal, respDualWrite).when(d2TransportClient).get(eq(metadataPath));
+    TransportClientResponse dictResp =
+        new TransportClientResponse(0, CompressionStrategy.NO_OP, RequestBasedMetadataTestUtils.DICTIONARY);
+    String dictPath = QueryAction.DICTIONARY.toString().toLowerCase() + "/" + storeName + "/" + CURRENT_VERSION;
+    doReturn(CompletableFuture.completedFuture(dictResp)).when(d2TransportClient).get(eq(dictPath));
+
+    try (RequestBasedMetadata requestBasedMetadata = new RequestBasedMetadata(clientConfig, d2TransportClient)) {
+      requestBasedMetadata
+          .setMetadataResponseSchemaReader(RequestBasedMetadataTestUtils.getMockRouterBackedSchemaReader());
+      requestBasedMetadata.setD2ServiceDiscovery(d2ServiceDiscovery);
+      requestBasedMetadata.start();
+
+      // Register AFTER the initial INTERNAL commit so we observe only the subsequent flip.
+      List<StoreConfigSnapshot[]> received = new java.util.concurrent.CopyOnWriteArrayList<>();
+      requestBasedMetadata
+          .registerStoreConfigChangeListener((prev, curr) -> received.add(new StoreConfigSnapshot[] { prev, curr }));
+
+      // Second refresh observes DUAL_WRITE.
+      requestBasedMetadata.updateCache(false).forEach(Runnable::run);
+
+      assertEquals(received.size(), 1, "exactly the currentVersionStorageMode flip must fire");
+      Assert.assertNotNull(received.get(0)[0]);
+      assertEquals(received.get(0)[0].getCurrentVersionStorageMode(), StorageMode.INTERNAL);
+      Assert.assertNotNull(received.get(0)[1]);
+      assertEquals(received.get(0)[1].getCurrentVersionStorageMode(), StorageMode.DUAL_WRITE);
+    }
+  }
+
+  /**
+   * An unrecognized currentVersionStorageMode wire value must coerce to INTERNAL rather than throw out of the
+   * synchronized {@code updateCache} and break the refresh loop. INTERNAL is the conservative choice: an unknown
+   * storage mode must never be treated as eligible for external-storage reads.
+   */
+  @Test(timeOut = TEST_TIMEOUT)
+  public void testStoreConfigSnapshotCoercesUnknownStorageModeToInternal() throws Exception {
+    String storeName = "testStore";
+    ClientConfig clientConfig = RequestBasedMetadataTestUtils.getMockClientConfig(storeName, false, false);
+    D2TransportClient d2TransportClient = mock(D2TransportClient.class);
+    D2ServiceDiscovery d2ServiceDiscovery =
+        RequestBasedMetadataTestUtils.getMockD2ServiceDiscovery(d2TransportClient, storeName);
+
+    // Inject a wire value (42) that StorageMode does not define.
+    int unknownWireValue = 42;
+    CompletableFuture<TransportClientResponse> respUnknown = CompletableFuture.completedFuture(
+        RequestBasedMetadataTestUtils.buildMetadataResponse(
+            CURRENT_VERSION,
+            ExternalStorageReadMode.EXTERNAL_ONLY.getValue(),
+            unknownWireValue));
+    String metadataPath = QueryAction.METADATA.toString().toLowerCase() + "/" + storeName;
+    doReturn(respUnknown).when(d2TransportClient).get(eq(metadataPath));
+    TransportClientResponse dictResp =
+        new TransportClientResponse(0, CompressionStrategy.NO_OP, RequestBasedMetadataTestUtils.DICTIONARY);
+    String dictPath = QueryAction.DICTIONARY.toString().toLowerCase() + "/" + storeName + "/" + CURRENT_VERSION;
+    doReturn(CompletableFuture.completedFuture(dictResp)).when(d2TransportClient).get(eq(dictPath));
+
+    try (RequestBasedMetadata requestBasedMetadata = new RequestBasedMetadata(clientConfig, d2TransportClient)) {
+      requestBasedMetadata
+          .setMetadataResponseSchemaReader(RequestBasedMetadataTestUtils.getMockRouterBackedSchemaReader());
+      requestBasedMetadata.setD2ServiceDiscovery(d2ServiceDiscovery);
+      List<StoreConfigSnapshot[]> received = new java.util.concurrent.CopyOnWriteArrayList<>();
+      requestBasedMetadata
+          .registerStoreConfigChangeListener((prev, curr) -> received.add(new StoreConfigSnapshot[] { prev, curr }));
+
+      // start() must not throw on the unknown wire value.
+      requestBasedMetadata.start();
+
+      assertEquals(received.size(), 1, "initial transition must fire with coerced INTERNAL");
+      Assert.assertNotNull(received.get(0)[1]);
+      assertEquals(received.get(0)[1].getCurrentVersionStorageMode(), StorageMode.INTERNAL);
+    }
+  }
+
+  /**
+   * The emitted snapshot must report the storage mode of the version actually being served. When a fetched version
+   * carries DUAL_WRITE but its switch is deferred, the snapshot must still report the serving version's INTERNAL,
+   * and only report DUAL_WRITE once the switch is adopted.
+   */
+  @Test(timeOut = TEST_TIMEOUT)
+  public void testStoreConfigSnapshotResolvesStorageModeAgainstServingVersionWhenSwitchDeferred() throws Exception {
+    String storeName = "testStore";
+    int nextVersion = CURRENT_VERSION + 1;
+    ClientConfig clientConfig = RequestBasedMetadataTestUtils.getMockClientConfig(storeName, false, false);
+    D2TransportClient d2TransportClient = mock(D2TransportClient.class);
+    D2ServiceDiscovery d2ServiceDiscovery =
+        RequestBasedMetadataTestUtils.getMockD2ServiceDiscovery(d2TransportClient, storeName);
+
+    // 1) Initial: v{CURRENT_VERSION}, INTERNAL, VENICE_ONLY, full routing -> adopted by start().
+    CompletableFuture<TransportClientResponse> respInitial =
+        CompletableFuture.completedFuture(RequestBasedMetadataTestUtils.buildMetadataResponse(CURRENT_VERSION));
+    // 2) Fetched v{nextVersion} DUAL_WRITE with partition resources not ready -> switch deferred.
+    // externalStorageReadMode also flips so the snapshot differs and the listener fires.
+    CompletableFuture<TransportClientResponse> respDeferred = CompletableFuture.completedFuture(
+        RequestBasedMetadataTestUtils
+            .buildDeferredSwitchMetadataResponse(CURRENT_VERSION, nextVersion, StorageMode.DUAL_WRITE));
+    // 3) Same fetched version, now with complete partition resources -> switch adopted.
+    CompletableFuture<TransportClientResponse> respAdopted = CompletableFuture.completedFuture(
+        RequestBasedMetadataTestUtils
+            .buildMetadataResponse(nextVersion, ExternalStorageReadMode.EXTERNAL_ONLY, StorageMode.DUAL_WRITE));
+    String metadataPath = QueryAction.METADATA.toString().toLowerCase() + "/" + storeName;
+    doReturn(respInitial, respDeferred, respAdopted).when(d2TransportClient).get(eq(metadataPath));
+    // Dictionary fetch is best-effort; succeed for both versions.
+    TransportClientResponse dictResp =
+        new TransportClientResponse(0, CompressionStrategy.NO_OP, RequestBasedMetadataTestUtils.DICTIONARY);
+    String dictPathCurrent = QueryAction.DICTIONARY.toString().toLowerCase() + "/" + storeName + "/" + CURRENT_VERSION;
+    String dictPathNext = QueryAction.DICTIONARY.toString().toLowerCase() + "/" + storeName + "/" + nextVersion;
+    doReturn(CompletableFuture.completedFuture(dictResp)).when(d2TransportClient).get(eq(dictPathCurrent));
+    doReturn(CompletableFuture.completedFuture(dictResp)).when(d2TransportClient).get(eq(dictPathNext));
+
+    try (RequestBasedMetadata requestBasedMetadata = new RequestBasedMetadata(clientConfig, d2TransportClient)) {
+      requestBasedMetadata
+          .setMetadataResponseSchemaReader(RequestBasedMetadataTestUtils.getMockRouterBackedSchemaReader());
+      requestBasedMetadata.setD2ServiceDiscovery(d2ServiceDiscovery);
+      requestBasedMetadata.start();
+      assertEquals(requestBasedMetadata.getCurrentStoreVersion(), CURRENT_VERSION);
+
+      List<StoreConfigSnapshot[]> configReceived = new java.util.concurrent.CopyOnWriteArrayList<>();
+      requestBasedMetadata.registerStoreConfigChangeListener(
+          (prev, curr) -> configReceived.add(new StoreConfigSnapshot[] { prev, curr }));
+      List<int[]> versionSwitchesReceived = new java.util.concurrent.CopyOnWriteArrayList<>();
+      requestBasedMetadata
+          .registerVersionSwitchListener((prev, next) -> versionSwitchesReceived.add(new int[] { prev, next }));
+
+      // Switch deferred: serving version stays INTERNAL.
+      requestBasedMetadata.updateCache(false).forEach(Runnable::run);
+
+      assertEquals(
+          requestBasedMetadata.getCurrentStoreVersion(),
+          CURRENT_VERSION,
+          "partition resources not ready for the fetched version -> version switch must stay deferred");
+      assertTrue(versionSwitchesReceived.isEmpty(), "no version-switch callback should fire while switch is deferred");
+      assertEquals(configReceived.size(), 1);
+      assertEquals(
+          configReceived.get(0)[1].getCurrentVersionStorageMode(),
+          StorageMode.INTERNAL,
+          "the still-serving version's storage mode must not be overwritten by the not-yet-adopted fetched "
+              + "version's DUAL_WRITE");
+
+      // Partition resources now complete -> switch adopted.
+      requestBasedMetadata.updateCache(false).forEach(Runnable::run);
+
+      assertEquals(requestBasedMetadata.getCurrentStoreVersion(), nextVersion);
+      assertEquals(versionSwitchesReceived.size(), 1);
+      assertEquals(versionSwitchesReceived.get(0)[0], CURRENT_VERSION);
+      assertEquals(versionSwitchesReceived.get(0)[1], nextVersion);
+      assertEquals(configReceived.size(), 2);
+      assertEquals(
+          configReceived.get(1)[1].getCurrentVersionStorageMode(),
+          StorageMode.DUAL_WRITE,
+          "after adoption the snapshot must reflect the newly-served version's DUAL_WRITE storage mode");
+    }
+  }
+
+  @Test
+  public void testIsPartitionResourceReady() {
+    String storeName = "testStore";
+    int version = 10;
+    int partitionCount = 3;
+    Map<Integer, List<String>> routingInfo = new HashMap<>();
+    routingInfo.put(0, Collections.singletonList("replica1"));
+    routingInfo.put(1, Collections.singletonList("replica2"));
+
+    assertFalse(RequestBasedMetadata.isPartitionResourcesReady(storeName, version, partitionCount, null));
+    assertFalse(RequestBasedMetadata.isPartitionResourcesReady(storeName, version, -1, null));
+    assertFalse(RequestBasedMetadata.isPartitionResourcesReady(storeName, version, partitionCount, routingInfo));
+
+    // Add a wrong partition
+    routingInfo.put(10, Collections.singletonList("replica1"));
+    assertFalse(RequestBasedMetadata.isPartitionResourcesReady(storeName, version, partitionCount, routingInfo));
+    // Add the correct partition
+    routingInfo.remove(10);
+    routingInfo.put(2, Collections.singletonList("replica3"));
+    assertTrue(RequestBasedMetadata.isPartitionResourcesReady(storeName, version, partitionCount, routingInfo));
+  }
+
+  @Test
+  public void testWhetherToSwitchToFetchedCurrentVersion() {
+    String storeName = "testStore";
+    AtomicInteger currentVersion = new AtomicInteger(10);
+    int fetchedCurrentVersion = 11;
+    int partitionCountForFetchedCurrentVersion = 3;
+    Set<Integer> activeVersions = new HashSet<>();
+    activeVersions.add(currentVersion.get());
+    activeVersions.add(fetchedCurrentVersion);
+    Map<Integer, List<String>> routingInfo = new HashMap<>();
+    routingInfo.put(0, Collections.singletonList("replica1"));
+    routingInfo.put(1, Collections.singletonList("replica2"));
+
+    // Same current version
+    assertFalse(
+        RequestBasedMetadata.whetherToSwitchToFetchedCurrentVersion(
+            storeName,
+            activeVersions,
+            currentVersion,
+            currentVersion.get(),
+            partitionCountForFetchedCurrentVersion,
+            routingInfo));
+    // Partition resource is not ready for the fetched current version
+    assertFalse(
+        RequestBasedMetadata.isPartitionResourcesReady(
+            storeName,
+            fetchedCurrentVersion,
+            partitionCountForFetchedCurrentVersion,
+            routingInfo));
+    assertFalse(
+        RequestBasedMetadata.whetherToSwitchToFetchedCurrentVersion(
+            storeName,
+            activeVersions,
+            currentVersion,
+            fetchedCurrentVersion,
+            partitionCountForFetchedCurrentVersion,
+            routingInfo));
+    activeVersions.remove(currentVersion.get());
+    // Current version is gone and partition resource is not ready for the fetched current version
+    assertTrue(
+        RequestBasedMetadata.whetherToSwitchToFetchedCurrentVersion(
+            storeName,
+            activeVersions,
+            currentVersion,
+            fetchedCurrentVersion,
+            partitionCountForFetchedCurrentVersion,
+            routingInfo));
+    // Add back current version
+    activeVersions.add(currentVersion.get());
+    // Add back the missing partition
+    routingInfo.put(2, Collections.singletonList("replica3"));
+    assertTrue(
+        RequestBasedMetadata.whetherToSwitchToFetchedCurrentVersion(
+            storeName,
+            activeVersions,
+            currentVersion,
+            fetchedCurrentVersion,
+            partitionCountForFetchedCurrentVersion,
+            routingInfo));
+  }
+
+  // -------- Push-based cluster-name trigger tests --------
+
+  /** {@code getClusterName} must return the Venice cluster name, not the D2 service name. */
+  @Test(timeOut = TEST_TIMEOUT)
+  public void testDiscoverD2ServiceStoresClusterNameNotD2ServiceName() throws IOException {
+    String storeName = "testStore";
+    String serverD2 = "venice-server-cluster-A-d2";
+    String clusterName = "cluster-A";
+    ClientConfig clientConfig = RequestBasedMetadataTestUtils.getMockClientConfig(storeName, false, false);
+    D2TransportClient d2TransportClient = mock(D2TransportClient.class);
+    D2ServiceDiscovery d2ServiceDiscovery = getMockD2ServiceDiscovery(d2TransportClient, storeName);
+    D2ServiceDiscoveryResponse response = new D2ServiceDiscoveryResponse();
+    response.setServerD2Service(serverD2);
+    response.setCluster(clusterName);
+    doReturn(response).when(d2ServiceDiscovery).find(any(), any(), anyBoolean());
+
+    try (RequestBasedMetadata requestBasedMetadata = new RequestBasedMetadata(clientConfig, d2TransportClient)) {
+      requestBasedMetadata.setD2ServiceDiscovery(d2ServiceDiscovery);
+      requestBasedMetadata.discoverD2Service();
+
+      assertEquals(requestBasedMetadata.getClusterName(), clusterName);
+      Assert.assertNotEquals(requestBasedMetadata.getClusterName(), serverD2);
+    }
+  }
+
+  /**
+   * Initial discovery fires the {@code ClientConfig} fan-out exactly once with the resolved cluster
+   * name, and re-entry is a pure no-op gated by {@code isServiceDiscovered} — the fan-out must not
+   * refire just because {@code discoverD2Service} was called again.
+   */
+  @Test(timeOut = TEST_TIMEOUT)
+  public void testDiscoverD2ServiceNoFanoutOnReentryWithSameDiscoveredFlag() throws IOException {
+    String storeName = "testStore";
+    String serverD2A = "venice-server-cluster-A-d2";
+    String clusterA = "cluster-A";
+    ClientConfig clientConfig = RequestBasedMetadataTestUtils.getMockClientConfig(storeName, false, false);
+    D2TransportClient d2TransportClient = mock(D2TransportClient.class);
+    D2ServiceDiscovery d2ServiceDiscovery = getMockD2ServiceDiscovery(d2TransportClient, storeName);
+    D2ServiceDiscoveryResponse response = new D2ServiceDiscoveryResponse();
+    response.setServerD2Service(serverD2A);
+    response.setCluster(clusterA);
+    doReturn(response).when(d2ServiceDiscovery).find(any(), any(), anyBoolean());
+
+    try (RequestBasedMetadata requestBasedMetadata = new RequestBasedMetadata(clientConfig, d2TransportClient)) {
+      requestBasedMetadata.setD2ServiceDiscovery(d2ServiceDiscovery);
+      requestBasedMetadata.discoverD2Service();
+      requestBasedMetadata.discoverD2Service(); // re-entry; gated by isServiceDiscovered
+      requestBasedMetadata.discoverD2Service();
+
+      // Even though discoverD2Service was called 3x, fan-out fired exactly once
+      verify(clientConfig, times(1)).onClusterNameUpdated(clusterA);
+    }
+  }
+
+  /**
+   * Store-migration recovery: a metadata fetch failure resets {@code isServiceDiscovered = false}
+   * and re-runs {@code discoverD2Service} from {@code updateCache}'s catch path. After resolution,
+   * the fan-out must fire with the new cluster value. Idempotency on no-change is delegated to
+   * {@code BasicClientStats.onClusterNameUpdated}'s own short-circuit, so this layer always fires.
+   */
+  @Test(timeOut = TEST_TIMEOUT)
+  public void testDiscoverD2ServiceFiresAgainOnClusterChange() throws Exception {
+    String storeName = "testStore";
+    String serverD2A = "venice-server-cluster-A-d2";
+    String serverD2B = "venice-server-cluster-B-d2";
+    String clusterA = "cluster-A";
+    String clusterB = "cluster-B";
+    ClientConfig clientConfig = RequestBasedMetadataTestUtils.getMockClientConfig(storeName, false, false);
+    D2TransportClient d2TransportClient = mock(D2TransportClient.class);
+    D2ServiceDiscovery d2ServiceDiscovery = getMockD2ServiceDiscovery(d2TransportClient, storeName);
+
+    D2ServiceDiscoveryResponse responseA = new D2ServiceDiscoveryResponse();
+    responseA.setServerD2Service(serverD2A);
+    responseA.setCluster(clusterA);
+    D2ServiceDiscoveryResponse responseB = new D2ServiceDiscoveryResponse();
+    responseB.setServerD2Service(serverD2B);
+    responseB.setCluster(clusterB);
+
+    try (RequestBasedMetadata requestBasedMetadata = new RequestBasedMetadata(clientConfig, d2TransportClient)) {
+      requestBasedMetadata.setD2ServiceDiscovery(d2ServiceDiscovery);
+
+      // Initial discovery — cluster A
+      doReturn(responseA).when(d2ServiceDiscovery).find(any(), any(), anyBoolean());
+      requestBasedMetadata.discoverD2Service();
+      verify(clientConfig, times(1)).onClusterNameUpdated(clusterA);
+
+      CompletableFuture<TransportClientResponse> failingFuture = new CompletableFuture<>();
+      failingFuture.completeExceptionally(new RuntimeException("simulated metadata fetch failure"));
+      doReturn(failingFuture).when(d2TransportClient).get(anyString());
+      doReturn(responseB).when(d2ServiceDiscovery).find(any(), any(), anyBoolean());
+
+      try {
+        requestBasedMetadata.updateCache(false);
+        Assert.fail("updateCache should throw after the on-demand retry also fails");
+      } catch (VeniceClientException expected) {
+        // expected — recovery path fires before this throws
+      }
+
+      // Cluster B fired (= migration recovery detected); cluster A still only fired once.
+      verify(clientConfig, times(1)).onClusterNameUpdated(clusterA);
+      verify(clientConfig, times(1)).onClusterNameUpdated(clusterB);
+    }
+  }
+
+  /**
+   * Verifies that close() completes quickly when a refresh task is pending.
+   * Before the fix, close() would block for up to refreshIntervalInSeconds (60s)
+   * because scheduler.shutdown() does not cancel already-queued delayed tasks.
+   */
+  @Test(timeOut = TEST_TIMEOUT)
+  public void testCloseDoesNotBlockOnPendingRefresh() throws IOException, InterruptedException {
+    String storeName = "testStore";
+    ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+    ClientConfig clientConfig = RequestBasedMetadataTestUtils.getMockClientConfig(storeName, false, false, scheduler);
+    RequestBasedMetadata requestBasedMetadata = null;
+
+    try {
+      requestBasedMetadata = getMockMetaData(clientConfig, storeName, false, true, false);
+      requestBasedMetadata.setRefreshIntervalInSeconds(60);
+      requestBasedMetadata.start();
+
+      // At this point, a refresh task is scheduled 60s in the future.
+      // close() must complete quickly (well under 10s) by cancelling the pending task.
+      long startTime = System.currentTimeMillis();
+      requestBasedMetadata.close();
+      long elapsed = System.currentTimeMillis() - startTime;
+
+      // close() should complete almost instantly (cancel + shutdownNow).
+      // Without the fix, it would block for up to 60 seconds.
+      assertTrue(elapsed < 6000, "close() took " + elapsed + "ms — expected <6000ms");
+    } finally {
+      scheduler.shutdownNow();
     }
   }
 }

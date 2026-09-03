@@ -1,0 +1,221 @@
+package com.linkedin.venice.stats.dimensions;
+
+import static com.linkedin.venice.stats.VeniceOpenTelemetryMetricNamingFormat.CAMEL_CASE;
+import static com.linkedin.venice.stats.VeniceOpenTelemetryMetricNamingFormat.PASCAL_CASE;
+import static com.linkedin.venice.stats.VeniceOpenTelemetryMetricNamingFormat.SNAKE_CASE;
+import static com.linkedin.venice.stats.VeniceOpenTelemetryMetricNamingFormat.transformMetricName;
+import static com.linkedin.venice.stats.VeniceOpenTelemetryMetricNamingFormat.validateMetricName;
+
+import com.google.common.annotations.VisibleForTesting;
+import com.linkedin.venice.server.VersionRole;
+import com.linkedin.venice.stats.VeniceOpenTelemetryMetricNamingFormat;
+
+
+public enum VeniceMetricsDimensions {
+  VENICE_STORE_NAME("venice.store.name"), VENICE_CLUSTER_NAME("venice.cluster.name"),
+
+  /** {@link com.linkedin.venice.read.RequestType} */
+  VENICE_REQUEST_METHOD("venice.request.method"),
+
+  /** Route name for routing metrics typed as String */
+  VENICE_ROUTE_NAME("venice.route.name"),
+
+  /** {@link HttpResponseStatusEnum} ie. 200, 400, etc */
+  HTTP_RESPONSE_STATUS_CODE("http.response.status_code"),
+
+  /** {@link HttpResponseStatusCodeCategory} ie. 1xx, 2xx, etc */
+  HTTP_RESPONSE_STATUS_CODE_CATEGORY("http.response.status_code_category"),
+
+  /** {@link ControllerRoute } */
+  VENICE_CONTROLLER_ENDPOINT("venice.controller.endpoint"),
+
+  /** {@link VeniceResponseStatusCategory} */
+  VENICE_RESPONSE_STATUS_CODE_CATEGORY("venice.response.status_code_category"),
+
+  /** {@link VeniceBlobTransferSource} */
+  VENICE_BLOB_TRANSFER_SENDER_SOURCE("venice.blob_transfer.sender_source"),
+
+  /** {@link VeniceBlobTransferFallbackReason} */
+  VENICE_BLOB_TRANSFER_FALLBACK_REASON("venice.blob_transfer.fallback_reason"),
+
+  /** {@link RequestRetryType} */
+  VENICE_REQUEST_RETRY_TYPE("venice.request.retry_type"),
+
+  /** {@link com.linkedin.venice.stats.dimensions.MessageType} */
+  VENICE_MESSAGE_TYPE("venice.message.type"),
+
+  /** Fanout type for requests {@link com.linkedin.venice.stats.dimensions.RequestFanoutType} (e.g., original vs retry) */
+  VENICE_REQUEST_FANOUT_TYPE("venice.request.fanout_type"),
+
+  /** {@link com.linkedin.venice.stats.dimensions.RejectionReason} */
+  VENICE_REQUEST_REJECTION_REASON("venice.request.rejection_reason"),
+
+  /**
+   * {@link StreamProgress} Streaming delivery progress for batch responses
+   * (e.g., first, 50pct, 90pct, etc.)
+   */
+  VENICE_STREAM_PROGRESS("venice.stream.progress"),
+
+  /** {@link RequestRetryAbortReason} */
+  VENICE_REQUEST_RETRY_ABORT_REASON("venice.request.retry_abort_reason"),
+
+  /** {@link StoreRepushTriggerSource} */
+  STORE_REPUSH_TRIGGER_SOURCE("store.repush.trigger.source"),
+
+  /** Instance error type for blocked, unhealthy, and overloaded instances */
+  VENICE_INSTANCE_ERROR_TYPE("venice.instance.error_type"),
+
+  /** Helix group id number */
+  VENICE_HELIX_GROUP_ID("venice.helix_group.id"),
+
+  /** Region/datacenter name */
+  VENICE_REGION_NAME("venice.region.name"),
+
+  /** {@link VersionRole} */
+  VENICE_VERSION_ROLE("venice.version.role"),
+
+  /** {@link ReplicaType} */
+  VENICE_REPLICA_TYPE("venice.replica.type"),
+
+  /** {@link ReplicaState} */
+  VENICE_REPLICA_STATE("venice.replica.state"),
+
+  /** {@link VeniceDCREvent} */
+  VENICE_DCR_EVENT("venice.dcr.event"),
+
+  /** {@link VeniceRegionLocality} */
+  VENICE_REGION_LOCALITY("venice.region.locality"),
+
+  /** Source region for hybrid region consumption */
+  VENICE_SOURCE_REGION("venice.source.region"),
+
+  /** Destination region for hybrid region consumption */
+  VENICE_DESTINATION_REGION("venice.destination.region"),
+
+  /** {@link VeniceIngestionSourceComponent} source component */
+  VENICE_INGESTION_SOURCE_COMPONENT("venice.ingestion.source.component"),
+
+  /** {@link VeniceIngestionDestinationComponent} destination component */
+  VENICE_INGESTION_DESTINATION_COMPONENT("venice.ingestion.destination.component"),
+
+  /** Venice push job type (e.g. batch, incremental). See Version.PushType */
+  VENICE_PUSH_JOB_TYPE("venice.push_job.type"),
+
+  /** {@link VenicePushJobStatus} */
+  VENICE_PUSH_JOB_STATUS("venice.push_job.status"),
+
+  /** {@link VenicePushJobDataWriterSink} */
+  VENICE_PUSH_JOB_DATA_WRITER_SINK("venice.push_job.data_writer.sink"),
+
+  /** {@link VeniceSystemStoreType} */
+  VENICE_SYSTEM_STORE_TYPE("venice.system_store.type"),
+
+  /** {@link AdminMessageProcessingComponent} */
+  VENICE_ADMIN_MESSAGE_PROCESSING_COMPONENT("venice.admin_message.processing.component"),
+
+  /** AdminMessageType */
+  VENICE_ADMIN_MESSAGE_TYPE("venice.admin_message.type"),
+
+  /** Thread pool name for ThreadPoolStats */
+  VENICE_THREAD_POOL_NAME("venice.thread_pool.name"),
+
+  /** {@link VeniceDCROperation} DCR merge operation type (put, update, delete) */
+  VENICE_DCR_OPERATION("venice.dcr.operation"),
+
+  /** {@link VenicePartialUpdateOperation} Phase of a partial update (write compute) operation: query or update */
+  VENICE_PARTIAL_UPDATE_OPERATION_PHASE("venice.partial_update.operation_phase"),
+
+  /** {@link VeniceRecordType} Record type (data, replication_metadata) */
+  VENICE_RECORD_TYPE("venice.record.type"),
+
+  /** {@link VeniceIngestionFailureReason} Categorized reason for ingestion failure */
+  VENICE_INGESTION_FAILURE_REASON("venice.ingestion.failure.reason"),
+
+  /** {@link VeniceChunkingStatus} */
+  VENICE_CHUNKING_STATUS("venice.chunking.status"),
+
+  /** {@link VeniceComputeOperationType} Type of read-compute operation: dot_product, cosine_similarity, etc. */
+  VENICE_READ_COMPUTE_OPERATION_TYPE("venice.read_compute.operation_type"),
+
+  /** {@link VeniceAdaptiveThrottlerType} Type of adaptive throttler: pubsub_consumption_records_count, pubsub_consumption_bandwidth, etc. */
+  VENICE_ADAPTIVE_THROTTLER_TYPE("venice.adaptive_throttler.type"),
+
+  /** {@link VeniceHeartbeatComponent} Heartbeat monitoring thread: reporter or logger. */
+  VENICE_HEARTBEAT_COMPONENT("venice.heartbeat.component"),
+
+  /** {@link VeniceConsumerPoolAction} Consumer pool action (subscribe, update_assignment). */
+  VENICE_CONSUMER_POOL_ACTION("venice.consumer_pool.action"),
+
+  /** Consumer pool type (regular_pool, current_version_aa_wc_leader_pool, etc.). */
+  VENICE_CONSUMER_POOL_TYPE("venice.consumer_pool.type"),
+
+  /** {@link VeniceDIVResult} Data Integrity Validation result (success, duplicate, missing, corrupted). */
+  VENICE_DIV_RESULT("venice.div.result"),
+
+  /** {@link VeniceDIVSeverity} Severity of a leader offset rewind (benign, potentially_lossy). */
+  VENICE_DIV_SEVERITY("venice.div.severity"),
+
+  /** {@link QuotaRequestOutcome} Outcome of read quota enforcement (allowed, rejected, allowed_unintentionally). */
+  VENICE_QUOTA_REQUEST_OUTCOME("venice.quota.request.outcome"),
+
+  /** {@link VeniceConnectionSource} Connection source type: router or client. */
+  VENICE_CONNECTION_SOURCE("venice.connection.source"),
+
+  /** {@link VeniceDrainerType} Drainer type: sorted or unsorted. */
+  VENICE_DRAINER_TYPE("venice.drainer.type"),
+
+  /** {@link VeniceRequestKeyCountBucket} Coarse key-count bucket for request batches. */
+  VENICE_REQUEST_KEY_COUNT_BUCKET("venice.request.key_count_bucket"),
+
+  /** Name of the metric being recorded; used for per-metric attribution on internal failure counters. */
+  VENICE_METRIC_NAME("venice.metric.name"),
+
+  /** {@link VeniceServerLoadRequestOutcome} Server load request outcome: accepted or rejected. */
+  VENICE_SERVER_LOAD_REQUEST_OUTCOME("venice.server.load_controller.request_outcome"),
+
+  /** {@link VeniceRocksDBLevel} RocksDB level where a Get was served from. */
+  VENICE_ROCKSDB_LEVEL("venice.rocksdb.level"),
+
+  /** {@link VeniceRocksDBBlockCacheComponent} RocksDB block cache component type. */
+  VENICE_ROCKSDB_BLOCK_CACHE_COMPONENT("venice.rocksdb.block_cache_component"),
+
+  /** {@link VeniceOperationOutcome} Generic operation outcome: success or fail. */
+  VENICE_OPERATION_OUTCOME("venice.operation.outcome"),
+
+  /** {@link VeniceHelixFromState} Helix state a partition is transitioning from. */
+  VENICE_HELIX_FROM_STATE("venice.helix.from_state"),
+
+  /** {@link VeniceHelixToState} Helix state a partition is transitioning to. */
+  VENICE_HELIX_TO_STATE("venice.helix.to_state"),
+
+  /** Helix state a partition is currently in (steady state). */
+  VENICE_HELIX_STATE("venice.helix.state"),
+
+  /** {@link VeniceRecordTransformerOperation} Record transformer operation: put or delete. */
+  VENICE_RECORD_TRANSFORMER_OPERATION("venice.record_transformer.operation"),
+
+  /** {@link VeniceStoreWriteType} Store write type: regular or write_compute. */
+  VENICE_STORE_WRITE_TYPE("venice.store.write_type"),
+
+  /** {@link VeniceReplicationMode} Store-version replication mode: non_active_active or active_active. */
+  VENICE_REPLICATION_MODE("venice.replication.mode");
+
+  private final String[] dimensionName = new String[VeniceOpenTelemetryMetricNamingFormat.SIZE];
+
+  VeniceMetricsDimensions(String dimensionName) {
+    validateMetricName(dimensionName);
+    this.dimensionName[SNAKE_CASE.getValue()] = dimensionName;
+    this.dimensionName[CAMEL_CASE.getValue()] = transformMetricName(dimensionName, CAMEL_CASE);
+    this.dimensionName[PASCAL_CASE.getValue()] = transformMetricName(dimensionName, PASCAL_CASE);
+  }
+
+  public String getDimensionName(VeniceOpenTelemetryMetricNamingFormat format) {
+    return dimensionName[format.getValue()];
+  }
+
+  // This is only for testing purpose and should never be used in production code.
+  @VisibleForTesting
+  public String getDimensionNameInDefaultFormat() {
+    return dimensionName[VeniceOpenTelemetryMetricNamingFormat.getDefaultFormat().getValue()];
+  }
+}

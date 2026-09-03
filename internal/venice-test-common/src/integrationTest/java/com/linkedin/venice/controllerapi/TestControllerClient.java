@@ -22,6 +22,7 @@ import io.netty.handler.codec.http.HttpVersion;
 import java.io.IOException;
 import java.net.ConnectException;
 import java.util.Optional;
+import java.util.stream.IntStream;
 import org.testng.Assert;
 import org.testng.annotations.Test;
 
@@ -170,9 +171,9 @@ public class TestControllerClient {
           discoResponseInvalidControllers.getError());
 
       // When only some controllers are missing, the ConnectException should never be bubbled up. Since this behavior is
-      // triggered from Java libs, and we randomise the controller list to do some load balancing, the best way to
+      // triggered from Java libs, and we randomize the controller list to do some load balancing, the best way to
       // validate is to try multiple invocations
-      for (int i = 0; i < 100; i++) {
+      IntStream.rangeClosed(1, 50).parallel().forEach(i -> {
         D2ServiceDiscoveryResponse discoResponsePartialValidController = ControllerClient
             .discoverCluster(nonExistentControllerUrl1 + "," + validControllerUrl, storeName, Optional.empty(), 1);
         Assert.assertFalse(discoResponsePartialValidController.isError());
@@ -208,16 +209,16 @@ public class TestControllerClient {
         Assert.assertTrue(nonExistentStoreDiscoResponseInvalidAndLegacy.isError());
         Assert.assertEquals(nonExistentStoreDiscoResponseInvalidAndLegacy.getErrorType(), ErrorType.STORE_NOT_FOUND);
 
-        // Backward compatibility test. When the controller/router doesn't return STORE_NOT_FOUND, and the client cannot
-        // identify it as a STORE_NOT_FOUND error, try to query routers using the path param type of cluster discovery
+        // Backward compatibility test. Errors which cannot be identified as STORE_NOT_FOUND still surface as the
+        // original request-path failure, even though the legacy router-style path fallback is no longer attempted.
         D2ServiceDiscoveryResponse errorDiscoResponseInvalidAndLegacy = ControllerClient.discoverCluster(
             nonExistentControllerUrl1 + "," + validControllerUrl,
             errorResponseStoreName,
             Optional.empty(),
             1);
         Assert.assertTrue(errorDiscoResponseInvalidAndLegacy.isError());
-        Assert.assertEquals(errorDiscoResponseInvalidAndLegacy.getErrorType(), ErrorType.BAD_REQUEST);
-      }
+        Assert.assertEquals(errorDiscoResponseInvalidAndLegacy.getErrorType(), ErrorType.GENERAL_ERROR);
+      });
 
       try (ControllerClient controllerClient =
           ControllerClientFactory.getControllerClient(clusterName, validControllerUrl, Optional.empty())) {

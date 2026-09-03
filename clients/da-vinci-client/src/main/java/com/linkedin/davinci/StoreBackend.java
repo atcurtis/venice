@@ -1,19 +1,27 @@
 package com.linkedin.davinci;
 
+import com.linkedin.davinci.client.DaVinciSeekCheckpointInfo;
 import com.linkedin.davinci.config.StoreBackendConfig;
+import com.linkedin.davinci.config.VeniceServerConfig;
+import com.linkedin.venice.annotation.VisibleForTesting;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.Version;
+import com.linkedin.venice.meta.VersionStatus;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
 import com.linkedin.venice.serialization.AvroStoreDeserializerCache;
 import com.linkedin.venice.serialization.StoreDeserializerCache;
 import com.linkedin.venice.utils.ComplementSet;
 import com.linkedin.venice.utils.ConcurrentRef;
 import com.linkedin.venice.utils.ReferenceCounted;
+import com.linkedin.venice.utils.RegionUtils;
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import org.apache.commons.lang.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -72,8 +80,6 @@ public class StoreBackend {
       setDaVinciCurrentVersion(null);
       version.close();
     }
-
-    backend.getStoreRepository().unsubscribe(storeName);
   }
 
   synchronized void delete() {
@@ -108,8 +114,24 @@ public class StoreBackend {
     return stats;
   }
 
+  public ComplementSet<Integer> getSubscription() {
+    return subscription;
+  }
+
   public ReferenceCounted<VersionBackend> getDaVinciCurrentVersion() {
     return daVinciCurrentVersionRef.get();
+  }
+
+  @VisibleForTesting
+  synchronized Set<Integer> getSubscribedVersionNumbers() {
+    Set<Integer> versionNumbers = new HashSet<>(2);
+    if (daVinciCurrentVersion != null) {
+      versionNumbers.add(daVinciCurrentVersion.getVersion().getNumber());
+    }
+    if (daVinciFutureVersion != null) {
+      versionNumbers.add(daVinciFutureVersion.getVersion().getNumber());
+    }
+    return versionNumbers;
   }
 
   private synchronized void setDaVinciCurrentVersion(VersionBackend version) {
@@ -120,22 +142,53 @@ public class StoreBackend {
   }
 
   private void setDaVinciFutureVersion(VersionBackend version) {
+    // Keep the IngestionService's future-slot registry in sync so the current-version
+    // bootstrapping speedup throttler does not activate for a version DVC is treating as a
+    // future slot (target-region push + deferred swap can promote the version controller-side
+    // before DVC has finished ingesting it as a future slot).
+    VersionBackend previousFutureVersion = daVinciFutureVersion;
     daVinciFutureVersion = version;
     stats.recordFutureVersion(version);
+    if (previousFutureVersion != null) {
+      backend.getIngestionService().unmarkAsDaVinciFutureSlot(previousFutureVersion.getVersion().kafkaTopicName());
+    }
+    if (version != null) {
+      backend.getIngestionService().markAsDaVinciFutureSlot(version.getVersion().kafkaTopicName());
+    }
   }
 
   public CompletableFuture<Void> subscribe(ComplementSet<Integer> partitions) {
-    return subscribe(partitions, Optional.empty());
+    return subscribe(partitions, Optional.empty(), null);
   }
 
-  synchronized CompletableFuture<Void> subscribe(
+  public CompletableFuture<Void> seekToCheckpoint(
+      DaVinciSeekCheckpointInfo checkpointInfo,
+      Optional<Version> storeVersion) {
+    return subscribe(checkpointInfo.getPartitions(), storeVersion, checkpointInfo);
+  }
+
+  private Version getCurrentVersion() {
+    return backend.getVeniceCurrentVersion(storeName);
+  }
+
+  private Version getLatestNonFaultyVersion() {
+    return backend.getVeniceLatestNonFaultyVersion(storeName, faultyVersionSet);
+  }
+
+  private Version getVersionByNumber(int versionNumber) {
+    Store store = backend.getStoreRepository().getStore(storeName);
+    return store == null ? null : store.getVersion(versionNumber);
+  }
+
+  public synchronized CompletableFuture<Void> subscribe(
       ComplementSet<Integer> partitions,
-      Optional<Version> bootstrapVersion) {
+      Optional<Version> bootstrapVersion,
+      DaVinciSeekCheckpointInfo checkpointInfo) {
     if (daVinciCurrentVersion == null) {
       setDaVinciCurrentVersion(new VersionBackend(backend, bootstrapVersion.orElseGet(() -> {
-        Version version = backend.getVeniceCurrentVersion(storeName);
+        Version version = getCurrentVersion();
         if (version == null) {
-          version = backend.getVeniceLatestNonFaultyVersion(storeName, faultyVersionSet);
+          version = getLatestNonFaultyVersion();
         }
         if (version == null) {
           throw new VeniceException("Cannot subscribe to an empty store, storeName=" + storeName);
@@ -143,7 +196,8 @@ public class StoreBackend {
         return version;
       }), stats));
 
-    } else if (bootstrapVersion.isPresent()) {
+    } else if (bootstrapVersion.isPresent()
+        && !bootstrapVersion.get().kafkaTopicName().equals(daVinciCurrentVersion.getVersion().kafkaTopicName())) {
       throw new VeniceException(
           "Bootstrap version is already selected, storeName=" + storeName + ", currentVersion=" + daVinciCurrentVersion
               + ", desiredVersion=" + bootstrapVersion.get().kafkaTopicName());
@@ -156,31 +210,55 @@ public class StoreBackend {
     }
     subscription.addAll(partitions);
 
-    if (daVinciFutureVersion == null) {
-      trySubscribeDaVinciFutureVersion();
+    if (DaVinciBackend.ClientType.VERSION_SPECIFIC.equals(backend.getStoreClientType(getStoreName()))
+        && bootstrapVersion.isPresent()) {
+      LOGGER.info(
+          "Ignoring version swaps for store: {} since its a version-specific client. Staying on target version: {}.",
+          storeName,
+          bootstrapVersion.get().getNumber());
     } else {
-      daVinciFutureVersion.subscribe(partitions).whenComplete((v, e) -> trySwapDaVinciCurrentVersion(e));
+      if (daVinciFutureVersion == null) {
+        trySubscribeDaVinciFutureVersion();
+      } else {
+        daVinciFutureVersion.subscribe(partitions, null, null, false)
+            .whenComplete((v, e) -> trySwapDaVinciCurrentVersion(e));
+      }
     }
 
     VersionBackend savedVersion = daVinciCurrentVersion;
-    return daVinciCurrentVersion.subscribe(partitions).exceptionally(e -> {
-      synchronized (this) {
-        addFaultyVersion(savedVersion, e);
-        // Don't propagate failure to subscribe() caller, if future version has become current and is ready to serve.
-        if (daVinciCurrentVersion != null && daVinciCurrentVersion.isReadyToServe(subscription)) {
-          return null;
-        }
+    Map<Integer, PubSubPosition> resolvedPositionMap = null;
+    Map<Integer, Long> resolvedTimestampsMap = null;
+    if (checkpointInfo != null) {
+      switch (checkpointInfo.getSeekMode()) {
+        case TIMESTAMPS_MAP:
+          resolvedTimestampsMap = checkpointInfo.getTimestampsMap();
+          break;
+        case POSITION_MAP:
+          resolvedPositionMap = checkpointInfo.getPositionMap();
+          break;
       }
-      throw (e instanceof CompletionException) ? (CompletionException) e : new CompletionException(e);
-    }).whenComplete((v, e) -> {
-      synchronized (this) {
-        if (e == null) {
-          LOGGER.info("Ready to serve partitions {} of {}", subscription, daVinciCurrentVersion);
-        } else {
-          LOGGER.warn("Failed to subscribe to partitions {} of {}", subscription, savedVersion, e);
-        }
-      }
-    });
+    }
+    return daVinciCurrentVersion.subscribe(partitions, resolvedTimestampsMap, resolvedPositionMap, false)
+        .exceptionally(e -> {
+          synchronized (this) {
+            addFaultyVersion(savedVersion, e);
+            // Don't propagate failure to subscribe() caller, if future version has become current and is ready to
+            // serve.
+            if (daVinciCurrentVersion != null && daVinciCurrentVersion.isReadyToServe(subscription)) {
+              return null;
+            }
+          }
+          throw (e instanceof CompletionException) ? (CompletionException) e : new CompletionException(e);
+        })
+        .whenComplete((v, e) -> {
+          synchronized (this) {
+            if (e == null) {
+              LOGGER.info("Ready to serve partitions {} of {}", subscription, daVinciCurrentVersion);
+            } else {
+              LOGGER.warn("Failed to subscribe to partitions {} of {}", subscription, savedVersion, e);
+            }
+          }
+        });
   }
 
   public synchronized void unsubscribe(ComplementSet<Integer> partitions) {
@@ -218,9 +296,9 @@ public class StoreBackend {
       return;
     }
 
-    Version veniceCurrentVersion = backend.getVeniceCurrentVersion(storeName);
+    Version veniceCurrentVersion = getCurrentVersion();
     // Latest non-faulty store version in Venice store.
-    Version veniceLatestVersion = backend.getVeniceLatestNonFaultyVersion(storeName, faultyVersionSet);
+    Version veniceLatestVersion = getLatestNonFaultyVersion();
     Version targetVersion;
     // Make sure current version in the store config has highest priority.
     if (veniceCurrentVersion != null
@@ -232,9 +310,112 @@ public class StoreBackend {
     } else {
       return;
     }
-    LOGGER.info("Subscribing to future version {}", targetVersion.kafkaTopicName());
+
+    String targetSwapRegion = targetVersion.getTargetSwapRegion();
+    boolean isTargetRegionEnabled = !StringUtils.isEmpty(targetSwapRegion);
+
+    if (!isTargetRegionEnabled) {
+      // No target-region push — always subscribe active.
+      subscribeFutureVersion(targetVersion, false);
+      return;
+    }
+
+    VeniceServerConfig serverConfig = backend.getConfigLoader().getVeniceServerConfig();
+    String currentRegion = serverConfig.getRegionName();
+
+    // Determine which region ingests actively (unpaused) for this deferred-swap push.
+    // When the cluster is configured for sequential roll-forward, the controller promotes regions one
+    // at a time following the roll-forward order, and the active region is its head. Da Vinci must key
+    // off the SAME order the controller uses (see AbstractPushMonitor#sequentialRollForwardFirstRegion);
+    // otherwise it can pause the very region the controller is waiting on to complete, deadlocking the
+    // swap (the region never completes because DVC is paused, and DVC never resumes because the region
+    // is not promoted).
+    //
+    // Skip blank entries when reading the head: a whitespace-only config or a leading comma would
+    // otherwise yield an empty-string head, which matches no region and — in paused-SIT mode — would
+    // pause EVERY region, reintroducing the deadlock. If the config is unset or has no non-blank
+    // entries, treat it as not configured and fall back to the version's targetSwapRegion (parallel
+    // target-region push).
+    String rollForwardHead = null;
+    for (String region: RegionUtils
+        .parseRegionRolloutOrderList(serverConfig.getDeferredVersionSwapRegionRollforwardOrder())) {
+      if (!StringUtils.isBlank(region)) {
+        rollForwardHead = region;
+        break;
+      }
+    }
+
+    boolean isActiveRegion;
+    if (rollForwardHead != null) {
+      // Sequential roll-forward: the active (unpaused) region is the head of the roll-forward order.
+      isActiveRegion = rollForwardHead.equals(currentRegion);
+    } else {
+      // Parallel target-region push (or roll-forward not configured): use targetSwapRegion membership.
+      isActiveRegion = RegionUtils.parseRegionsFilterList(targetSwapRegion).contains(currentRegion);
+    }
+
+    if (isActiveRegion) {
+      // This DVC instance is in the active (target / roll-forward head) region — always subscribe active.
+      subscribeFutureVersion(targetVersion, false);
+      return;
+    }
+
+    // Non-active region with a deferred-swap push in flight.
+    boolean pausedSitEnabled = serverConfig.isDaVinciPausedSitEnabled();
+    if (pausedSitEnabled) {
+      // Paused-SIT mode: subscribe immediately in a paused state; resume when targetRegionPromoted fires.
+      boolean createPaused = !targetVersion.isTargetRegionPromoted();
+      LOGGER.info(
+          "Subscribing to future version {} in region {} with createPaused={} "
+              + "(targetSwapRegion={}, rollForwardHead={}, targetRegionPromoted={})",
+          targetVersion.kafkaTopicName(),
+          currentRegion,
+          createPaused,
+          targetSwapRegion,
+          rollForwardHead,
+          targetVersion.isTargetRegionPromoted());
+      subscribeFutureVersion(targetVersion, createPaused);
+    } else {
+      // Legacy mode: subscribe only once the version is ONLINE in this region.
+      if (targetVersion.getStatus() == VersionStatus.ONLINE) {
+        subscribeFutureVersion(targetVersion, false);
+      } else {
+        LOGGER.info(
+            "Skipping subscribe to future version: {} in region: {} because paused-SIT is disabled and "
+                + "version is not yet ONLINE (status={}, targetSwapRegion={})",
+            targetVersion.kafkaTopicName(),
+            currentRegion,
+            targetVersion.getStatus(),
+            targetSwapRegion);
+      }
+    }
+  }
+
+  private void subscribeFutureVersion(Version targetVersion, boolean createPaused) {
+    LOGGER.info("Subscribing to future version {} (createPaused={})", targetVersion.kafkaTopicName(), createPaused);
     setDaVinciFutureVersion(new VersionBackend(backend, targetVersion, stats));
-    daVinciFutureVersion.subscribe(subscription).whenComplete((v, e) -> trySwapDaVinciCurrentVersion(e));
+    // For future version subscription, we don't need to pass any timestamps or position map
+    daVinciFutureVersion.subscribe(subscription, null, null, createPaused)
+        .whenComplete((v, e) -> trySwapDaVinciCurrentVersion(e));
+  }
+
+  /**
+   * Resume the future version's ingestion if it was created paused and targetRegionPromoted has
+   * since flipped to true. Only relevant when paused-SIT mode is enabled.
+   */
+  synchronized void maybeResumeDaVinciFutureVersion() {
+    if (daVinciFutureVersion == null || !daVinciFutureVersion.isPaused()) {
+      return;
+    }
+    // Re-fetch the version fresh from the store repository instead of reading
+    // daVinciFutureVersion.getVersion(), which is an immutable snapshot captured at subscribe time.
+    // VersionBackend holds a final Version whose targetRegionPromoted flag never updates, so trusting
+    // the snapshot here would never observe the flip and the paused SIT would never resume.
+    Version freshFutureVersion = getVersionByNumber(daVinciFutureVersion.getVersion().getNumber());
+    if (freshFutureVersion != null && freshFutureVersion.isTargetRegionPromoted()) {
+      LOGGER.info("Resuming future-slot-paused SIT for version {}", daVinciFutureVersion.getVersion().kafkaTopicName());
+      daVinciFutureVersion.resume();
+    }
   }
 
   /**
@@ -246,7 +427,7 @@ public class StoreBackend {
    * failure.
    */
   synchronized void validateDaVinciAndVeniceCurrentVersion() {
-    Version veniceCurrentVersion = backend.getVeniceCurrentVersion(storeName);
+    Version veniceCurrentVersion = getCurrentVersion();
     if (veniceCurrentVersion != null && daVinciCurrentVersion != null) {
       if (veniceCurrentVersion.getNumber() > daVinciCurrentVersion.getVersion().getNumber()
           && faultyVersionSet.contains(veniceCurrentVersion.getNumber())) {
@@ -273,14 +454,17 @@ public class StoreBackend {
     if (daVinciFutureVersion != null) {
       Store store = backend.getStoreRepository().getStoreOrThrow(storeName);
       int versionNumber = daVinciFutureVersion.getVersion().getNumber();
-      if (store.getVersion(versionNumber) == null) {
+      Version futureVersion = store.getVersion(versionNumber);
+      if (futureVersion == null) {
         LOGGER.info(
             "Deleting obsolete future version " + daVinciFutureVersion + ", currentVersion=" + daVinciCurrentVersion);
         deleteFutureVersion();
+        return;
       }
-      if (faultyVersionSet.contains(versionNumber)) {
+      if (DaVinciBackend.isDaVinciVersionIneligible(futureVersion, faultyVersionSet)) {
         LOGGER.info(
-            "Deleting faulty future version " + daVinciFutureVersion + ", currentVersion=" + daVinciCurrentVersion);
+            "Deleting ineligible future version " + daVinciFutureVersion + " (status=" + futureVersion.getStatus()
+                + "), currentVersion=" + daVinciCurrentVersion);
         deleteFutureVersion();
       }
     }
@@ -294,19 +478,18 @@ public class StoreBackend {
   synchronized void trySwapDaVinciCurrentVersion(Throwable failure) {
     if (daVinciFutureVersion != null) {
       // Fetch current version from store config.
-      Version veniceCurrentVersion = backend.getVeniceCurrentVersion(storeName);
+      Version veniceCurrentVersion = getCurrentVersion();
       if (veniceCurrentVersion == null) {
         LOGGER.warn("Failed to retrieve current version of store: " + storeName);
         return;
       }
       int veniceCurrentVersionNumber = veniceCurrentVersion.getNumber();
       int daVinciFutureVersionNumber = daVinciFutureVersion.getVersion().getNumber();
+      // Re-read authoritative metadata before promotion to catch a concurrent terminal transition.
+      Version futureVersion =
+          backend.getStoreRepository().getStoreOrThrow(storeName).getVersion(daVinciFutureVersionNumber);
       boolean isDaVinciFutureVersionInvalid =
-          faultyVersionSet.contains(daVinciFutureVersionNumber) || backend.getStoreRepository()
-              .getStoreOrThrow(storeName)
-              .getVersions()
-              .stream()
-              .noneMatch(v -> (v.getNumber() == daVinciFutureVersionNumber));
+          DaVinciBackend.isDaVinciVersionIneligible(futureVersion, faultyVersionSet);
       /**
        * We will only swap it to current version slot when it is fully pushed and the version number is (or was) the
        * current version in store config.
@@ -364,5 +547,9 @@ public class StoreBackend {
 
   public StoreDeserializerCache getStoreDeserializerCache() {
     return storeDeserializerCache;
+  }
+
+  public String getStoreName() {
+    return storeName;
   }
 }

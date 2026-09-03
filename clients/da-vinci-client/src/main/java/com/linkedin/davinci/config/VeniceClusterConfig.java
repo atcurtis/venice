@@ -17,7 +17,6 @@ import static com.linkedin.venice.ConfigKeys.KAFKA_FETCH_QUOTA_TIME_WINDOW_MS;
 import static com.linkedin.venice.ConfigKeys.KAFKA_FETCH_QUOTA_UNORDERED_BYTES_PER_SECOND;
 import static com.linkedin.venice.ConfigKeys.KAFKA_FETCH_QUOTA_UNORDERED_RECORDS_PER_SECOND;
 import static com.linkedin.venice.ConfigKeys.KAFKA_READ_CYCLE_DELAY_MS;
-import static com.linkedin.venice.ConfigKeys.KAFKA_SECURITY_PROTOCOL;
 import static com.linkedin.venice.ConfigKeys.PERSISTENCE_TYPE;
 import static com.linkedin.venice.ConfigKeys.REFRESH_ATTEMPTS_FOR_ZK_RECONNECT;
 import static com.linkedin.venice.ConfigKeys.REFRESH_INTERVAL_FOR_ZK_RECONNECT_MS;
@@ -27,8 +26,11 @@ import com.linkedin.venice.SSLConfig;
 import com.linkedin.venice.exceptions.ConfigurationException;
 import com.linkedin.venice.exceptions.UndefinedPropertyException;
 import com.linkedin.venice.meta.PersistenceType;
-import com.linkedin.venice.utils.KafkaSSLUtils;
+import com.linkedin.venice.pubsub.PubSubPositionTypeRegistry;
+import com.linkedin.venice.pubsub.PubSubUtil;
+import com.linkedin.venice.pubsub.api.PubSubSecurityProtocol;
 import com.linkedin.venice.utils.RegionUtils;
+import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.VeniceProperties;
 import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
 import it.unimi.dsi.fastutil.ints.Int2ObjectMaps;
@@ -44,7 +46,6 @@ import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
-import org.apache.kafka.common.protocol.SecurityProtocol;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -53,7 +54,7 @@ import org.apache.logging.log4j.Logger;
  * class that maintains config very specific to a Venice cluster
  */
 public class VeniceClusterConfig {
-  private static final Logger LOGGER = LogManager.getLogger(VeniceServerConfig.class);
+  private static final Logger LOGGER = LogManager.getLogger(VeniceClusterConfig.class);
 
   private final String clusterName;
   private final String zookeeperAddress;
@@ -89,15 +90,16 @@ public class VeniceClusterConfig {
 
   private final VeniceProperties clusterProperties;
 
-  private final SecurityProtocol kafkaSecurityProtocol;
-  private final Map<String, SecurityProtocol> kafkaBootstrapUrlToSecurityProtocol;
+  private final PubSubSecurityProtocol pubSubSecurityProtocol;
+  private final Map<String, PubSubSecurityProtocol> kafkaBootstrapUrlToSecurityProtocol;
   private final Optional<SSLConfig> sslConfig;
+  private final PubSubPositionTypeRegistry pubSubPositionTypeRegistry;
 
   public VeniceClusterConfig(VeniceProperties clusterProps, Map<String, Map<String, String>> kafkaClusterMap)
       throws ConfigurationException {
     this.clusterName = clusterProps.getString(CLUSTER_NAME);
     this.zookeeperAddress = clusterProps.getString(ZOOKEEPER_ADDRESS);
-
+    this.pubSubPositionTypeRegistry = PubSubPositionTypeRegistry.fromPropertiesOrDefault(clusterProps);
     try {
       this.persistenceType =
           PersistenceType.valueOf(clusterProps.getString(PERSISTENCE_TYPE, PersistenceType.IN_MEMORY.toString()));
@@ -133,22 +135,31 @@ public class VeniceClusterConfig {
 
     this.regionName = RegionUtils.getLocalRegionName(clusterProps, false);
     LOGGER.info("Final region name for this node: {}", this.regionName);
-
-    String kafkaSecurityProtocolString =
-        clusterProps.getString(KAFKA_SECURITY_PROTOCOL, SecurityProtocol.PLAINTEXT.name());
-    if (!KafkaSSLUtils.isKafkaProtocolValid(kafkaSecurityProtocolString)) {
-      throw new ConfigurationException("Invalid kafka security protocol: " + kafkaSecurityProtocolString);
-    }
-    this.kafkaSecurityProtocol = SecurityProtocol.forName(kafkaSecurityProtocolString);
+    this.pubSubSecurityProtocol = PubSubUtil.getPubSubSecurityProtocolOrDefault(clusterProps);
 
     Int2ObjectMap<String> tmpKafkaClusterIdToUrlMap = new Int2ObjectOpenHashMap<>();
     Object2IntMap<String> tmpKafkaClusterUrlToIdMap = new Object2IntOpenHashMap<>();
     Int2ObjectMap<String> tmpKafkaClusterIdToAliasMap = new Int2ObjectOpenHashMap<>();
     Object2IntMap<String> tmpKafkaClusterAliasToIdMap = new Object2IntOpenHashMap<>();
-    Map<String, SecurityProtocol> tmpKafkaBootstrapUrlToSecurityProtocol = new HashMap<>();
+    Map<String, PubSubSecurityProtocol> tmpKafkaBootstrapUrlToSecurityProtocol = new HashMap<>();
     Map<String, String> tmpKafkaUrlResolution = new HashMap<>();
 
     boolean foundBaseKafkaUrlInMappingIfItIsPopulated = kafkaClusterMap.isEmpty();
+    /**
+     * The cluster ID, alias and kafka URL mappings are defined in the service config file
+     * so in order to support multiple cluster id mappings we pass them as separated entries
+     * for example, we can build a new cluster id with its alias and url
+     * <entry key="2">
+     *   <map>
+     *    <entry key="name" value="region1_sep"/>
+     *    <entry key="url" value="${venice.kafka.ssl.bootstrap.servers.region1}_sep"/>
+     *   </map>
+     * </entry>
+     *
+     * For the separate incremental push topic feature, we duplicate entries with "_sep" suffix and different cluster id
+     * to support two RT topics (regular rt and incremental rt) with different cluster id.
+     */
+
     for (Map.Entry<String, Map<String, String>> kafkaCluster: kafkaClusterMap.entrySet()) {
       int clusterId = Integer.parseInt(kafkaCluster.getKey());
       Map<String, String> mappings = kafkaCluster.getValue();
@@ -167,7 +178,7 @@ public class VeniceClusterConfig {
         tmpKafkaClusterUrlToIdMap.put(url, clusterId);
         tmpKafkaUrlResolution.put(url, url);
         if (securityProtocolString != null) {
-          tmpKafkaBootstrapUrlToSecurityProtocol.put(url, SecurityProtocol.valueOf(securityProtocolString));
+          tmpKafkaBootstrapUrlToSecurityProtocol.put(url, PubSubSecurityProtocol.valueOf(securityProtocolString));
         }
       }
       if (baseKafkaBootstrapServers.equals(url)) {
@@ -207,11 +218,11 @@ public class VeniceClusterConfig {
     /**
      * If the {@link kafkaClusterIdToUrlMap} and {@link kafkaClusterUrlToIdMap} are equal in size, then it means
      * that {@link KAFKA_CLUSTER_MAP_KEY_OTHER_URLS} was never specified in the {@link kafkaClusterMap}, in which
-     * case, the resolver needs not lookup anything, and it will always return the same as its input.
+     * case, the resolver needs not lookup anything, and it will always return the same input with potentially filtering
      */
     this.kafkaClusterUrlResolver = this.kafkaClusterIdToUrlMap.size() == this.kafkaClusterUrlToIdMap.size()
-        ? String::toString
-        : url -> kafkaUrlResolution.getOrDefault(url, url);
+        ? Utils::resolveKafkaUrlForSepTopic
+        : url -> Utils.resolveKafkaUrlForSepTopic(kafkaUrlResolution.getOrDefault(url, url));
     this.kafkaBootstrapServers = this.kafkaClusterUrlResolver.apply(baseKafkaBootstrapServers);
     if (this.kafkaBootstrapServers == null || this.kafkaBootstrapServers.isEmpty()) {
       throw new ConfigurationException("kafkaBootstrapServers can't be empty");
@@ -224,11 +235,8 @@ public class VeniceClusterConfig {
     }
     this.kafkaClusterUrlToAliasMap = Collections.unmodifiableMap(tmpKafkaClusterUrlToAliasMap);
 
-    if (!KafkaSSLUtils.isKafkaProtocolValid(kafkaSecurityProtocolString)) {
-      throw new ConfigurationException("Invalid kafka security protocol: " + kafkaSecurityProtocolString);
-    }
-    if (KafkaSSLUtils.isKafkaSSLProtocol(kafkaSecurityProtocolString)
-        || kafkaBootstrapUrlToSecurityProtocol.containsValue(SecurityProtocol.SSL)) {
+    if (PubSubUtil.isPubSubSslProtocol(pubSubSecurityProtocol)
+        || kafkaBootstrapUrlToSecurityProtocol.containsValue(PubSubSecurityProtocol.SSL)) {
       this.sslConfig = Optional.of(new SSLConfig(clusterProps));
     } else {
       this.sslConfig = Optional.empty();
@@ -260,9 +268,9 @@ public class VeniceClusterConfig {
     return kafkaBootstrapServers;
   }
 
-  public SecurityProtocol getKafkaSecurityProtocol(String kafkaBootstrapUrl) {
-    SecurityProtocol clusterSpecificSecurityProtocol = kafkaBootstrapUrlToSecurityProtocol.get(kafkaBootstrapUrl);
-    return clusterSpecificSecurityProtocol == null ? kafkaSecurityProtocol : clusterSpecificSecurityProtocol;
+  public PubSubSecurityProtocol getPubSubSecurityProtocol(String kafkaBootstrapUrl) {
+    PubSubSecurityProtocol clusterSpecificSecurityProtocol = kafkaBootstrapUrlToSecurityProtocol.get(kafkaBootstrapUrl);
+    return clusterSpecificSecurityProtocol == null ? pubSubSecurityProtocol : clusterSpecificSecurityProtocol;
   }
 
   public Optional<SSLConfig> getSslConfig() {
@@ -321,7 +329,7 @@ public class VeniceClusterConfig {
     return kafkaFetchQuotaUnorderedRecordPerSecond;
   }
 
-  public String getRegionName() {
+  public final String getRegionName() {
     return regionName;
   }
 
@@ -363,5 +371,28 @@ public class VeniceClusterConfig {
 
   public Map<String, Map<String, String>> getKafkaClusterMap() {
     return kafkaClusterMap;
+  }
+
+  /**
+   * @return pubsub position mapper
+   */
+  public PubSubPositionTypeRegistry getPubSubPositionTypeRegistry() {
+    return pubSubPositionTypeRegistry;
+  }
+
+  /**
+   *  For the separate incremental push topic feature, we need to resolve the cluster id to the original one for monitoring
+   *  purposes as the incremental push topic essentially uses the same pubsub clusters as the regular push topic, though
+   *  it appears to have a different cluster id
+   * @param clusterId
+   * @return
+   */
+  public int getEquivalentKafkaClusterIdForSepTopic(int clusterId) {
+    String alias = kafkaClusterIdToAliasMap.get(clusterId);
+    if (alias == null || !alias.endsWith(Utils.SEPARATE_TOPIC_SUFFIX)) {
+      return clusterId;
+    }
+    String originalAlias = alias.substring(0, alias.length() - Utils.SEPARATE_TOPIC_SUFFIX.length());
+    return kafkaClusterAliasToIdMap.getInt(originalAlias);
   }
 }

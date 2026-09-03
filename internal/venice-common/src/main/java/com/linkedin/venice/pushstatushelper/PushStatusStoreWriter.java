@@ -2,17 +2,20 @@ package com.linkedin.venice.pushstatushelper;
 
 import com.linkedin.venice.common.PushStatusStoreUtils;
 import com.linkedin.venice.pubsub.api.PubSubProduceResult;
+import com.linkedin.venice.pubsub.api.PubSubProducerCallback;
 import com.linkedin.venice.pushmonitor.ExecutionStatus;
 import com.linkedin.venice.pushstatus.PushStatusKey;
 import com.linkedin.venice.schema.SchemaEntry;
 import com.linkedin.venice.schema.writecompute.DerivedSchemaEntry;
 import com.linkedin.venice.utils.LatencyUtils;
+import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.writer.VeniceWriter;
 import com.linkedin.venice.writer.VeniceWriterFactory;
 import com.linkedin.venice.writer.update.UpdateBuilder;
 import com.linkedin.venice.writer.update.UpdateBuilderImpl;
 import java.util.Collections;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.Future;
 import org.apache.avro.Schema;
 import org.apache.logging.log4j.LogManager;
@@ -32,6 +35,20 @@ public class PushStatusStoreWriter implements AutoCloseable {
   private final int valueSchemaId;
   private final int derivedSchemaId;
   private final Schema updateSchema;
+
+  private static final PubSubProducerCallback PUSH_STATUS_UPDATE_LOGGER_CALLBACK = new PubSubProducerCallback() {
+    @Override
+    public void onCompletion(PubSubProduceResult produceResult, Exception exception) {
+      if (exception != null) {
+        LOGGER.error("Failed to update push status. Error: ", exception);
+      } else {
+        LOGGER.info(
+            "Updated push status into topic: {} at position: {}",
+            Utils.getReplicaId(produceResult.getTopic(), produceResult.getPartition()),
+            produceResult.getPubSubPosition());
+      }
+    }
+  };
 
   public PushStatusStoreWriter(
       VeniceWriterFactory writerFactory,
@@ -66,12 +83,25 @@ public class PushStatusStoreWriter implements AutoCloseable {
     writeHeartbeat(storeName, System.currentTimeMillis());
   }
 
+  /**
+   * This function will write `-1` to indicate the node is bootstrapping and Controller
+   * should ignore all the reports from this instance.
+   * @param storeName
+   */
+  public void writeHeartbeatForBootstrappingInstance(String storeName) {
+    writeHeartbeat(storeName, -1);
+  }
+
   public void writeHeartbeat(String storeName, long heartbeat) {
     VeniceWriter writer = veniceWriterCache.prepareVeniceWriter(storeName);
     PushStatusKey pushStatusKey = PushStatusStoreUtils.getHeartbeatKey(instanceName);
     UpdateBuilder updateBuilder = new UpdateBuilderImpl(updateSchema);
     updateBuilder.setNewFieldValue("reportTimestamp", heartbeat);
-    LOGGER.info("Sending heartbeat of {}", instanceName);
+    LOGGER.info(
+        "Sending heartbeat: {} with instance name: {} for push status store of: {}",
+        heartbeat,
+        instanceName,
+        storeName);
     writer.update(pushStatusKey, updateBuilder.build(), valueSchemaId, derivedSchemaId, null);
   }
 
@@ -111,6 +141,36 @@ public class PushStatusStoreWriter implements AutoCloseable {
         && incrementalPushPrefix.isPresent()) {
       addToSupposedlyOngoingIncrementalPushVersions(storeName, version, incrementalPushVersion.get(), status);
     }
+  }
+
+  /**
+   * This only works for "batch push" status update.
+   * Write one single push status for all partitions on this node, which assumes that all partitions are on the same
+   * state. The key only contains version number.
+   */
+  public void writeVersionLevelPushStatus(
+      String storeName,
+      int version,
+      ExecutionStatus status,
+      Set<Integer> partitionIds,
+      Optional<String> incrementalPushVersion) {
+    VeniceWriter writer = veniceWriterCache.prepareVeniceWriter(storeName);
+    PushStatusKey pushStatusKey = PushStatusStoreUtils.getPushKey(version, incrementalPushVersion);
+    UpdateBuilder updateBuilder = new UpdateBuilderImpl(updateSchema);
+    updateBuilder.setEntriesToAddToMapField("instances", Collections.singletonMap(instanceName, status.getValue()));
+    LOGGER.info(
+        "Updating pushStatus of {} to {}. Store: {}, version: {}, for all partition on this node: {}",
+        instanceName,
+        status,
+        storeName,
+        version,
+        partitionIds);
+    writer.update(
+        pushStatusKey,
+        updateBuilder.build(),
+        valueSchemaId,
+        derivedSchemaId,
+        PUSH_STATUS_UPDATE_LOGGER_CALLBACK);
   }
 
   // For storing ongoing incremental push versions, we are (re)using 'instances' field of the PushStatusValue record.

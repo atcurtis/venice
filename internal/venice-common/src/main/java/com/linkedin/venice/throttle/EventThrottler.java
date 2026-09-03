@@ -1,6 +1,7 @@
 package com.linkedin.venice.throttle;
 
 import com.linkedin.venice.exceptions.QuotaExceededException;
+import com.linkedin.venice.utils.RedundantExceptionFilter;
 import io.tehuti.metrics.MetricConfig;
 import io.tehuti.metrics.MetricsRepository;
 import io.tehuti.metrics.Quota;
@@ -30,7 +31,9 @@ import org.apache.logging.log4j.Logger;
  * This is a generalized IoThrottler as it existed before, which can be used to
  * throttle Bytes read or written, number of entries scanned, etc.
  */
-public class EventThrottler {
+public class EventThrottler implements VeniceRateLimiter {
+  private static final RedundantExceptionFilter REDUNDANT_EXCEPTION_FILTER =
+      RedundantExceptionFilter.getRedundantExceptionFilter();
   private static final Logger LOGGER = LogManager.getLogger(EventThrottler.class);
   private static final long DEFAULT_CHECK_INTERVAL_MS = TimeUnit.SECONDS.toMillis(30);
   private static final String THROTTLER_NAME = "event-throttler";
@@ -50,6 +53,13 @@ public class EventThrottler {
   private Sensor rateSensor = null;
   private MetricConfig rateConfig = null;
   private final EventThrottlingStrategy throttlingStrategy;
+
+  // Used only to compare if the new quota requests are different from the existing quota.
+  private long quota = -1;
+
+  public EventThrottler() {
+    this(1, DEFAULT_CHECK_INTERVAL_MS, null, false, BLOCK_STRATEGY);
+  }
 
   /**
    * @param maxRatePerSecond Maximum rate that this throttler should allow (-1 is unlimited)
@@ -158,16 +168,17 @@ public class EventThrottler {
     Validate.notNull(time);
     Validate.notNull(throttlingStrategy);
     this.time = time;
+    long maxRatePerSecond = maxRatePerSecondProvider.getAsLong();
+
+    if (maxRatePerSecond == 0) {
+      throw new IllegalArgumentException("Can not create throttler with 0 quotaPerSecond");
+    }
     this.maxRatePerSecondProvider = maxRatePerSecondProvider;
     this.throttlingStrategy = throttlingStrategy;
     this.enforcementIntervalMs = intervalMs;
     this.throttlerName = throttlerName != null ? throttlerName : THROTTLER_NAME;
     this.checkQuotaBeforeRecording = checkQuotaBeforeRecording;
-
-    long maxRatePerSecond = maxRatePerSecondProvider.getAsLong();
-    if (maxRatePerSecond >= 0) {
-      initialize(maxRatePerSecond);
-    }
+    initialize(maxRatePerSecond);
     LOGGER.debug("EventThrottler constructed with maxRatePerSecond: {}", getMaxRatePerSecond());
   }
 
@@ -202,22 +213,27 @@ public class EventThrottler {
       if (quota == 0) {
         sleepTimeMs = timeWindowMS;
       } else {
-        sleepTimeMs = Math.round(excessRate / quota * Time.MS_PER_SECOND);
+        sleepTimeMs = Math.min(Math.round(excessRate / quota * Time.MS_PER_SECOND), timeWindowMS * 5);
       }
-      LOGGER.debug(
-          "Throttler: {} quota exceeded:\ncurrentRate \t={}{}\nmaxRatePerSecond \t= {}{}\nexcessRate \t= {}{}\nsleeping for \t {} ms to compensate.\nrateConfig.timeWindowMs = {}",
-          throttlerName,
-          currentRate,
-          UNIT_POSTFIX,
-          quota,
-          UNIT_POSTFIX,
-          excessRate,
-          UNIT_POSTFIX,
-          sleepTimeMs,
-          timeWindowMS);
+      String msg = "Throttler: " + throttlerName;
+      if (!REDUNDANT_EXCEPTION_FILTER.isRedundantException(msg)) {
+        LOGGER.warn(
+            "Throttler: {} quota exceeded:\ncurrentRate \t={}{}\nmaxRatePerSecond \t= {}{}\nexcessRate \t= {}{}\nsleeping for \t {} ms to compensate.\nrateConfig.timeWindowMs = {}",
+            throttlerName,
+            currentRate,
+            UNIT_POSTFIX,
+            quota,
+            UNIT_POSTFIX,
+            excessRate,
+            UNIT_POSTFIX,
+            sleepTimeMs,
+            timeWindowMS);
+      }
       if (sleepTimeMs > timeWindowMS) {
         LOGGER.warn(
-            "Throttler: {} sleep time ({} ms) exceeds window size ({} ms). This will likely result in not being able to honor the rate limit accurately.",
+            "Throttler: With current rate {}, quota {}, {} sleep time ({} ms) exceeds window size ({} ms). This will likely result in not being able to honor the rate limit accurately.",
+            currentRate,
+            quota,
             throttlerName,
             sleepTimeMs,
             timeWindowMS);
@@ -278,5 +294,41 @@ public class EventThrottler {
 
   protected boolean isCheckQuotaBeforeRecording() {
     return checkQuotaBeforeRecording;
+  }
+
+  @Override
+  public boolean tryAcquirePermit(int units) {
+    if (getMaxRatePerSecond() < 0) {
+      return true;
+    }
+    long now = time.milliseconds();
+    try {
+      rateSensor.record(units, now);
+      return true;
+    } catch (QuotaViolationException e) {
+      return false;
+    }
+  }
+
+  @Override
+  public void setQuota(long quota) {
+    this.quota = quota;
+  }
+
+  @Override
+  public long getQuota() {
+    return quota;
+  }
+
+  public String getThrottlerName() {
+    return throttlerName;
+  }
+
+  @Override
+  public String toString() {
+    return "EventThrottler{" + "maxRatePerSecondProvider=" + maxRatePerSecondProvider + ", enforcementIntervalMs="
+        + enforcementIntervalMs + ", throttlerName='" + throttlerName + ", checkQuotaBeforeRecording="
+        + checkQuotaBeforeRecording + ", configuredMaxRatePerSecond=" + configuredMaxRatePerSecond + ", time=" + time
+        + ", throttlingStrategy=" + throttlingStrategy + '}';
   }
 }

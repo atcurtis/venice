@@ -11,32 +11,43 @@ public enum Arg {
   URL("url", "u", true, "Venice url, eg. http://localhost:1689  This can be a router or a controller"),
   SERVER_URL("server-url", "su", true, "Venice server url, eg. http://localhost:1690  This has to be a storage node"),
   VENICE_ZOOKEEPER_URL("venice-zookeeper-url", "vzu", true, "Venice Zookeeper url, eg. localhost:2622"),
+  SRC_ZOOKEEPER_URL("src-zookeeper-url", "szu", true, "Source Zookeeper url, eg. localhost:2181"),
+  DEST_ZOOKEEPER_URL("dest-zookeeper-url", "dzu", true, "Destination Zookeeper url, eg. localhost:2182"),
+  INFILE("infile", "if", true, "Path to input text file"), OUTFILE("outfile", "of", true, "Path to output text file"),
+  BASE_PATH("base-path", "bp", true, "Base path for ZK, eg. /venice-parent"),
   CLUSTER("cluster", "c", true, "Name of Venice cluster"),
   CLUSTER_SRC("cluster-src", "cs", true, "Store migration original Venice cluster name"),
   CLUSTER_DEST("cluster-dest", "cd", true, "Store migration destination Venice cluster name"),
+  CLUSTER_LIST("cluster-list", "cl", true, "Comma separated list of cluster names, eg. venice-0, venice-1, ..."),
   STORE("store", "s", true, "Name of Venice store"), STORES("stores", "sts", true, "Name of a group of Venice stores"),
   VERSION("version", "v", true, "Active store version number"),
   LARGEST_USED_VERSION_NUMBER(
       "largest-used-version", "luv", true, "Largest used store version number (whether active or not)"
-  ), PUSH_ID("push-id", "pid", true, "Push Id"),
+  ), LARGEST_USED_RT_VERSION_NUMBER("largest-used-rt-version", "lurtv", true, "Largest used RT store version number"),
+  PUSH_ID("push-id", "pid", true, "Push Id"),
   STORE_SIZE("store-size", "ss", true, "Size of the store in bytes, used to calculate partitioning"),
   KEY_SCHEMA("key-schema-file", "ks", true, "Path to text file with key schema"),
   VALUE_SCHEMA_ID("value-schema-id", "vid", true, "value schema id"),
   VALUE_SCHEMA("value-schema-file", "vs", true, "Path to text file with value schema"),
   ZK_SSL_CONFIG_FILE("zk-ssl-config-file", "zscf", true, "Path to text file with ZK SSL configs"),
-  DERIVED_SCHEMA_ID("derived-schema-id", "did", true, "derived schema id"),
+  SRC_ZK_SSL_CONFIG_FILE("src-zk-ssl-config-file", "szscf", true, "Path to text file with source ZK SSL configs"),
+  DEST_ZK_SSL_CONFIG_FILE(
+      "dest-zk-ssl-config-file", "dzscf", true, "Path to text file with destination ZK SSL configs"
+  ), DERIVED_SCHEMA_ID("derived-schema-id", "did", true, "derived schema id"),
   DERIVED_SCHEMA("derived-schema-file", "ds", true, "Path to text file with derived schema"),
   OWNER("owner", "o", true, "Owner email for new store creation"),
   STORAGE_NODE("storage-node", "n", true, "Helix instance ID for a storage node, eg. lva1-app1234_1690"),
   KEY("key", "k", true, "Plain-text key for identifying a record in a store"),
   OFFSET("offset", "of", true, "Kafka offset number"),
+  POSITION("position", "po", true, "<typeId:base64EncodedPositionWfBytes>"),
+  EXECUTION_ID("execution-id", "eid", true, "Execution ID of admin operation"),
   EXECUTION("execution", "e", true, "Execution ID of async admin command"),
   PARTITION_COUNT("partition-count", "pn", true, "number of partitions a store has"),
   PARTITIONER_CLASS("partitioner-class", "pc", true, "Name of chosen partitioner class"),
   PARTITIONER_PARAMS("partitioner-params", "pp", true, "Additional parameters for partitioner."),
   READABILITY("readability", "rb", true, "store's readability"),
   WRITEABILITY("writeability", "wb", true, "store's writeability"),
-  STORAGE_QUOTA("storage-quota", "sq", true, "maximum capacity a store version or storage persona could have"),
+  STORAGE_QUOTA("storage-quota", "sq", true, "maximum capacity a store version or storage persona could have in bytes"),
   STORAGE_NODE_READ_QUOTA_ENABLED(
       "storage-node-read-quota-enabled", "snrqe", true, "whether storage node read quota is enabled for this store"
   ),
@@ -92,6 +103,10 @@ public enum Arg {
   ),
   INCREMENTAL_PUSH_ENABLED(
       "incremental-push-enabled", "ipe", true, "a flag to see if the store supports incremental push or not"
+  ),
+  SEPARATE_REALTIME_TOPIC_ENABLED(
+      "separate-realtime-topic-enabled", "srte", true,
+      "a flag to see if the store supports separate real-time topic or not"
   ), BATCH_GET_LIMIT("batch-get-limit", "bgl", true, "Key number limit inside one batch-get request"),
   NUM_VERSIONS_TO_PRESERVE("num-versions-to-preserve", "nvp", true, "Number of version that store should preserve."),
   KAFKA_BOOTSTRAP_SERVERS("kafka-bootstrap-servers", "kbs", true, "Kafka bootstrap server URL(s)"),
@@ -105,8 +120,14 @@ public enum Arg {
   ),
   VENICE_CLIENT_SSL_CONFIG_FILE(
       "venice-client-ssl-config-file", "vcsc", true, "Configuration file for querying key in Venice client through SSL."
-  ), STARTING_OFFSET("starting_offset", "so", true, "Starting offset when dumping admin messages, inclusive"),
-  MESSAGE_COUNT("message_count", "mc", true, "Max message count when dumping admin messages"),
+  ),
+  STARTING_POSITION(
+      "starting_position", "sp", true, "Starting <typeId:base64EncodedPositionWfBytes> when dumping messages, inclusive"
+  ),
+  STARTING_OFFSET(
+      "starting_offset", "so", true,
+      "Starting offset when dumping messages, inclusive. Accepts a numeric offset, 'earliest', or 'latest'"
+  ), MESSAGE_COUNT("message_count", "mc", true, "Max message count when dumping messages"),
   PARENT_DIRECTORY(
       "parent_output_directory", "pod", true,
       "A directory where output can be dumped to.  If dumping a kafka topic, the output will be dumped under this directory."
@@ -126,6 +147,24 @@ public enum Arg {
       "backup-strategy", "bus", true,
       "Strategies to preserve backup versions, eg KEEP_MIN_VERSIONS, DELETE_ON_NEW_PUSH_START. Default is KEEP_MIN_VERSIONS"
   ),
+  INGESTION_PAUSE_MODE(
+      "ingestion-pause-mode", "ipm", true, "Ingestion pause mode. Values: NOT_PAUSED, CURRENT_VERSION, ALL_VERSIONS"
+  ),
+  INGESTION_PAUSED_REGIONS(
+      "ingestion-paused-regions", "ipr", true,
+      "Comma-separated list of fabrics to pause (e.g. prod-lor1,prod-ltx1). Empty = all regions"
+  ),
+  STORAGE_MODE(
+      "storage-mode", "smd", true,
+      "Per-version storage mode controlling where data is persisted. Values: INTERNAL, DUAL_WRITE, EXTERNAL. "
+          + "Applied to all existing versions of the store; combine with --regions-filter to scope by region."
+  ),
+  EXTERNAL_STORAGE_READ_MODE(
+      "external-storage-read-mode", "esrm", true,
+      "Store-level read routing across Venice and external storage. "
+          + "Values: VENICE_ONLY, DUAL_MODE_CONSISTENCY_CHECK, DUAL_MODE_EARLY_RETURN, EXTERNAL_ONLY. "
+          + "Combine with --regions-filter to scope by region."
+  ),
   AUTO_SCHEMA_REGISTER_FOR_PUSHJOB_ENABLED(
       "auto-schema-register-push-job-enabled", "asp", true, "whether or not to use auto-schema register for pushjob"
   ),
@@ -140,6 +179,14 @@ public enum Arg {
       "etled-proxy-user-account", "epu", true,
       "if enabled ETL, the proxy user account for HDFS file directory where the ETLed snapshots will go."
   ),
+  VENICE_ETL_STRATEGY(
+      "venice-etl-strategy", "ves", true,
+      "ETL strategy for this store. Supported strategies are: EXTERNAL_SERVICE, EXTERNAL_WITH_VENICE_TRIGGER. Default is EXTERNAL_SERVICE."
+  ),
+  ETL_ACTIVE_FABRICS(
+      "etl-active-fabrics", "eaf", true,
+      "Comma-separated list of fabrics where ETL onboard/offboard fires. Omit to fire in every fabric (default). Otherwise must be a non-empty list. To disable ETL entirely, use --regular-version-etl-enabled=false and --future-version-etl-enabled=false."
+  ),
   BACKUP_VERSION_RETENTION_DAY(
       "backup-version-retention-day", "bvrd", true,
       "Backup version retention time in day after a new version is promoted to the current version, if not specified, Venice will use the configured retention as the default policy"
@@ -148,6 +195,7 @@ public enum Arg {
   FLAT_JSON("flat-json", "flj", false, "Display output as flat json, without pretty-print indentation and line breaks"),
   HELP("help", "h", false, "Show usage"), FORCE("force", "f", false, "Force execute this operation"),
   INCLUDE_SYSTEM_STORES("include-system-stores", "iss", true, "Include internal stores maintained by the system."),
+  LOOK_BACK_MS("look-back-ms", "lbms", true, "Look back time in milliseconds for dead store detection"),
   SSL_CONFIG_PATH("ssl-config-path", "scp", true, "SSl config file path"),
   STORE_TYPE(
       "store-type", "st", true,
@@ -169,6 +217,8 @@ public enum Arg {
   LOG_METADATA("log-metadata", "lm", false, "Log the metadata for each kafka message on console"),
   LOG_DATA_RECORD("log-data-record", "ldr", false, "Log the data record for each kafka message on console"),
   LOG_RMD_RECORD("log-rmd-record", "lrr", false, "Log the RMD record for each kafka message on console"),
+  LOG_TS_RECORD("log-ts-record", "lts", false, "Log the topic switch message on console"),
+  LOG_HEADERS("log-headers", "lh", false, "Log the PubSub headers for each control message on console"),
   NATIVE_REPLICATION_SOURCE_FABRIC(
       "native-replication-source-fabric", "nrsf", true,
       "The source fabric name to be used in native replication. Remote consumption will happen from kafka in this fabric."
@@ -206,6 +256,13 @@ public enum Arg {
   KAFKA_TOPIC_RETENTION_IN_MS(
       "kafka-topic-retention-in-ms", "ktrim", true, "Kafka topic retention time in milliseconds"
   ), KAFKA_TOPIC_MIN_IN_SYNC_REPLICA("kafka-topic-min-in-sync-replica", "ktmisr", true, "Kafka topic minISR config"),
+  KAFKA_RT_TOPICS_MIN_IN_SYNC_REPLICAS(
+      "kafka-rt-topic-min-in-sync-replica", "krtmisr", true, "Kafka topic rt minISR config"
+  ),
+  KAFKA_TOPIC_UNCLEAN_LEADER_ELECTION_ENABLED(
+      "kafka-topic-unclean-leader-election-enabled", "ktulee", true,
+      "Enable/disable Kafka unclean leader election for a topic"
+  ),
   CHILD_CONTROLLER_ADMIN_TOPIC_CONSUMPTION_ENABLED(
       ConfigKeys.CHILD_CONTROLLER_ADMIN_TOPIC_CONSUMPTION_ENABLED, "atc", true,
       "whether child controller consumes admin topic"
@@ -213,14 +270,21 @@ public enum Arg {
   SYSTEM_STORE_TYPE(
       "system-store-type", "sst", true,
       "Type of system store to backfill. Supported types are davinci_push_status_store and meta_store"
-  ), RETRY("retry", "r", false, "Retry this operation"),
+  ), TASK_NAME("task-name", "tn", true, "Name of the task for cluster command. Supported command [PushSystemStore]."),
+  CHECKPOINT_FILE("checkpoint-file", "cf", true, "Checkpoint file path for cluster command."),
+  STORE_FILTER_FILE(
+      "store-filter-file", "sff", true,
+      "Store filter file path for cluster command. By default we will be performing cluster operation on the intersection of this file and stores in the cluster."
+  ), THREAD_COUNT("thread-count", "tc", true, "Number of threads to execute. 1 if not specified"),
+  RETRY("retry", "r", false, "Retry this operation"),
   DISABLE_LOG("disable-log", "dl", false, "Disable logs from internal classes. Only print command output on console"),
   STORE_VIEW_CONFIGS(
       "storage-view-configs", "svc", true,
-      "Config that describes views to be added for a store.  Input is a json map.  Example: {\"ExampleView\": {\"viewClassName\": \"com.linkedin.venice.views.ChangeCaptureView\",\"params\": {}}}"
+      "Config that describes views to be added for a store.  Input is a json map.  Example: {\"ExampleView\": {\"viewClassName\": \"com.linkedin.venice.views.MaterializedView\",\"params\": {}}}"
   ), VIEW_NAME("view-name", "vn", true, "Name of a store view"),
   VIEW_CLASS("view-class", "vc", true, "Name of a store view class"),
   VIEW_PARAMS("view-params", "vp", true, "Additional parameter map of a store view class"),
+  FLINK_VENICE_VIEWS_ENABLED("flink-venice-views-enabled", "fvve", true, "Enable flink-based views"),
   REMOVE_VIEW("remove-view", "rv", false, "Optional config to specify to disable certain store view"),
   PARTITION_DETAIL_ENABLED(
       "partition-detail-enabled", "pde", true, "A flag to indicate whether to retrieve partition details"
@@ -235,11 +299,44 @@ public enum Arg {
   EXTRA_COMMAND_ARGS("extra-command-args", "eca", true, "extra command arguments"),
   ENABLE_DISABLED_REPLICA("enable-disabled-replicas", "edr", true, "Reenable disabled replicas"),
   NON_INTERACTIVE("non-interactive", "nita", false, "non-interactive mode"),
+  ENABLE_COMPACTION("enable-compaction", "ec", true, "Enable compaction"),
+  COMPACTION_THRESHOLD_MILLISECONDS(
+      "compaction-threshold-milliseconds", "ctms", true, "Set compaction threshold in milliseconds"
+  ),
+  PUB_SUB_ENCRYPTION_KEY_URN(
+      "pub-sub-encryption-key-urn", "psekurn", true, "Set the PubSub encryption key URN for an encryption-enabled store"
+  ),
   MIN_COMPACTION_LAG_SECONDS(
       "min-compaction-lag-seconds", "mcls", true, "Min compaction lag seconds for version topic of hybrid stores"
   ),
   MAX_COMPACTION_LAG_SECONDS(
       "max-compaction-lag-seconds", "mxcls", true, "Max compaction lag seconds for version topic of hybrid stores"
+  ),
+  MAX_RECORD_SIZE_BYTES(
+      "max-record-size-bytes", "mrsb", true,
+      "Store-level max record size for VeniceWriter to determine whether to fail batch push jobs. This setting can potentially converge with the nearline setting in the future."
+  ),
+  MAX_NEARLINE_RECORD_SIZE_BYTES(
+      "max-nearline-record-size-bytes", "mnrsb", true,
+      "Store-level max record size for VeniceWriter to determine whether to pause consumption on nearline jobs with partial updates."
+  ),
+  VENICE_UNITS(
+      "venice-units", "vu", true,
+      "Store-level forecasted Venice Units (VU) capacity ask, derived from the store-needs-estimation process. "
+          + "Pass 'null' to clear the config; omit the flag to leave it unchanged."
+  ),
+  WORKLOAD_TYPE(
+      "workload-type", "wlt", true,
+      "Store-level requested class of service. Values: GENERIC, LOW_LATENCY. "
+          + "Pass 'null' to clear the config; omit the flag to leave it unchanged."
+  ),
+  THROUGHPUT_QUOTA_IN_BYTES(
+      "throughput-quota-in-bytes", "tqib", true,
+      "Store-level nearline write quota: maximum throughput in bytes clients can produce into the store. -1 means no limit."
+  ),
+  THROUGHPUT_QUOTA_IN_RECORDS(
+      "throughput-quota-in-records", "tqir", true,
+      "Store-level nearline write quota: maximum throughput in records clients can produce into the store. -1 means no limit."
   ), UNUSED_SCHEMA_DELETION_ENABLED("enable-unused-schema-deletion", "usde", true, "Enable unused schema deletion"),
   PARTITION("partition", "p", true, "Partition Id"),
   INTERVAL(
@@ -255,9 +352,49 @@ public enum Arg {
   ), RECOVER_CLUSTER("recover-cluster", "rc", true, "Cluster to recover from"),
   BACKUP_FOLDER("backup-folder", "bf", true, "Backup folder path"),
   DEBUG("debug", "d", false, "Print debugging messages for execute-data-recovery"),
-  BLOB_TRANSFER_ENABLED(
-      "blob-transfer-enabled", "bt", false, "Flag to indicate if the blob transfer is allowed or not"
-  );
+  BLOB_TRANSFER_ENABLED("blob-transfer-enabled", "bt", true, "Flag to indicate if the blob transfer is allowed or not"),
+  BLOB_TRANSFER_IN_SERVER_ENABLED(
+      "blob-transfer-in-server-enabled", "bts", true,
+      "Flag to indicate if the blob transfer is allowed or not in server. Values can be 'NOT_SPECIFIED' as default, 'ENABLED', or 'DISABLED'."
+  ),
+  BLOB_DB_ENABLED(
+      "blob-db-enabled", "bdb", true,
+      "Flag to indicate if the RocksDB BlobDB feature is enabled or not. Values can be 'NOT_SPECIFIED' (default, follows cluster level config), 'ENABLED', or 'DISABLED'."
+  ),
+  NEARLINE_PRODUCER_COMPRESSION_ENABLED(
+      "nearline-producer-compression-enabled", "npce", true,
+      "Flag to control whether KafkaProducer will use compression or not for nearline workload"
+  ),
+  NEARLINE_PRODUCER_COUNT_PER_WRITER(
+      "nearline-producer-count-per-writer", "npcpw", true,
+      "How many producers will be used to write nearline workload in Server"
+  ), INSTANCES("instances", "in", true, "Input list of helix ids of nodes to check if they can removed or not"),
+  TO_BE_STOPPED_NODES("to-be-stopped-nodes", "tbsn", true, "List of helix ids of nodes assumed to be stopped"),
+  LAG_FILTER_ENABLED("lag-filter-enabled", "lfe", true, "Enable heartbeat lag filter for a heartbeat request"),
+  TARGET_SWAP_REGION("target-region-swap", "trs", true, "Region to swap current version during target colo push"),
+  TARGET_SWAP_REGION_WAIT_TIME(
+      "target-region-swap-wait-time", "trswt", true,
+      "How long to wait in minutes before swapping to the new version in a target colo push"
+  ),
+  DAVINCI_HEARTBEAT_REPORTED(
+      "dvc-heartbeat-reported", "dvchb", true, "Flag to indicate whether DVC is bootstrapping and sending heartbeats"
+  ), ENABLE_STORE_MIGRATION("enable-store-migration", "esm", true, "Toggle store migration store config"),
+  ADMIN_OPERATION_PROTOCOL_VERSION(
+      "admin-operation-protocol-version", "aopv", true, "Admin operation protocol version"
+  ),
+  STORES_TO_REPLICATE(
+      "stores-to-replicate", "str", true,
+      "Comma separated list of stores to be replicated to dark cluster, eg. store1,store2,..."
+  ), GLOBAL_RT_DIV_ENABLED("global-rt-div-enabled", "grde", true, "Enable Global RT DIV for a store"),
+  TTL_REPUSH_ENABLED("ttl-repush-enabled", "ttlr", true, "Enable TTL repush for a store"),
+  ENUM_SCHEMA_EVOLUTION_ALLOWED(
+      "enum-schema-evolution-allowed", "esea", true, "Allow enum schema evolution for a store"
+  ), INITIAL_STEP("initial-step", "is", true, "Initial step of the auto store migration"),
+  ABORT_ON_FAILURE("abort-on-failure", "aof", true, "Abort the auto store migration if any step fails"),
+  PAUSE_AFTER_STEP("pause-after-step", "pas", true, "Pause the auto store migration after this step"),
+  STORE_LIFECYCLE_HOOKS_LIST("store-lifecycle-hooks-list", "slhl", true, "List of store lifecycle hooks"),
+  GRPC_PORT("grpc-port", "gp", true, "gRPC port on the target Venice server"),
+  INTERVAL_MS("interval-ms", "ims", true, "Monitoring interval in milliseconds (default: 5000, minimum: 1000)");
 
   private final String argName;
   private final String first;

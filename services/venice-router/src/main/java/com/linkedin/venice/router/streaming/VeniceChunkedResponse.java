@@ -47,7 +47,6 @@ import java.nio.ByteBuffer;
 import java.nio.channels.ClosedChannelException;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Queue;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -96,7 +95,7 @@ public class VeniceChunkedResponse {
   private final String storeName;
   private final RequestType requestType;
   private final RouterStats<AggRouterHttpRequestStats> routerStats;
-  private final Optional<Map<CharSequence, String>> optionalHeaders;
+  private final String clientComputeHeader;
   private final ChannelHandlerContext ctx;
   private final VeniceChunkedWriteHandler chunkedWriteHandler;
   private final ChannelProgressivePromise writeFuture;
@@ -137,11 +136,11 @@ public class VeniceChunkedResponse {
       ChannelHandlerContext ctx,
       VeniceChunkedWriteHandler handler,
       RouterStats<AggRouterHttpRequestStats> routerStats,
-      Optional<Map<CharSequence, String>> optionalHeaders) {
+      String clientComputeHeader) {
     this.storeName = storeName;
     this.requestType = requestType;
     this.routerStats = routerStats;
-    this.optionalHeaders = optionalHeaders;
+    this.clientComputeHeader = clientComputeHeader;
     if (!requestType.equals(RequestType.MULTI_GET_STREAMING) && !requestType.equals(RequestType.COMPUTE_STREAMING)) {
       throw new VeniceException(
           "Unexpected request type for streaming: " + requestType + ", and currently only"
@@ -290,7 +289,9 @@ public class VeniceChunkedResponse {
       // Send out response metadata
       Map<CharSequence, String> headers =
           new HashMap<>(isMultiGetStreaming ? MULTI_GET_VALID_HEADER_MAP : COMPUTE_VALID_HEADER_MAP);
-      optionalHeaders.ifPresent(headers::putAll);
+      if (this.clientComputeHeader != null) {
+        headers.put(HttpConstants.VENICE_CLIENT_COMPUTE, clientComputeHeader);
+      }
       headers.put(HttpConstants.VENICE_COMPRESSION_STRATEGY, Integer.toString(compression.getValue()));
       ChannelPromise writePromise = ctx.newPromise().addListener(new ResponseMetadataWriteListener());
       chunkedWriteHandler.write(ctx, new StreamingResponseMetadata(headers), writePromise);
@@ -502,10 +503,21 @@ public class VeniceChunkedResponse {
      */
     @Override
     public void operationProgressed(ChannelProgressiveFuture future, long progress, long total) {
-      while (chunksAwaitingCallback.peek() != null
-          && progress >= chunksAwaitingCallback.peek().writeCompleteThreshold) {
-        chunksAwaitingCallback.poll().resolveChunk(null);
-      }
+      /**
+       * The netty version being used doesn't seem to provide the progress correctly when H2 is enabled, so we are not going
+       * to release any chunks here, but until the full write is complete.
+       *
+       * If we release the chunks early while the underlying write is still in progress, Router would end up
+       * with such exception:
+       * io.netty.util.IllegalReferenceCountException: refCnt: 0
+       *         at io.netty.buffer.AbstractByteBuf.ensureAccessible(AbstractByteBuf.java:1489) ~[io.netty.netty-all-4.1.52.Final.jar:4.1.52.Final]
+       *         at io.netty.buffer.AbstractByteBuf.checkReadableBytes0(AbstractByteBuf.java:1475) ~[io.netty.netty-all-4.1.52.Final.jar:4.1.52.Final]
+       *         at io.netty.buffer.AbstractByteBuf.checkReadableBytes(AbstractByteBuf.java:1463) ~[io.netty.netty-all-4.1.52.Final.jar:4.1.52.Final]
+       *         at io.netty.buffer.AbstractByteBuf.readRetainedSlice(AbstractByteBuf.java:888) ~[io.netty.netty-all-4.1.52.Final.jar:4.1.52.Final]
+       *         at io.netty.handler.codec.http2.DefaultHttp2FrameWriter.writeData(DefaultHttp2FrameWriter.java:158) [io.netty.netty-all-4.1.52.Final.jar:4.1.52.Final]
+       *         at io.netty.handler.codec.http2.Http2OutboundFrameLogger.writeData(Http2OutboundFrameLogger.java:44) [io.netty.netty-all-4.1.52.Final.jar:4.1.52.Final]
+       *         at io.netty.handler.codec.http2.DefaultHttp2ConnectionEncoder$FlowControlledData.write(DefaultHttp2ConnectionEncoder.java:508) [io.netty.netty-all-4.1.52.Final.jar:4.1.52.Final]
+       */
     }
 
     /**
@@ -563,8 +575,6 @@ public class VeniceChunkedResponse {
     final boolean isLast;
     /** bytes to be writen for this chunk */
     final long bytesToBeWritten;
-    /** threshold to decide whether this chunk is done or not */
-    final long writeCompleteThreshold;
 
     public Chunk(ByteBuf buffer, boolean isLast, StreamingCallback<Long> streamingCallback) {
       this.buffer = buffer;
@@ -572,7 +582,7 @@ public class VeniceChunkedResponse {
       this.callback = streamingCallback;
 
       this.bytesToBeWritten = buffer.readableBytes();
-      this.writeCompleteThreshold = totalBytesReceived.addAndGet(bytesToBeWritten);
+      totalBytesReceived.addAndGet(bytesToBeWritten);
     }
 
     /**
@@ -637,11 +647,17 @@ public class VeniceChunkedResponse {
       if (chunk != null) {
         progress.addAndGet(chunk.buffer.readableBytes());
         chunksAwaitingCallback.add(chunk);
+        /**
+         * Retain the buffer before passing to Netty. Netty will release the buffer after the write
+         * completes (success or failure), and we also release it in resolveChunk(). Without retain(),
+         * this would cause IllegalReferenceCountException when client disconnects abruptly and both
+         * Netty cleanup and resolveChunk() try to release the same buffer.
+         */
         if (chunk.isLast) {
-          content = new DefaultLastHttpContent(chunk.buffer);
+          content = new DefaultLastHttpContent(chunk.buffer.retain());
           sentLastChunk = true;
         } else {
-          content = new DefaultHttpContent(chunk.buffer);
+          content = new DefaultHttpContent(chunk.buffer.retain());
         }
       }
       return content;

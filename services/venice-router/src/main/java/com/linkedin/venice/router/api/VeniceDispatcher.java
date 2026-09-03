@@ -32,6 +32,7 @@ import com.linkedin.venice.router.streaming.VeniceChunkedResponse;
 import com.linkedin.venice.router.throttle.PendingRequestThrottler;
 import com.linkedin.venice.utils.LatencyUtils;
 import com.linkedin.venice.utils.Pair;
+import com.linkedin.venice.utils.RedundantExceptionFilter;
 import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import io.netty.buffer.ByteBuf;
@@ -44,12 +45,12 @@ import io.tehuti.metrics.MetricsRepository;
 import java.io.IOException;
 import java.util.Collections;
 import java.util.List;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.locks.ReentrantLock;
+import java.util.stream.Collectors;
 import javax.annotation.Nonnull;
 import org.apache.http.HttpHeaders;
 import org.apache.http.HttpStatus;
@@ -59,6 +60,16 @@ import org.apache.logging.log4j.Logger;
 
 public final class VeniceDispatcher implements PartitionDispatchHandler4<Instance, VenicePath, RouterKey> {
   private static final Logger LOGGER = LogManager.getLogger(VeniceDispatcher.class);
+  /**
+   * Prefix for slow multiget request log throttling identifier.
+   * Combined with store name to create unique throttling keys per store.
+   */
+  private static final String SLOW_MULTIGET_REQUEST_LOG_PREFIX = "SLOW_MULTIGET_REQUEST_";
+  /**
+   * Singleton filter for throttling redundant slow request logs to prevent log spamming.
+   */
+  private static final RedundantExceptionFilter REDUNDANT_LOG_FILTER =
+      RedundantExceptionFilter.getRedundantExceptionFilter();
   /**
    * This map is used to capture all the {@link CompletableFuture} returned by {@link #storageNodeClient},
    * and it is used to clean up the leaked futures in {@link LeakedCompletableFutureCleanupService}.
@@ -84,6 +95,7 @@ public final class VeniceDispatcher implements PartitionDispatchHandler4<Instanc
 
   private final AggHostHealthStats aggHostHealthStats;
   private final long routerUnhealthyPendingConnThresholdPerRoute;
+  private final long slowScatterRequestThresholdMs;
 
   private final boolean isStatefulHealthCheckEnabled;
 
@@ -102,6 +114,7 @@ public final class VeniceDispatcher implements PartitionDispatchHandler4<Instanc
       RouterStats<AggRouterHttpRequestStats> routerStats) {
     this.routerConfig = config;
     this.routerUnhealthyPendingConnThresholdPerRoute = routerConfig.getRouterUnhealthyPendingConnThresholdPerRoute();
+    this.slowScatterRequestThresholdMs = routerConfig.getSlowScatterRequestThresholdMs();
     this.isStatefulHealthCheckEnabled = routerConfig.isStatefulRouterHealthCheckEnabled();
     this.storeRepository = storeRepository;
     this.routeHttpRequestStats = routeHttpRequestStats;
@@ -114,6 +127,10 @@ public final class VeniceDispatcher implements PartitionDispatchHandler4<Instanc
     this.leakedCompletableFutureCleanupService = new LeakedCompletableFutureCleanupService();
     this.leakedCompletableFutureCleanupService.start();
     this.routerStats = routerStats;
+  }
+
+  public RouterStats<RouteHttpStats> getPerRouteStatsByType() {
+    return perRouteStatsByType;
   }
 
   @Override
@@ -133,8 +150,8 @@ public final class VeniceDispatcher implements PartitionDispatchHandler4<Instanc
 
     if (part.getHosts().size() != 1) {
       throw RouterExceptionAndTrackingUtils.newRouterExceptionAndTracking(
-          Optional.of(storeName),
-          Optional.of(requestType),
+          storeName,
+          requestType,
           INTERNAL_SERVER_ERROR,
           "There should be only one chosen replica for the request: " + part);
     }
@@ -142,9 +159,21 @@ public final class VeniceDispatcher implements PartitionDispatchHandler4<Instanc
     Instance storageNode = part.getHosts().get(0);
     hostSelected.setSuccess(storageNode);
 
+    // Track dispatch start time for slow request logging
+    long dispatchStartTimeNs = System.nanoTime();
+
     // sendRequest completes future either immediately in the calling thread context or on the executor
     sendRequest(storageNode, path, retryFuture).whenComplete((response, throwable) -> {
       try {
+        // Log slow scatter requests to help debug high P99 latency (with throttling to prevent log spamming)
+        double elapsedTimeMs = LatencyUtils.getElapsedTimeFromNSToMS(dispatchStartTimeNs);
+        if (elapsedTimeMs > slowScatterRequestThresholdMs && RequestType.isStreaming(requestType)) {
+          String throttleKey = SLOW_MULTIGET_REQUEST_LOG_PREFIX + storeName;
+          if (!REDUNDANT_LOG_FILTER.isRedundantException(throttleKey)) {
+            logSlowScatterRequest(path, part, storageNode, elapsedTimeMs, response, throwable);
+          }
+        }
+
         int statusCode = response != null ? response.getStatusCode() : HttpStatus.SC_INTERNAL_SERVER_ERROR;
         if (!retryFuture.isCancelled() && RETRIABLE_ERROR_CODES.contains(statusCode)) {
           retryFuture.setSuccess(HttpResponseStatus.valueOf(statusCode));
@@ -157,7 +186,8 @@ public final class VeniceDispatcher implements PartitionDispatchHandler4<Instanc
           throw throwable;
         }
 
-        if (statusCode < HttpStatus.SC_INTERNAL_SERVER_ERROR) {
+        // Do not mark storage node fast for 429 status code
+        if (statusCode < HttpStatus.SC_INTERNAL_SERVER_ERROR && statusCode != HttpStatus.SC_TOO_MANY_REQUESTS) {
           path.markStorageNodeAsFast(storageNode.getNodeId());
         }
 
@@ -189,8 +219,8 @@ public final class VeniceDispatcher implements PartitionDispatchHandler4<Instanc
       AggRouterHttpRequestStats stats = routerStats.getStatsByType(requestType);
       stats.recordRequestThrottledByRouterCapacity(storeName);
       throw RouterExceptionAndTrackingUtils.newRouterExceptionAndTracking(
-          Optional.of(storeName),
-          Optional.of(requestType),
+          storeName,
+          requestType,
           SERVICE_UNAVAILABLE,
           "Maximum number of pending request threshold reached! Current pending request count: "
               + pendingRequestThrottler.getCurrentPendingRequestCount());
@@ -215,8 +245,8 @@ public final class VeniceDispatcher implements PartitionDispatchHandler4<Instanc
           return responseFuture;
         } else {
           throw RouterExceptionAndTrackingUtils.newRouterExceptionAndTracking(
-              Optional.of(storeName),
-              Optional.of(requestType),
+              storeName,
+              requestType,
               SERVICE_UNAVAILABLE,
               "Too many pending request to storage node : " + hostName);
         }
@@ -301,8 +331,8 @@ public final class VeniceDispatcher implements PartitionDispatchHandler4<Instanc
             break;
           default:
             throw RouterExceptionAndTrackingUtils.newVeniceExceptionAndTracking(
-                Optional.empty(),
-                Optional.empty(),
+                null,
+                null,
                 INTERNAL_SERVER_ERROR,
                 "Unknown request type: " + path.getRequestType());
         }
@@ -351,6 +381,57 @@ public final class VeniceDispatcher implements PartitionDispatchHandler4<Instanc
         .set(HttpHeaderNames.CONTENT_TYPE, HttpConstants.TEXT_PLAIN)
         .set(HttpHeaderNames.CONTENT_LENGTH, content.readableBytes());
     return response;
+  }
+
+  /**
+   * Logs detailed information about slow scatter requests to help debug high P99 latency issues.
+   * This method is called when a scatter request takes longer than the configured threshold.
+   *
+   * @param path the Venice path containing store and version information
+   * @param part the scatter gather request part containing partition keys
+   * @param storageNode the storage node that the request was sent to
+   * @param elapsedTimeMs the time taken for the request in milliseconds
+   * @param response the response from the storage node (may be null if there was an error)
+   * @param throwable any exception that occurred during the request (may be null)
+   */
+  private void logSlowScatterRequest(
+      VenicePath path,
+      ScatterGatherRequest<Instance, RouterKey> part,
+      Instance storageNode,
+      double elapsedTimeMs,
+      PortableHttpResponse response,
+      Throwable throwable) {
+    try {
+      String storeName = path.getStoreName();
+      int version = path.getVersionNumber();
+      boolean isRetry = path.isRetryRequest();
+      String serverNodeId = storageNode.getNodeId();
+
+      // Collect unique partition IDs from the scatter request
+      Set<Integer> partitionIds = part.getPartitionKeys()
+          .stream()
+          .filter(RouterKey::hasPartitionId)
+          .map(RouterKey::getPartitionId)
+          .collect(Collectors.toSet());
+
+      int statusCode = response != null ? response.getStatusCode() : -1;
+      String errorMessage = throwable != null ? throwable.getMessage() : "none";
+
+      LOGGER.warn(
+          "Slow scatter request detected - store: {}, version: {}, partitions: {}, "
+              + "isRetryRequest: {}, serverNode: {}, elapsedTimeMs: {}, statusCode: {}, error: {}",
+          storeName,
+          version,
+          partitionIds,
+          isRetry,
+          serverNodeId,
+          String.format("%.2f", elapsedTimeMs),
+          statusCode,
+          errorMessage);
+    } catch (Exception e) {
+      // Don't let logging errors affect request processing
+      LOGGER.error("Failed to log slow scatter request", e);
+    }
   }
 
   public void stop() {

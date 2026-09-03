@@ -1,0 +1,499 @@
+package com.linkedin.venice.meta;
+
+import static com.linkedin.venice.utils.ConfigCommonUtils.ActivationState;
+import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertNull;
+import static org.testng.Assert.assertThrows;
+import static org.testng.Assert.assertTrue;
+
+import com.linkedin.venice.exceptions.VeniceException;
+import com.linkedin.venice.systemstore.schemas.StoreETLConfig;
+import com.linkedin.venice.systemstore.schemas.StoreHybridConfig;
+import com.linkedin.venice.systemstore.schemas.StorePartitionerConfig;
+import com.linkedin.venice.systemstore.schemas.StoreProperties;
+import com.linkedin.venice.systemstore.schemas.StoreViewConfig;
+import com.linkedin.venice.systemstore.schemas.SystemStoreProperties;
+import com.linkedin.venice.utils.TestUtils;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.testng.annotations.BeforeClass;
+import org.testng.annotations.Test;
+
+
+public class ReadOnlyStoreTest {
+  private static final Logger LOGGER = LogManager.getLogger(ReadOnlyStoreTest.class);
+
+  private Random RANDOM;
+
+  @BeforeClass
+  public void setupReadOnlyStore() {
+    long seed = System.nanoTime();
+    RANDOM = new Random(seed);
+    LOGGER.info("Random seed set: {}", seed);
+  }
+
+  @Test
+  public void testCloneStoreProperties() {
+
+    ZKStore store = TestUtils.populateZKStore(
+        (ZKStore) TestUtils.createTestStore(
+            Long.toString(RANDOM.nextLong()),
+            Long.toString(RANDOM.nextLong()),
+            System.currentTimeMillis()),
+        RANDOM);
+
+    List<LifecycleHooksRecord> storeLifecycleHooks = new ArrayList<>();
+    storeLifecycleHooks.add(new LifecycleHooksRecordImpl("testLifecycleHooksClassName", Collections.emptyMap()));
+    store.setStoreLifecycleHooks(storeLifecycleHooks);
+    store.setPubSubEncryptionKeyUrn("keyUrn:abc");
+    ReadOnlyStore readOnlyStore = new ReadOnlyStore(store);
+    StoreProperties storeProperties = readOnlyStore.cloneStoreProperties();
+
+    // Assert
+    assertEquals(storeProperties.getName(), store.getName());
+    assertEquals(storeProperties.getOwner(), store.getOwner());
+    assertEquals(storeProperties.getCreatedTime(), store.getCreatedTime());
+    assertEquals(storeProperties.getCurrentVersion(), store.getCurrentVersion());
+    assertEquals(storeProperties.getPartitionCount(), store.getPartitionCount());
+    assertEquals(storeProperties.getLowWatermark(), store.getLowWatermark());
+    assertEquals(storeProperties.getEnableWrites(), store.isEnableWrites());
+    assertEquals(storeProperties.getEnableReads(), store.isEnableReads());
+    assertEquals(storeProperties.getStorageQuotaInByte(), store.getStorageQuotaInByte());
+    assertEquals(storeProperties.getPersistenceType(), store.getPersistenceType().value);
+    assertEquals(storeProperties.getRoutingStrategy(), store.getRoutingStrategy().value);
+    assertEquals(storeProperties.getReadStrategy(), store.getReadStrategy().value);
+    assertEquals(storeProperties.getOfflinePushStrategy(), store.getOffLinePushStrategy().value);
+    assertEquals(storeProperties.getLargestUsedVersionNumber(), store.getLargestUsedVersionNumber());
+    assertEquals(storeProperties.getReadQuotaInCU(), store.getReadQuotaInCU());
+    assertEqualHybridConfig(storeProperties.getHybridConfig(), store.getHybridStoreConfig());
+    assertEqualViewConfig(storeProperties.getViews(), store.getViewConfigs());
+    assertEquals(storeProperties.getAccessControlled(), store.isAccessControlled());
+    assertEquals(storeProperties.getCompressionStrategy(), store.getCompressionStrategy().getValue());
+    assertEquals(storeProperties.getClientDecompressionEnabled(), store.getClientDecompressionEnabled());
+    assertEquals(storeProperties.getChunkingEnabled(), store.isChunkingEnabled());
+    assertEquals(storeProperties.getRmdChunkingEnabled(), store.isRmdChunkingEnabled());
+    assertEquals(storeProperties.getBatchGetLimit(), store.getBatchGetLimit());
+    assertEquals(storeProperties.getNumVersionsToPreserve(), store.getNumVersionsToPreserve());
+    assertEquals(storeProperties.getIncrementalPushEnabled(), store.isIncrementalPushEnabled());
+    assertEquals(storeProperties.getSeparateRealTimeTopicEnabled(), store.isSeparateRealTimeTopicEnabled());
+    assertEquals(storeProperties.getMigrating(), store.isMigrating());
+    assertEquals(storeProperties.getWriteComputationEnabled(), store.isWriteComputationEnabled());
+    assertEquals(storeProperties.getReadComputationEnabled(), store.isReadComputationEnabled());
+    assertEquals(storeProperties.getBootstrapToOnlineTimeoutInHours(), store.getBootstrapToOnlineTimeoutInHours());
+    assertEquals(storeProperties.getNativeReplicationEnabled(), store.isNativeReplicationEnabled());
+    assertEquals(storeProperties.getPushStreamSourceAddress(), store.getPushStreamSourceAddress());
+    assertEquals(storeProperties.getBackupStrategy(), store.getBackupStrategy().getValue());
+    assertEquals(
+        storeProperties.getSchemaAutoRegisteFromPushJobEnabled(),
+        store.isSchemaAutoRegisterFromPushJobEnabled());
+    assertEquals(storeProperties.getLatestSuperSetValueSchemaId(), store.getLatestSuperSetValueSchemaId());
+    assertEquals(storeProperties.getHybridStoreDiskQuotaEnabled(), store.isHybridStoreDiskQuotaEnabled());
+    assertEquals(storeProperties.getStoreMetaSystemStoreEnabled(), store.isStoreMetaSystemStoreEnabled());
+    assertEqualsETLStoreConfig(storeProperties.getEtlConfig(), store.getEtlStoreConfig());
+    assertEqualsPartitionerConfig(storeProperties.getPartitionerConfig(), store.getPartitionerConfig());
+    assertEquals(
+        storeProperties.getLatestVersionPromoteToCurrentTimestamp(),
+        store.getLatestVersionPromoteToCurrentTimestamp());
+    assertEquals(storeProperties.getBackupVersionRetentionMs(), store.getBackupVersionRetentionMs());
+    assertEquals(storeProperties.getMigrationDuplicateStore(), store.isMigrationDuplicateStore());
+    assertEquals(storeProperties.getNativeReplicationEnabled(), store.isNativeReplicationEnabled());
+    assertEquals(storeProperties.getDaVinciPushStatusStoreEnabled(), store.isDaVinciPushStatusStoreEnabled());
+    assertEquals(storeProperties.getStoreMetadataSystemStoreEnabled(), store.isStoreMetadataSystemStoreEnabled());
+    assertEquals(storeProperties.getActiveActiveReplicationEnabled(), store.isActiveActiveReplicationEnabled());
+    assertEquals(storeProperties.getMinCompactionLagSeconds(), store.getMinCompactionLagSeconds());
+    assertEquals(storeProperties.getMaxCompactionLagSeconds(), store.getMaxCompactionLagSeconds());
+    assertEquals(storeProperties.getMaxRecordSizeBytes(), store.getMaxRecordSizeBytes());
+    assertEquals(storeProperties.getMaxNearlineRecordSizeBytes(), store.getMaxNearlineRecordSizeBytes());
+    assertEquals(storeProperties.getVeniceUnits(), store.getVeniceUnits());
+    assertEquals(storeProperties.getWorkloadType().toString(), store.getWorkloadType());
+    assertEquals(storeProperties.getUnusedSchemaDeletionEnabled(), store.isUnusedSchemaDeletionEnabled());
+    assertEquals(storeProperties.getVersions().size(), store.getVersions().size());
+    assertEqualsSystemStores(storeProperties.getSystemStores(), store.getSystemStores());
+    assertEquals(storeProperties.getStorageNodeReadQuotaEnabled(), store.isStorageNodeReadQuotaEnabled());
+    assertEquals(storeProperties.getPubSubEncryptionKeyUrn(), store.getPubSubEncryptionKeyUrn());
+    assertEquals(storeProperties.getBlobTransferEnabled(), store.isBlobTransferEnabled());
+    assertEquals(storeProperties.getBlobTransferInServerEnabled(), store.getBlobTransferInServerEnabled());
+    assertEquals(storeProperties.getBlobTransferInServerEnabled(), ActivationState.NOT_SPECIFIED.name());
+    assertEquals(storeProperties.getBlobDbEnabled(), store.getBlobDbEnabled());
+    assertEquals(storeProperties.getBlobDbEnabled(), ActivationState.NOT_SPECIFIED.name());
+    assertEquals(storeProperties.getNearlineProducerCompressionEnabled(), store.isNearlineProducerCompressionEnabled());
+    assertEquals(storeProperties.getNearlineProducerCountPerWriter(), store.getNearlineProducerCountPerWriter());
+    assertEquals(storeProperties.getStoreLifecycleHooks().size(), store.getStoreLifecycleHooks().size());
+    assertEquals(storeProperties.getPreviousCurrentVersion(), store.getPreviousCurrentVersion());
+  }
+
+  private void assertEqualHybridConfig(StoreHybridConfig actual, HybridStoreConfig expected) {
+    assertEquals(actual.getRewindTimeInSeconds(), expected.getRewindTimeInSeconds());
+    assertEquals(actual.getOffsetLagThresholdToGoOnline(), expected.getOffsetLagThresholdToGoOnline());
+    assertEquals(
+        actual.getProducerTimestampLagThresholdToGoOnlineInSeconds(),
+        expected.getProducerTimestampLagThresholdToGoOnlineInSeconds());
+    assertEquals(actual.getDataReplicationPolicy(), expected.getDataReplicationPolicy().getValue());
+    assertEquals(actual.getBufferReplayPolicy(), expected.getBufferReplayPolicy().getValue());
+    assertEquals(actual.getRealTimeTopicName(), expected.getRealTimeTopicName());
+  }
+
+  private static void assertEqualViewConfig(
+      Map<CharSequence, StoreViewConfig> actual,
+      Map<String, ViewConfig> expected) {
+
+    for (Map.Entry<CharSequence, StoreViewConfig> viewConfigEntry: actual.entrySet()) {
+      StoreViewConfig actualViewConfig = viewConfigEntry.getValue();
+      ViewConfig expectedViewConfig = expected.get(viewConfigEntry.getKey().toString());
+
+      assertEquals(actualViewConfig.getViewClassName().toString(), expectedViewConfig.getViewClassName());
+
+      for (Map.Entry<String, CharSequence> viewParamsEntry: actualViewConfig.getViewParameters().entrySet()) {
+        CharSequence actualViewParam = viewParamsEntry.getValue();
+        String expectedViewParam = expectedViewConfig.getViewParameters().get(viewParamsEntry.getKey());
+
+        assertEquals(actualViewParam.toString(), expectedViewParam);
+      }
+    }
+  }
+
+  private void assertEqualsETLStoreConfig(StoreETLConfig actual, ETLStoreConfig expected) {
+    assertEquals(actual.getEtledUserProxyAccount(), expected.getEtledUserProxyAccount());
+    assertEquals(actual.getFutureVersionETLEnabled(), expected.isFutureVersionETLEnabled());
+    assertEquals(actual.getRegularVersionETLEnabled(), expected.isFutureVersionETLEnabled());
+    assertEquals(actual.getEtlStrategy(), expected.getETLStrategy().getValue());
+  }
+
+  private void assertEqualsPartitionerConfig(StorePartitionerConfig actual, PartitionerConfig expected) {
+
+    assertEquals(actual.getPartitionerClass(), expected.getPartitionerClass());
+    assertEquals(actual.getAmplificationFactor(), expected.getAmplificationFactor());
+
+    for (Map.Entry<CharSequence, CharSequence> entry: actual.getPartitionerParams().entrySet()) {
+      CharSequence actualPartitionerParam = entry.getValue();
+      String expectedPartitionerParam = expected.getPartitionerParams().get(entry.getKey().toString());
+
+      assertEquals(actualPartitionerParam.toString(), expectedPartitionerParam);
+    }
+  }
+
+  private void assertEqualsSystemStores(
+      Map<CharSequence, SystemStoreProperties> actual,
+      Map<String, SystemStoreAttributes> expected) {
+
+    for (Map.Entry<CharSequence, SystemStoreProperties> entry: actual.entrySet()) {
+      SystemStoreProperties actualSystemStoreProperties = entry.getValue();
+      SystemStoreAttributes expectedSystemStoreAttributes = expected.get(entry.getKey().toString());
+
+      assertEquals(actualSystemStoreProperties.getCurrentVersion(), expectedSystemStoreAttributes.getCurrentVersion());
+      assertEquals(
+          actualSystemStoreProperties.getVersions().size(),
+          expectedSystemStoreAttributes.getVersions().size());
+      assertEquals(
+          actualSystemStoreProperties.getLatestVersionPromoteToCurrentTimestamp(),
+          expectedSystemStoreAttributes.getLatestVersionPromoteToCurrentTimestamp());
+      assertEquals(
+          actualSystemStoreProperties.getLargestUsedVersionNumber(),
+          expectedSystemStoreAttributes.getLargestUsedVersionNumber());
+    }
+  }
+
+  @Test
+  public void testSetCurrentVersionSetsPreviousCurrentVersionOnNewVersion() {
+    ZKStore store = new ZKStore(
+        "testStore",
+        "testOwner",
+        System.currentTimeMillis(),
+        PersistenceType.ROCKS_DB,
+        RoutingStrategy.CONSISTENT_HASH,
+        ReadStrategy.ANY_OF_ONLINE,
+        OfflinePushStrategy.WAIT_ALL_REPLICAS,
+        3);
+
+    // Add versions
+    Version v1 = new VersionImpl("testStore", 1, "push1");
+    Version v2 = new VersionImpl("testStore", 2, "push2");
+    Version v3 = new VersionImpl("testStore", 3, "push3");
+    store.addVersion(v1);
+    store.addVersion(v2);
+    store.addVersion(v3);
+
+    // Initially set current version to 1 without auto-setting previousCurrentVersion
+    store.setCurrentVersionWithoutCheck(1);
+
+    // v1 should have default previousCurrentVersion (-1) since setCurrentVersionWithoutCheck doesn't set it
+    assertEquals(store.getVersion(1).getPreviousCurrentVersion(), -1);
+
+    // Set current version to 2 - v2 should have previousCurrentVersion = 1
+    store.setCurrentVersion(2);
+    assertEquals(store.getVersion(2).getPreviousCurrentVersion(), 1);
+    assertEquals(store.getCurrentVersion(), 2);
+
+    // Set current version to 3 - v3 should have previousCurrentVersion = 2
+    store.setCurrentVersion(3);
+    assertEquals(store.getVersion(3).getPreviousCurrentVersion(), 2);
+    assertEquals(store.getCurrentVersion(), 3);
+
+    // v2's previousCurrentVersion should still be 1 (unchanged)
+    assertEquals(store.getVersion(2).getPreviousCurrentVersion(), 1);
+
+    // v1's previousCurrentVersion should still be -1 (unchanged)
+    assertEquals(store.getVersion(1).getPreviousCurrentVersion(), -1);
+  }
+
+  @Test
+  public void testPreviousCurrentVersionNotSetWhenNoExistingVersion() {
+    ZKStore store = new ZKStore(
+        "testStore",
+        "testOwner",
+        System.currentTimeMillis(),
+        PersistenceType.ROCKS_DB,
+        RoutingStrategy.CONSISTENT_HASH,
+        ReadStrategy.ANY_OF_ONLINE,
+        OfflinePushStrategy.WAIT_ALL_REPLICAS,
+        3);
+    Version v1 = new VersionImpl("testStore", 1, "push1");
+    store.addVersion(v1);
+
+    // No current version set initially (NON_EXISTING_VERSION == 0)
+    assertEquals(store.getCurrentVersion(), Store.NON_EXISTING_VERSION);
+
+    // Set current version to 1 - v1 should have default previousCurrentVersion (-1)
+    // because the old current version was NON_EXISTING_VERSION
+    store.setCurrentVersion(1);
+
+    assertEquals(store.getVersion(1).getPreviousCurrentVersion(), -1);
+    assertEquals(store.getCurrentVersion(), 1);
+  }
+
+  @Test
+  public void testSetCurrentVersionWithoutCheckDoesNotSetPreviousCurrentVersion() {
+    ZKStore store = new ZKStore(
+        "testStore",
+        "testOwner",
+        System.currentTimeMillis(),
+        PersistenceType.ROCKS_DB,
+        RoutingStrategy.CONSISTENT_HASH,
+        ReadStrategy.ANY_OF_ONLINE,
+        OfflinePushStrategy.WAIT_ALL_REPLICAS,
+        3);
+    Version v1 = new VersionImpl("testStore", 1, "push1");
+    Version v2 = new VersionImpl("testStore", 2, "push2");
+    store.addVersion(v1);
+    store.addVersion(v2);
+
+    // Set current version to 1
+    store.setCurrentVersionWithoutCheck(1);
+
+    // Use setCurrentVersionWithoutCheck - should NOT set previousCurrentVersion
+    store.setCurrentVersionWithoutCheck(2);
+
+    // v2's previousCurrentVersion should still be default (-1)
+    assertEquals(store.getVersion(2).getPreviousCurrentVersion(), -1);
+  }
+
+  @Test
+  public void testCloneVersionCopiesPreviousCurrentVersion() {
+    Version v1 = new VersionImpl("testStore", 1, "push1");
+    v1.setPreviousCurrentVersion(99);
+
+    Version cloned = v1.cloneVersion();
+    assertEquals(cloned.getPreviousCurrentVersion(), 99);
+  }
+
+  @Test
+  public void testCloneVersionPreservesBlobDbEnabled() {
+    Version v = new VersionImpl("testStore", 1, "push1");
+    v.setBlobDbEnabled(ActivationState.DISABLED.name());
+
+    Version cloned = v.cloneVersion();
+    assertEquals(cloned.getBlobDbEnabled(), ActivationState.DISABLED.name());
+  }
+
+  @Test
+  public void testCloneStorePropertiesPreservesVersionBlobDbEnabled() {
+    ZKStore store = (ZKStore) TestUtils.createTestStore(
+        Long.toString(RANDOM.nextLong()),
+        Long.toString(RANDOM.nextLong()),
+        System.currentTimeMillis());
+    store.setBlobDbEnabled(ActivationState.DISABLED.name());
+    Version v = new VersionImpl(store.getName(), 1, "push1");
+    store.addVersion(v);
+    // addVersion stamps the store-level value onto the new version (AbstractStore.addVersion).
+    assertEquals(store.getVersion(1).getBlobDbEnabled(), ActivationState.DISABLED.name());
+
+    StoreProperties cloned = new ReadOnlyStore(store).cloneStoreProperties();
+    assertEquals(cloned.getBlobDbEnabled(), ActivationState.DISABLED.name());
+    assertEquals(cloned.getVersions().size(), 1);
+    assertEquals(cloned.getVersions().get(0).getBlobDbEnabled(), ActivationState.DISABLED.name());
+  }
+
+  @Test
+  public void testVeniceUnitsAndWorkloadTypeDefaultToNullAndRoundTrip() {
+    ZKStore store = (ZKStore) TestUtils.createTestStore(
+        Long.toString(RANDOM.nextLong()),
+        Long.toString(RANDOM.nextLong()),
+        System.currentTimeMillis());
+
+    // Unset fields stay null rather than falling back to a sentinel value.
+    assertNull(store.getVeniceUnits());
+    assertNull(store.getWorkloadType());
+    StoreProperties unsetProperties = new ReadOnlyStore(store).cloneStoreProperties();
+    assertNull(unsetProperties.getVeniceUnits());
+    assertNull(unsetProperties.getWorkloadType());
+
+    store.setVeniceUnits(42);
+    store.setWorkloadType("LOW_LATENCY");
+    assertEquals(store.getVeniceUnits(), Integer.valueOf(42));
+    assertEquals(store.getWorkloadType(), "LOW_LATENCY");
+
+    ReadOnlyStore readOnlyStore = new ReadOnlyStore(store);
+    assertEquals(readOnlyStore.getVeniceUnits(), Integer.valueOf(42));
+    assertEquals(readOnlyStore.getWorkloadType(), "LOW_LATENCY");
+    assertThrows(UnsupportedOperationException.class, () -> readOnlyStore.setVeniceUnits(1));
+    assertThrows(UnsupportedOperationException.class, () -> readOnlyStore.setWorkloadType("GENERIC"));
+
+    // Explicitly clearing the fields is honored.
+    store.setVeniceUnits(null);
+    store.setWorkloadType(null);
+    assertNull(store.getVeniceUnits());
+    assertNull(store.getWorkloadType());
+  }
+
+  @Test
+  public void testCloneStorePropertiesPreservesVersionStorageMode() {
+    ZKStore store = (ZKStore) TestUtils.createTestStore(
+        Long.toString(RANDOM.nextLong()),
+        Long.toString(RANDOM.nextLong()),
+        System.currentTimeMillis());
+    store.setStorageMode(StorageMode.DUAL_WRITE);
+    Version v = new VersionImpl(store.getName(), 1, "push1");
+    store.addVersion(v);
+    // addVersion stamps the store-level value onto the new version (AbstractStore.addVersion).
+    assertEquals(store.getVersion(1).getStorageMode(), StorageMode.DUAL_WRITE);
+
+    // Regression: ReadOnlyStore.convertVersion previously dropped storageMode, so a Store ->
+    // StoreProperties round-trip via cloneStoreProperties / dataModel would emit the schema
+    // default (INTERNAL) for every version, silently losing the field on any caller that
+    // re-serializes a ReadOnlyStore (e.g. meta-system-store snapshot writes).
+    StoreProperties cloned = new ReadOnlyStore(store).cloneStoreProperties();
+    assertEquals(cloned.getStorageMode(), StorageMode.DUAL_WRITE.getValue());
+    assertEquals(cloned.getVersions().size(), 1);
+    assertEquals(cloned.getVersions().get(0).getStorageMode(), StorageMode.DUAL_WRITE.getValue());
+  }
+
+  @Test
+  public void testCloneStorePropertiesPreservesVersionTargetRegionPromoted() {
+    ZKStore store = (ZKStore) TestUtils.createTestStore(
+        Long.toString(RANDOM.nextLong()),
+        Long.toString(RANDOM.nextLong()),
+        System.currentTimeMillis());
+    store.addVersion(new VersionImpl(store.getName(), 1, "push1"));
+    store.setVersionTargetRegionPromoted(1, true);
+    assertTrue(store.getVersion(1).isTargetRegionPromoted());
+
+    // Regression: ReadOnlyStore.convertVersion previously dropped targetRegionPromoted, so a
+    // Store -> StoreProperties round-trip via cloneStoreProperties emitted the schema default
+    // (false) for every version. Non-target DaVinci clients read this field (via the meta system
+    // store / request-based store_properties, both built from cloneStoreProperties) to know when
+    // to resume paused ingestion, so losing it here deadlocked paused-SIT resume.
+    StoreProperties promoted = new ReadOnlyStore(store).cloneStoreProperties();
+    assertEquals(promoted.getVersions().size(), 1);
+    assertTrue(promoted.getVersions().get(0).getTargetRegionPromoted());
+  }
+
+  @Test
+  public void testCloneStorePropertiesTargetRegionPromotedDefaultsFalse() {
+    ZKStore store = (ZKStore) TestUtils.createTestStore(
+        Long.toString(RANDOM.nextLong()),
+        Long.toString(RANDOM.nextLong()),
+        System.currentTimeMillis());
+    store.addVersion(new VersionImpl(store.getName(), 1, "push1"));
+    assertFalse(store.getVersion(1).isTargetRegionPromoted());
+
+    // Unpromoted versions must round-trip as false (not silently flipped).
+    StoreProperties cloned = new ReadOnlyStore(store).cloneStoreProperties();
+    assertEquals(cloned.getVersions().size(), 1);
+    assertFalse(cloned.getVersions().get(0).getTargetRegionPromoted());
+  }
+
+  @Test
+  public void testReadOnlyEtlConfigDelegatesGetEtlActiveFabrics() {
+    ZKStore store = (ZKStore) TestUtils.createTestStore("test_store", "owner", System.currentTimeMillis());
+    store.setEtlStoreConfig(new ETLStoreConfigImpl("proxy", true, false, 2, Arrays.asList("dc-0", "dc-1")));
+    ReadOnlyStore readOnly = new ReadOnlyStore(store);
+    assertEquals(readOnly.getEtlStoreConfig().getEtlActiveFabrics(), Arrays.asList("dc-0", "dc-1"));
+  }
+
+  @Test(expectedExceptions = UnsupportedOperationException.class)
+  public void testReadOnlyEtlConfigRejectsSetEtlActiveFabrics() {
+    ZKStore store = (ZKStore) TestUtils.createTestStore("test_store", "owner", System.currentTimeMillis());
+    store.setEtlStoreConfig(new ETLStoreConfigImpl());
+    ReadOnlyStore readOnly = new ReadOnlyStore(store);
+    readOnly.getEtlStoreConfig().setEtlActiveFabrics(Arrays.asList("dc-0"));
+  }
+
+  @Test
+  public void testSetVersionTargetRegionPromoted() {
+    ZKStore store = new ZKStore(
+        "testStore",
+        "testOwner",
+        System.currentTimeMillis(),
+        PersistenceType.ROCKS_DB,
+        RoutingStrategy.CONSISTENT_HASH,
+        ReadStrategy.ANY_OF_ONLINE,
+        OfflinePushStrategy.WAIT_ALL_REPLICAS,
+        3);
+    store.addVersion(new VersionImpl("testStore", 1, "push1"));
+
+    // Default is false
+    assertFalse(store.getVersion(1).isTargetRegionPromoted());
+
+    // AbstractStore implementation uses getForUpdate() so setters on the mutable Avro record persist
+    store.setVersionTargetRegionPromoted(1, true);
+    assertTrue(store.getVersion(1).isTargetRegionPromoted());
+
+    // Non-existent version is a no-op (no exception)
+    store.setVersionTargetRegionPromoted(99, true);
+
+    // ReadOnlyStore must not mutate; setVersionTargetRegionPromoted should throw
+    ReadOnlyStore readOnlyStore = new ReadOnlyStore(store);
+    try {
+      readOnlyStore.setVersionTargetRegionPromoted(1, false);
+      throw new AssertionError("Expected UnsupportedOperationException");
+    } catch (UnsupportedOperationException e) {
+      // expected
+    }
+    // Backing store is unchanged
+    assertTrue(store.getVersion(1).isTargetRegionPromoted());
+  }
+
+  @Test
+  public void testSetVersionStorageMode() {
+    ZKStore store = (ZKStore) TestUtils.createTestStore("testStore", "testOwner", System.currentTimeMillis());
+    store.addVersion(new VersionImpl(store.getName(), 1, "push1"));
+    store.addVersion(new VersionImpl(store.getName(), 2, "push2"));
+
+    store.setVersionStorageMode(1, StorageMode.DUAL_WRITE);
+    assertEquals(store.getVersion(1).getStorageMode(), StorageMode.DUAL_WRITE);
+    assertEquals(store.getVersion(2).getStorageMode(), StorageMode.INTERNAL);
+
+    try {
+      store.setVersionStorageMode(99, StorageMode.DUAL_WRITE);
+      throw new AssertionError("Expected VeniceException");
+    } catch (VeniceException e) {
+      assertTrue(e.getMessage().contains("Version:99 does not exist"));
+    }
+
+    ReadOnlyStore readOnlyStore = new ReadOnlyStore(store);
+    try {
+      readOnlyStore.setVersionStorageMode(1, StorageMode.INTERNAL);
+      throw new AssertionError("Expected UnsupportedOperationException");
+    } catch (UnsupportedOperationException e) {
+      // expected
+    }
+    assertEquals(store.getVersion(1).getStorageMode(), StorageMode.DUAL_WRITE);
+  }
+}

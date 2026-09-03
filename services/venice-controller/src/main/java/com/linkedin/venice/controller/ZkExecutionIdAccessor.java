@@ -1,5 +1,7 @@
 package com.linkedin.venice.controller;
 
+import static com.linkedin.venice.zk.VeniceZkPaths.EXECUTION_IDS;
+
 import com.linkedin.venice.controller.kafka.consumer.StringToLongMapJSONSerializer;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.exceptions.ZkDataAccessException;
@@ -9,7 +11,10 @@ import com.linkedin.venice.utils.HelixUtils;
 import com.linkedin.venice.utils.PathResourceRegistry;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 import org.apache.helix.AccessOption;
 import org.apache.helix.manager.zk.ZkBaseDataAccessor;
 import org.apache.helix.zookeeper.impl.client.ZkClient;
@@ -20,7 +25,7 @@ import org.apache.logging.log4j.Logger;
 
 
 public class ZkExecutionIdAccessor implements ExecutionIdAccessor {
-  private static final String EXECUTION_ID_DIR = "/executionids";
+  private static final String EXECUTION_ID_DIR = "/" + EXECUTION_IDS;
   private static final int ZK_RETRY_COUNT = 3;
   private static final Logger LOGGER = LogManager.getLogger(ZkExecutionIdAccessor.class);
   private final ZkClient zkclient;
@@ -154,6 +159,28 @@ public class ZkExecutionIdAccessor implements ExecutionIdAccessor {
       executionIdMap.put(storeName, lastSucceededExecutionId);
       return executionIdMap;
     });
+  }
+
+  public Map<String, Long> cleanExecutionIdMap(String clusterName, Set<String> allStores) {
+    String path = getLastSucceededExecutionIdMapPath(clusterName);
+    AtomicReference<Map<String, Long>> executionIdsCleaned = new AtomicReference<>(new HashMap<>());
+    AtomicReference<Map<String, Long>> executionIdsToKeep = new AtomicReference<>(new HashMap<>());
+
+    HelixUtils.compareAndUpdate(zkMapAccessor, path, ZK_RETRY_COUNT, executionIdMap -> {
+      // initializing `executionIdsCleaned` with all the entries
+      executionIdsCleaned.set(executionIdMap);
+      Map<String, Long> filteredExecutionIds = executionIdMap.entrySet()
+          .parallelStream()
+          .filter(entry -> allStores.contains(entry.getKey()))
+          .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+      executionIdsToKeep.set(filteredExecutionIds);
+      return filteredExecutionIds;
+    });
+
+    // update `executionIdsCleaned` by removing the entries that are kept
+    executionIdsCleaned.get().keySet().removeAll(executionIdsToKeep.get().keySet());
+
+    return executionIdsCleaned.get();
   }
 
   private Long getExecutionIdFromZk(String path) {

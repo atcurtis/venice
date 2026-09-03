@@ -3,16 +3,43 @@ package com.linkedin.davinci.ingestion;
 import com.linkedin.davinci.config.VeniceStoreVersionConfig;
 import com.linkedin.davinci.kafka.consumer.KafkaStoreIngestionService;
 import com.linkedin.davinci.notifier.VeniceNotifier;
-import com.linkedin.davinci.store.AbstractStorageEngine;
+import com.linkedin.davinci.store.StorageEngine;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
 import java.io.Closeable;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicReference;
 
 
 public interface IngestionBackend extends Closeable {
-  void startConsumption(VeniceStoreVersionConfig storeConfig, int partition);
+  void startConsumption(
+      VeniceStoreVersionConfig storeConfig,
+      int partition,
+      Optional<PubSubPosition> pubSubPosition,
+      String replicaId);
 
-  CompletableFuture<Void> stopConsumption(VeniceStoreVersionConfig storeConfig, int partition);
+  /**
+   * Start consumption for the given partition. If {@code createPaused} is {@code true}, the
+   * {@link com.linkedin.davinci.kafka.consumer.StoreIngestionTask} will be paused after receiving
+   * START_OF_PUSH (future-slot pause). Only DaVinci clients support {@code createPaused=true}.
+   *
+   * <p>Implementations that do not support paused creation must leave this default in place; it will
+   * throw {@link UnsupportedOperationException} when {@code createPaused=true} is requested.
+   */
+  default void startConsumption(
+      VeniceStoreVersionConfig storeConfig,
+      int partition,
+      Optional<PubSubPosition> pubSubPosition,
+      String replicaId,
+      boolean createPaused) {
+    if (createPaused) {
+      throw new UnsupportedOperationException(
+          "createPaused=true is not supported by this IngestionBackend: " + getClass().getSimpleName());
+    }
+    startConsumption(storeConfig, partition, pubSubPosition, replicaId);
+  }
+
+  CompletableFuture<Void> stopConsumption(VeniceStoreVersionConfig storeConfig, int partition, String replicaId);
 
   void killConsumptionTask(String topicName);
 
@@ -26,12 +53,14 @@ public interface IngestionBackend extends Closeable {
    * @param storeConfig Store version config
    * @param partition Partition number to be dropped in the store version.
    * @param timeoutInSeconds Number of seconds to wait before timeout.
+   * @return a future for the drop partition action.
    */
-  default void dropStoragePartitionGracefully(
+  default CompletableFuture<Void> dropStoragePartitionGracefully(
       VeniceStoreVersionConfig storeConfig,
       int partition,
-      int timeoutInSeconds) {
-    dropStoragePartitionGracefully(storeConfig, partition, timeoutInSeconds, true);
+      int timeoutInSeconds,
+      String replicaId) {
+    return dropStoragePartitionGracefully(storeConfig, partition, timeoutInSeconds, true, replicaId);
   }
 
   /**
@@ -40,12 +69,15 @@ public interface IngestionBackend extends Closeable {
    * @param partition Partition number to be dropped in the store version.
    * @param timeoutInSeconds Number of seconds to wait before timeout.
    * @param removeEmptyStorageEngine Whether to drop storage engine when dropping the last partition.
+   * @param replicaId The replica identifier for this partition.
+   * @return a future for the drop partition action.
    */
-  void dropStoragePartitionGracefully(
+  CompletableFuture<Void> dropStoragePartitionGracefully(
       VeniceStoreVersionConfig storeConfig,
       int partition,
       int timeoutInSeconds,
-      boolean removeEmptyStorageEngine);
+      boolean removeEmptyStorageEngine,
+      String replicaId);
 
   KafkaStoreIngestionService getStoreIngestionService();
 
@@ -53,5 +85,10 @@ public interface IngestionBackend extends Closeable {
   void removeStorageEngine(String topicName);
 
   // setStorageEngineReference is used by Da Vinci exclusively to speed up storage engine retrieval for read path.
-  void setStorageEngineReference(String topicName, AtomicReference<AbstractStorageEngine> storageEngineReference);
+  void setStorageEngineReference(String topicName, AtomicReference<StorageEngine> storageEngineReference);
+
+  /**
+   * Check whether there are any current version bootstrapping or not.
+   */
+  boolean hasCurrentVersionBootstrapping();
 }

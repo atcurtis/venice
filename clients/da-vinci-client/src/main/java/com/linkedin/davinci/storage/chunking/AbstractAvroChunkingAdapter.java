@@ -1,7 +1,8 @@
 package com.linkedin.davinci.storage.chunking;
 
-import com.linkedin.davinci.listener.response.ReadResponse;
-import com.linkedin.davinci.store.AbstractStorageEngine;
+import com.linkedin.davinci.listener.response.NoOpReadResponseStats;
+import com.linkedin.davinci.listener.response.ReadResponseStats;
+import com.linkedin.davinci.store.StorageEngine;
 import com.linkedin.davinci.store.record.ByteBufferValueRecord;
 import com.linkedin.davinci.store.record.ValueRecord;
 import com.linkedin.venice.client.store.streaming.StreamingCallback;
@@ -12,10 +13,10 @@ import com.linkedin.venice.serialization.StoreDeserializerCache;
 import com.linkedin.venice.serializer.RecordDeserializer;
 import com.linkedin.venice.storage.protocol.ChunkedValueManifest;
 import com.linkedin.venice.utils.ByteUtils;
-import com.linkedin.venice.utils.LatencyUtils;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.ByteBuffer;
+import java.util.function.BiFunction;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.avro.io.BinaryDecoder;
 
@@ -24,6 +25,7 @@ import org.apache.avro.io.BinaryDecoder;
  * Read compute and write compute chunking adapter
  */
 public abstract class AbstractAvroChunkingAdapter<T> implements ChunkingAdapter<ChunkedValueInputStream, T> {
+  public static final int DO_NOT_USE_READER_SCHEMA_ID = -1;
   private static final int UNUSED_INPUT_BYTES_LENGTH = -1;
 
   @Override
@@ -32,18 +34,19 @@ public abstract class AbstractAvroChunkingAdapter<T> implements ChunkingAdapter<
       int bytesLength,
       T reusedValue,
       BinaryDecoder reusedDecoder,
-      ReadResponse response,
+      ReadResponseStats responseStats,
       int writerSchemaId,
       int readerSchemaId,
       StoreDeserializerCache<T> storeDeserializerCache,
       VeniceCompressor compressor) {
-    return getByteArrayDecoder(compressor.getCompressionStrategy(), response).decode(
+    int resolvedReaderSchemaId = resolveReaderSchemaId(readerSchemaId, writerSchemaId);
+    return getByteArrayDecoder(compressor.getCompressionStrategy()).decode(
         reusedDecoder,
         fullBytes,
         bytesLength,
         reusedValue,
-        storeDeserializerCache.getDeserializer(writerSchemaId, readerSchemaId),
-        response,
+        storeDeserializerCache.getDeserializer(writerSchemaId, resolvedReaderSchemaId),
+        responseStats,
         compressor);
   }
 
@@ -55,8 +58,15 @@ public abstract class AbstractAvroChunkingAdapter<T> implements ChunkingAdapter<
       RecordDeserializer<T> recordDeserializer,
       VeniceCompressor veniceCompressor) {
     try {
-      return byteArrayDecompressingDecoderValueOnly
-          .decode(null, valueOnlyBytes, offset, bytesLength, null, veniceCompressor, recordDeserializer, null);
+      return byteArrayDecompressingDecoderValueOnly.decode(
+          null,
+          valueOnlyBytes,
+          offset,
+          bytesLength,
+          null,
+          veniceCompressor,
+          recordDeserializer,
+          NoOpReadResponseStats.SINGLETON);
     } catch (IOException e) {
       throw new RuntimeException(e);
     }
@@ -80,29 +90,30 @@ public abstract class AbstractAvroChunkingAdapter<T> implements ChunkingAdapter<
       ChunkedValueInputStream chunkedValueInputStream,
       T reusedValue,
       BinaryDecoder reusedDecoder,
-      ReadResponse response,
+      ReadResponseStats responseStats,
       int writerSchemaId,
       int readerSchemaId,
       StoreDeserializerCache<T> storeDeserializerCache,
       VeniceCompressor compressor) {
-    return getInputStreamDecoder(response).decode(
+    int resolvedReaderSchemaId = resolveReaderSchemaId(readerSchemaId, writerSchemaId);
+    return instrumentedDecompressingInputStreamDecoder.decode(
         reusedDecoder,
         chunkedValueInputStream,
         UNUSED_INPUT_BYTES_LENGTH,
         reusedValue,
-        storeDeserializerCache.getDeserializer(writerSchemaId, readerSchemaId),
-        response,
+        storeDeserializerCache.getDeserializer(writerSchemaId, resolvedReaderSchemaId),
+        responseStats,
         compressor);
   }
 
   public T get(
-      AbstractStorageEngine store,
+      StorageEngine store,
       int partition,
       ByteBuffer key,
       boolean isChunked,
       T reusedValue,
       BinaryDecoder reusedDecoder,
-      ReadResponse response,
+      ReadResponseStats responseStats,
       int readerSchemaId,
       StoreDeserializerCache<T> storeDeserializerCache,
       VeniceCompressor compressor,
@@ -112,21 +123,57 @@ public abstract class AbstractAvroChunkingAdapter<T> implements ChunkingAdapter<
     }
     return ChunkingUtils.getFromStorage(
         this,
-        store,
+        store::get,
+        store.getStoreVersionName(),
         partition,
         key,
-        response,
+        responseStats,
         reusedValue,
         reusedDecoder,
         readerSchemaId,
         storeDeserializerCache,
         compressor,
-        false,
+        manifestContainer);
+  }
+
+  /**
+   * Variant of {@link #get} that accepts a custom storage getter function instead of a {@link StorageEngine}.
+   * Use this when the data lives outside a regular data partition (e.g., in a metadata partition) and a
+   * custom lookup is needed to locate both the manifest and the individual chunks.
+   */
+  public T get(
+      BiFunction<Integer, ByteBuffer, byte[]> storageGetter,
+      String storeVersionName,
+      int partition,
+      ByteBuffer key,
+      boolean isChunked,
+      T reusedValue,
+      BinaryDecoder reusedDecoder,
+      ReadResponseStats responseStats,
+      int readerSchemaId,
+      StoreDeserializerCache<T> storeDeserializerCache,
+      VeniceCompressor compressor,
+      ChunkedValueManifestContainer manifestContainer) {
+    if (isChunked) {
+      key = ChunkingUtils.KEY_WITH_CHUNKING_SUFFIX_SERIALIZER.serializeNonChunkedKey(key);
+    }
+    return ChunkingUtils.getFromStorage(
+        this,
+        (p, k) -> storageGetter.apply(p, k),
+        storeVersionName,
+        partition,
+        key,
+        responseStats,
+        reusedValue,
+        reusedDecoder,
+        readerSchemaId,
+        storeDeserializerCache,
+        compressor,
         manifestContainer);
   }
 
   public ByteBufferValueRecord<T> getWithSchemaId(
-      AbstractStorageEngine store,
+      StorageEngine store,
       int partition,
       ByteBuffer key,
       boolean isChunked,
@@ -147,19 +194,18 @@ public abstract class AbstractAvroChunkingAdapter<T> implements ChunkingAdapter<
         reusedDecoder,
         storeDeserializerCache,
         compressor,
-        false,
         manifestContainer);
   }
 
   public T get(
-      AbstractStorageEngine store,
+      StorageEngine store,
       int partition,
       byte[] key,
       ByteBuffer reusedRawValue,
       T reusedValue,
       BinaryDecoder reusedDecoder,
       boolean isChunked,
-      ReadResponse response,
+      ReadResponseStats responseStats,
       int readerSchemaId,
       StoreDeserializerCache<T> storeDeserializerCache,
       VeniceCompressor compressor) {
@@ -174,21 +220,20 @@ public abstract class AbstractAvroChunkingAdapter<T> implements ChunkingAdapter<
         reusedRawValue,
         reusedValue,
         reusedDecoder,
-        response,
+        responseStats,
         readerSchemaId,
         storeDeserializerCache,
         compressor);
   }
 
   public void getByPartialKey(
-      AbstractStorageEngine store,
+      StorageEngine store,
       int userPartition,
       byte[] keyPrefixBytes,
       T reusedValue,
       BinaryDecoder reusedDecoder,
       RecordDeserializer<GenericRecord> keyRecordDeserializer,
       boolean isChunked,
-      ReadResponse response,
       int readerSchemaId,
       StoreDeserializerCache<T> storeDeserializerCache,
       VeniceCompressor compressor,
@@ -206,7 +251,6 @@ public abstract class AbstractAvroChunkingAdapter<T> implements ChunkingAdapter<
         reusedValue,
         keyRecordDeserializer,
         reusedDecoder,
-        response,
         readerSchemaId,
         storeDeserializerCache,
         compressor,
@@ -272,18 +316,12 @@ public abstract class AbstractAvroChunkingAdapter<T> implements ChunkingAdapter<
   private final DecoderWrapper<InputStream, T> instrumentedDecompressingInputStreamDecoder =
       new InstrumentedDecoderWrapper<>(decompressingInputStreamDecoder);
 
-  private DecoderWrapper<byte[], T> getByteArrayDecoder(
-      CompressionStrategy compressionStrategy,
-      ReadResponse response) {
+  private DecoderWrapper<byte[], T> getByteArrayDecoder(CompressionStrategy compressionStrategy) {
     if (compressionStrategy == CompressionStrategy.NO_OP) {
-      return (response == null) ? byteArrayDecoder : instrumentedByteArrayDecoder;
+      return instrumentedByteArrayDecoder;
     } else {
-      return (response == null) ? decompressingByteArrayDecoder : instrumentedDecompressingByteArrayDecoder;
+      return instrumentedDecompressingByteArrayDecoder;
     }
-  }
-
-  private DecoderWrapper<InputStream, T> getInputStreamDecoder(ReadResponse response) {
-    return (response == null) ? decompressingInputStreamDecoder : instrumentedDecompressingInputStreamDecoder;
   }
 
   private interface DecoderWrapper<INPUT, OUTPUT> {
@@ -293,7 +331,7 @@ public abstract class AbstractAvroChunkingAdapter<T> implements ChunkingAdapter<
         int inputBytesLength,
         OUTPUT reusedValue,
         RecordDeserializer<OUTPUT> deserializer,
-        ReadResponse response,
+        ReadResponseStats responseStats,
         VeniceCompressor compressor);
   }
 
@@ -306,7 +344,7 @@ public abstract class AbstractAvroChunkingAdapter<T> implements ChunkingAdapter<
         OUTPUT reusedValue,
         VeniceCompressor compressor,
         RecordDeserializer<OUTPUT> deserializer,
-        ReadResponse response) throws IOException;
+        ReadResponseStats response) throws IOException;
   }
 
   private static class InstrumentedDecoderWrapper<INPUT, OUTPUT> implements DecoderWrapper<INPUT, OUTPUT> {
@@ -322,13 +360,22 @@ public abstract class AbstractAvroChunkingAdapter<T> implements ChunkingAdapter<
         int inputBytesLength,
         OUTPUT reusedValue,
         RecordDeserializer<OUTPUT> deserializer,
-        ReadResponse response,
+        ReadResponseStats responseStats,
         VeniceCompressor compressor) {
-      long deserializeStartTimeInNS = System.nanoTime();
+      long deserializeStartTimeInNS = responseStats.getCurrentTimeInNanos();
       OUTPUT output =
-          delegate.decode(reusedDecoder, input, inputBytesLength, reusedValue, deserializer, response, compressor);
-      response.addReadComputeDeserializationLatency(LatencyUtils.getElapsedTimeFromNSToMS(deserializeStartTimeInNS));
+          delegate.decode(reusedDecoder, input, inputBytesLength, reusedValue, deserializer, responseStats, compressor);
+      responseStats.addReadComputeDeserializationLatency(deserializeStartTimeInNS);
       return output;
     }
+  }
+
+  private int resolveReaderSchemaId(int readerSchemaId, int writerSchemaId) {
+    if (readerSchemaId == DO_NOT_USE_READER_SCHEMA_ID) {
+      // Venice client libraries (e.g. DVC) could pass in NON_EXISTING_SCHEMA_ID as reader schema to expect value to
+      // be deserialized using the same reader schema as writer schema.
+      return writerSchemaId;
+    }
+    return readerSchemaId;
   }
 }

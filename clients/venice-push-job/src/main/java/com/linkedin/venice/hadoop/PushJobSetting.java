@@ -4,13 +4,17 @@ import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.controllerapi.RepushInfoResponse;
 import com.linkedin.venice.controllerapi.StoreResponse;
 import com.linkedin.venice.etl.ETLValueSchemaTransformation;
-import com.linkedin.venice.hadoop.jobs.DataWriterComputeJob;
+import com.linkedin.venice.jobs.DataWriterComputeJob;
 import com.linkedin.venice.meta.BufferReplayPolicy;
 import com.linkedin.venice.meta.HybridStoreConfig;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.schema.vson.VsonSchema;
+import com.linkedin.venice.vpj.VenicePushJobConstants;
 import java.io.Serializable;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import org.apache.avro.Schema;
 
 
@@ -39,19 +43,38 @@ public class PushJobSetting implements Serializable {
   public boolean isIncrementalPush;
   public String incrementalPushVersion;
   public boolean isDuplicateKeyAllowed;
-  public boolean enablePushJobStatusUpload;
   public int controllerRetries;
   public int controllerStatusPollRetries;
   public long pollJobStatusIntervalMs;
   public long jobStatusInUnknownStateTimeoutMs;
+  public long pushJobTimeoutOverrideMs;
   public boolean sendControlMessagesDirectly;
   public boolean isSourceETL;
   public boolean enableWriteCompute;
   public boolean isSourceKafka;
-  public String kafkaInputBrokerUrl;
+  /**
+   * Broker URL for <b>consuming/reading</b> existing version data during a KIF (Kafka Input Format) repush.
+   *
+   * <p>This is the "input/source" side of a repush: the Kafka broker from which the previous version's
+   * data is read. It is set from one of two sources:
+   * <ol>
+   *   <li>{@link RepushInfoResponse} returned by the controller (which resolves the fabric name
+   *       from {@code KAFKA_INPUT_FABRIC} to a broker URL), or</li>
+   *   <li>An explicit {@code VENICE_REPUSH_SOURCE_PUBSUB_BROKER} property provided by the caller.</li>
+   * </ol>
+   *
+   * <p>This may point to a <em>different</em> fabric than {@link #pushDestinationPubsubBroker} when
+   * the repush input fabric differs from the NR source fabric. For example, a repush may read v1
+   * data from dc-1 but write v2 data to dc-0 (the NR source).
+   *
+   * @see #pushDestinationPubsubBroker the "output/destination" broker URL for producing new version data
+   */
+  public String repushSourcePubsubBroker;
   public String kafkaInputTopic;
   public int repushSourceVersion;
   public long rewindTimeInSecondsOverride;
+  public boolean pushToSeparateRealtimeTopicEnabled;
+  public boolean versionSeparateRealTimeTopicEnabled;
   public boolean kafkaInputCombinerEnabled;
   public boolean kafkaInputBuildNewDictEnabled;
   public BufferReplayPolicy validateRemoteReplayPolicy;
@@ -60,9 +83,8 @@ public class PushJobSetting implements Serializable {
   public boolean extendedSchemaValidityCheckEnabled;
   /** Refer {@link VenicePushJobConstants#COMPRESSION_METRIC_COLLECTION_ENABLED} **/
   public boolean compressionMetricCollectionEnabled;
-  /** Refer {@link VenicePushJobConstants#USE_MAPPER_TO_BUILD_DICTIONARY} **/
-  public boolean useMapperToBuildDict;
   public boolean repushTTLEnabled;
+  public boolean isCompliancePush;
   // specify time to drop stale records.
   public long repushTTLStartTimeMs;
   // HDFS directory to cache RMD schemas
@@ -77,14 +99,18 @@ public class PushJobSetting implements Serializable {
   public boolean d2Routing;
   public String targetedRegions;
   public boolean isTargetedRegionPushEnabled;
+  public boolean isTargetRegionPushWithDeferredSwapEnabled;
+  public int targetRegionPushWithDeferredSwapWaitTime;
+  public boolean isDegradedModePush;
+  public Set<String> degradedDatacenters;
   public boolean isSystemSchemaReaderEnabled;
-  public String systemSchemaClusterD2ServiceName;
-  public String systemSchemaClusterD2ZKHost;
   public boolean isZstdDictCreationRequired;
   public boolean isZstdDictCreationSuccess;
 
   // Multiple compute engine support
   public Class<? extends DataWriterComputeJob> dataWriterComputeJobClass;
+  /** Refer {@link VenicePushJobConstants#SPARK_PRE_WRITE_QUOTA_CHECK}. */
+  public boolean sparkPreWriteQuotaCheckEnabled;
 
   // Store-config setting
   public String clusterName;
@@ -92,6 +118,16 @@ public class PushJobSetting implements Serializable {
   public boolean isChunkingEnabled;
   public boolean isRmdChunkingEnabled;
   public long storeStorageQuota;
+  /**
+   * Names of the regions whose store-level storage mode is {@code DUAL_WRITE} for this push, resolved at job
+   * setup by querying each region's store-level storage mode through the (parent) controller. The partition
+   * writer loads one {@code ExternalStorageWriter} per region in this list and writes the dataset to that
+   * region's external-storage endpoint; regions absent from the list stay Kafka-only. Reading the store-level
+   * value per region (rather than the new version's value) avoids a race against the new version not yet
+   * being materialized in child regions when VPJ resolves it. Only populated when the VPJ-side dual-write
+   * writer-class is configured; otherwise stays empty (dual-write off).
+   */
+  public List<String> dualWriteTargetRegions = Collections.emptyList();
   public boolean isSchemaAutoRegisterFromPushJobEnabled;
   public CompressionStrategy storeCompressionStrategy;
   public boolean isStoreWriteComputeEnabled;
@@ -106,23 +142,43 @@ public class PushJobSetting implements Serializable {
   public int version;
   // Kafka topic partition count
   public int partitionCount;
-  // Kafka url will get from Venice backend for store push
-  public String kafkaUrl;
+  /**
+   * Broker URL for <b>producing/writing</b> new version topic data.
+   *
+   * <p>This is the "output/destination" side of a push: the Kafka broker to which new version data
+   * records are written. It is set from {@link com.linkedin.venice.controllerapi.VersionCreationResponse#getKafkaBootstrapServers()},
+   * which returns the broker for the NR (Native Replication) source region. In NR mode, data is
+   * first written to this broker, then replicated to other regions by the storage nodes.
+   *
+   * <p>For a cross-fabric repush (where the input fabric differs from the NR source), this URL
+   * should point to the NR source fabric's broker — <em>not</em> the input fabric. For example,
+   * if NR source = dc-0 and repush reads from dc-1, this URL should be dc-0's broker.
+   *
+   * @see #repushSourcePubsubBroker the "input/source" broker URL for consuming existing version data
+   */
+  public String pushDestinationPubsubBroker;
   public boolean sslToKafka;
   public CompressionStrategy topicCompressionStrategy;
   public String partitionerClass;
   public Map<String, String> partitionerParams;
   public boolean chunkingEnabled;
   public boolean rmdChunkingEnabled;
+  public int maxRecordSizeBytes;
+  public boolean enableUncompressedRecordSizeLimit;
   public String kafkaSourceRegion;
   public transient RepushInfoResponse repushInfoResponse;
+
+  public boolean repushUseFallbackValueSchemaId;
 
   // Schema-properties
   public boolean isAvro = true;
   public int valueSchemaId; // Value schema id retrieved from backend for valueSchemaString
+  public int rmdSchemaId = -1; // Replication metadata schema id retrieved from backend for
+                               // replicationMetadataSchemaString
   public int derivedSchemaId = -1;
   public String keyField;
   public String valueField;
+  public String rmdField;
 
   public Schema inputDataSchema;
   public String inputDataSchemaString;
@@ -133,6 +189,8 @@ public class PushJobSetting implements Serializable {
   public Schema valueSchema;
   public String valueSchemaString;
 
+  public String replicationMetadataSchemaString;
+
   public VsonSchema vsonInputKeySchema;
   public String vsonInputKeySchemaString;
 
@@ -141,6 +199,17 @@ public class PushJobSetting implements Serializable {
 
   public boolean generatePartialUpdateRecordFromInput;
   public ETLValueSchemaTransformation etlValueSchemaTransformation;
+  public Map<Integer, String> newKmeSchemasFromController;
+
+  /**
+   * Schema projection (internal / advanced use only &mdash; see {@code TARGET_WRITER_VALUE_SCHEMA_ID_PROP}): the
+   * target writer value schema ID to project superset input records down to. {@code -1} (default) disables projection.
+   * Not intended for regular push jobs; misuse silently drops fields absent from the target writer schema.
+   */
+  public int targetWriterValueSchemaId = -1;
+  public boolean projectInputToWriterSchema;
+  public Schema writerValueSchema;
+  public String writerValueSchemaString;
 
   // Additional inferred properties
   public boolean inputHasRecords;
@@ -151,8 +220,18 @@ public class PushJobSetting implements Serializable {
   public CompressionStrategy sourceVersionCompressionStrategy;
   public boolean sourceVersionChunkingEnabled;
 
+  public byte[] sourceDictionary;
+  public byte[] topicDictionary;
+
   public PushJobSetting() {
     // Default for preserving backward compatibility
     this.jobStartTimeMs = System.currentTimeMillis();
   }
+
+  public String materializedViewConfigFlatMap;
+
+  public boolean isBatchWriteOptimizationForHybridStoreEnabled;
+  public boolean isSortedIngestionEnabled;
+  public boolean allowRegularPushWithTTLRepush;
+
 }

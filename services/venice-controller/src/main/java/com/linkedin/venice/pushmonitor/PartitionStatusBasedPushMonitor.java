@@ -1,7 +1,8 @@
 package com.linkedin.venice.pushmonitor;
 
 import com.linkedin.venice.controller.HelixAdminClient;
-import com.linkedin.venice.controller.VeniceControllerConfig;
+import com.linkedin.venice.controller.StoreLifecycleHooksCache;
+import com.linkedin.venice.controller.VeniceControllerClusterConfig;
 import com.linkedin.venice.controller.stats.DisabledPartitionStats;
 import com.linkedin.venice.ingestion.control.RealTimeTopicSwitcher;
 import com.linkedin.venice.meta.Instance;
@@ -11,6 +12,7 @@ import com.linkedin.venice.meta.RoutingDataRepository;
 import com.linkedin.venice.meta.StoreCleaner;
 import com.linkedin.venice.pushstatushelper.PushStatusStoreReader;
 import com.linkedin.venice.utils.locks.ClusterLockManager;
+import com.linkedin.venice.writer.VeniceWriterFactory;
 import java.util.List;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -34,11 +36,14 @@ public class PartitionStatusBasedPushMonitor extends AbstractPushMonitor {
       RealTimeTopicSwitcher realTimeTopicSwitcher,
       ClusterLockManager clusterLockManager,
       String aggregateRealTimeSourceKafkaUrl,
-      List<String> childDataCenterKafkaUrls,
+      List<String> activeActiveRealTimeSourceKafkaURLs,
       HelixAdminClient helixAdminClient,
-      VeniceControllerConfig controllerConfig,
+      VeniceControllerClusterConfig controllerConfig,
       PushStatusStoreReader pushStatusStoreReader,
-      DisabledPartitionStats disabledPartitionStats) {
+      DisabledPartitionStats disabledPartitionStats,
+      VeniceWriterFactory veniceWriterFactory,
+      CurrentVersionChangeNotifier currentVersionChangeNotifier,
+      StoreLifecycleHooksCache storeLifecycleHooksCache) {
     super(
         clusterName,
         offlinePushAccessor,
@@ -49,11 +54,14 @@ public class PartitionStatusBasedPushMonitor extends AbstractPushMonitor {
         realTimeTopicSwitcher,
         clusterLockManager,
         aggregateRealTimeSourceKafkaUrl,
-        childDataCenterKafkaUrls,
+        activeActiveRealTimeSourceKafkaURLs,
         helixAdminClient,
         controllerConfig,
         pushStatusStoreReader,
-        disabledPartitionStats);
+        disabledPartitionStats,
+        veniceWriterFactory,
+        currentVersionChangeNotifier,
+        storeLifecycleHooksCache);
   }
 
   @Override

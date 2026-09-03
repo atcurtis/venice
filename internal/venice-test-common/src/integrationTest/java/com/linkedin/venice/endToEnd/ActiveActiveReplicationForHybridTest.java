@@ -1,32 +1,18 @@
 package com.linkedin.venice.endToEnd;
 
-import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_PLAIN_TABLE_FORMAT_ENABLED;
-import static com.linkedin.venice.CommonConfigKeys.SSL_ENABLED;
+import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_BLOCK_CACHE_SIZE_IN_BYTES;
 import static com.linkedin.venice.ConfigKeys.DATA_BASE_PATH;
 import static com.linkedin.venice.ConfigKeys.NATIVE_REPLICATION_SOURCE_FABRIC;
 import static com.linkedin.venice.ConfigKeys.PARENT_KAFKA_CLUSTER_FABRIC_LIST;
 import static com.linkedin.venice.ConfigKeys.PERSISTENCE_TYPE;
-import static com.linkedin.venice.ConfigKeys.SERVER_DATABASE_CHECKSUM_VERIFICATION_ENABLED;
 import static com.linkedin.venice.ConfigKeys.SERVER_DATABASE_SYNC_BYTES_INTERNAL_FOR_DEFERRED_WRITE_MODE;
-import static com.linkedin.venice.ConfigKeys.SERVER_PROMOTION_TO_LEADER_REPLICA_DELAY_SECONDS;
+import static com.linkedin.venice.integration.utils.DaVinciTestContext.getCachingDaVinciClientFactory;
 import static com.linkedin.venice.integration.utils.VeniceClusterWrapperConstants.DEFAULT_PARENT_DATA_CENTER_REGION_NAME;
 import static com.linkedin.venice.integration.utils.VeniceControllerWrapper.D2_SERVICE_NAME;
-import static com.linkedin.venice.integration.utils.VeniceControllerWrapper.PARENT_D2_SERVICE_NAME;
 import static com.linkedin.venice.meta.PersistenceType.ROCKS_DB;
-import static com.linkedin.venice.samza.VeniceSystemFactory.DEPLOYMENT_ID;
-import static com.linkedin.venice.samza.VeniceSystemFactory.DOT;
-import static com.linkedin.venice.samza.VeniceSystemFactory.SYSTEMS_PREFIX;
-import static com.linkedin.venice.samza.VeniceSystemFactory.VENICE_AGGREGATE;
-import static com.linkedin.venice.samza.VeniceSystemFactory.VENICE_CHILD_CONTROLLER_D2_SERVICE;
-import static com.linkedin.venice.samza.VeniceSystemFactory.VENICE_CHILD_D2_ZK_HOSTS;
-import static com.linkedin.venice.samza.VeniceSystemFactory.VENICE_PARENT_CONTROLLER_D2_SERVICE;
-import static com.linkedin.venice.samza.VeniceSystemFactory.VENICE_PARENT_D2_ZK_HOSTS;
-import static com.linkedin.venice.samza.VeniceSystemFactory.VENICE_PUSH_TYPE;
-import static com.linkedin.venice.samza.VeniceSystemFactory.VENICE_STORE;
 import static com.linkedin.venice.utils.IntegrationTestPushUtils.sendStreamingDeleteRecord;
 import static com.linkedin.venice.utils.IntegrationTestPushUtils.sendStreamingRecordWithKeyPrefix;
 import static com.linkedin.venice.utils.TestUtils.assertCommand;
-import static com.linkedin.venice.utils.TestUtils.createAndVerifyStoreInAllRegions;
 import static com.linkedin.venice.utils.TestUtils.updateStoreToHybrid;
 import static com.linkedin.venice.utils.TestUtils.waitForNonDeterministicAssertion;
 import static com.linkedin.venice.utils.TestWriteUtils.STRING_SCHEMA;
@@ -36,13 +22,10 @@ import static org.testng.Assert.assertNull;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.fail;
 
-import com.linkedin.d2.balancer.D2Client;
-import com.linkedin.d2.balancer.D2ClientBuilder;
 import com.linkedin.davinci.client.DaVinciClient;
 import com.linkedin.davinci.client.DaVinciConfig;
 import com.linkedin.davinci.client.factory.CachingDaVinciClientFactory;
 import com.linkedin.davinci.kafka.consumer.StoreIngestionTaskBackdoor;
-import com.linkedin.venice.D2.D2ClientUtils;
 import com.linkedin.venice.client.store.AvroGenericStoreClient;
 import com.linkedin.venice.client.store.ClientConfig;
 import com.linkedin.venice.client.store.ClientFactory;
@@ -51,25 +34,22 @@ import com.linkedin.venice.controllerapi.ControllerResponse;
 import com.linkedin.venice.controllerapi.JobStatusQueryResponse;
 import com.linkedin.venice.controllerapi.MultiSchemaResponse;
 import com.linkedin.venice.controllerapi.StoreResponse;
-import com.linkedin.venice.controllerapi.UpdateStoreQueryParams;
-import com.linkedin.venice.integration.utils.ServiceFactory;
 import com.linkedin.venice.integration.utils.VeniceClusterWrapper;
-import com.linkedin.venice.integration.utils.VeniceControllerWrapper;
 import com.linkedin.venice.integration.utils.VeniceMultiClusterWrapper;
 import com.linkedin.venice.integration.utils.VeniceRouterWrapper;
 import com.linkedin.venice.integration.utils.VeniceServerWrapper;
-import com.linkedin.venice.integration.utils.VeniceTwoLayerMultiRegionMultiClusterWrapper;
 import com.linkedin.venice.meta.DataReplicationPolicy;
 import com.linkedin.venice.meta.HybridStoreConfig;
 import com.linkedin.venice.meta.Instance;
 import com.linkedin.venice.meta.OnlineInstanceFinder;
 import com.linkedin.venice.meta.StoreInfo;
-import com.linkedin.venice.meta.VeniceUserStoreType;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.samza.VeniceObjectWithTimestamp;
 import com.linkedin.venice.samza.VeniceSystemFactory;
 import com.linkedin.venice.samza.VeniceSystemProducer;
+import com.linkedin.venice.samza.VeniceSystemProducerConfig;
 import com.linkedin.venice.utils.DataProviderUtils;
+import com.linkedin.venice.utils.IntegrationTestPushUtils;
 import com.linkedin.venice.utils.MockCircularTime;
 import com.linkedin.venice.utils.PropertyBuilder;
 import com.linkedin.venice.utils.Time;
@@ -86,13 +66,10 @@ import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 import org.apache.helix.HelixAdmin;
 import org.apache.helix.manager.zk.ZKHelixAdmin;
 import org.apache.helix.model.IdealState;
 import org.apache.http.HttpStatus;
-import org.apache.samza.config.MapConfig;
 import org.apache.samza.system.OutgoingMessageEnvelope;
 import org.apache.samza.system.SystemStream;
 import org.testng.annotations.AfterClass;
@@ -100,168 +77,55 @@ import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
 
-/**
- * TODO: Update the corresponding test cases and comments after the related Active/Active replication implementation
- *       is done.
- */
-public class ActiveActiveReplicationForHybridTest {
+public class ActiveActiveReplicationForHybridTest extends AbstractMultiRegionTest {
   private static final int TEST_TIMEOUT = 5 * Time.MS_PER_MINUTE;
   private static final int PUSH_TIMEOUT = TEST_TIMEOUT / 2;
 
-  protected static final int NUMBER_OF_CHILD_DATACENTERS = 2;
-  protected static final int NUMBER_OF_CLUSTERS = 1;
-  static final String[] CLUSTER_NAMES =
-      IntStream.range(0, NUMBER_OF_CLUSTERS).mapToObj(i -> "venice-cluster" + i).toArray(String[]::new);
-  // ["venice-cluster0", "venice-cluster1", ...];
-
-  protected List<VeniceMultiClusterWrapper> childDatacenters;
-  protected List<VeniceControllerWrapper> parentControllers;
-  protected VeniceTwoLayerMultiRegionMultiClusterWrapper multiRegionMultiClusterWrapper;
-
-  private D2Client d2ClientForDC0Region;
   private Properties serverProperties;
   private ControllerClient parentControllerClient;
   private ControllerClient dc0Client;
   private ControllerClient dc1Client;
   private List<ControllerClient> dcControllerClientList;
 
-  @BeforeClass(alwaysRun = true)
-  public void setUp() {
-    /**
-     * Reduce leader promotion delay to 1 second;
-     * Create a testing environment with 1 parent fabric and 3 child fabrics;
-     * Set server and replication factor to 2 to ensure at least 1 leader replica and 1 follower replica;
-     */
-    serverProperties = new Properties();
-    serverProperties.put(SERVER_PROMOTION_TO_LEADER_REPLICA_DELAY_SECONDS, 1L);
-    serverProperties.put(ROCKSDB_PLAIN_TABLE_FORMAT_ENABLED, false);
-    serverProperties.put(SERVER_DATABASE_CHECKSUM_VERIFICATION_ENABLED, true);
-    serverProperties.put(SERVER_DATABASE_SYNC_BYTES_INTERNAL_FOR_DEFERRED_WRITE_MODE, "300");
+  @Override
+  protected boolean shouldCreateD2Client() {
+    return true;
+  }
 
+  @Override
+  protected Properties getExtraServerProperties() {
+    Properties props = new Properties();
+    props.put(SERVER_DATABASE_SYNC_BYTES_INTERNAL_FOR_DEFERRED_WRITE_MODE, "300");
+    return props;
+  }
+
+  @Override
+  protected Properties getExtraControllerProperties() {
     Properties controllerProps = new Properties();
     controllerProps.put(NATIVE_REPLICATION_SOURCE_FABRIC, "dc-0");
     controllerProps.put(PARENT_KAFKA_CLUSTER_FABRIC_LIST, DEFAULT_PARENT_DATA_CENTER_REGION_NAME);
-    multiRegionMultiClusterWrapper = ServiceFactory.getVeniceTwoLayerMultiRegionMultiClusterWrapper(
-        NUMBER_OF_CHILD_DATACENTERS,
-        NUMBER_OF_CLUSTERS,
-        1,
-        1,
-        2,
-        1,
-        2,
-        Optional.of(controllerProps),
-        Optional.of(controllerProps),
-        Optional.of(serverProperties),
-        false);
-    childDatacenters = multiRegionMultiClusterWrapper.getChildRegions();
-    parentControllers = multiRegionMultiClusterWrapper.getParentControllers();
+    return controllerProps;
+  }
 
-    // Set up a d2 client for DC0 region
-    d2ClientForDC0Region = new D2ClientBuilder().setZkHosts(childDatacenters.get(0).getZkServerWrapper().getAddress())
-        .setZkSessionTimeout(3, TimeUnit.SECONDS)
-        .setZkStartupTimeout(3, TimeUnit.SECONDS)
-        .build();
-    D2ClientUtils.startClient(d2ClientForDC0Region);
-
-    String clusterName = CLUSTER_NAMES[0];
-    String parentControllerURLs =
-        parentControllers.stream().map(VeniceControllerWrapper::getControllerUrl).collect(Collectors.joining(","));
-    parentControllerClient = new ControllerClient(clusterName, parentControllerURLs);
+  @Override
+  @BeforeClass(alwaysRun = true)
+  public void setUp() {
+    super.setUp();
+    serverProperties = getExtraServerProperties();
+    String clusterName = CLUSTER_NAME;
+    parentControllerClient = new ControllerClient(clusterName, getParentControllerUrl());
     dc0Client = new ControllerClient(clusterName, childDatacenters.get(0).getControllerConnectString());
     dc1Client = new ControllerClient(clusterName, childDatacenters.get(1).getControllerConnectString());
     dcControllerClientList = Arrays.asList(dc0Client, dc1Client);
   }
 
+  @Override
   @AfterClass(alwaysRun = true)
   public void cleanUp() {
-    if (d2ClientForDC0Region != null) {
-      D2ClientUtils.shutdownClient(d2ClientForDC0Region);
-    }
     Utils.closeQuietlyWithErrorLogged(parentControllerClient);
     Utils.closeQuietlyWithErrorLogged(dc0Client);
     Utils.closeQuietlyWithErrorLogged(dc1Client);
-    Utils.closeQuietlyWithErrorLogged(multiRegionMultiClusterWrapper);
-  }
-
-  @Test(timeOut = TEST_TIMEOUT)
-  public void testEnableActiveActiveReplicationForCluster() {
-    String storeName1 = Utils.getUniqueString("test-batch-store");
-    String storeName2 = Utils.getUniqueString("test-hybrid-agg-store");
-    String storeName3 = Utils.getUniqueString("test-hybrid-non-agg-store");
-    String storeName4 = Utils.getUniqueString("test-incremental-push-store");
-    try {
-      createAndVerifyStoreInAllRegions(storeName1, parentControllerClient, dcControllerClientList);
-      createAndVerifyStoreInAllRegions(storeName2, parentControllerClient, dcControllerClientList);
-      createAndVerifyStoreInAllRegions(storeName3, parentControllerClient, dcControllerClientList);
-      createAndVerifyStoreInAllRegions(storeName4, parentControllerClient, dcControllerClientList);
-
-      assertCommand(
-          parentControllerClient.updateStore(
-              storeName2,
-              new UpdateStoreQueryParams().setHybridRewindSeconds(10)
-                  .setHybridOffsetLagThreshold(2)
-                  .setHybridDataReplicationPolicy(DataReplicationPolicy.AGGREGATE)));
-
-      assertCommand(
-          parentControllerClient.updateStore(
-              storeName3,
-              new UpdateStoreQueryParams().setHybridRewindSeconds(10).setHybridOffsetLagThreshold(2)));
-
-      assertCommand(
-          parentControllerClient.updateStore(storeName4, new UpdateStoreQueryParams().setIncrementalPushEnabled(true)));
-
-      // Test batch
-      assertCommand(
-          parentControllerClient.configureActiveActiveReplicationForCluster(
-              true,
-              VeniceUserStoreType.BATCH_ONLY.toString(),
-              Optional.empty()));
-      verifyDCConfigAARepl(parentControllerClient, storeName1, false, false, true);
-      verifyDCConfigAARepl(dc0Client, storeName1, false, false, true);
-      verifyDCConfigAARepl(dc1Client, storeName1, false, false, true);
-      assertCommand(
-          assertCommand(
-              parentControllerClient.configureActiveActiveReplicationForCluster(
-                  false,
-                  VeniceUserStoreType.BATCH_ONLY.toString(),
-                  Optional.of("dc-parent-0.parent,dc-0"))));
-      verifyDCConfigAARepl(parentControllerClient, storeName1, false, true, false);
-      verifyDCConfigAARepl(dc0Client, storeName1, false, true, false);
-      verifyDCConfigAARepl(dc1Client, storeName1, false, true, true);
-
-      // Test hybrid - agg vs non-agg
-      assertCommand(
-          parentControllerClient.configureActiveActiveReplicationForCluster(
-              true,
-              VeniceUserStoreType.HYBRID_ONLY.toString(),
-              Optional.empty()));
-      verifyDCConfigAARepl(parentControllerClient, storeName2, true, false, false);
-      verifyDCConfigAARepl(dc0Client, storeName2, true, false, false);
-      verifyDCConfigAARepl(dc1Client, storeName2, true, false, false);
-      verifyDCConfigAARepl(parentControllerClient, storeName3, true, false, true);
-      verifyDCConfigAARepl(dc0Client, storeName3, true, false, true);
-      verifyDCConfigAARepl(dc1Client, storeName3, true, false, true);
-      assertCommand(
-          parentControllerClient.configureActiveActiveReplicationForCluster(
-              false,
-              VeniceUserStoreType.HYBRID_ONLY.toString(),
-              Optional.empty()));
-      verifyDCConfigAARepl(parentControllerClient, storeName3, true, true, false);
-      verifyDCConfigAARepl(dc0Client, storeName3, true, true, false);
-      verifyDCConfigAARepl(dc1Client, storeName3, true, true, false);
-
-      // Test incremental
-      assertCommand(
-          parentControllerClient.configureActiveActiveReplicationForCluster(
-              true,
-              VeniceUserStoreType.INCREMENTAL_PUSH.toString(),
-              Optional.empty()));
-      verifyDCConfigAARepl(parentControllerClient, storeName4, false, false, true);
-      verifyDCConfigAARepl(dc0Client, storeName4, false, false, true);
-      verifyDCConfigAARepl(dc1Client, storeName4, false, false, true);
-    } finally {
-      deleteStores(storeName1, storeName2, storeName3, storeName4);
-    }
+    super.cleanUp();
   }
 
   @Test(timeOut = TEST_TIMEOUT)
@@ -332,7 +196,7 @@ public class ActiveActiveReplicationForHybridTest {
   @Test(timeOut = TEST_TIMEOUT, dataProvider = "Two-True-and-False", dataProviderClass = DataProviderUtils.class)
   public void testAAReplicationCanConsumeFromAllRegions(boolean isChunkingEnabled, boolean useTransientRecordCache)
       throws InterruptedException, ExecutionException {
-    String clusterName = CLUSTER_NAMES[0];
+    String clusterName = CLUSTER_NAME;
     String storeName = Utils.getUniqueString("test-store");
     try {
       assertCommand(
@@ -372,30 +236,17 @@ public class ActiveActiveReplicationForHybridTest {
       }
 
       Map<VeniceMultiClusterWrapper, VeniceSystemProducer> childDatacenterToSystemProducer =
-          new HashMap<>(NUMBER_OF_CHILD_DATACENTERS);
+          new HashMap<>(childDatacenters.size());
       int streamingRecordCount = 10;
       try {
-        for (int dataCenterIndex = 0; dataCenterIndex < NUMBER_OF_CHILD_DATACENTERS; dataCenterIndex++) {
-          // Send messages to RT in the corresponding region
-          String keyPrefix = "dc-" + dataCenterIndex + "_key_";
+        for (int dataCenterIndex = 0; dataCenterIndex < childDatacenters.size(); dataCenterIndex++) {
           VeniceMultiClusterWrapper childDataCenter = childDatacenters.get(dataCenterIndex);
 
-          Map<String, String> samzaConfig = new HashMap<>();
-          String configPrefix = SYSTEMS_PREFIX + "venice" + DOT;
-          samzaConfig.put(configPrefix + VENICE_PUSH_TYPE, Version.PushType.STREAM.toString());
-          samzaConfig.put(configPrefix + VENICE_STORE, storeName);
-          samzaConfig.put(configPrefix + VENICE_AGGREGATE, "false");
-          samzaConfig.put(VENICE_CHILD_D2_ZK_HOSTS, childDataCenter.getZkServerWrapper().getAddress());
-          samzaConfig.put(VENICE_CHILD_CONTROLLER_D2_SERVICE, D2_SERVICE_NAME);
-          samzaConfig.put(VENICE_PARENT_D2_ZK_HOSTS, multiRegionMultiClusterWrapper.getZkServerWrapper().getAddress());
-          samzaConfig.put(VENICE_PARENT_CONTROLLER_D2_SERVICE, PARENT_D2_SERVICE_NAME);
-          samzaConfig.put(DEPLOYMENT_ID, Utils.getUniqueString("venice-push-id"));
-          samzaConfig.put(SSL_ENABLED, "false");
-          VeniceSystemFactory factory = new VeniceSystemFactory();
-          VeniceSystemProducer veniceProducer = factory.getClosableProducer("venice", new MapConfig(samzaConfig), null);
-          veniceProducer.start();
+          VeniceSystemProducer veniceProducer = IntegrationTestPushUtils
+              .getSamzaProducerForStream(multiRegionMultiClusterWrapper, dataCenterIndex, storeName);
           childDatacenterToSystemProducer.put(childDataCenter, veniceProducer);
-
+          // Send messages to RT in the corresponding region
+          String keyPrefix = "dc-" + dataCenterIndex + "_key_";
           for (int i = 0; i < streamingRecordCount; i++) {
             sendStreamingRecordWithKeyPrefix(veniceProducer, storeName, keyPrefix, i);
           }
@@ -407,7 +258,7 @@ public class ActiveActiveReplicationForHybridTest {
         try (AvroGenericStoreClient<String, Object> client = ClientFactory
             .getAndStartGenericAvroClient(ClientConfig.defaultGenericClientConfig(storeName).setVeniceURL(routerUrl))) {
           waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, true, () -> {
-            for (int dataCenterIndex = 0; dataCenterIndex < NUMBER_OF_CHILD_DATACENTERS; dataCenterIndex++) {
+            for (int dataCenterIndex = 0; dataCenterIndex < childDatacenters.size(); dataCenterIndex++) {
               // Verify the data sent by Samza producer from different regions
               String keyPrefix = "dc-" + dataCenterIndex + "_key_";
               for (int i = 0; i < streamingRecordCount; i++) {
@@ -428,7 +279,7 @@ public class ActiveActiveReplicationForHybridTest {
           });
 
           // Send DELETE from all child datacenter for existing and new records
-          for (int dataCenterIndex = 0; dataCenterIndex < NUMBER_OF_CHILD_DATACENTERS; dataCenterIndex++) {
+          for (int dataCenterIndex = 0; dataCenterIndex < childDatacenters.size(); dataCenterIndex++) {
             String keyPrefix = "dc-" + dataCenterIndex + "_key_";
             sendStreamingDeleteRecord(
                 childDatacenterToSystemProducer.get(childDatacenters.get(dataCenterIndex)),
@@ -442,7 +293,7 @@ public class ActiveActiveReplicationForHybridTest {
 
           // Verify both DELETEs can be processed
           waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, true, () -> {
-            for (int dataCenterIndex = 0; dataCenterIndex < NUMBER_OF_CHILD_DATACENTERS; dataCenterIndex++) {
+            for (int dataCenterIndex = 0; dataCenterIndex < childDatacenters.size(); dataCenterIndex++) {
               // Verify the data sent by Samza producer from different regions
               String keyPrefix = "dc-" + dataCenterIndex + "_key_";
               assertNull(
@@ -455,7 +306,7 @@ public class ActiveActiveReplicationForHybridTest {
           });
 
           // Send PUT from all child datacenter for new records
-          for (int dataCenterIndex = 0; dataCenterIndex < NUMBER_OF_CHILD_DATACENTERS; dataCenterIndex++) {
+          for (int dataCenterIndex = 0; dataCenterIndex < childDatacenters.size(); dataCenterIndex++) {
             String keyPrefix = "dc-" + dataCenterIndex + "_key_";
             sendStreamingRecordWithKeyPrefix(
                 childDatacenterToSystemProducer.get(childDatacenters.get(dataCenterIndex)),
@@ -465,7 +316,7 @@ public class ActiveActiveReplicationForHybridTest {
           }
 
           waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, true, () -> {
-            for (int dataCenterIndex = 0; dataCenterIndex < NUMBER_OF_CHILD_DATACENTERS; dataCenterIndex++) {
+            for (int dataCenterIndex = 0; dataCenterIndex < childDatacenters.size(); dataCenterIndex++) {
               // Verify the data sent by Samza producer from different regions
               String keyPrefix = "dc-" + dataCenterIndex + "_key_";
               assertNull(
@@ -492,21 +343,24 @@ public class ActiveActiveReplicationForHybridTest {
 
       // Verify that DaVinci client can successfully bootstrap all partitions from AA enabled stores
       String baseDataPath = Utils.getTempDataDirectory().getAbsolutePath();
-      VeniceProperties backendConfig =
-          new PropertyBuilder().put(DATA_BASE_PATH, baseDataPath).put(PERSISTENCE_TYPE, ROCKS_DB).build();
+      VeniceProperties backendConfig = new PropertyBuilder().put(DATA_BASE_PATH, baseDataPath)
+          .put(ROCKSDB_BLOCK_CACHE_SIZE_IN_BYTES, 2 * 1024 * 1024L)
+          .put(PERSISTENCE_TYPE, ROCKS_DB)
+          .build();
 
       MetricsRepository metricsRepository = new MetricsRepository();
       try (
-          CachingDaVinciClientFactory factory = new CachingDaVinciClientFactory(
-              d2ClientForDC0Region,
+          CachingDaVinciClientFactory factory = getCachingDaVinciClientFactory(
+              d2ClientDC0,
               VeniceRouterWrapper.CLUSTER_DISCOVERY_D2_SERVICE_NAME,
               metricsRepository,
-              backendConfig);
+              backendConfig,
+              multiRegionMultiClusterWrapper);
           DaVinciClient<String, Object> daVinciClient =
               factory.getAndStartGenericAvroClient(storeName, new DaVinciConfig())) {
         daVinciClient.subscribeAll().get();
         waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, true, true, () -> {
-          for (int dataCenterIndex = 0; dataCenterIndex < NUMBER_OF_CHILD_DATACENTERS; dataCenterIndex++) {
+          for (int dataCenterIndex = 0; dataCenterIndex < childDatacenters.size(); dataCenterIndex++) {
             // Verify the data sent by Samza producer from different regions
             String keyPrefix = "dc-" + dataCenterIndex + "_key_";
             assertNull(
@@ -555,7 +409,7 @@ public class ActiveActiveReplicationForHybridTest {
 
   @Test(timeOut = TEST_TIMEOUT, dataProvider = "Two-True-and-False", dataProviderClass = DataProviderUtils.class)
   public void testAAReplicationCanResolveConflicts(boolean useLogicalTimestamp, boolean chunkingEnabled) {
-    String clusterName = CLUSTER_NAMES[0];
+    String clusterName = CLUSTER_NAME;
     String storeName = Utils.getUniqueString("test-store");
     try {
       assertCommand(
@@ -573,11 +427,15 @@ public class ActiveActiveReplicationForHybridTest {
           parentControllerClient
               .sendEmptyPushAndWait(storeName, Utils.getUniqueString("empty-hybrid-push"), 1L, PUSH_TIMEOUT));
 
-      // Verify that version 1 is already created in dc-0 region
-      waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, () -> {
-        StoreResponse storeResponse = assertCommand(dc0Client.getStore(storeName));
-        assertEquals(storeResponse.getStore().getCurrentVersion(), 1);
-      });
+      // Verify that version 1 is available in BOTH dc-0 and dc-1 regions.
+      // Without this, the dc-1 producer start at line ~561 can race and fail with
+      // "Store is not initialized with a version yet" if dc-1 hasn't processed the version yet.
+      for (ControllerClient dcClient: dcControllerClientList) {
+        waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, () -> {
+          StoreResponse storeResponse = assertCommand(dcClient.getStore(storeName));
+          assertEquals(storeResponse.getStore().getCurrentVersion(), 1);
+        });
+      }
 
       /**
        * First test:
@@ -610,18 +468,17 @@ public class ActiveActiveReplicationForHybridTest {
       // Build the SystemProducer with the mock time
       VeniceMultiClusterWrapper childDataCenter = childDatacenters.get(0);
       try (VeniceSystemProducer producerInDC0 = new VeniceSystemProducer(
-          childDataCenter.getZkServerWrapper().getAddress(),
-          childDataCenter.getZkServerWrapper().getAddress(),
-          D2_SERVICE_NAME,
-          storeName,
-          Version.PushType.STREAM,
-          Utils.getUniqueString("venice-push-id"),
-          "dc-0",
-          true,
-          null,
-          Optional.empty(),
-          Optional.empty(),
-          mockTime)) {
+          new VeniceSystemProducerConfig.Builder().setFactory(new VeniceSystemFactory())
+              .setStoreName(storeName)
+              .setPushType(Version.PushType.STREAM)
+              .setSamzaJobId(Utils.getUniqueString("venice-push-id"))
+              .setRunningFabric("dc-0")
+              .setVerifyLatestProtocolPresent(true)
+              .setVeniceChildD2ZkHost(childDataCenter.getZkServerWrapper().getAddress())
+              .setPrimaryControllerColoD2ZKHost(childDataCenter.getZkServerWrapper().getAddress())
+              .setPrimaryControllerD2ServiceName(D2_SERVICE_NAME)
+              .setTime(mockTime)
+              .build())) {
         producerInDC0.start();
 
         // Send <Key1, Value1>
@@ -691,21 +548,31 @@ public class ActiveActiveReplicationForHybridTest {
       String key3 = "key3";
       String value3 = "value3";
 
+      /*
+       * Mirror the dc-0 wait above for dc-1: wait until dc-1's controller has registered
+       * version 1 before starting the Samza producer there. Without this, producerInDC1.start()
+       * can race the version-creation propagation from the parent controller and fail with
+       * "Store ... is not initialized with a version yet" on /request_topic.
+       */
+      waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, () -> {
+        StoreResponse storeResponse = assertCommand(dc1Client.getStore(storeName));
+        assertEquals(storeResponse.getStore().getCurrentVersion(), 1);
+      });
+
       // Build the SystemProducer with the mock time
       VeniceMultiClusterWrapper childDataCenter1 = childDatacenters.get(1);
       try (VeniceSystemProducer producerInDC1 = new VeniceSystemProducer(
-          childDataCenter.getZkServerWrapper().getAddress(),
-          childDataCenter1.getZkServerWrapper().getAddress(),
-          D2_SERVICE_NAME,
-          storeName,
-          Version.PushType.STREAM,
-          Utils.getUniqueString("venice-push-id"),
-          "dc-1",
-          true,
-          null,
-          Optional.empty(),
-          Optional.empty(),
-          mockTime)) {
+          new VeniceSystemProducerConfig.Builder().setFactory(new VeniceSystemFactory())
+              .setStoreName(storeName)
+              .setPushType(Version.PushType.STREAM)
+              .setSamzaJobId(Utils.getUniqueString("venice-push-id"))
+              .setRunningFabric("dc-1")
+              .setVerifyLatestProtocolPresent(true)
+              .setVeniceChildD2ZkHost(childDataCenter.getZkServerWrapper().getAddress())
+              .setPrimaryControllerColoD2ZKHost(childDataCenter1.getZkServerWrapper().getAddress())
+              .setPrimaryControllerD2ServiceName(D2_SERVICE_NAME)
+              .setTime(mockTime)
+              .build())) {
         producerInDC1.start();
 
         // Send <Key1, Value3>, which will be ignored if DCR is implemented properly
@@ -746,7 +613,7 @@ public class ActiveActiveReplicationForHybridTest {
 
   @Test(timeOut = TEST_TIMEOUT)
   public void testHelixReplicationFactorConfigChange() {
-    String clusterName = CLUSTER_NAMES[0];
+    String clusterName = CLUSTER_NAME;
     String storeName = Utils.getUniqueString("test-store");
     VeniceClusterWrapper clusterForDC0Region = childDatacenters.get(0).getClusters().get(clusterName);
     String kafkaTopic;

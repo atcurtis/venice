@@ -1,9 +1,11 @@
 package com.linkedin.venice.listener;
 
+import com.linkedin.alpini.base.ssl.SslFactory;
 import com.linkedin.alpini.netty4.handlers.BasicHttpServerCodec;
 import com.linkedin.alpini.netty4.http2.Http2PipelineInitializer;
 import com.linkedin.alpini.netty4.ssl.SslInitializer;
 import com.linkedin.davinci.config.VeniceServerConfig;
+import com.linkedin.davinci.storage.StorageEngineRepository;
 import com.linkedin.venice.acl.DynamicAccessController;
 import com.linkedin.venice.acl.StaticAccessController;
 import com.linkedin.venice.authorization.IdentityParser;
@@ -17,13 +19,13 @@ import com.linkedin.venice.listener.grpc.handlers.GrpcStatsHandler;
 import com.linkedin.venice.listener.grpc.handlers.GrpcStorageReadRequestHandler;
 import com.linkedin.venice.listener.grpc.handlers.VeniceServerGrpcRequestProcessor;
 import com.linkedin.venice.meta.ReadOnlyStoreRepository;
-import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.read.RequestType;
 import com.linkedin.venice.security.SSLFactory;
 import com.linkedin.venice.stats.AggServerHttpRequestStats;
-import com.linkedin.venice.stats.AggServerQuotaTokenBucketStats;
 import com.linkedin.venice.stats.AggServerQuotaUsageStats;
 import com.linkedin.venice.stats.ServerConnectionStats;
+import com.linkedin.venice.stats.ServerLoadStats;
+import com.linkedin.venice.stats.ThreadPoolStats;
 import com.linkedin.venice.utils.ReflectUtils;
 import com.linkedin.venice.utils.SslUtils;
 import com.linkedin.venice.utils.Utils;
@@ -40,7 +42,7 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executor;
+import java.util.concurrent.ThreadPoolExecutor;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -52,20 +54,21 @@ public class HttpChannelInitializer extends ChannelInitializer<SocketChannel> {
   private final AggServerHttpRequestStats singleGetStats;
   private final AggServerHttpRequestStats multiGetStats;
   private final AggServerHttpRequestStats computeStats;
+  private final ThreadPoolStats sslHandshakesThreadPoolStats;
   private final Optional<SSLFactory> sslFactory;
-  private final Executor sslHandshakeExecutor;
+  private final SslFactory alpiniSslFactory;
+  private final ThreadPoolExecutor sslHandshakeExecutor;
   private final Optional<ServerAclHandler> aclHandler;
   private final Optional<ServerStoreAclHandler> storeAclHandler;
   private final VerifySslHandler verifySsl = new VerifySslHandler();
   private final VeniceServerConfig serverConfig;
   private final ReadQuotaEnforcementHandler quotaEnforcer;
   private final VeniceHttp2PipelineInitializerBuilder http2PipelineInitializerBuilder;
-  private final ServerConnectionStats serverConnectionStats;
-  AggServerQuotaUsageStats quotaUsageStats;
-  AggServerQuotaTokenBucketStats quotaTokenBucketStats;
+  private final ServerConnectionStatsHandler serverConnectionStatsHandler;
+  private AggServerQuotaUsageStats quotaUsageStats;
   List<ServerInterceptor> aclInterceptors;
   private final IdentityParser identityParser;
-
+  private final ServerLoadControllerHandler loadControllerHandler;
   private boolean isDaVinciClient;
 
   public HttpChannelInitializer(
@@ -73,36 +76,35 @@ public class HttpChannelInitializer extends ChannelInitializer<SocketChannel> {
       CompletableFuture<HelixCustomizedViewOfflinePushRepository> customizedViewRepository,
       MetricsRepository metricsRepository,
       Optional<SSLFactory> sslFactory,
-      Executor sslHandshakeExecutor,
+      ThreadPoolExecutor sslHandshakeExecutor,
       VeniceServerConfig serverConfig,
       Optional<StaticAccessController> routerAccessController,
       Optional<DynamicAccessController> storeAccessController,
-      StorageReadRequestHandler requestHandler) {
+      StorageReadRequestHandler requestHandler,
+      StorageEngineRepository storageEngineRepository) {
     this.serverConfig = serverConfig;
     this.requestHandler = requestHandler;
     this.isDaVinciClient = serverConfig.isDaVinciClient();
 
-    boolean isKeyValueProfilingEnabled = serverConfig.isKeyValueProfilingEnabled();
     boolean isUnregisterMetricForDeletedStoreEnabled = serverConfig.isUnregisterMetricForDeletedStoreEnabled();
-
     this.singleGetStats = new AggServerHttpRequestStats(
+        serverConfig.getClusterName(),
         metricsRepository,
         RequestType.SINGLE_GET,
-        isKeyValueProfilingEnabled,
         storeMetadataRepository,
         isUnregisterMetricForDeletedStoreEnabled,
         isDaVinciClient);
     this.multiGetStats = new AggServerHttpRequestStats(
+        serverConfig.getClusterName(),
         metricsRepository,
         RequestType.MULTI_GET,
-        isKeyValueProfilingEnabled,
         storeMetadataRepository,
         isUnregisterMetricForDeletedStoreEnabled,
         isDaVinciClient);
     this.computeStats = new AggServerHttpRequestStats(
+        serverConfig.getClusterName(),
         metricsRepository,
         RequestType.COMPUTE,
-        isKeyValueProfilingEnabled,
         storeMetadataRepository,
         isUnregisterMetricForDeletedStoreEnabled,
         isDaVinciClient);
@@ -112,9 +114,22 @@ public class HttpChannelInitializer extends ChannelInitializer<SocketChannel> {
     }
 
     this.sslFactory = sslFactory;
+    this.alpiniSslFactory = sslFactory.isPresent() ? SslUtils.toAlpiniSSLFactory(sslFactory.get()) : null;
     this.sslHandshakeExecutor = sslHandshakeExecutor;
+    this.sslHandshakesThreadPoolStats = sslHandshakeExecutor != null
+        ? new ThreadPoolStats(metricsRepository, sslHandshakeExecutor, "ssl_handshake_thread_pool")
+        : null;
+
+    Class<IdentityParser> identityParserClass = ReflectUtils.loadClass(serverConfig.getIdentityParserClassName());
+    this.identityParser = ReflectUtils.callConstructor(identityParserClass, new Class[0], new Object[0]);
+
     this.storeAclHandler = storeAccessController.isPresent()
-        ? Optional.of(new ServerStoreAclHandler(storeAccessController.get(), storeMetadataRepository))
+        ? Optional.of(
+            new ServerStoreAclHandler(
+                identityParser,
+                storeAccessController.get(),
+                storeMetadataRepository,
+                serverConfig.getAclInMemoryCacheTTLMs()))
         : Optional.empty();
     /**
      * If the store-level access handler is present, we don't want to fail fast if the access gets denied by {@link ServerAclHandler}.
@@ -126,21 +141,14 @@ public class HttpChannelInitializer extends ChannelInitializer<SocketChannel> {
 
     if (serverConfig.isQuotaEnforcementEnabled()) {
       String nodeId = Utils.getHelixNodeIdentifier(serverConfig.getListenerHostname(), serverConfig.getListenerPort());
-      this.quotaUsageStats = new AggServerQuotaUsageStats(metricsRepository);
+      this.quotaUsageStats = new AggServerQuotaUsageStats(serverConfig.getClusterName(), metricsRepository);
       this.quotaEnforcer = new ReadQuotaEnforcementHandler(
-          serverConfig.getNodeCapacityInRcu(),
+          serverConfig,
           storeMetadataRepository,
           customizedViewRepository,
+          storageEngineRepository,
           nodeId,
-          quotaUsageStats,
-          metricsRepository);
-
-      // Token Bucket Stats for a store must be initialized when that store is created
-      this.quotaTokenBucketStats = new AggServerQuotaTokenBucketStats(metricsRepository, quotaEnforcer);
-      storeMetadataRepository.registerStoreDataChangedListener(quotaTokenBucketStats);
-      for (Store store: storeMetadataRepository.getAllStores()) {
-        this.quotaTokenBucketStats.initializeStatsForStore(store.getName());
-      }
+          quotaUsageStats);
     } else {
       this.quotaEnforcer = null;
     }
@@ -155,10 +163,24 @@ public class HttpChannelInitializer extends ChannelInitializer<SocketChannel> {
     }
     this.http2PipelineInitializerBuilder = new VeniceHttp2PipelineInitializerBuilder(serverConfig);
 
-    serverConnectionStats = new ServerConnectionStats(metricsRepository, "server_connection_stats");
-
-    Class<IdentityParser> identityParserClass = ReflectUtils.loadClass(serverConfig.getIdentityParserClassName());
-    this.identityParser = ReflectUtils.callConstructor(identityParserClass, new Class[0], new Object[0]);
+    if (sslFactory.isPresent()) {
+      this.serverConnectionStatsHandler = new ServerConnectionStatsHandler(
+          this.identityParser,
+          new ServerConnectionStats(metricsRepository, "server_connection_stats", serverConfig.getClusterName()),
+          serverConfig.getRouterPrincipalName(),
+          serverConfig.getLogContext());
+    } else {
+      this.serverConnectionStatsHandler = null;
+    }
+    if (serverConfig.isLoadControllerEnabled()) {
+      this.loadControllerHandler = new ServerLoadControllerHandler(
+          serverConfig,
+          new ServerLoadStats(metricsRepository, "server_load", serverConfig.getClusterName()));
+      LOGGER.info("Server load controller is enabled");
+    } else {
+      this.loadControllerHandler = null;
+      LOGGER.info("Server load controller is disabled");
+    }
   }
 
   /*
@@ -175,18 +197,20 @@ public class HttpChannelInitializer extends ChannelInitializer<SocketChannel> {
   @Override
   public void initChannel(SocketChannel ch) {
     if (sslFactory.isPresent()) {
-      SslInitializer sslInitializer = new SslInitializer(SslUtils.toAlpiniSSLFactory(sslFactory.get()), false);
+      ch.attr(ServerConnectionStatsHandler.CHANNEL_INIT_START_TS).set(System.nanoTime());
+      SslInitializer sslInitializer = new SslInitializer(alpiniSslFactory, false);
       if (sslHandshakeExecutor != null) {
-        sslInitializer.enableSslTaskExecutor(sslHandshakeExecutor);
+        sslInitializer.enableSslTaskExecutor(
+            sslHandshakeExecutor,
+            ignored -> sslHandshakesThreadPoolStats.recordQueuedTasksCount());
       }
       sslInitializer.setIdentityParser(identityParser::parseIdentityFromCert);
       ch.pipeline().addLast(sslInitializer);
+      ch.pipeline().addLast(serverConnectionStatsHandler);
     }
+
     ChannelPipelineConsumer httpPipelineInitializer = (pipeline, whetherNeedServerCodec) -> {
-      ServerConnectionStatsHandler serverConnectionStatsHandler =
-          new ServerConnectionStatsHandler(serverConnectionStats, serverConfig.getRouterPrincipalName());
-      pipeline.addLast(serverConnectionStatsHandler);
-      StatsHandler statsHandler = new StatsHandler(singleGetStats, multiGetStats, computeStats);
+      StatsHandler statsHandler = new StatsHandler(singleGetStats, multiGetStats, computeStats, loadControllerHandler);
       pipeline.addLast(statsHandler);
       if (whetherNeedServerCodec) {
         pipeline.addLast(new HttpServerCodec());
@@ -213,6 +237,9 @@ public class HttpChannelInitializer extends ChannelInitializer<SocketChannel> {
       pipeline.addLast(new HttpObjectAggregator(serverConfig.getMaxRequestSize()))
           .addLast(new OutboundHttpWrapperHandler(statsHandler))
           .addLast(new IdleStateHandler(0, 0, serverConfig.getNettyIdleTimeInSeconds()));
+      if (loadControllerHandler != null) {
+        pipeline.addLast(loadControllerHandler);
+      }
       if (sslFactory.isPresent()) {
         pipeline.addLast(verifySsl);
         if (aclHandler.isPresent()) {
@@ -245,7 +272,7 @@ public class HttpChannelInitializer extends ChannelInitializer<SocketChannel> {
   public VeniceServerGrpcRequestProcessor initGrpcRequestProcessor() {
     VeniceServerGrpcRequestProcessor grpcServerRequestProcessor = new VeniceServerGrpcRequestProcessor();
 
-    StatsHandler statsHandler = new StatsHandler(singleGetStats, multiGetStats, computeStats);
+    StatsHandler statsHandler = new StatsHandler(singleGetStats, multiGetStats, computeStats, null);
     GrpcStatsHandler grpcStatsHandler = new GrpcStatsHandler(statsHandler);
     grpcServerRequestProcessor.addHandler(grpcStatsHandler);
 

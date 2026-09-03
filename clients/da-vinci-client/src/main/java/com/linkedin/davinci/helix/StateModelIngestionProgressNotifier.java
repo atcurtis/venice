@@ -5,7 +5,11 @@ import static com.linkedin.davinci.helix.AbstractStateModelFactory.getStateModel
 import com.linkedin.davinci.kafka.consumer.StoreIngestionService;
 import com.linkedin.davinci.notifier.VeniceNotifier;
 import com.linkedin.venice.exceptions.VeniceException;
+import com.linkedin.venice.exceptions.VeniceTimeoutException;
 import com.linkedin.venice.meta.Version;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
+import com.linkedin.venice.stats.dimensions.VeniceIngestionFailureReason;
+import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
@@ -50,8 +54,10 @@ public class StateModelIngestionProgressNotifier implements VeniceNotifier {
         logger.error(errorMsg);
         // Report ingestion_failure
         String storeName = Version.parseStoreFromKafkaTopicName(resourceName);
-        storeIngestionService.recordIngestionFailure(storeName);
-        VeniceException veniceException = new VeniceException(errorMsg);
+        int version = Version.parseVersionFromKafkaTopicName(resourceName);
+        storeIngestionService
+            .recordIngestionFailure(storeName, version, VeniceIngestionFailureReason.SERVING_VERSION_BOOTSTRAP_TIMEOUT);
+        VeniceTimeoutException veniceException = new VeniceTimeoutException(errorMsg);
         storeIngestionService.getStoreIngestionTask(resourceName).reportError(errorMsg, partitionId, veniceException);
       }
       stateModelToIngestionCompleteFlagMap.remove(stateModelId);
@@ -73,12 +79,8 @@ public class StateModelIngestionProgressNotifier implements VeniceNotifier {
     return stateModelToIngestionCompleteFlagMap.get(getStateModelID(resourceName, partitionId));
   }
 
-  void removeIngestionCompleteFlag(String resourceName, int partitionId) {
-    stateModelToIngestionCompleteFlagMap.remove(getStateModelID(resourceName, partitionId));
-  }
-
   @Override
-  public void completed(String resourceName, int partitionId, long offset, String message) {
+  public void completed(String resourceName, int partitionId, PubSubPosition position, String message) {
     CountDownLatch ingestionCompleteFlag = getIngestionCompleteFlag(resourceName, partitionId);
     if (ingestionCompleteFlag != null) {
       stateModelToSuccessMap.put(getStateModelID(resourceName, partitionId), true);
@@ -90,6 +92,7 @@ public class StateModelIngestionProgressNotifier implements VeniceNotifier {
 
   @Override
   public void error(String resourceName, int partitionId, String message, Exception ex) {
+    logger.error("Ingestion failed for replica: {} : {}", Utils.getReplicaId(resourceName, partitionId), message, ex);
     CountDownLatch ingestionCompleteFlag = getIngestionCompleteFlag(resourceName, partitionId);
     if (ingestionCompleteFlag != null) {
       ingestionCompleteFlag.countDown();
@@ -99,7 +102,7 @@ public class StateModelIngestionProgressNotifier implements VeniceNotifier {
   }
 
   @Override
-  public void stopped(String resourceName, int partitionId, long offset) {
+  public void stopped(String resourceName, int partitionId, PubSubPosition position) {
     /**
      * Must remove the state model from the model-to-success map first before releasing the latch;
      * otherwise, error will happen in {@link #waitConsumptionCompleted} if latch is released but

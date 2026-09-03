@@ -1,10 +1,17 @@
 package com.linkedin.venice.client.store;
 
 import static com.linkedin.venice.VeniceConstants.VENICE_COMPUTATION_ERROR_MAP_FIELD_NAME;
+import static com.linkedin.venice.client.stats.BasicClientStats.CLIENT_METRIC_ENTITIES;
+import static com.linkedin.venice.read.RequestType.SINGLE_GET;
+import static com.linkedin.venice.stats.ClientType.THIN_CLIENT;
+import static com.linkedin.venice.stats.VeniceMetricsRepository.getVeniceMetricsRepository;
+import static com.linkedin.venice.stats.dimensions.VeniceResponseStatusCategory.SUCCESS;
+import static com.linkedin.venice.utils.OpenTelemetryDataTestUtils.validateLongPointDataFromCounter;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.anyLong;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
 import static org.testng.Assert.fail;
 
 import com.linkedin.venice.client.exceptions.VeniceClientException;
@@ -23,11 +30,17 @@ import com.linkedin.venice.schema.avro.ReadAvroProtocolDefinition;
 import com.linkedin.venice.serializer.RecordDeserializer;
 import com.linkedin.venice.serializer.RecordSerializer;
 import com.linkedin.venice.serializer.SerializerDeserializerFactory;
+import com.linkedin.venice.stats.VeniceMetricsConfig;
+import com.linkedin.venice.stats.VeniceMetricsRepository;
+import com.linkedin.venice.stats.dimensions.HttpResponseStatusEnum;
+import com.linkedin.venice.utils.OpenTelemetryDataTestUtils;
 import com.linkedin.venice.utils.TestUtils;
 import com.linkedin.venice.utils.Utils;
+import com.linkedin.venice.utils.metrics.MetricsRepositoryUtils;
 import io.netty.handler.codec.http.HttpResponseStatus;
+import io.opentelemetry.api.common.Attributes;
+import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
 import io.tehuti.Metric;
-import io.tehuti.metrics.MetricsRepository;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -44,9 +57,11 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Consumer;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
+import org.mockito.ArgumentCaptor;
 import org.testng.Assert;
 import org.testng.annotations.BeforeTest;
 import org.testng.annotations.Test;
@@ -208,7 +223,7 @@ public class StatTrackingStoreClientTest {
 
     doReturn(mockInnerFuture).when(mockStoreClient).get(any(), any(), anyLong());
 
-    MetricsRepository repository = new MetricsRepository();
+    VeniceMetricsRepository repository = getVeniceMetricsRepository(THIN_CLIENT, CLIENT_METRIC_ENTITIES, true);
 
     StatTrackingStoreClient<String, Object> statTrackingStoreClient = new StatTrackingStoreClient<>(
         mockStoreClient,
@@ -219,10 +234,12 @@ public class StatTrackingStoreClientTest {
     Metric requestMetric = metrics.get(metricPrefix + "--request.OccurrenceRate");
     Metric healthyRequestMetric = metrics.get(metricPrefix + "--healthy_request.OccurrenceRate");
     Metric unhealthyRequestMetric = metrics.get(metricPrefix + "--unhealthy_request.OccurrenceRate");
+    Metric successKeyCountMetric = metrics.get(metricPrefix + "--success_request_key_count.Avg");
 
     Assert.assertTrue(requestMetric.value() > 0.0);
     Assert.assertTrue(healthyRequestMetric.value() > 0.0);
     Assert.assertEquals(unhealthyRequestMetric.value(), 0.0);
+    Assert.assertEquals(successKeyCountMetric.value(), 1.0);
   }
 
   @Test
@@ -237,39 +254,56 @@ public class StatTrackingStoreClientTest {
       keySet.add(keyPrefix + i);
     }
 
-    MetricsRepository repository = new MetricsRepository();
+    // Use a dedicated single-threaded executor to avoid contention with the shared DEFAULT_ASYNC_GAUGE_EXECUTOR in CI
+    VeniceMetricsRepository repository = new VeniceMetricsRepository(
+        new VeniceMetricsConfig.Builder().setServiceName(THIN_CLIENT.getName())
+            .setMetricPrefix(THIN_CLIENT.getMetricsPrefix())
+            .setMetricEntities(CLIENT_METRIC_ENTITIES)
+            .setEmitOtelMetrics(true)
+            .setTehutiMetricConfig(MetricsRepositoryUtils.createDefaultSingleThreadedMetricConfig())
+            .build());
+    try {
+      InternalAvroStoreClient innerClient = new StoreClientForMultiGetStreamTest(
+          mock(TransportClient.class),
+          storeName,
+          true,
+          AbstractAvroStoreClient.getDefaultDeserializationExecutor(),
+          result,
+          true,
+          false);
 
-    InternalAvroStoreClient innerClient = new StoreClientForMultiGetStreamTest(
-        mock(TransportClient.class),
-        storeName,
-        true,
-        AbstractAvroStoreClient.getDefaultDeserializationExecutor(),
-        result,
-        true,
-        false);
+      StatTrackingStoreClient<String, Object> statTrackingStoreClient = new StatTrackingStoreClient<>(
+          innerClient,
+          ClientConfig.defaultGenericClientConfig(storeName).setMetricsRepository(repository));
+      Map<String, Object> batchGetResult = statTrackingStoreClient.batchGet(keySet).get();
 
-    StatTrackingStoreClient<String, Object> statTrackingStoreClient = new StatTrackingStoreClient<>(
-        innerClient,
-        ClientConfig.defaultGenericClientConfig(storeName).setMetricsRepository(repository));
-    Map<String, Object> batchGetResult = statTrackingStoreClient.batchGet(keySet).get();
+      Assert.assertEquals(batchGetResult, result);
 
-    Assert.assertEquals(batchGetResult, result);
+      TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, true, () -> {
+        // Issue a fresh batchGet to keep rate-based metrics active within the measurement window;
+        // SimpleRatioStat returns NaN when the underlying Rate metrics decay to zero.
+        statTrackingStoreClient.batchGet(keySet).get();
 
-    Map<String, ? extends Metric> metrics = repository.metrics();
-    Metric requestMetric = metrics.get(metricPrefix + "--multiget_streaming_request.OccurrenceRate");
-    Metric healthyRequestMetric = metrics.get(metricPrefix + "--multiget_streaming_healthy_request.OccurrenceRate");
-    Metric unhealthyRequestMetric = metrics.get(metricPrefix + "--multiget_streaming_unhealthy_request.OccurrenceRate");
-    Metric keyCountMetric = metrics.get(metricPrefix + "--multiget_streaming_request_key_count.Avg");
-    Metric successKeyCountMetric = metrics.get(metricPrefix + "--multiget_streaming_success_request_key_count.Avg");
-    Metric successKeyRatioMetric =
-        metrics.get(metricPrefix + "--multiget_streaming_success_request_key_ratio.SimpleRatioStat");
+        Map<String, ? extends Metric> metrics = repository.metrics();
+        Metric requestMetric = metrics.get(metricPrefix + "--multiget_streaming_request.OccurrenceRate");
+        Metric healthyRequestMetric = metrics.get(metricPrefix + "--multiget_streaming_healthy_request.OccurrenceRate");
+        Metric unhealthyRequestMetric =
+            metrics.get(metricPrefix + "--multiget_streaming_unhealthy_request.OccurrenceRate");
+        Metric keyCountMetric = metrics.get(metricPrefix + "--multiget_streaming_request_key_count.Avg");
+        Metric successKeyCountMetric = metrics.get(metricPrefix + "--multiget_streaming_success_request_key_count.Avg");
+        Metric successKeyRatioMetric =
+            metrics.get(metricPrefix + "--multiget_streaming_success_request_key_ratio.SimpleRatioStat");
 
-    Assert.assertTrue(requestMetric.value() > 0.0);
-    Assert.assertTrue(healthyRequestMetric.value() > 0.0);
-    Assert.assertEquals(unhealthyRequestMetric.value(), 0.0);
-    Assert.assertEquals(keyCountMetric.value(), 10.0);
-    Assert.assertEquals(successKeyCountMetric.value(), 10.0);
-    Assert.assertTrue(successKeyRatioMetric.value() > 0, "Success Key Ratio should be positive");
+        Assert.assertTrue(requestMetric.value() > 0.0);
+        Assert.assertTrue(healthyRequestMetric.value() > 0.0);
+        Assert.assertEquals(unhealthyRequestMetric.value(), 0.0);
+        Assert.assertEquals(keyCountMetric.value(), 10.0);
+        Assert.assertEquals(successKeyCountMetric.value(), 10.0);
+        Assert.assertTrue(successKeyRatioMetric.value() > 0, "Success Key Ratio should be positive");
+      });
+    } finally {
+      repository.close();
+    }
   }
 
   @Test(expectedExceptions = ExecutionException.class, expectedExceptionsMessageRegExp = ".*Received partial response.*")
@@ -280,7 +314,7 @@ public class StatTrackingStoreClientTest {
       keySet.add(keyPrefix + i);
     }
 
-    MetricsRepository repository = new MetricsRepository();
+    VeniceMetricsRepository repository = getVeniceMetricsRepository(THIN_CLIENT, CLIENT_METRIC_ENTITIES, true);
 
     InternalAvroStoreClient innerClient = new StoreClientForMultiGetStreamTest(
         mock(TransportClient.class),
@@ -306,7 +340,7 @@ public class StatTrackingStoreClientTest {
       keySet.add(keyPrefix + i);
     }
 
-    MetricsRepository repository = new MetricsRepository();
+    VeniceMetricsRepository repository = getVeniceMetricsRepository(THIN_CLIENT, CLIENT_METRIC_ENTITIES, true);
 
     InternalAvroStoreClient innerClient = new StoreClientForMultiGetStreamTest(
         mock(TransportClient.class),
@@ -337,7 +371,7 @@ public class StatTrackingStoreClientTest {
       keySet.add(keyPrefix + i);
     }
 
-    MetricsRepository repository = new MetricsRepository();
+    VeniceMetricsRepository repository = getVeniceMetricsRepository(THIN_CLIENT, CLIENT_METRIC_ENTITIES, true);
 
     InternalAvroStoreClient innerClient = new StoreClientForMultiGetStreamTest(
         mock(TransportClient.class),
@@ -364,7 +398,7 @@ public class StatTrackingStoreClientTest {
         new VeniceClientHttpException("Inner mock exception", HttpResponseStatus.BAD_REQUEST.code()));
     doReturn(mockInnerFuture).when(mockStoreClient).get(any(), any(), anyLong());
 
-    MetricsRepository repository = new MetricsRepository();
+    VeniceMetricsRepository repository = getVeniceMetricsRepository(THIN_CLIENT, CLIENT_METRIC_ENTITIES, true);
 
     StatTrackingStoreClient<String, Object> statTrackingStoreClient = new StatTrackingStoreClient<>(
         mockStoreClient,
@@ -381,11 +415,13 @@ public class StatTrackingStoreClientTest {
     Metric healthyRequestMetric = metrics.get(metricPrefix + "--healthy_request.OccurrenceRate");
     Metric unhealthyRequestMetric = metrics.get(metricPrefix + "--unhealthy_request.OccurrenceRate");
     Metric http400RequestMetric = metrics.get(metricPrefix + "--http_400_request.OccurrenceRate");
+    Metric successKeyCountMetric = metrics.get(metricPrefix + "--success_request_key_count.Rate");
 
     Assert.assertTrue(requestMetric.value() > 0.0);
     Assert.assertEquals(healthyRequestMetric.value(), 0.0);
     Assert.assertTrue(unhealthyRequestMetric.value() > 0.0);
     Assert.assertTrue(http400RequestMetric.value() > 0.0);
+    Assert.assertEquals(successKeyCountMetric.value(), 0.0);
   }
 
   @Test
@@ -395,7 +431,7 @@ public class StatTrackingStoreClientTest {
         new VeniceClientHttpException("Inner mock exception", HttpResponseStatus.BAD_REQUEST.code()));
     doReturn(mockInnerFuture).when(mockStoreClient).batchGet(any());
 
-    MetricsRepository repository = new MetricsRepository();
+    VeniceMetricsRepository repository = getVeniceMetricsRepository(THIN_CLIENT, CLIENT_METRIC_ENTITIES, true);
 
     InternalAvroStoreClient innerClient = new MultiGetStreamTestWithExceptionStoreClient(
         mock(TransportClient.class),
@@ -422,11 +458,13 @@ public class StatTrackingStoreClientTest {
     Metric healthyRequestMetric = metrics.get(metricPrefix + "--multiget_streaming_healthy_request.OccurrenceRate");
     Metric unhealthyRequestMetric = metrics.get(metricPrefix + "--multiget_streaming_unhealthy_request.OccurrenceRate");
     Metric http500RequestMetric = metrics.get(metricPrefix + "--multiget_streaming_http_500_request.OccurrenceRate");
+    Metric successKeyCountMetric = metrics.get(metricPrefix + "--multiget_streaming_success_request_key_count.Rate");
 
     Assert.assertTrue(requestMetric.value() > 0.0);
     Assert.assertEquals(healthyRequestMetric.value(), 0.0);
     Assert.assertTrue(unhealthyRequestMetric.value() > 0.0);
     Assert.assertTrue(http500RequestMetric.value() > 0.0);
+    Assert.assertTrue(successKeyCountMetric.value() > 0.0);
   }
 
   @Test(enabled = false)
@@ -489,7 +527,7 @@ public class StatTrackingStoreClientTest {
         true,
         AbstractAvroStoreClient.getDefaultDeserializationExecutor());
 
-    MetricsRepository repository = new MetricsRepository();
+    VeniceMetricsRepository repository = getVeniceMetricsRepository(THIN_CLIENT, CLIENT_METRIC_ENTITIES, true);
     StatTrackingStoreClient<String, GenericRecord> statTrackingStoreClient = new StatTrackingStoreClient<>(
         storeClient,
         ClientConfig.defaultGenericClientConfig(storeName).setMetricsRepository(repository));
@@ -544,7 +582,7 @@ public class StatTrackingStoreClientTest {
         Collections.emptyMap(),
         true,
         false);
-    MetricsRepository repository = new MetricsRepository();
+    VeniceMetricsRepository repository = getVeniceMetricsRepository(THIN_CLIENT, CLIENT_METRIC_ENTITIES, true);
     StatTrackingStoreClient<String, GenericRecord> statTrackingStoreClient = new StatTrackingStoreClient<>(
         innerClient,
         ClientConfig.defaultGenericClientConfig(storeName).setMetricsRepository(repository));
@@ -588,7 +626,7 @@ public class StatTrackingStoreClientTest {
         false,
         AbstractAvroStoreClient.getDefaultDeserializationExecutor(),
         new VeniceClientHttpException(500));
-    MetricsRepository repository = new MetricsRepository();
+    VeniceMetricsRepository repository = getVeniceMetricsRepository(THIN_CLIENT, CLIENT_METRIC_ENTITIES, true);
     StatTrackingStoreClient<String, GenericRecord> statTrackingStoreClient = new StatTrackingStoreClient<>(
         innerClient,
         ClientConfig.defaultGenericClientConfig(storeName).setMetricsRepository(repository));
@@ -664,7 +702,7 @@ public class StatTrackingStoreClientTest {
         false,
         AbstractAvroStoreClient.getDefaultDeserializationExecutor(),
         new VeniceClientHttpException(500));
-    MetricsRepository repository = new MetricsRepository();
+    VeniceMetricsRepository repository = getVeniceMetricsRepository(THIN_CLIENT, CLIENT_METRIC_ENTITIES, true);
     StatTrackingStoreClient<String, GenericRecord> statTrackingStoreClient = new StatTrackingStoreClient<>(
         innerClient,
         ClientConfig.defaultGenericClientConfig(storeName).setMetricsRepository(repository));
@@ -737,7 +775,7 @@ public class StatTrackingStoreClientTest {
         false,
         AbstractAvroStoreClient.getDefaultDeserializationExecutor(),
         new VeniceClientHttpException(500));
-    MetricsRepository repository = new MetricsRepository();
+    VeniceMetricsRepository repository = getVeniceMetricsRepository(THIN_CLIENT, CLIENT_METRIC_ENTITIES, true);
     StatTrackingStoreClient<String, GenericRecord> statTrackingStoreClient = new StatTrackingStoreClient<>(
         innerClient,
         ClientConfig.defaultGenericClientConfig(storeName).setMetricsRepository(repository));
@@ -761,5 +799,47 @@ public class StatTrackingStoreClientTest {
         metrics.get(storeMetricPrefix + "--compute_streaming_app_timed_out_request_result_ratio.Avg");
     Assert.assertTrue(timedOutRequestMetric.value() > 0);
     Assert.assertTrue(timedOutRequestResultRatioMetric.value() > 0);
+  }
+
+  /**
+   * When the wired listener is invoked (simulating an upstream cluster-name push from initial
+   * discovery or the redirect notifier), the {@code StatTrackingStoreClient}'s
+   * {@code onClusterNameUpdated} fans the new value out to every
+   * {@link com.linkedin.venice.client.stats.ClientStats}. We verify by emitting through the
+   * single-get path and checking the OTel {@code call_count} dimension carries the pushed cluster
+   * name.
+   */
+  @SuppressWarnings("unchecked")
+  @Test
+  public void testListenerInvocationFansOutToStats() throws Exception {
+    String pushedCluster = "venice-cluster-pushed";
+
+    InternalAvroStoreClient<String, Object> internalAvroMock = mock(InternalAvroStoreClient.class);
+    doReturn(storeName).when(internalAvroMock).getStoreName();
+
+    InMemoryMetricReader reader = InMemoryMetricReader.create();
+    VeniceMetricsRepository repository = getVeniceMetricsRepository(THIN_CLIENT, CLIENT_METRIC_ENTITIES, true, reader);
+
+    StatTrackingStoreClient<String, Object> client = new StatTrackingStoreClient<>(
+        internalAvroMock,
+        ClientConfig.defaultGenericClientConfig(storeName).setMetricsRepository(repository));
+
+    // Capture the listener wired in the ctor and fire it as discovery / the redirect notifier would.
+    ArgumentCaptor<Consumer<String>> listenerCaptor = ArgumentCaptor.forClass(Consumer.class);
+    verify(internalAvroMock).setClusterNameChangeListener(listenerCaptor.capture());
+    listenerCaptor.getValue().accept(pushedCluster);
+
+    // Drive a single-get through the client; the emitted call_count should carry pushedCluster.
+    CompletableFuture<Object> mockInnerFuture = CompletableFuture.completedFuture(mock(Object.class));
+    doReturn(mockInnerFuture).when(internalAvroMock).get(any(), any(), anyLong());
+    client.get("k1").get();
+
+    Attributes expected = new OpenTelemetryDataTestUtils.OpenTelemetryAttributesBuilder().setStoreName(storeName)
+        .setClusterName(pushedCluster)
+        .setRequestType(SINGLE_GET)
+        .setHttpStatus(HttpResponseStatusEnum.OK)
+        .setVeniceStatusCategory(SUCCESS)
+        .build();
+    validateLongPointDataFromCounter(reader, 1, expected, "call_count", THIN_CLIENT.getMetricsPrefix());
   }
 }

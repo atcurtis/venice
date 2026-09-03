@@ -4,17 +4,13 @@ import com.linkedin.venice.admin.protocol.response.AdminResponseRecord;
 import com.linkedin.venice.client.change.capture.protocol.RecordChangeEvent;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.exceptions.VeniceMessageException;
-import com.linkedin.venice.ingestion.protocol.IngestionMetricsReport;
-import com.linkedin.venice.ingestion.protocol.IngestionStorageMetadata;
-import com.linkedin.venice.ingestion.protocol.IngestionTaskCommand;
-import com.linkedin.venice.ingestion.protocol.IngestionTaskReport;
-import com.linkedin.venice.ingestion.protocol.LoadedStoreUserPartitionMapping;
-import com.linkedin.venice.ingestion.protocol.ProcessShutdownCommand;
 import com.linkedin.venice.kafka.protocol.KafkaMessageEnvelope;
 import com.linkedin.venice.kafka.protocol.Put;
+import com.linkedin.venice.kafka.protocol.state.GlobalRtDivState;
 import com.linkedin.venice.kafka.protocol.state.PartitionState;
 import com.linkedin.venice.kafka.protocol.state.StoreVersionState;
 import com.linkedin.venice.meta.Store;
+import com.linkedin.venice.metadata.payload.StorePropertiesPayloadRecord;
 import com.linkedin.venice.metadata.response.MetadataResponseRecord;
 import com.linkedin.venice.participant.protocol.ParticipantMessageValue;
 import com.linkedin.venice.pubsub.api.PubSubPositionWireFormat;
@@ -24,6 +20,7 @@ import com.linkedin.venice.status.protocol.BatchJobHeartbeatValue;
 import com.linkedin.venice.status.protocol.PushJobDetails;
 import com.linkedin.venice.storage.protocol.ChunkedKeySuffix;
 import com.linkedin.venice.storage.protocol.ChunkedValueManifest;
+import com.linkedin.venice.systemstore.schemas.ParentControllerMetadataValue;
 import com.linkedin.venice.systemstore.schemas.StoreMetaKey;
 import com.linkedin.venice.systemstore.schemas.StoreMetaValue;
 import java.nio.ByteBuffer;
@@ -40,18 +37,20 @@ import org.apache.avro.specific.SpecificRecord;
  *
  * Having these definitions in a single place makes it easy to ensure that magic bytes
  * are defined only once and do not conflict with each other.
+ *
+ * @see <a href="https://venicedb.org/docs/ops_guide/system_stores#schema-system-stores">System Stores in the docs</a>
  */
 public enum AvroProtocolDefinition {
   /**
    * Used for the Kafka topics, including the main data topics as well as the admin topic.
    */
-  KAFKA_MESSAGE_ENVELOPE(23, 11, KafkaMessageEnvelope.class),
+  KAFKA_MESSAGE_ENVELOPE(23, 14, KafkaMessageEnvelope.class),
 
   /**
    * Used to persist the state of a partition in Storage Nodes, including offset,
    * Data Ingest Validation state, etc.
    */
-  PARTITION_STATE(24, 12, PartitionState.class),
+  PARTITION_STATE(24, 24, PartitionState.class),
 
   /**
    * Used to persist state related to a store-version, including Start of Buffer Replay
@@ -61,8 +60,16 @@ public enum AvroProtocolDefinition {
 
   /**
    * Used to encode push job details records to be written to the PushJobDetails system store.
+   *
+   * <p><b>Deployment ordering.</b> This is a system-store value schema, so controllers must have registered
+   * v6 (which they do on startup, from the resources of the venice-common they were built with) <em>before</em>
+   * any push job serializes a v6 payload. Rolling out a VPJ built from this commit against a controller fleet
+   * still on v5 would make the controller reject the write. The safe order is: deploy controllers first, then
+   * the push job. v6 only appends one nullable {@code map<string, long>} field ({@code additionalPushMetrics})
+   * defaulting to {@code null}, so a v5 reader can still read a v6 record (it drops the map) and a v6 reader
+   * resolves a v5 record's missing map to {@code null}.
    */
-  PUSH_JOB_DETAILS(26, 4, PushJobDetails.class),
+  PUSH_JOB_DETAILS(26, 6, PushJobDetails.class),
 
   /**
    * Used to encode metadata changes about the system as a whole. Records of this type
@@ -72,7 +79,7 @@ public enum AvroProtocolDefinition {
    *
    * TODO: Move AdminOperation to venice-common module so that we can properly reference it here.
    */
-  ADMIN_OPERATION(78, SpecificData.get().getSchema(ByteBuffer.class), "AdminOperation"),
+  ADMIN_OPERATION(104, SpecificData.get().getSchema(ByteBuffer.class), "AdminOperation"),
 
   /**
    * Single chunk of a large multi-chunk value. Just a bunch of bytes.
@@ -97,43 +104,12 @@ public enum AvroProtocolDefinition {
    */
   CHUNKED_KEY_SUFFIX(ChunkedKeySuffix.class),
 
-  /**
-   * Used to encode various kinds of ingestion task commands, which are used to control ingestion task in child process.
-   */
-  INGESTION_TASK_COMMAND(28, 1, IngestionTaskCommand.class),
-
-  /**
-   * Used to encode status of ingestion task, that are reported backed from child process to Storage Node / Da Vinci backend.
-   */
-  INGESTION_TASK_REPORT(29, 1, IngestionTaskReport.class),
-
-  /**
-   * Used to encode metrics collected from ingestion task, that are reported backed from child process to Storage Node / Da Vinci backend.
-   */
-  INGESTION_METRICS_REPORT(30, 1, IngestionMetricsReport.class),
-
-  /**
-   * Used to encode storage metadata updates that are reported backed from Storage Node / Da Vinci backend to child process.
-   */
-  INGESTION_STORAGE_METADATA(31, 1, IngestionStorageMetadata.class),
-
-  /**
-   * Used to encode various kinds of ingestion task commands, which are used to control ingestion task in child process.
-   */
-  PROCESS_SHUTDOWN_COMMAND(32, 1, ProcessShutdownCommand.class),
-
   BATCH_JOB_HEARTBEAT(33, 1, BatchJobHeartbeatValue.class),
 
   /**
    * Used to encode the position of a PubSub message.
    */
   PUBSUB_POSITION_WIRE_FORMAT(34, 1, PubSubPositionWireFormat.class),
-
-  /**
-   * Used to retrieve the loaded store partition mapping in the isolated process.
-   * In theory, we don't need to use magicByte for the communication with II process.
-   */
-  LOADED_STORE_USER_PARTITION_MAPPING(35, 1, LoadedStoreUserPartitionMapping.class),
 
   /**
    * Key schema for metadata system store.
@@ -143,7 +119,12 @@ public enum AvroProtocolDefinition {
   /**
    * Value schema for metadata system store.
    */
-  METADATA_SYSTEM_SCHEMA_STORE(21, StoreMetaValue.class),
+  METADATA_SYSTEM_SCHEMA_STORE(49, StoreMetaValue.class),
+
+  /*
+    Value Schema for Parent Controller Metadata system store
+  */
+  PARENT_CONTROLLER_METADATA_SYSTEM_STORE_VALUE(1, ParentControllerMetadataValue.class),
 
   /**
    * Key schema for push status system store.
@@ -168,13 +149,23 @@ public enum AvroProtocolDefinition {
   /**
    * Response record for metadata fetch request.
    */
-  SERVER_METADATA_RESPONSE(2, MetadataResponseRecord.class),
+  SERVER_METADATA_RESPONSE(4, MetadataResponseRecord.class),
+
+  /**
+   * Response record for metadata by client fetch request.
+   */
+  SERVER_STORE_PROPERTIES_PAYLOAD(1, StorePropertiesPayloadRecord.class),
 
   /**
    * Value schema for change capture event.
    * TODO: Figure out a way to pull in protocol from different view class.
    */
-  RECORD_CHANGE_EVENT(1, RecordChangeEvent.class);
+  RECORD_CHANGE_EVENT(1, RecordChangeEvent.class),
+
+  /**
+   * Global Realtime Topic Data Integrity Validator is the RT DIV snapshot propagated from the leader to followers.
+   */
+  GLOBAL_RT_DIV_STATE(1, GlobalRtDivState.class);
 
   private static final Set<Byte> magicByteSet = validateMagicBytes();
 
@@ -283,7 +274,7 @@ public enum AvroProtocolDefinition {
     if (magicByte.isPresent() || protocolVersionStoredInHeader) {
       return new InternalAvroSpecificSerializer<>(this);
     }
-    return new InternalAvroSpecificSerializer<>(this, 0);
+    return new InternalAvroSpecificSerializer<>(this, 0, this.getCurrentProtocolVersionSchema());
   }
 
   public int getCurrentProtocolVersion() {

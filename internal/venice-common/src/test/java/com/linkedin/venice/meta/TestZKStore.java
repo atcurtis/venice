@@ -1,21 +1,22 @@
 package com.linkedin.venice.meta;
 
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertNull;
 import static org.testng.Assert.assertThrows;
+import static org.testng.Assert.assertTrue;
 
 import com.linkedin.venice.exceptions.StoreDisabledException;
 import com.linkedin.venice.exceptions.StoreVersionNotFoundException;
 import com.linkedin.venice.exceptions.VeniceException;
+import com.linkedin.venice.utils.ConfigCommonUtils.ActivationState;
 import com.linkedin.venice.utils.TestUtils;
 import com.linkedin.venice.utils.Utils;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 import org.testng.Assert;
 import org.testng.annotations.Test;
 
@@ -24,8 +25,6 @@ import org.testng.annotations.Test;
  * Test cases for Venice Store.
  */
 public class TestZKStore {
-  private static final Logger LOGGER = LogManager.getLogger(TestZKStore.class);
-
   @Test
   public void testVersionsAreAddedInOrdered() {
     Store s = TestUtils.createTestStore("s1", "owner", System.currentTimeMillis());
@@ -78,7 +77,7 @@ public class TestZKStore {
     Assert.assertTrue(s.equals(clonedStore), "The cloned store is expected to be equal!");
     clonedStore.setCurrentVersion(100);
     Assert.assertEquals(s.getCurrentVersion(), 0, "The cloned store's version is expected to be 0!");
-    Assert.assertEquals(s.peekNextVersion().getNumber(), 1, "clone should peek at biggest used version plus 1");
+    Assert.assertEquals(s.peekNextVersionNumber(), 1, "clone should peek at biggest used version plus 1");
 
     Store s2 = TestUtils.createTestStore("s2", "owner", System.currentTimeMillis());
     s2.addVersion(new VersionImpl(s2.getName(), s2.getLargestUsedVersionNumber() + 1, "pushJobId"));
@@ -86,6 +85,51 @@ public class TestZKStore {
     Assert.assertEquals(s2, s2clone);
     s2clone.setEnableWrites(false);
     Assert.assertNotEquals(s2, s2clone);
+  }
+
+  @Test
+  public void testCloneStorePreservesVersionLevelBlobDbEnabled() {
+    Store store = TestUtils.createTestStore("blobDbStore", "owner", System.currentTimeMillis());
+    store.setBlobDbEnabled(ActivationState.DISABLED.name());
+    Version v = new VersionImpl(store.getName(), 1, "pushJobId");
+    store.addVersion(v);
+    // Sanity check: addVersion should stamp the store-level value onto the new version.
+    Assert.assertEquals(store.getVersion(1).getBlobDbEnabled(), ActivationState.DISABLED.name());
+
+    Store clonedStore = store.cloneStore();
+    // Regression: cloneVersion was dropping blobDbEnabled, which caused every read-modify-write
+    // cycle through the store repository to silently wipe the field back to NOT_SPECIFIED on
+    // all existing versions.
+    Assert.assertEquals(clonedStore.getVersion(1).getBlobDbEnabled(), ActivationState.DISABLED.name());
+  }
+
+  @Test
+  public void testCloneStorePreservesThroughputQuota() {
+    Store store = TestUtils.createTestStore("throughputStore", "owner", System.currentTimeMillis());
+    // Default is -1 (no limit).
+    Assert.assertEquals(store.getThroughputQuotaInBytes(), -1L);
+    Assert.assertEquals(store.getThroughputQuotaInRecords(), -1L);
+
+    store.setThroughputQuotaInBytes(123456L);
+    store.setThroughputQuotaInRecords(789L);
+    Assert.assertEquals(store.getThroughputQuotaInBytes(), 123456L);
+    Assert.assertEquals(store.getThroughputQuotaInRecords(), 789L);
+
+    Store clonedStore = store.cloneStore();
+    Assert.assertEquals(clonedStore.getThroughputQuotaInBytes(), 123456L);
+    Assert.assertEquals(clonedStore.getThroughputQuotaInRecords(), 789L);
+    Assert.assertEquals(store, clonedStore);
+  }
+
+  @Test
+  public void testPubSubEncryptionKeyUrnDefaultSetAndClone() {
+    Store store = TestUtils.createTestStore("encryptionStore", "owner", System.currentTimeMillis());
+    Assert.assertEquals(store.getPubSubEncryptionKeyUrn(), "");
+
+    String pubSubEncryptionKeyUrn = "keyUrn:abc";
+    store.setPubSubEncryptionKeyUrn(pubSubEncryptionKeyUrn);
+    Assert.assertEquals(store.getPubSubEncryptionKeyUrn(), pubSubEncryptionKeyUrn);
+    Assert.assertEquals(store.cloneStore().getPubSubEncryptionKeyUrn(), pubSubEncryptionKeyUrn);
   }
 
   private static void assertVersionsEquals(
@@ -143,9 +187,14 @@ public class TestZKStore {
 
     assertVersionsEquals(store, 1, Arrays.asList(version1, version3), "error version should be deleted");
 
+    // current version is in the middle, delete 1 and 3
+    version3.setStatus(VersionStatus.ONLINE);
+    assertVersionsEquals(store, 1, Arrays.asList(version1, version3), "version 1 and 3 should be deleted");
+
     Version version4 = new VersionImpl(store.getName(), 4);
     store.addVersion(version4);
     version4.setStatus(VersionStatus.ERROR);
+    version3.setStatus(VersionStatus.ERROR);
 
     assertVersionsEquals(store, 2, Arrays.asList(version3, version4), "error versions should be deleted.");
     assertVersionsEquals(
@@ -226,7 +275,7 @@ public class TestZKStore {
     Assert.assertEquals(store.getVersions().get(0).getNumber(), 1);
     store.addVersion(new VersionImpl(store.getName(), store.getLargestUsedVersionNumber() + 1, "pushJobId"));
     Assert.assertEquals(store.getVersions().get(1).getNumber(), 2);
-    Assert.assertEquals(store.peekNextVersion().getNumber(), 3);
+    Assert.assertEquals(store.peekNextVersionNumber(), 3);
     store.setCurrentVersion(1);
     Assert.assertEquals(store.getCurrentVersion(), 1);
     store.updateVersionStatus(2, VersionStatus.ONLINE);
@@ -263,8 +312,8 @@ public class TestZKStore {
     for (Version version: store.getVersions()) {
       Assert.assertEquals(
           version.getStatus(),
-          VersionStatus.ONLINE,
-          "After enabling a store to write, all of PUSHED version should be activated.");
+          VersionStatus.PUSHED,
+          "After enabling a store to write, all of PUSHED will stay as PUSHED. Deferred swap service will mark them as online");
     }
   }
 
@@ -306,51 +355,57 @@ public class TestZKStore {
     Version version = new VersionImpl(store.getName(), store.getLargestUsedVersionNumber() + 1, "pushJobId3");
     store.addVersion(version);
     Assert.assertEquals(version.getNumber(), 3);
-    Assert.assertEquals(store.peekNextVersion().getNumber(), 4);
+    Assert.assertEquals(store.peekNextVersionNumber(), 4);
   }
 
   @Test
   public void testAddVersion() {
     String storeName = Utils.getUniqueString("store");
     Store store = TestUtils.createTestStore(storeName, "owner", System.currentTimeMillis());
-    assertNull(store.getVersion(2));
-    assertThrows(StoreVersionNotFoundException.class, () -> store.getVersionOrThrow(2));
-    assertNull(store.getVersion(5));
-    assertThrows(StoreVersionNotFoundException.class, () -> store.getVersionOrThrow(5));
-    assertNull(store.getVersion(6));
-    assertThrows(StoreVersionNotFoundException.class, () -> store.getVersionOrThrow(6));
-    assertEquals(store.getVersions().size(), 0);
+    assertMissingVersion(store, 2, 5, 6);
+    assertVersionCount(store, 0);
+
     store.addVersion(new VersionImpl(storeName, 5));
-    assertNull(store.getVersion(2));
-    assertThrows(StoreVersionNotFoundException.class, () -> store.getVersionOrThrow(2));
-    assertNotNull(store.getVersion(5));
-    assertEquals(store.getVersionOrThrow(5).getNumber(), 5);
-    assertNull(store.getVersion(6));
-    assertThrows(StoreVersionNotFoundException.class, () -> store.getVersionOrThrow(6));
-    assertEquals(store.getVersions().size(), 1);
+    assertMissingVersion(store, 2, 6);
+    assertPresentVersion(store, 5);
+    assertVersionCount(store, 1);
     // largest used version is 5
-    assertEquals(store.peekNextVersion().getNumber(), 6);
+    assertEquals(store.peekNextVersionNumber(), 6);
+
     store.addVersion(new VersionImpl(storeName, 2));
-    assertNotNull(store.getVersion(2));
-    assertEquals(store.getVersionOrThrow(2).getNumber(), 2);
-    assertNotNull(store.getVersion(5));
-    assertEquals(store.getVersionOrThrow(5).getNumber(), 5);
-    assertNull(store.getVersion(6));
-    assertThrows(StoreVersionNotFoundException.class, () -> store.getVersionOrThrow(6));
-    assertEquals(store.getVersions().size(), 2);
+    assertMissingVersion(store, 6);
+    assertPresentVersion(store, 2, 5);
+    assertVersionCount(store, 2);
     // largest used version is still 5
-    Assert.assertEquals(store.peekNextVersion().getNumber(), 6);
+    Assert.assertEquals(store.peekNextVersionNumber(), 6);
+
     Version version = new VersionImpl(store.getName(), store.getLargestUsedVersionNumber() + 1, "pushJobId");
     Assert.assertEquals(version.getNumber(), 6);
     store.addVersion(version);
-    Assert.assertEquals(store.peekNextVersion().getNumber(), 7);
-    assertNotNull(store.getVersion(2));
-    assertEquals(store.getVersionOrThrow(2).getNumber(), 2);
-    assertNotNull(store.getVersion(5));
-    assertEquals(store.getVersionOrThrow(5).getNumber(), 5);
-    assertNotNull(store.getVersion(6));
-    assertEquals(store.getVersionOrThrow(6).getNumber(), 6);
-    assertEquals(store.getVersions().size(), 3);
+    Assert.assertEquals(store.peekNextVersionNumber(), 7);
+    assertPresentVersion(store, 2, 5, 6);
+    assertVersionCount(store, 3);
+  }
+
+  private void assertMissingVersion(Store store, int... versionNumbers) {
+    for (int versionNumber: versionNumbers) {
+      assertNull(store.getVersion(versionNumber));
+      assertThrows(StoreVersionNotFoundException.class, () -> store.getVersionOrThrow(versionNumber));
+      assertFalse(store.getVersionNumbers().contains(versionNumber));
+    }
+  }
+
+  private void assertPresentVersion(Store store, int... versionNumbers) {
+    for (int versionNumber: versionNumbers) {
+      assertNotNull(store.getVersion(versionNumber));
+      assertEquals(store.getVersionOrThrow(versionNumber).getNumber(), versionNumber);
+      assertTrue(store.getVersionNumbers().contains(versionNumber));
+    }
+  }
+
+  private void assertVersionCount(Store store, int versionCount) {
+    assertEquals(store.getVersions().size(), versionCount);
+    assertEquals(store.getVersionNumbers().size(), versionCount);
   }
 
   @Test
@@ -375,10 +430,10 @@ public class TestZKStore {
     List<String> valid = Arrays.asList("foo", "Bar", "foo_bar", "foo-bar", "f00Bar");
     List<String> invalid = Arrays.asList("foo bar", "foo.bar", " foo", ".bar", "!", "@", "#", "$", "%");
     for (String name: valid) {
-      Assert.assertTrue(Store.isValidStoreName(name));
+      Assert.assertTrue(StoreName.isValidStoreName(name));
     }
     for (String name: invalid) {
-      Assert.assertFalse(Store.isValidStoreName(name));
+      Assert.assertFalse(StoreName.isValidStoreName(name));
     }
   }
 
@@ -395,34 +450,6 @@ public class TestZKStore {
         1);
   }
 
-  /**
-   * We're not relying on push ID uniqueness.  We can reenable this test if we start relying on (and enforcing) push ID uniqueness
-   */
-  @Test(groups = { "flaky" })
-  public void cannotAddDifferentVersionsWithSamePushId() {
-    String storeName = "storeName";
-    Store store = new ZKStore(
-        storeName,
-        "owner",
-        System.currentTimeMillis(),
-        PersistenceType.IN_MEMORY,
-        RoutingStrategy.CONSISTENT_HASH,
-        ReadStrategy.ANY_OF_ONLINE,
-        OfflinePushStrategy.WAIT_N_MINUS_ONE_REPLCIA_PER_PARTITION,
-        1);
-    String duplicatePushJobId = "pushId";
-    Version versionOne = new VersionImpl(storeName, 1, duplicatePushJobId);
-    store.addVersion(versionOne);
-    Version versionTwo = new VersionImpl(storeName, 2, duplicatePushJobId);
-    try {
-      store.addVersion(versionTwo);
-      Assert.fail("Store must not allow adding a new version with same pushId");
-    } catch (Exception e) {
-      // expected
-      LOGGER.info("Expected exception: {}", e.getLocalizedMessage());
-    }
-  }
-
   @Test
   public void testStoreLevelAcl() {
     Store store = new ZKStore(
@@ -436,4 +463,124 @@ public class TestZKStore {
         1);
     Assert.assertTrue(store.isAccessControlled());
   }
+
+  @Test
+  public void testUpdateVersionForDaVinciHeartbeat() {
+    String storeName = "testUpdateVersionForDaVinciHeartbeat";
+    Store store = TestUtils.createTestStore(storeName, "owner", System.currentTimeMillis());
+    store.addVersion(new VersionImpl(storeName, 1, "test"));
+    store.updateVersionForDaVinciHeartbeat(1, true);
+    Assert.assertTrue(store.getVersion(1).getIsDavinciHeartbeatReported());
+  }
+
+  @Test
+  public void testIngestionPauseModeDefaultIsNotPaused() {
+    Store store = TestUtils.createTestStore("testStore", "owner", System.currentTimeMillis());
+    Assert.assertEquals(store.getIngestionPauseMode(), IngestionPauseMode.NOT_PAUSED);
+  }
+
+  @Test
+  public void testSetGetIngestionPauseMode() {
+    Store store = TestUtils.createTestStore("testStore", "owner", System.currentTimeMillis());
+    for (IngestionPauseMode mode: IngestionPauseMode.values()) {
+      store.setIngestionPauseMode(mode);
+      Assert.assertEquals(store.getIngestionPauseMode(), mode);
+    }
+  }
+
+  @Test
+  public void testIngestionPausedRegionsDefault() {
+    Store store = TestUtils.createTestStore("testStore", "owner", System.currentTimeMillis());
+    Assert.assertTrue(store.getIngestionPausedRegions().isEmpty());
+  }
+
+  @Test
+  public void testSetGetIngestionPausedRegions() {
+    Store store = TestUtils.createTestStore("testStore", "owner", System.currentTimeMillis());
+    List<String> regions = Arrays.asList("prod-lor1", "prod-ltx1");
+    store.setIngestionPausedRegions(regions);
+    Assert.assertEquals(store.getIngestionPausedRegions(), regions);
+  }
+
+  @Test
+  public void testCloneStorePreservesIngestionPauseFields() {
+    Store store = TestUtils.createTestStore("testStore", "owner", System.currentTimeMillis());
+    store.setIngestionPauseMode(IngestionPauseMode.ALL_VERSIONS);
+    store.setIngestionPausedRegions(Arrays.asList("prod-lor1"));
+    Store clonedStore = store.cloneStore();
+    Assert.assertEquals(clonedStore.getIngestionPauseMode(), IngestionPauseMode.ALL_VERSIONS);
+    Assert.assertEquals(clonedStore.getIngestionPausedRegions(), Arrays.asList("prod-lor1"));
+  }
+
+  @Test
+  public void testExternalStorageReadModeDefault() {
+    Store store = TestUtils.createTestStore("testStore", "owner", System.currentTimeMillis());
+    Assert.assertEquals(store.getExternalStorageReadMode(), ExternalStorageReadMode.VENICE_ONLY);
+  }
+
+  @Test
+  public void testExternalStorageReadModeRoundTrip() {
+    Store store = TestUtils.createTestStore("testStore", "owner", System.currentTimeMillis());
+    store.setExternalStorageReadMode(ExternalStorageReadMode.DUAL_MODE_CONSISTENCY_CHECK);
+    Assert.assertEquals(store.getExternalStorageReadMode(), ExternalStorageReadMode.DUAL_MODE_CONSISTENCY_CHECK);
+  }
+
+  @Test
+  public void testCloneStorePreservesExternalStorageReadMode() {
+    Store store = TestUtils.createTestStore("testStore", "owner", System.currentTimeMillis());
+    store.setExternalStorageReadMode(ExternalStorageReadMode.DUAL_MODE_EARLY_RETURN);
+    Store clonedStore = store.cloneStore();
+    Assert.assertEquals(clonedStore.getExternalStorageReadMode(), ExternalStorageReadMode.DUAL_MODE_EARLY_RETURN);
+  }
+
+  @Test
+  public void testExternalStorageReadModePersistsThroughAvroDataModel() {
+    ZKStore store = (ZKStore) TestUtils.createTestStore("testStore", "owner", System.currentTimeMillis());
+    store.setExternalStorageReadMode(ExternalStorageReadMode.DUAL_MODE_CONSISTENCY_CHECK);
+    Assert.assertEquals(
+        store.dataModel().externalStorageReadMode,
+        ExternalStorageReadMode.DUAL_MODE_CONSISTENCY_CHECK.getValue());
+  }
+
+  @Test
+  public void testStoreLevelStorageModeDefault() {
+    Store store = TestUtils.createTestStore("testStore", "owner", System.currentTimeMillis());
+    Assert.assertEquals(store.getStorageMode(), StorageMode.INTERNAL);
+  }
+
+  @Test
+  public void testStoreLevelStorageModeRoundTrip() {
+    Store store = TestUtils.createTestStore("testStore", "owner", System.currentTimeMillis());
+    store.setStorageMode(StorageMode.DUAL_WRITE);
+    Assert.assertEquals(store.getStorageMode(), StorageMode.DUAL_WRITE);
+  }
+
+  @Test
+  public void testCloneStorePreservesStoreLevelStorageMode() {
+    Store store = TestUtils.createTestStore("testStore", "owner", System.currentTimeMillis());
+    store.setStorageMode(StorageMode.EXTERNAL);
+    Store clonedStore = store.cloneStore();
+    Assert.assertEquals(clonedStore.getStorageMode(), StorageMode.EXTERNAL);
+  }
+
+  @Test
+  public void testStoreLevelStorageModePersistsThroughAvroDataModel() {
+    ZKStore store = (ZKStore) TestUtils.createTestStore("testStore", "owner", System.currentTimeMillis());
+    store.setStorageMode(StorageMode.DUAL_WRITE);
+    Assert.assertEquals(store.dataModel().storageMode, StorageMode.DUAL_WRITE.getValue());
+  }
+
+  @Test
+  public void testAddVersionCopiesStoreLevelStorageMode() {
+    Store store = TestUtils.createTestStore("testStore", "owner", System.currentTimeMillis());
+    store.setStorageMode(StorageMode.DUAL_WRITE);
+    Version newVersion = new VersionImpl(store.getName(), 1, "pushJobId");
+    store.addVersion(newVersion);
+    // addVersion stamps the current store-level default onto the new version.
+    Assert.assertEquals(store.getVersion(1).getStorageMode(), StorageMode.DUAL_WRITE);
+    // A later store-level change does NOT mutate the already-added version.
+    store.setStorageMode(StorageMode.EXTERNAL);
+    Assert.assertEquals(store.getVersion(1).getStorageMode(), StorageMode.DUAL_WRITE);
+  }
+
 }

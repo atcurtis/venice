@@ -1,13 +1,20 @@
 package com.linkedin.venice.grpc;
 
+import com.google.protobuf.ByteString;
+import com.google.protobuf.UnsafeByteOperations;
+import com.linkedin.venice.acl.handler.AccessResult;
+import com.linkedin.venice.client.exceptions.VeniceClientException;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.security.SSLConfig;
 import com.linkedin.venice.security.SSLFactory;
 import com.linkedin.venice.utils.SslUtils;
+import io.grpc.ChannelCredentials;
 import io.grpc.Grpc;
+import io.grpc.InsecureChannelCredentials;
 import io.grpc.ServerCall;
 import io.grpc.Status;
-import io.netty.handler.codec.http.HttpResponseStatus;
+import io.grpc.TlsChannelCredentials;
+import io.netty.buffer.ByteBuf;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.file.Files;
@@ -50,12 +57,17 @@ public final class GrpcUtils {
     return trustManagerFactory.getTrustManagers();
   }
 
-  public static Status httpResponseStatusToGrpcStatus(HttpResponseStatus status, String errorMessage) {
-    if (status.equals(HttpResponseStatus.FORBIDDEN) || status.equals(HttpResponseStatus.UNAUTHORIZED)) {
-      return Status.PERMISSION_DENIED.withDescription(errorMessage);
+  public static Status accessResultToGrpcStatus(AccessResult accessResult) {
+    switch (accessResult) {
+      case GRANTED:
+        return Status.OK;
+      case FORBIDDEN:
+      case UNAUTHORIZED:
+      case ERROR_FORBIDDEN:
+        return Status.PERMISSION_DENIED.withDescription(accessResult.getMessage());
+      default:
+        return Status.UNKNOWN.withDescription(accessResult.getMessage());
     }
-
-    return Status.UNKNOWN.withDescription(errorMessage);
   }
 
   public static X509Certificate extractGrpcClientCert(ServerCall<?, ?> call) throws SSLPeerUnverifiedException {
@@ -91,5 +103,48 @@ public final class GrpcUtils {
       keyStore.load(in, password);
     }
     return keyStore;
+  }
+
+  /**
+   * Wraps a byte array into a {@link ByteString} <b>without copying</b>. The returned {@code ByteString} directly
+   * aliases the provided array, so the caller <b>must not</b> modify the array after calling this method.
+   * Violating this contract can cause silent data corruption in serialized gRPC payloads.
+   *
+   * <p>If the caller cannot guarantee immutability of the input array, use {@link ByteString#copyFrom(byte[])}
+   * instead.
+   */
+  public static ByteString toByteStringNoCopy(byte[] bytes) {
+    if (bytes == null || bytes.length == 0) {
+      return ByteString.EMPTY;
+    }
+    return UnsafeByteOperations.unsafeWrap(bytes);
+  }
+
+  /** Copies readable bytes from a {@link ByteBuf} into a {@link ByteString}. */
+  public static ByteString toByteString(ByteBuf buf) {
+    if (buf == null || buf.readableBytes() == 0) {
+      return ByteString.EMPTY;
+    }
+    byte[] bytes = new byte[buf.readableBytes()];
+    buf.getBytes(buf.readerIndex(), bytes);
+    return ByteString.copyFrom(bytes);
+  }
+
+  public static ChannelCredentials buildChannelCredentials(SSLFactory sslFactory) {
+    // TODO: Evaluate if this needs to fail instead since it depends on plain text support on server
+    if (sslFactory == null) {
+      return InsecureChannelCredentials.create();
+    }
+
+    try {
+      TlsChannelCredentials.Builder tlsBuilder = TlsChannelCredentials.newBuilder()
+          .keyManager(GrpcUtils.getKeyManagers(sslFactory))
+          .trustManager(GrpcUtils.getTrustManagers(sslFactory));
+      return tlsBuilder.build();
+    } catch (Exception e) {
+      throw new VeniceClientException(
+          "Failed to initialize SSL channel credentials for Venice gRPC Transport Client",
+          e);
+    }
   }
 }

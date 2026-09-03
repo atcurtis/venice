@@ -7,6 +7,7 @@ import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.schema.SchemaEntry;
 import com.linkedin.venice.service.AbstractVeniceService;
 import com.linkedin.venice.utils.DaemonThreadFactory;
+import com.linkedin.venice.utils.LogContext;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashSet;
@@ -26,8 +27,7 @@ import org.apache.logging.log4j.Logger;
 public class UnusedValueSchemaCleanupService extends AbstractVeniceService {
   private static final Logger LOGGER = LogManager.getLogger(UnusedValueSchemaCleanupService.class);
 
-  private final ScheduledExecutorService executor =
-      Executors.newSingleThreadScheduledExecutor(new DaemonThreadFactory("UnusedValueSchemaCleanupService"));
+  private final ScheduledExecutorService executor;
   private final VeniceControllerMultiClusterConfig multiClusterConfig;
   private final VeniceParentHelixAdmin veniceParentHelixAdmin;
   private final int scheduleIntervalSeconds;
@@ -38,6 +38,8 @@ public class UnusedValueSchemaCleanupService extends AbstractVeniceService {
       VeniceControllerMultiClusterConfig multiClusterConfig,
       VeniceParentHelixAdmin parentHelixAdmin) {
     this.multiClusterConfig = multiClusterConfig;
+    this.executor = Executors.newSingleThreadScheduledExecutor(
+        new DaemonThreadFactory("UnusedValueSchemaCleanupService", multiClusterConfig.getLogContext()));
     this.scheduleIntervalSeconds = multiClusterConfig.getUnusedSchemaCleanupIntervalSeconds();
     this.minSchemaCountToKeep = multiClusterConfig.getMinSchemaCountToKeep();
     this.veniceParentHelixAdmin = parentHelixAdmin;
@@ -45,6 +47,7 @@ public class UnusedValueSchemaCleanupService extends AbstractVeniceService {
 
   private Runnable getRunnableForSchemaCleanup() {
     return () -> {
+      LogContext.setLogContext(multiClusterConfig.getLogContext());
       if (stop) {
         return;
       }

@@ -1,6 +1,7 @@
 package com.linkedin.venice.hadoop.input.kafka.ttl;
 
-import com.linkedin.venice.hadoop.input.kafka.chunk.ChunkAssembler;
+import com.linkedin.venice.common.ChunkAssembler;
+import com.linkedin.venice.common.VeniceRmdTTLFilter;
 import com.linkedin.venice.utils.VeniceProperties;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -31,7 +32,8 @@ public class VeniceChunkedPayloadTTLFilter extends VeniceRmdTTLFilter<ChunkAssem
 
   @Override
   protected ByteBuffer getValuePayload(ChunkAssembler.ValueBytesAndSchemaId valueBytesAndSchemaId) {
-    return ByteBuffer.wrap(valueBytesAndSchemaId.getBytes());
+    byte[] valueBytes = valueBytesAndSchemaId.getBytes();
+    return valueBytes == null ? null : ByteBuffer.wrap(valueBytes);
   }
 
   @Override

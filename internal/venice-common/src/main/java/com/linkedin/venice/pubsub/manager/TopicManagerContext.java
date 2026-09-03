@@ -4,11 +4,15 @@ import static com.linkedin.venice.pubsub.PubSubConstants.DEFAULT_KAFKA_MIN_LOG_C
 import static com.linkedin.venice.pubsub.PubSubConstants.PUBSUB_OPERATION_TIMEOUT_MS_DEFAULT_VALUE;
 import static com.linkedin.venice.pubsub.PubSubConstants.PUBSUB_TOPIC_DELETION_STATUS_POLL_INTERVAL_MS_DEFAULT_VALUE;
 
+import com.linkedin.venice.acl.VeniceComponent;
+import com.linkedin.venice.meta.AsyncStoreChangeNotifier;
 import com.linkedin.venice.pubsub.PubSubAdminAdapterFactory;
 import com.linkedin.venice.pubsub.PubSubConsumerAdapterFactory;
+import com.linkedin.venice.pubsub.PubSubPositionTypeRegistry;
 import com.linkedin.venice.pubsub.PubSubTopicRepository;
 import com.linkedin.venice.pubsub.api.PubSubAdminAdapter;
 import com.linkedin.venice.pubsub.api.PubSubConsumerAdapter;
+import com.linkedin.venice.utils.LogContext;
 import com.linkedin.venice.utils.VeniceProperties;
 import io.tehuti.metrics.MetricsRepository;
 
@@ -20,6 +24,7 @@ public class TopicManagerContext {
   private final PubSubAdminAdapterFactory<PubSubAdminAdapter> pubSubAdminAdapterFactory;
   private final PubSubConsumerAdapterFactory<PubSubConsumerAdapter> pubSubConsumerAdapterFactory;
   private final PubSubTopicRepository pubSubTopicRepository;
+  private final PubSubPositionTypeRegistry pubSubPositionTypeRegistry;
   private final MetricsRepository metricsRepository;
   private final PubSubPropertiesSupplier pubSubPropertiesSupplier;
   private final long pubSubOperationTimeoutMs;
@@ -28,6 +33,9 @@ public class TopicManagerContext {
   private final long topicOffsetCheckIntervalMs;
   private final int topicMetadataFetcherConsumerPoolSize;
   private final int topicMetadataFetcherThreadPoolSize;
+  private final VeniceComponent veniceComponent;
+  private final LogContext logContext;
+  private final AsyncStoreChangeNotifier asyncStoreChangeNotifier;
 
   private TopicManagerContext(Builder builder) {
     this.pubSubOperationTimeoutMs = builder.pubSubOperationTimeoutMs;
@@ -36,11 +44,15 @@ public class TopicManagerContext {
     this.pubSubAdminAdapterFactory = builder.pubSubAdminAdapterFactory;
     this.pubSubConsumerAdapterFactory = builder.pubSubConsumerAdapterFactory;
     this.pubSubTopicRepository = builder.pubSubTopicRepository;
+    this.pubSubPositionTypeRegistry = builder.pubSubPositionTypeRegistry;
     this.metricsRepository = builder.metricsRepository;
     this.pubSubPropertiesSupplier = builder.pubSubPropertiesSupplier;
     this.topicOffsetCheckIntervalMs = builder.topicOffsetCheckIntervalMs;
     this.topicMetadataFetcherConsumerPoolSize = builder.topicMetadataFetcherConsumerPoolSize;
     this.topicMetadataFetcherThreadPoolSize = builder.topicMetadataFetcherThreadPoolSize;
+    this.veniceComponent = builder.veniceComponent;
+    this.logContext = builder.logContext;
+    this.asyncStoreChangeNotifier = builder.asyncStoreChangeNotifier;
   }
 
   public long getPubSubOperationTimeoutMs() {
@@ -91,16 +103,32 @@ public class TopicManagerContext {
     return topicMetadataFetcherThreadPoolSize;
   }
 
+  public VeniceComponent getVeniceComponent() {
+    return veniceComponent;
+  }
+
+  public LogContext getLogContext() {
+    return logContext;
+  }
+
   public interface PubSubPropertiesSupplier {
     VeniceProperties get(String pubSubBootstrapServers);
   }
 
+  public PubSubPositionTypeRegistry getPubSubPositionTypeRegistry() {
+    return pubSubPositionTypeRegistry;
+  }
+
+  public AsyncStoreChangeNotifier getStoreChangeNotifier() {
+    return asyncStoreChangeNotifier;
+  }
+
   @Override
   public String toString() {
-    return "TopicManagerContext{pubSubOperationTimeoutMs=" + pubSubOperationTimeoutMs
-        + ", topicDeletionStatusPollIntervalMs=" + topicDeletionStatusPollIntervalMs + ", topicMinLogCompactionLagMs="
-        + topicMinLogCompactionLagMs + ", topicOffsetCheckIntervalMs=" + topicOffsetCheckIntervalMs
-        + ", topicMetadataFetcherConsumerPoolSize=" + topicMetadataFetcherConsumerPoolSize
+    return "TopicManagerContext{veniceComponent=" + veniceComponent + ", pubSubOperationTimeoutMs="
+        + pubSubOperationTimeoutMs + ", topicDeletionStatusPollIntervalMs=" + topicDeletionStatusPollIntervalMs
+        + ", topicMinLogCompactionLagMs=" + topicMinLogCompactionLagMs + ", topicOffsetCheckIntervalMs="
+        + topicOffsetCheckIntervalMs + ", topicMetadataFetcherConsumerPoolSize=" + topicMetadataFetcherConsumerPoolSize
         + ", topicMetadataFetcherThreadPoolSize=" + topicMetadataFetcherThreadPoolSize + ", pubSubAdminAdapterFactory="
         + pubSubAdminAdapterFactory.getClass().getSimpleName() + ", pubSubConsumerAdapterFactory="
         + pubSubConsumerAdapterFactory.getClass().getSimpleName() + '}';
@@ -110,8 +138,12 @@ public class TopicManagerContext {
     private PubSubAdminAdapterFactory<PubSubAdminAdapter> pubSubAdminAdapterFactory;
     private PubSubConsumerAdapterFactory<PubSubConsumerAdapter> pubSubConsumerAdapterFactory;
     private PubSubTopicRepository pubSubTopicRepository;
+    private PubSubPositionTypeRegistry pubSubPositionTypeRegistry;
     private MetricsRepository metricsRepository;
     private PubSubPropertiesSupplier pubSubPropertiesSupplier;
+    private VeniceComponent veniceComponent = VeniceComponent.UNSPECIFIED; // Default component
+    private LogContext logContext;
+    private AsyncStoreChangeNotifier asyncStoreChangeNotifier;
     private long pubSubOperationTimeoutMs = PUBSUB_OPERATION_TIMEOUT_MS_DEFAULT_VALUE;
     private long topicDeletionStatusPollIntervalMs = PUBSUB_TOPIC_DELETION_STATUS_POLL_INTERVAL_MS_DEFAULT_VALUE;
     private long topicMinLogCompactionLagMs = DEFAULT_KAFKA_MIN_LOG_COMPACTION_LAG_MS;
@@ -151,6 +183,11 @@ public class TopicManagerContext {
       return this;
     }
 
+    public Builder setPubSubPositionTypeRegistry(PubSubPositionTypeRegistry pubSubPositionTypeRegistry) {
+      this.pubSubPositionTypeRegistry = pubSubPositionTypeRegistry;
+      return this;
+    }
+
     public Builder setMetricsRepository(MetricsRepository metricsRepository) {
       this.metricsRepository = metricsRepository;
       return this;
@@ -173,6 +210,21 @@ public class TopicManagerContext {
 
     public Builder setTopicMetadataFetcherThreadPoolSize(int topicMetadataFetcherThreadPoolSize) {
       this.topicMetadataFetcherThreadPoolSize = topicMetadataFetcherThreadPoolSize;
+      return this;
+    }
+
+    public Builder setVeniceComponent(VeniceComponent veniceComponent) {
+      this.veniceComponent = veniceComponent;
+      return this;
+    }
+
+    public Builder setLogContext(LogContext logContext) {
+      this.logContext = logContext;
+      return this;
+    }
+
+    public Builder setStoreChangeNotifier(AsyncStoreChangeNotifier asyncStoreChangeNotifier) {
+      this.asyncStoreChangeNotifier = asyncStoreChangeNotifier;
       return this;
     }
 

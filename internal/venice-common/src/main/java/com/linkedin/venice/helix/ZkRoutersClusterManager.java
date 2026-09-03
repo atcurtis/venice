@@ -1,5 +1,7 @@
 package com.linkedin.venice.helix;
 
+import static com.linkedin.venice.zk.VeniceZkPaths.ROUTERS;
+
 import com.linkedin.venice.VeniceResource;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.meta.Instance;
@@ -32,7 +34,7 @@ import org.apache.zookeeper.Watcher;
 public class ZkRoutersClusterManager
     implements RoutersClusterManager, IZkChildListener, IZkDataListener, VeniceResource, IZkStateListener {
   private static final Logger LOGGER = LogManager.getLogger(ZkRoutersClusterManager.class);
-  private static final String PREFIX_PATH = "/routers";
+  private static final String PREFIX_PATH = "/" + ROUTERS;
   private final String clusterName;
   private final ZkClient zkClient;
   private volatile int liveRouterCount = 0;
@@ -160,8 +162,8 @@ public class ZkRoutersClusterManager
 
   @Override
   public void updateExpectedRouterCount(int expectedNumber) {
+    validateExpectRouterCount(expectedNumber);
     compareAndSetClusterConfig(currentData -> {
-      validateExpectRouterCount(expectedNumber);
       currentData.setExpectedRouterCount(expectedNumber);
       return currentData;
     });
@@ -171,13 +173,6 @@ public class ZkRoutersClusterManager
   public void subscribeRouterCountChangedEvent(RouterCountChangedListener listener) {
     synchronized (routerCountListeners) {
       routerCountListeners.add(listener);
-    }
-  }
-
-  @Override
-  public void unSubscribeRouterCountChangedEvent(RouterCountChangedListener listener) {
-    synchronized (routerCountListeners) {
-      routerCountListeners.remove(listener);
     }
   }
 

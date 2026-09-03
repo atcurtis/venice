@@ -2,6 +2,7 @@ package com.linkedin.venice.hooks;
 
 import com.linkedin.venice.annotation.Threadsafe;
 import com.linkedin.venice.controllerapi.JobStatusQueryResponse;
+import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.status.PushJobDetailsStatus;
 import com.linkedin.venice.utils.VeniceProperties;
 import com.linkedin.venice.utils.lazy.Lazy;
@@ -104,6 +105,65 @@ public abstract class StoreLifecycleHooks {
   }
 
   /**
+   * Invoked prior to updating a store's config with a given list of params. If the hook implementation recognizes the
+   * params, then it will return {@link StoreLifecycleEventOutcome#PROCEED}, otherwise it should return
+   * * {@link StoreLifecycleEventOutcome#ABORT} if any params are missing or invalid.<br>
+   * @param clusterName
+   * @param storeName
+   * @param hookParams
+   * @return
+   */
+  public StoreLifecycleEventOutcome validateHookParams(
+      String clusterName,
+      String storeName,
+      Map<String, String> hookParams) {
+    return StoreLifecycleEventOutcome.PROCEED;
+  }
+
+  /**
+   * Invoked prior to deleting a store. The hook has the option of aborting the deletion.<br>
+   * <br>
+   * Cardinality: once per store deletion attempt.
+   */
+  public StoreLifecycleEventOutcome preStoreDeletion(
+      String clusterName,
+      String storeName,
+      VeniceProperties storeHooksConfigs) {
+    return StoreLifecycleEventOutcome.PROCEED;
+  }
+
+  /**
+   * Invoked after a store has been successfully deleted.<br>
+   * <br>
+   * Cardinality: once per successful store deletion.
+   */
+  public void postStoreDeletion(String clusterName, String storeName, VeniceProperties storeHooksConfigs) {
+  }
+
+  /**
+   * Invoked prior to creating a new store. The hook has the option of aborting the creation.<br>
+   * <br>
+   * Note: at the time this hook fires, the store object has been configured but not yet persisted. Any lifecycle hooks
+   * configured on the store (e.g. via an initial hooks config) are available via {@code storeHooksConfigs}.<br>
+   * <br>
+   * Cardinality: once per store creation attempt.
+   */
+  public StoreLifecycleEventOutcome preStoreCreation(
+      String clusterName,
+      String storeName,
+      VeniceProperties storeHooksConfigs) {
+    return StoreLifecycleEventOutcome.PROCEED;
+  }
+
+  /**
+   * Invoked after a new store has been successfully created and persisted.<br>
+   * <br>
+   * Cardinality: once per successful store creation.
+   */
+  public void postStoreCreation(String clusterName, String storeName, VeniceProperties storeHooksConfigs) {
+  }
+
+  /**
    * Invoked prior to starting a new job. The hook has the option of aborting the job.<br>
    * <br>
    * N.B.: this hook returns a {@link StoreLifecycleEventOutcome}, and not a {@link StoreVersionLifecycleEventOutcome},
@@ -189,6 +249,33 @@ public abstract class StoreLifecycleHooks {
   }
 
   /**
+   * Invoked prior to deleting a store-version in a given region. The hook has the option of aborting the deletion.<br>
+   * <br>
+   * Cardinality: once per store-version deletion attempt per region.
+   */
+  public StoreLifecycleEventOutcome preStoreVersionDeletion(
+      String clusterName,
+      String storeName,
+      int versionNumber,
+      String regionName,
+      VeniceProperties storeHooksConfigs) {
+    return StoreLifecycleEventOutcome.PROCEED;
+  }
+
+  /**
+   * Invoked after deleting a store-version in a given region.<br>
+   * <br>
+   * Cardinality: once per successful store-version deletion per region.
+   */
+  public void postStoreVersionDeletion(
+      String clusterName,
+      String storeName,
+      int versionNumber,
+      String regionName,
+      VeniceProperties storeHooksConfigs) {
+  }
+
+  /**
    * Invoked prior to informing Da Vinci Clients about starting to ingest a new store-version.<br>
    * <br>
    * Cardinality: once per store-version per region.
@@ -264,7 +351,34 @@ public abstract class StoreLifecycleHooks {
    * Invoked after swapping read traffic for servers.<br>
    * <br>
    * Cardinality: once per store-version per region which has successfully swapped.
+   *
+   * @param clusterName the name of the cluster in which the swap occurred
+   * @param storeName the name of the store whose version was swapped
+   * @param versionNumber the version number that is now current (the new serving version)
+   * @param previousVersion the version number that was current before the swap (now becoming backup),
+   *                        or {@link Store#NON_EXISTING_VERSION} if there was no prior current version.
+   * @param regionName the region in which the swap occurred
+   * @param jobStatus a lazy reference to the push job status, may be null for rollbacks/rollforwards
+   * @param storeHooksConfigs per-store hook configuration bag
    */
+  public StoreVersionLifecycleEventOutcome postStoreVersionSwap(
+      String clusterName,
+      String storeName,
+      int versionNumber,
+      int previousVersion,
+      String regionName,
+      Lazy<JobStatusQueryResponse> jobStatus,
+      VeniceProperties storeHooksConfigs) {
+    // Delegate to the deprecated 6-arg override for backward compatibility: subclasses that only
+    // override the 6-arg method will still be invoked when callers use the 7-arg signature.
+    return postStoreVersionSwap(clusterName, storeName, versionNumber, regionName, jobStatus, storeHooksConfigs);
+  }
+
+  /**
+   * @deprecated Override {@link #postStoreVersionSwap(String, String, int, int, String, Lazy, VeniceProperties)}
+   *             instead to receive the previous version number.
+   */
+  @Deprecated
   public StoreVersionLifecycleEventOutcome postStoreVersionSwap(
       String clusterName,
       String storeName,

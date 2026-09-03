@@ -1,8 +1,8 @@
 package com.linkedin.venice.helix;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.linkedin.venice.common.VeniceSystemStoreType;
 import com.linkedin.venice.meta.BufferReplayPolicy;
-import com.linkedin.venice.meta.DataReplicationPolicy;
 import com.linkedin.venice.meta.HybridStoreConfig;
 import com.linkedin.venice.meta.HybridStoreConfigImpl;
 import com.linkedin.venice.meta.Store;
@@ -13,6 +13,7 @@ import com.linkedin.venice.meta.VersionImpl;
 import com.linkedin.venice.meta.ViewConfig;
 import com.linkedin.venice.meta.ViewConfigImpl;
 import com.linkedin.venice.partitioner.DefaultVenicePartitioner;
+import com.linkedin.venice.utils.ObjectMapperFactory;
 import com.linkedin.venice.utils.TestUtils;
 import java.io.IOException;
 import java.util.Arrays;
@@ -28,6 +29,49 @@ import org.testng.annotations.Test;
  */
 public class TestStoreJsonSerializer {
   @Test
+  void testRealTimeTopicNameDefault() throws IOException {
+    StoreJSONSerializer serializer = new StoreJSONSerializer();
+    Store store = serializer
+        .deserialize(TestUtils.loadFileAsString("TestStoreJsonSerializer/testHybridStore.json").getBytes(), "");
+
+    Assert.assertNotNull(store.getHybridStoreConfig().getRealTimeTopicName(), "realTimeTopicName should not be null");
+    Assert.assertEquals(
+        HybridStoreConfigImpl.DEFAULT_REAL_TIME_TOPIC_NAME,
+        store.getHybridStoreConfig().getRealTimeTopicName(),
+        "realTimeTopicName should have default value of an empty string");
+
+    store.getVersions().forEach(v -> {
+      Assert.assertNotNull(v.getHybridStoreConfig().getRealTimeTopicName(), "realTimeTopicName should not be null");
+      Assert.assertEquals(
+          HybridStoreConfigImpl.DEFAULT_REAL_TIME_TOPIC_NAME,
+          v.getHybridStoreConfig().getRealTimeTopicName(),
+          "realTimeTopicName should have default value of an empty string");
+    });
+  }
+
+  @Test
+  void testRealTimeTopicName() throws IOException {
+    StoreJSONSerializer serializer = new StoreJSONSerializer();
+    Store store = serializer
+        .deserialize(TestUtils.loadFileAsString("TestStoreJsonSerializer/testHybridStore2.json").getBytes(), "");
+
+    Assert.assertEquals(
+        "TEST_RT_TOPIC_NAME",
+        store.getHybridStoreConfig().getRealTimeTopicName(),
+        "realTimeTopicName should have default value of an empty string");
+
+    store.getVersions().forEach(v -> {
+      if (v.getNumber() == 817) {
+        Assert.assertEquals("TEST_RT_TOPIC_NAME_817", v.getHybridStoreConfig().getRealTimeTopicName());
+      } else if (v.getNumber() == 818) {
+        Assert.assertEquals("TEST_RT_TOPIC_NAME_818", v.getHybridStoreConfig().getRealTimeTopicName());
+      } else {
+        Assert.fail("Unexpected version number!");
+      }
+    });
+  }
+
+  @Test
   public void testSerializeAndDeserializeStore() throws IOException {
     Store store = TestUtils.createTestStore("s1", "owner", 1l);
     store.addVersion(new VersionImpl(store.getName(), store.getLargestUsedVersionNumber() + 1, "pushJobId"));
@@ -35,15 +79,13 @@ public class TestStoreJsonSerializer {
         1000,
         1000,
         HybridStoreConfigImpl.DEFAULT_HYBRID_TIME_LAG_THRESHOLD,
-        DataReplicationPolicy.NON_AGGREGATE,
         BufferReplayPolicy.REWIND_FROM_EOP);
     store.setHybridStoreConfig(hybridStoreConfig);
     store.setReadQuotaInCU(100);
 
     Map<String, ViewConfig> viewConfigMap = new HashMap<>();
-    viewConfigMap.put(
-        "changeCapture",
-        new ViewConfigImpl("com.linkedin.venice.views.ChangeCaptureView", Collections.emptyMap()));
+    viewConfigMap
+        .put("testView", new ViewConfigImpl("com.linkedin.venice.views.MaterializedView", Collections.emptyMap()));
     store.setViewConfigs(viewConfigMap);
 
     StoreJSONSerializer serializer = new StoreJSONSerializer();
@@ -61,7 +103,6 @@ public class TestStoreJsonSerializer {
             1000,
             1,
             HybridStoreConfigImpl.DEFAULT_HYBRID_TIME_LAG_THRESHOLD,
-            DataReplicationPolicy.NON_AGGREGATE,
             BufferReplayPolicy.REWIND_FROM_EOP));
     Assert.assertNotEquals(store, newStore);
     Assert.assertNotEquals(store.getHybridStoreConfig(), newStore.getHybridStoreConfig());
@@ -70,10 +111,58 @@ public class TestStoreJsonSerializer {
             1,
             1000,
             HybridStoreConfigImpl.DEFAULT_HYBRID_TIME_LAG_THRESHOLD,
-            DataReplicationPolicy.NON_AGGREGATE,
             BufferReplayPolicy.REWIND_FROM_EOP));
     Assert.assertNotEquals(store, newStore);
     Assert.assertNotEquals(store.getHybridStoreConfig(), newStore.getHybridStoreConfig());
+  }
+
+  /**
+   * Stores are persisted to ZK as JSON, which is a separate path from the Avro store-properties
+   * schema. These two configs are nullable, so this covers that a value survives the ZK round trip,
+   * that an unset or explicitly cleared config stays null rather than being resurrected as a
+   * default, and that znodes written before these fields existed still deserialize.
+   */
+  @Test
+  public void testSerializeAndDeserializeVeniceUnitsAndWorkloadType() throws IOException {
+    StoreJSONSerializer serializer = new StoreJSONSerializer();
+
+    Store store = TestUtils.createTestStore("s1", "owner", 1L);
+    store.setVeniceUnits(42);
+    store.setWorkloadType("LOW_LATENCY");
+
+    byte[] serialized = serializer.serialize(store, "");
+    // Assert on the persisted znode itself, so a field silently missing from the JSON is caught here
+    // rather than being masked by an in-memory cache on read.
+    JsonNode znode = ObjectMapperFactory.getInstance().readTree(serialized);
+    Assert.assertEquals(znode.get("veniceUnits").intValue(), 42, "veniceUnits must be written to the znode");
+    Assert.assertEquals(
+        znode.get("workloadType").textValue(),
+        "LOW_LATENCY",
+        "workloadType must be written to the znode");
+
+    Store roundTripped = serializer.deserialize(serialized, "");
+    Assert.assertEquals(roundTripped.getVeniceUnits(), Integer.valueOf(42));
+    Assert.assertEquals(roundTripped.getWorkloadType(), "LOW_LATENCY");
+    Assert.assertEquals(store, roundTripped);
+
+    // A store that never had either config set stays null through the round trip.
+    Store unset = TestUtils.createTestStore("s2", "owner", 1L);
+    Store unsetRoundTripped = serializer.deserialize(serializer.serialize(unset, ""), "");
+    Assert.assertNull(unsetRoundTripped.getVeniceUnits());
+    Assert.assertNull(unsetRoundTripped.getWorkloadType());
+
+    // Clearing a previously set config persists as null rather than reverting to the old value.
+    store.setVeniceUnits(null);
+    store.setWorkloadType(null);
+    Store clearedRoundTripped = serializer.deserialize(serializer.serialize(store, ""), "");
+    Assert.assertNull(clearedRoundTripped.getVeniceUnits(), "A cleared veniceUnits must persist as null");
+    Assert.assertNull(clearedRoundTripped.getWorkloadType(), "A cleared workloadType must persist as null");
+    Assert.assertEquals(store, clearedRoundTripped);
+
+    // Znodes written before these fields existed must still deserialize, with both configs unset.
+    Store legacy = serializer.deserialize("{\"name\":\"s1\"}".getBytes(), "");
+    Assert.assertNull(legacy.getVeniceUnits());
+    Assert.assertNull(legacy.getWorkloadType());
   }
 
   @Test

@@ -1,9 +1,13 @@
 package com.linkedin.venice.meta;
 
+import static com.linkedin.venice.meta.HybridStoreConfigImpl.DEFAULT_REAL_TIME_TOPIC_NAME;
+import static com.linkedin.venice.meta.Version.DEFAULT_RT_VERSION_NUMBER;
+
 import com.linkedin.venice.exceptions.StoreDisabledException;
 import com.linkedin.venice.exceptions.StoreVersionNotFoundException;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.systemstore.schemas.StoreVersion;
+import com.linkedin.venice.utils.Utils;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -78,17 +82,17 @@ public abstract class AbstractStore implements Store {
 
   @Override
   public void addVersion(Version version) {
-    addVersion(version, true, false);
+    addVersion(version, true, false, DEFAULT_RT_VERSION_NUMBER);
   }
 
   @Override
-  public void addVersion(Version version, boolean isClonedVersion) {
-    addVersion(version, true, isClonedVersion);
+  public void addVersion(Version version, boolean isClonedVersion, int currentRTVersionNumber) {
+    addVersion(version, true, isClonedVersion, currentRTVersionNumber);
   }
 
   @Override
   public void forceAddVersion(Version version, boolean isClonedVersion) {
-    addVersion(version, false, isClonedVersion);
+    addVersion(version, false, isClonedVersion, DEFAULT_RT_VERSION_NUMBER);
   }
 
   @Override
@@ -107,7 +111,11 @@ public abstract class AbstractStore implements Store {
    *                        any store level config on it; if false, the version being added is new version, so the new version
    *                        config should be the same as store config.
    */
-  private void addVersion(Version version, boolean checkDisableWrite, boolean isClonedVersion) {
+  private void addVersion(
+      Version version,
+      boolean checkDisableWrite,
+      boolean isClonedVersion,
+      int currentRTVersionNumber) {
     checkVersionSupplier();
     if (checkDisableWrite) {
       checkDisableStoreWrite("add", version.getNumber());
@@ -152,19 +160,39 @@ public abstract class AbstractStore implements Store {
 
       version.setIncrementalPushEnabled(isIncrementalPushEnabled());
 
+      version.setSeparateRealTimeTopicEnabled(isSeparateRealTimeTopicEnabled());
+
       version.setBlobTransferEnabled(isBlobTransferEnabled());
+      version.setBlobTransferInServerEnabled(getBlobTransferInServerEnabled());
+      version.setBlobDbEnabled(getBlobDbEnabled());
+
+      version.setStorageMode(getStorageMode());
 
       version.setUseVersionLevelIncrementalPushEnabled(true);
 
+      version.setTargetSwapRegionWaitTime(getTargetSwapRegionWaitTime());
+
+      version.setGlobalRtDivEnabled(isGlobalRtDivEnabled());
+
       HybridStoreConfig hybridStoreConfig = getHybridStoreConfig();
       if (hybridStoreConfig != null) {
-        version.setHybridStoreConfig(hybridStoreConfig.clone());
+        HybridStoreConfig clonedHybridStoreConfig = hybridStoreConfig.clone();
+        if (currentRTVersionNumber > DEFAULT_RT_VERSION_NUMBER) {
+          String newRealTimeTopicName = Utils.isRTVersioningApplicable(getName())
+              ? Utils.composeRealTimeTopic(getName(), currentRTVersionNumber)
+              : DEFAULT_REAL_TIME_TOPIC_NAME;
+          clonedHybridStoreConfig.setRealTimeTopicName(newRealTimeTopicName);
+        }
+        version.setHybridStoreConfig(clonedHybridStoreConfig);
       }
 
       version.setUseVersionLevelHybridConfig(true);
 
       version.setActiveActiveReplicationEnabled(isActiveActiveReplicationEnabled());
       version.setViewConfigs(getViewConfigs());
+
+      version.setKeyUrnCompressionEnabled(isKeyUrnCompressionEnabled());
+      version.setKeyUrnFields(getKeyUrnFields());
     }
 
     storeVersionsSupplier.getForUpdate().add(index, version.dataModel());
@@ -214,8 +242,35 @@ public abstract class AbstractStore implements Store {
   }
 
   @Override
-  public Version peekNextVersion() {
-    return increaseVersion(Version.guidBasedDummyPushId(), false);
+  public void setVersionTargetRegionPromoted(int versionNumber, boolean targetRegionPromoted) {
+    checkVersionSupplier();
+    for (int i = storeVersionsSupplier.getForUpdate().size() - 1; i >= 0; i--) {
+      Version version = new VersionImpl(storeVersionsSupplier.getForUpdate().get(i));
+      if (version.getNumber() == versionNumber) {
+        version.setTargetRegionPromoted(targetRegionPromoted);
+        return;
+      }
+    }
+  }
+
+  @Override
+  public void setVersionStorageMode(int versionNumber, StorageMode storageMode) {
+    checkVersionSupplier();
+    for (int i = storeVersionsSupplier.getForUpdate().size() - 1; i >= 0; i--) {
+      Version version = new VersionImpl(storeVersionsSupplier.getForUpdate().get(i));
+      if (version.getNumber() == versionNumber) {
+        version.setStorageMode(storageMode);
+        return;
+      }
+    }
+    throw new VeniceException("Version:" + versionNumber + " does not exist");
+  }
+
+  @Override
+  public int peekNextVersionNumber() {
+    int nextVersionNumber = getLargestUsedVersionNumber() + 1;
+    checkDisableStoreWrite("increase", nextVersionNumber);
+    return nextVersionNumber;
   }
 
   @Override
@@ -251,24 +306,33 @@ public abstract class AbstractStore implements Store {
     return version.getStatus();
   }
 
-  private Version increaseVersion(String pushJobId, boolean createNewVersion) {
-    int versionNumber = getLargestUsedVersionNumber() + 1;
-    checkDisableStoreWrite("increase", versionNumber);
-    Version version = new VersionImpl(getName(), versionNumber, pushJobId);
-    if (createNewVersion) {
-      addVersion(version);
-      return version.cloneVersion();
-    } else {
-      return version;
-    }
-  }
-
   @Override
   public List<Version> retrieveVersionsToDelete(int clusterNumVersionsToPreserve) {
     checkVersionSupplier();
+    return computeVersionsToDelete(
+        storeVersionsSupplier.getForRead(),
+        getCurrentVersion(),
+        clusterNumVersionsToPreserve,
+        getNumVersionsToPreserve(),
+        isMigrating());
+  }
+
+  /**
+   * Same version-deletion policy as {@link #retrieveVersionsToDelete(int)}, but over raw fields so
+   * callers that only hold a version snapshot (e.g. a child {@code StoreInfo}) can reuse it without a
+   * full {@link Store}. {@code storeNumVersionsToPreserve} is the store-level override
+   * ({@link #NUM_VERSION_PRESERVE_NOT_SET} when unset, in which case {@code clusterNumVersionsToPreserve}
+   * applies). Assumes {@code versions} is sorted by version number ascending.
+   */
+  public static List<Version> computeVersionsToDelete(
+      List<Version> versions,
+      int currentVersion,
+      int clusterNumVersionsToPreserve,
+      int storeNumVersionsToPreserve,
+      boolean isMigrating) {
     int curNumVersionsToPreserve = clusterNumVersionsToPreserve;
-    if (getNumVersionsToPreserve() != NUM_VERSION_PRESERVE_NOT_SET) {
-      curNumVersionsToPreserve = getNumVersionsToPreserve();
+    if (storeNumVersionsToPreserve != NUM_VERSION_PRESERVE_NOT_SET) {
+      curNumVersionsToPreserve = storeNumVersionsToPreserve;
     }
     // when numVersionsToPreserve is less than 1, it usually means a config issue.
     // Setting it to zero, will cause the store to be deleted as soon as push completes.
@@ -277,13 +341,11 @@ public abstract class AbstractStore implements Store {
           "At least 1 version should be preserved. Parameter " + curNumVersionsToPreserve);
     }
 
-    List<Version> versions = storeVersionsSupplier.getForRead();
     int versionCnt = versions.size();
     if (versionCnt == 0) {
       return Collections.emptyList();
     }
 
-    // The code assumes that Versions are sorted in increasing order by addVersion and increaseVersion
     int lastElementIndex = versionCnt - 1;
     List<Version> versionsToDelete = new ArrayList<>();
 
@@ -295,11 +357,26 @@ public abstract class AbstractStore implements Store {
      *     c) STARTED versions if its not the last one and the store is not migrating.
      *     d) KILLED versions by {@link org.apache.kafka.clients.admin.Admin#killOfflinePush} api.
      */
+    // current version need not be the largest version, preseve it before finding other versions > current version
+    for (int i = lastElementIndex; i >= 0; i--) {
+      if (versions.get(i).getNumber() == currentVersion) { // currentVersion is always preserved
+        curNumVersionsToPreserve--;
+      }
+    }
+
     for (int i = lastElementIndex; i >= 0; i--) {
       Version version = versions.get(i);
 
-      if (version.getNumber() == getCurrentVersion()) { // currentVersion is always preserved
-        curNumVersionsToPreserve--;
+      if (version.getNumber() == currentVersion) { // currentVersion is always preserved
+        continue;
+      }
+      if (VersionStatus.isVersionRolledBack(version.getStatus())) {
+        // ROLLED_BACK versions are retained and cleaned up by StoreBackupVersionCleanupService
+        // with a dedicated retention period. Skip them here so the retention window is honored.
+        // Note: if the backup version retention-based cleanup service is disabled for the cluster,
+        // ROLLED_BACK versions will not be automatically deleted by this path. The admin tool's
+        // deleteOldVersion can still be used for manual cleanup in that case.
+        continue;
       } else if (VersionStatus.canDelete(version.getStatus())) { // ERROR and KILLED versions are always deleted
         versionsToDelete.add(version);
       } else if (VersionStatus.ONLINE.equals(version.getStatus())) {
@@ -308,7 +385,7 @@ public abstract class AbstractStore implements Store {
         } else {
           versionsToDelete.add(version);
         }
-      } else if (VersionStatus.STARTED.equals(version.getStatus()) && (i != lastElementIndex) && !isMigrating()) {
+      } else if (VersionStatus.STARTED.equals(version.getStatus()) && (i != lastElementIndex) && !isMigrating) {
         // For the non-last started version, if it's not the current version(STARTED version should not be the current
         // version, just prevent some edge cases here.), we should delete it only if the store is not migrating
         // as during store migration are there are concurrent pushes with STARTED version.
@@ -337,6 +414,19 @@ public abstract class AbstractStore implements Store {
       }
       if (version.getPartitionCount() == 0) {
         version.setPartitionCount(getPartitionCount());
+      }
+    }
+  }
+
+  @Override
+  public void updateVersionForDaVinciHeartbeat(int versionNumber, boolean reported) {
+    checkVersionSupplier();
+
+    for (StoreVersion storeVersion: storeVersionsSupplier.getForUpdate()) {
+      Version version = new VersionImpl(storeVersion);
+      if (version.getNumber() == versionNumber) {
+        version.setIsDavinciHeartbeatReported(reported);
+        return;
       }
     }
   }

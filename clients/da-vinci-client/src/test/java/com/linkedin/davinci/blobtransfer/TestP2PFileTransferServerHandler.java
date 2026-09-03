@@ -1,0 +1,757 @@
+package com.linkedin.davinci.blobtransfer;
+
+import static com.linkedin.davinci.blobtransfer.BlobTransferUtils.BLOB_TRANSFER_COMPLETED;
+import static com.linkedin.davinci.blobtransfer.BlobTransferUtils.BLOB_TRANSFER_PARTITION_STATE_SCHEMA_VERSION;
+import static com.linkedin.davinci.blobtransfer.BlobTransferUtils.BLOB_TRANSFER_REQUEST_ORIGIN;
+import static com.linkedin.davinci.blobtransfer.BlobTransferUtils.BLOB_TRANSFER_STATUS;
+import static com.linkedin.davinci.blobtransfer.BlobTransferUtils.BLOB_TRANSFER_STORE_VERSION_STATE_SCHEMA_VERSION;
+import static com.linkedin.davinci.blobtransfer.BlobTransferUtils.BLOB_TRANSFER_TYPE;
+import static com.linkedin.davinci.blobtransfer.BlobTransferUtils.BlobTransferRequestOrigin;
+import static com.linkedin.davinci.blobtransfer.BlobTransferUtils.BlobTransferType;
+import static com.linkedin.venice.response.VeniceReadResponseStatus.TOO_MANY_REQUESTS;
+import static com.linkedin.venice.utils.TestUtils.DEFAULT_PUBSUB_CONTEXT_FOR_UNIT_TESTING;
+import static org.mockito.ArgumentMatchers.any;
+
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.linkedin.davinci.blobtransfer.server.BlobTransferAdmissionController;
+import com.linkedin.davinci.blobtransfer.server.P2PFileTransferServerHandler;
+import com.linkedin.davinci.stats.AggBlobTransferStats;
+import com.linkedin.davinci.storage.StorageEngineRepository;
+import com.linkedin.davinci.storage.StorageMetadataService;
+import com.linkedin.davinci.store.StorageEngine;
+import com.linkedin.venice.kafka.protocol.state.PartitionState;
+import com.linkedin.venice.kafka.protocol.state.StoreVersionState;
+import com.linkedin.venice.offsets.OffsetRecord;
+import com.linkedin.venice.serialization.avro.AvroProtocolDefinition;
+import com.linkedin.venice.serialization.avro.InternalAvroSpecificSerializer;
+import com.linkedin.venice.store.rocksdb.RocksDBUtils;
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.embedded.EmbeddedChannel;
+import io.netty.handler.codec.http.DefaultFullHttpRequest;
+import io.netty.handler.codec.http.DefaultHttpResponse;
+import io.netty.handler.codec.http.FullHttpRequest;
+import io.netty.handler.codec.http.FullHttpResponse;
+import io.netty.handler.codec.http.HttpChunkedInput;
+import io.netty.handler.codec.http.HttpContent;
+import io.netty.handler.codec.http.HttpHeaderNames;
+import io.netty.handler.codec.http.HttpMethod;
+import io.netty.handler.codec.http.HttpResponseStatus;
+import io.netty.handler.codec.http.HttpVersion;
+import io.netty.handler.stream.ChunkedWriteHandler;
+import io.netty.handler.timeout.IdleStateEvent;
+import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
+import org.mockito.Mockito;
+import org.testng.Assert;
+import org.testng.annotations.AfterMethod;
+import org.testng.annotations.BeforeMethod;
+import org.testng.annotations.Test;
+
+
+public class TestP2PFileTransferServerHandler {
+  EmbeddedChannel ch;
+  Path baseDir;
+  int blobTransferMaxTimeoutInMin;
+  StorageMetadataService storageMetadataService;
+  P2PFileTransferServerHandler serverHandler;
+  BlobSnapshotManager blobSnapshotManager;
+  StorageEngineRepository storageEngineRepository;
+  AggBlobTransferStats blobTransferStats;
+  int maxAllowedConcurrentSnapshotUsers = 20;
+
+  @BeforeMethod
+  public void setUp() throws IOException {
+    baseDir = Files.createTempDirectory("tmp");
+    blobTransferMaxTimeoutInMin = 30;
+    storageMetadataService = Mockito.mock(StorageMetadataService.class);
+    storageEngineRepository = Mockito.mock(StorageEngineRepository.class);
+    blobTransferStats = Mockito.mock(AggBlobTransferStats.class);
+    blobSnapshotManager = Mockito.spy(new BlobSnapshotManager(storageEngineRepository, storageMetadataService));
+    serverHandler = new P2PFileTransferServerHandler(
+        baseDir.toString(),
+        blobTransferMaxTimeoutInMin,
+        blobSnapshotManager,
+        blobTransferStats,
+        maxAllowedConcurrentSnapshotUsers,
+        2 * 1024 * 1024,
+        new BlobTransferAdmissionController(maxAllowedConcurrentSnapshotUsers, 25),
+        true);
+    ch = new EmbeddedChannel(serverHandler);
+  }
+
+  @AfterMethod
+  public void tearDown() throws IOException {
+    ch.close();
+    Files.walk(baseDir).sorted(Comparator.reverseOrder()).forEach(path -> {
+      try {
+        Files.delete(path);
+      } catch (IOException e) {
+        e.printStackTrace();
+      }
+    });
+  }
+
+  @Test
+  public void testRejectClientOriginWhenClientReservationFull() {
+    // clientCap = 1 (25% of 4). Pre-occupy the only client slot so the incoming client-origin request is rejected at
+    // admission with 429, before any snapshot work -- independent of whether getTransferMetadata would succeed.
+    BlobTransferAdmissionController fullController = new BlobTransferAdmissionController(4, 25);
+    Assert.assertTrue(fullController.tryAdmitClient(), "Test setup: the single client slot should be claimable");
+    P2PFileTransferServerHandler clientHandler = new P2PFileTransferServerHandler(
+        baseDir.toString(),
+        blobTransferMaxTimeoutInMin,
+        blobSnapshotManager,
+        blobTransferStats,
+        4,
+        2 * 1024 * 1024,
+        fullController,
+        true);
+    EmbeddedChannel clientChannel = new EmbeddedChannel(clientHandler);
+    clientChannel.attr(BLOB_TRANSFER_REQUEST_ORIGIN).set(BlobTransferRequestOrigin.CLIENT);
+
+    clientChannel.writeInbound(
+        new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/myStore/1/10/BLOCK_BASED_TABLE"));
+
+    boolean foundTooManyRequestsResponse = false;
+    Object outbound;
+    while ((outbound = clientChannel.readOutbound()) != null) {
+      if (outbound instanceof FullHttpResponse
+          && ((FullHttpResponse) outbound).status().code() == TOO_MANY_REQUESTS.getCode()) {
+        foundTooManyRequestsResponse = true;
+      }
+    }
+    Assert.assertTrue(
+        foundTooManyRequestsResponse,
+        "Client-origin request must be rejected once the client reservation is full");
+    clientChannel.close();
+  }
+
+  @Test
+  public void testClientSlotReleasedWhenMetadataFails() {
+    // A client-origin request that fails getTransferMetadata (no storage engine in this mock setup) must release its
+    // admission slot immediately rather than holding it until the channel closes.
+    BlobTransferAdmissionController controller = new BlobTransferAdmissionController(4, 25); // clientCap = 1
+    P2PFileTransferServerHandler clientHandler = new P2PFileTransferServerHandler(
+        baseDir.toString(),
+        blobTransferMaxTimeoutInMin,
+        blobSnapshotManager,
+        blobTransferStats,
+        4,
+        2 * 1024 * 1024,
+        controller,
+        true);
+    EmbeddedChannel clientChannel = new EmbeddedChannel(clientHandler);
+    clientChannel.attr(BLOB_TRANSFER_REQUEST_ORIGIN).set(BlobTransferRequestOrigin.CLIENT);
+
+    clientChannel.writeInbound(
+        new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/myStore/1/10/BLOCK_BASED_TABLE"));
+
+    // The handler closes the channel on a failed client-origin metadata fetch, so channelInactive promptly releases
+    // the admission slot instead of pinning it on a kept-alive connection.
+    Assert.assertFalse(
+        clientChannel.isActive(),
+        "Channel must be closed after a failed client-origin metadata fetch so cleanup runs promptly");
+    Assert.assertEquals(
+        controller.getClientInFlight(),
+        0,
+        "A failed client-origin metadata fetch must release the admission slot immediately");
+    clientChannel.close();
+  }
+
+  @Test
+  public void testClientSlotReleasedWhenSnapshotMissing() throws Exception {
+    BlobTransferAdmissionController controller = new BlobTransferAdmissionController(4, 25); // clientCap = 1
+    P2PFileTransferServerHandler clientHandler = new P2PFileTransferServerHandler(
+        baseDir.toString(),
+        blobTransferMaxTimeoutInMin,
+        blobSnapshotManager,
+        blobTransferStats,
+        4,
+        2 * 1024 * 1024,
+        controller,
+        true);
+    EmbeddedChannel clientChannel = new EmbeddedChannel(clientHandler);
+    clientChannel.attr(BLOB_TRANSFER_REQUEST_ORIGIN).set(BlobTransferRequestOrigin.CLIENT);
+
+    BlobTransferPartitionMetadata metadata = new BlobTransferPartitionMetadata();
+    Mockito.doReturn(metadata).when(blobSnapshotManager).getTransferMetadata(any(), any());
+    clientChannel.writeInbound(
+        new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/myStore/1/10/BLOCK_BASED_TABLE"));
+
+    Assert.assertFalse(
+        clientChannel.isActive(),
+        "Channel must be closed after a post-admission client-origin error so cleanup runs promptly");
+    Assert.assertEquals(controller.getClientInFlight(), 0, "The client admission slot must be released promptly");
+    clientChannel.close();
+  }
+
+  @Test
+  public void testAdmissionControllerNotRequiredWhenAcceptDisabled() {
+    new P2PFileTransferServerHandler(
+        baseDir.toString(),
+        blobTransferMaxTimeoutInMin,
+        blobSnapshotManager,
+        blobTransferStats,
+        maxAllowedConcurrentSnapshotUsers,
+        2 * 1024 * 1024,
+        null,
+        false);
+  }
+
+  @Test(expectedExceptions = IllegalArgumentException.class)
+  public void testAdmissionControllerRequiredWhenAcceptEnabled() {
+    new P2PFileTransferServerHandler(
+        baseDir.toString(),
+        blobTransferMaxTimeoutInMin,
+        blobSnapshotManager,
+        blobTransferStats,
+        maxAllowedConcurrentSnapshotUsers,
+        2 * 1024 * 1024,
+        null,
+        true);
+  }
+
+  @Test
+  public void testSendFileHonorsConfiguredMaxChunkSize() throws IOException {
+    // Exercise a real transfer through ChunkedWriteHandler (as production pipelines do; the default `ch` in this
+    // class has no ChunkedWriteHandler so it never materializes actual HttpContent chunks) and assert every emitted
+    // chunk respects the configured ceiling. This proves sendFile() actually honors maxChunkSizeBytes rather than
+    // silently keeping the old hardcoded 2MB limit.
+    int configuredMaxChunkSizeBytes = 16384; // smallest legal ceiling (the chunk-size floor used in sendFile())
+    P2PFileTransferServerHandler smallChunkHandler = new P2PFileTransferServerHandler(
+        baseDir.toString(),
+        blobTransferMaxTimeoutInMin,
+        blobSnapshotManager,
+        blobTransferStats,
+        maxAllowedConcurrentSnapshotUsers,
+        configuredMaxChunkSizeBytes,
+        new BlobTransferAdmissionController(maxAllowedConcurrentSnapshotUsers, 25),
+        true);
+    EmbeddedChannel smallChunkChannel = new EmbeddedChannel(new ChunkedWriteHandler(), smallChunkHandler);
+
+    StorageEngine localStorageEngine = Mockito.mock(StorageEngine.class);
+    Mockito.doReturn(localStorageEngine).when(storageEngineRepository).getLocalStorageEngine(Mockito.any());
+    Mockito.doReturn(true).when(localStorageEngine).containsPartition(Mockito.anyInt());
+
+    StoreVersionState storeVersionState = new StoreVersionState();
+    Mockito.doReturn(storeVersionState).when(storageMetadataService).getStoreVersionState(Mockito.any());
+
+    InternalAvroSpecificSerializer<PartitionState> partitionStateSerializer =
+        AvroProtocolDefinition.PARTITION_STATE.getSerializer();
+    OffsetRecord offsetRecord = new OffsetRecord(partitionStateSerializer, DEFAULT_PUBSUB_CONTEXT_FOR_UNIT_TESTING);
+    Mockito.doReturn(offsetRecord).when(storageMetadataService).getLastOffset(Mockito.any(), Mockito.anyInt(), any());
+
+    // File large enough (5x the configured ceiling) to force multiple chunks: sendFile()'s chunkSize formula is
+    // min(maxChunkSizeBytes, max(16384, length / 4)), so at length = 5 * 16384, length / 4 = 20480 >= 16384, meaning
+    // the configured ceiling (16384) -- not the floor -- determines chunkSize, and the file requires 5 chunks.
+    Path snapshotDir = Paths.get(RocksDBUtils.composeSnapshotDir(baseDir.toString(), "myStore_v1", 10));
+    Files.createDirectories(snapshotDir);
+    Path file1 = snapshotDir.resolve("file1");
+    byte[] fileContent = new byte[configuredMaxChunkSizeBytes * 5];
+    ThreadLocalRandom.current().nextBytes(fileContent);
+    Files.write(file1.toAbsolutePath(), fileContent);
+
+    Mockito.doNothing().when(blobSnapshotManager).createSnapshot(Mockito.anyString(), Mockito.anyInt());
+
+    FullHttpRequest request =
+        new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/myStore/1/10/BLOCK_BASED_TABLE");
+    smallChunkChannel.writeInbound(request);
+
+    // start of file1 headers
+    Object response = smallChunkChannel.readOutbound();
+    Assert.assertTrue(response instanceof DefaultHttpResponse);
+
+    // Drain the actual HttpContent chunks that ChunkedWriteHandler pulled from the ChunkedFile and wrote downstream.
+    // The metadata and STATUS responses that follow are DefaultFullHttpResponse, which also implements HttpContent
+    // (via LastHttpContent), so stop as soon as a FullHttpResponse appears -- that marks the end of the file's
+    // chunked stream and the start of the next, separately-written response.
+    int totalBytesReceived = 0;
+    int chunkCount = 0;
+    Object outbound;
+    while ((outbound = smallChunkChannel.readOutbound()) != null && !(outbound instanceof FullHttpResponse)) {
+      Assert.assertTrue(outbound instanceof HttpContent, "Unexpected outbound message: " + outbound);
+      HttpContent httpContent = (HttpContent) outbound;
+      int chunkBytes = httpContent.content().readableBytes();
+      Assert.assertTrue(
+          chunkBytes <= configuredMaxChunkSizeBytes,
+          "Chunk " + chunkCount + " was " + chunkBytes + " bytes, exceeding the configured ceiling of "
+              + configuredMaxChunkSizeBytes);
+      totalBytesReceived += chunkBytes;
+      chunkCount++;
+      httpContent.release();
+    }
+
+    Assert.assertEquals(totalBytesReceived, fileContent.length, "All file bytes must be transferred");
+    // Expect 5 full-size chunks; HttpChunkedInput may emit an additional trailing empty chunk to mark end-of-input,
+    // so allow for that without weakening the core claim that the file was actually split into multiple chunks
+    // bounded by the configured ceiling (a single 2MB-sized write would have produced just 1-2 chunks here).
+    Assert.assertTrue(
+        chunkCount >= 5,
+        "File of 5x the configured chunk size must be split into at least 5 chunks when the ceiling, not the "
+            + "floor, is the binding constraint; got " + chunkCount);
+
+    smallChunkChannel.close();
+  }
+
+  @Test
+  public void testRejectNonGETMethod() {
+    FullHttpRequest request = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.POST, "/test");
+    ch.writeInbound(request);
+    FullHttpResponse response = ch.readOutbound();
+    Assert.assertEquals(response.status().code(), 405);
+  }
+
+  /**
+   * Testing the method is GET, but uri format is invalid
+   */
+  @Test
+  public void testRejectInvalidPath() {
+    FullHttpRequest request = new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/test");
+    ch.writeInbound(request);
+    FullHttpResponse response = ch.readOutbound();
+    Assert.assertEquals(response.status().code(), 500);
+  }
+
+  @Test
+  public void testRejectTooManyRequest() throws IOException {
+    StorageEngine localStorageEngine = Mockito.mock(StorageEngine.class);
+    Mockito.doReturn(localStorageEngine).when(storageEngineRepository).getLocalStorageEngine(Mockito.any());
+    Mockito.doReturn(true).when(localStorageEngine).containsPartition(Mockito.anyInt());
+
+    // prepare response from metadata service
+    StoreVersionState storeVersionState = new StoreVersionState();
+    Mockito.doReturn(storeVersionState).when(storageMetadataService).getStoreVersionState(Mockito.any());
+
+    InternalAvroSpecificSerializer<PartitionState> partitionStateSerializer =
+        AvroProtocolDefinition.PARTITION_STATE.getSerializer();
+    OffsetRecord offsetRecord = new OffsetRecord(partitionStateSerializer, DEFAULT_PUBSUB_CONTEXT_FOR_UNIT_TESTING);
+    offsetRecord.setOffsetLag(1000L);
+    Mockito.doReturn(offsetRecord).when(storageMetadataService).getLastOffset(Mockito.any(), Mockito.anyInt(), any());
+
+    // prepare the file request
+    Path snapshotDir = Paths.get(RocksDBUtils.composeSnapshotDir(baseDir.toString(), "myStore_v1", 10));
+    Files.createDirectories(snapshotDir);
+    Path file1 = snapshotDir.resolve("file1");
+    Files.write(file1.toAbsolutePath(), "hello".getBytes());
+    Mockito.doNothing().when(blobSnapshotManager).createSnapshot(Mockito.anyString(), Mockito.anyInt());
+
+    // Send maxAllowedConcurrentSnapshotUsers + 1 requests so the final one exceeds the host budget.
+    for (int requestCount = 0; requestCount <= maxAllowedConcurrentSnapshotUsers; requestCount++) {
+      FullHttpRequest request =
+          new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/myStore/1/10/BLOCK_BASED_TABLE");
+      ch.writeInbound(request);
+    }
+
+    // Read all outbound responses and check if at least one is 429
+    boolean foundTooManyRequestsResponse = false;
+    while (true) {
+      Object outbound = ch.readOutbound();
+      if (outbound == null) {
+        break;
+      }
+
+      if (outbound instanceof FullHttpResponse) {
+        FullHttpResponse httpResponse = (FullHttpResponse) outbound;
+        if (httpResponse.status().code() == TOO_MANY_REQUESTS.getCode()) {
+          foundTooManyRequestsResponse = true;
+          break;
+        }
+      }
+    }
+
+    Assert.assertTrue(foundTooManyRequestsResponse);
+  }
+
+  @Test
+  public void testRejectNonExistPath() {
+    // prepare response from metadata service for the metadata preparation
+    StoreVersionState storeVersionState = new StoreVersionState();
+    Mockito.doReturn(storeVersionState).when(storageMetadataService).getStoreVersionState(Mockito.any());
+    InternalAvroSpecificSerializer<PartitionState> partitionStateSerializer =
+        AvroProtocolDefinition.PARTITION_STATE.getSerializer();
+    OffsetRecord offsetRecord = new OffsetRecord(partitionStateSerializer, DEFAULT_PUBSUB_CONTEXT_FOR_UNIT_TESTING);
+    offsetRecord.setOffsetLag(1000L);
+    Mockito.doReturn(offsetRecord).when(storageMetadataService).getLastOffset(Mockito.any(), Mockito.anyInt(), any());
+
+    FullHttpRequest request =
+        new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/myStore/1/10/BLOCK_BASED_TABLE");
+    ch.writeInbound(request);
+    FullHttpResponse response = ch.readOutbound();
+    Assert.assertEquals(response.status().code(), 404);
+    Assert.assertEquals(blobSnapshotManager.getConcurrentSnapshotUsers("myStore_v1", 10), 0);
+  }
+
+  /**
+   * Sending request for plain table format, but the snapshot manager is use the block based format.
+   */
+  @Test
+  public void testRejectNotMatchFormat() throws IOException {
+    // prepare the file request
+    Path snapshotDir = Paths.get(RocksDBUtils.composeSnapshotDir(baseDir.toString(), "myStore_v1", 10));
+    Files.createDirectories(snapshotDir);
+    Path file1 = snapshotDir.resolve("file1");
+    Files.write(file1.toAbsolutePath(), "hello".getBytes());
+
+    // prepare response from metadata service for the metadata preparation
+    StoreVersionState storeVersionState = new StoreVersionState();
+    Mockito.doReturn(storeVersionState).when(storageMetadataService).getStoreVersionState(Mockito.any());
+    InternalAvroSpecificSerializer<PartitionState> partitionStateSerializer =
+        AvroProtocolDefinition.PARTITION_STATE.getSerializer();
+    OffsetRecord offsetRecord = new OffsetRecord(partitionStateSerializer, DEFAULT_PUBSUB_CONTEXT_FOR_UNIT_TESTING);
+    offsetRecord.setOffsetLag(1000L);
+    Mockito.doReturn(offsetRecord).when(storageMetadataService).getLastOffset(Mockito.any(), Mockito.anyInt(), any());
+
+    FullHttpRequest request =
+        new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/myStore/1/10/PLAIN_TABLE");
+    ch.writeInbound(request);
+    FullHttpResponse response = ch.readOutbound();
+    Assert.assertEquals(response.status().code(), 404);
+    Assert.assertEquals(blobSnapshotManager.getConcurrentSnapshotUsers("myStore_v1", 10), 0);
+  }
+
+  @Test
+  public void testFailOnAccessPath() throws IOException {
+    StorageEngine localStorageEngine = Mockito.mock(StorageEngine.class);
+    Mockito.doReturn(localStorageEngine).when(storageEngineRepository).getLocalStorageEngine(Mockito.any());
+    Mockito.doReturn(true).when(localStorageEngine).containsPartition(Mockito.anyInt());
+    // prepare response from metadata service for the metadata preparation
+    StoreVersionState storeVersionState = new StoreVersionState();
+    Mockito.doReturn(storeVersionState).when(storageMetadataService).getStoreVersionState(Mockito.any());
+    InternalAvroSpecificSerializer<PartitionState> partitionStateSerializer =
+        AvroProtocolDefinition.PARTITION_STATE.getSerializer();
+    OffsetRecord offsetRecord = new OffsetRecord(partitionStateSerializer, DEFAULT_PUBSUB_CONTEXT_FOR_UNIT_TESTING);
+    offsetRecord.setOffsetLag(1000L);
+    Mockito.doReturn(offsetRecord).when(storageMetadataService).getLastOffset(Mockito.any(), Mockito.anyInt(), any());
+
+    // create an empty snapshot dir
+    Path snapshotDir = Paths.get(RocksDBUtils.composeSnapshotDir(baseDir.toString(), "myStore_v1", 10));
+    Files.createDirectories(snapshotDir);
+    FullHttpRequest request =
+        new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/myStore/1/10/BLOCK_BASED_TABLE");
+    Mockito.doNothing().when(blobSnapshotManager).createSnapshot(Mockito.anyString(), Mockito.anyInt());
+
+    ch.writeInbound(request);
+    FullHttpResponse response = ch.readOutbound();
+    Assert.assertEquals(response.status().code(), 500);
+    // make the ch inactive
+    ch.pipeline().fireUserEventTriggered(IdleStateEvent.ALL_IDLE_STATE_EVENT);
+    Assert.assertEquals(blobSnapshotManager.getConcurrentSnapshotUsers("myStore_v1", 10), 0);
+  }
+
+  @Test
+  public void testIdleChannelClose() {
+    IdleStateEvent event = IdleStateEvent.ALL_IDLE_STATE_EVENT;
+    Assert.assertTrue(ch.isOpen());
+    ch.pipeline().fireUserEventTriggered(event);
+    Assert.assertFalse(ch.isOpen());
+  }
+
+  @Test
+  public void testTransferSingleFileAndSingleMetadataForBatchStore() throws IOException {
+    StorageEngine localStorageEngine = Mockito.mock(StorageEngine.class);
+    Mockito.doReturn(localStorageEngine).when(storageEngineRepository).getLocalStorageEngine(Mockito.any());
+    Mockito.doReturn(true).when(localStorageEngine).containsPartition(Mockito.anyInt());
+
+    // prepare response from metadata service
+    StoreVersionState storeVersionState = new StoreVersionState();
+    Mockito.doReturn(storeVersionState).when(storageMetadataService).getStoreVersionState(Mockito.any());
+
+    InternalAvroSpecificSerializer<PartitionState> partitionStateSerializer =
+        AvroProtocolDefinition.PARTITION_STATE.getSerializer();
+    OffsetRecord offsetRecord = new OffsetRecord(partitionStateSerializer, DEFAULT_PUBSUB_CONTEXT_FOR_UNIT_TESTING);
+    offsetRecord.setOffsetLag(1000L);
+    Mockito.doReturn(offsetRecord).when(storageMetadataService).getLastOffset(Mockito.any(), Mockito.anyInt(), any());
+
+    // prepare the file request
+    Path snapshotDir = Paths.get(RocksDBUtils.composeSnapshotDir(baseDir.toString(), "myStore_v1", 10));
+    Files.createDirectories(snapshotDir);
+    Path file1 = snapshotDir.resolve("file1");
+    Files.write(file1.toAbsolutePath(), "hello".getBytes());
+    String file1ChecksumHeader = BlobTransferUtils.generateFileChecksum(file1);
+    FullHttpRequest request =
+        new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/myStore/1/10/BLOCK_BASED_TABLE");
+
+    Mockito.doNothing().when(blobSnapshotManager).createSnapshot(Mockito.anyString(), Mockito.anyInt());
+
+    ch.writeInbound(request);
+
+    // start of file1
+    Object response = ch.readOutbound();
+    Assert.assertTrue(response instanceof DefaultHttpResponse);
+    DefaultHttpResponse httpResponse = (DefaultHttpResponse) response;
+    Assert.assertEquals(
+        httpResponse.headers().get(HttpHeaderNames.CONTENT_DISPOSITION),
+        "attachment; filename=\"file1\"");
+    Assert.assertEquals(httpResponse.headers().get(HttpHeaderNames.CONTENT_MD5), file1ChecksumHeader);
+    Assert.assertEquals(httpResponse.headers().get(BLOB_TRANSFER_TYPE), BlobTransferType.FILE.toString());
+    // send the content in one chunk
+    response = ch.readOutbound();
+    Assert.assertTrue(response instanceof HttpChunkedInput);
+    // end of file1
+
+    // start of metadata
+    response = ch.readOutbound();
+    Assert.assertTrue(response instanceof DefaultHttpResponse);
+    DefaultHttpResponse metadataResponse = (DefaultHttpResponse) response;
+    Assert.assertEquals(metadataResponse.headers().get(BLOB_TRANSFER_TYPE), BlobTransferType.METADATA.toString());
+    // end of metadata
+
+    // start of STATUS response
+    response = ch.readOutbound();
+    Assert.assertTrue(response instanceof DefaultHttpResponse);
+    DefaultHttpResponse endOfTransfer = (DefaultHttpResponse) response;
+    Assert.assertEquals(endOfTransfer.headers().get(BLOB_TRANSFER_STATUS), BLOB_TRANSFER_COMPLETED);
+    // end of STATUS response
+
+    // make the ch inactive
+    ch.pipeline().fireUserEventTriggered(IdleStateEvent.ALL_IDLE_STATE_EVENT);
+    Assert.assertEquals(blobSnapshotManager.getConcurrentSnapshotUsers("myStore_v1", 10), 0);
+  }
+
+  @Test
+  public void testTransferMultipleFiles() throws IOException {
+    StorageEngine localStorageEngine = Mockito.mock(StorageEngine.class);
+    Mockito.doReturn(localStorageEngine).when(storageEngineRepository).getLocalStorageEngine(Mockito.any());
+    Mockito.doReturn(true).when(localStorageEngine).containsPartition(Mockito.anyInt());
+
+    // prepare response from metadata service
+    StoreVersionState storeVersionState = new StoreVersionState();
+    Mockito.doReturn(storeVersionState).when(storageMetadataService).getStoreVersionState(Mockito.any());
+
+    InternalAvroSpecificSerializer<PartitionState> partitionStateSerializer =
+        AvroProtocolDefinition.PARTITION_STATE.getSerializer();
+    OffsetRecord offsetRecord = new OffsetRecord(partitionStateSerializer, DEFAULT_PUBSUB_CONTEXT_FOR_UNIT_TESTING);
+    offsetRecord.setOffsetLag(1000L);
+    Mockito.doReturn(offsetRecord).when(storageMetadataService).getLastOffset(Mockito.any(), Mockito.anyInt(), any());
+
+    Path snapshotDir = Paths.get(RocksDBUtils.composeSnapshotDir(baseDir.toString(), "myStore_v1", 10));
+    Files.createDirectories(snapshotDir);
+
+    Path file1 = snapshotDir.resolve("file1");
+    Files.write(file1.toAbsolutePath(), "hello".getBytes());
+    String file1ChecksumHeader = BlobTransferUtils.generateFileChecksum(file1);
+
+    Path file2 = snapshotDir.resolve("file2");
+    Files.write(file2.toAbsolutePath(), "world".getBytes());
+    String file2ChecksumHeader = BlobTransferUtils.generateFileChecksum(file2);
+
+    FullHttpRequest request =
+        new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/myStore/1/10/BLOCK_BASED_TABLE");
+    Set<String> fileNames = new HashSet<>();
+    Set<String> fileChecksums = new HashSet<>();
+    // the order of file transfer is not guaranteed so put them into a set and remove them one by one
+    Collections.addAll(fileNames, "attachment; filename=\"file1\"", "attachment; filename=\"file2\"");
+    Collections.addAll(fileChecksums, file1ChecksumHeader, file2ChecksumHeader);
+
+    Mockito.doNothing().when(blobSnapshotManager).createSnapshot(Mockito.anyString(), Mockito.anyInt());
+
+    ch.writeInbound(request);
+    // start of file1
+    Object response = ch.readOutbound();
+    Assert.assertTrue(response instanceof DefaultHttpResponse);
+    DefaultHttpResponse httpResponse = (DefaultHttpResponse) response;
+    Assert.assertTrue(fileNames.contains(httpResponse.headers().get(HttpHeaderNames.CONTENT_DISPOSITION)));
+    Assert.assertTrue(fileChecksums.contains(httpResponse.headers().get(HttpHeaderNames.CONTENT_MD5)));
+    fileNames.remove(httpResponse.headers().get(HttpHeaderNames.CONTENT_DISPOSITION));
+    fileChecksums.remove(httpResponse.headers().get(HttpHeaderNames.CONTENT_MD5));
+    response = ch.readOutbound();
+    Assert.assertTrue(response instanceof HttpChunkedInput);
+    // end of file1
+
+    // start of file2
+    response = ch.readOutbound();
+    Assert.assertTrue(response instanceof DefaultHttpResponse);
+    httpResponse = (DefaultHttpResponse) response;
+    Assert.assertTrue(fileNames.contains(httpResponse.headers().get(HttpHeaderNames.CONTENT_DISPOSITION)));
+    Assert.assertTrue(fileChecksums.contains(httpResponse.headers().get(HttpHeaderNames.CONTENT_MD5)));
+    response = ch.readOutbound();
+    Assert.assertTrue(response instanceof HttpChunkedInput);
+    // end of a file2
+
+    // start of metadata
+    response = ch.readOutbound();
+    Assert.assertTrue(response instanceof FullHttpResponse);
+    FullHttpResponse metadataResponse = (FullHttpResponse) response;
+    Assert.assertEquals(metadataResponse.headers().get(BLOB_TRANSFER_TYPE), BlobTransferType.METADATA.toString());
+
+    ByteBuf content = metadataResponse.content();
+    byte[] metadataBytes = new byte[content.readableBytes()];
+    content.readBytes(metadataBytes);
+    ObjectMapper objectMapper = new ObjectMapper();
+    BlobTransferPartitionMetadata metadata = objectMapper.readValue(metadataBytes, BlobTransferPartitionMetadata.class);
+
+    Assert.assertEquals(metadata.getTopicName(), "myStore_v1");
+    Assert.assertEquals(metadata.getPartitionId(), 10);
+    Assert.assertEquals(metadata.getOffsetRecord(), ByteBuffer.wrap(offsetRecord.toBytes()));
+
+    InternalAvroSpecificSerializer<StoreVersionState> storeVersionStateSerializer =
+        AvroProtocolDefinition.STORE_VERSION_STATE.getSerializer();
+    java.nio.ByteBuffer storeVersionStateByte =
+        ByteBuffer.wrap(storeVersionStateSerializer.serialize(metadata.getTopicName(), storeVersionState));
+    Assert.assertEquals(metadata.getStoreVersionState(), storeVersionStateByte);
+    // end of metadata
+
+    // start of STATUS response
+    response = ch.readOutbound();
+    Assert.assertTrue(response instanceof DefaultHttpResponse);
+    DefaultHttpResponse endOfTransfer = (DefaultHttpResponse) response;
+    Assert.assertEquals(endOfTransfer.headers().get(BLOB_TRANSFER_STATUS), BLOB_TRANSFER_COMPLETED);
+    // end of STATUS response
+
+    // make the ch inactive
+    ch.pipeline().fireUserEventTriggered(IdleStateEvent.ALL_IDLE_STATE_EVENT);
+    Assert.assertEquals(blobSnapshotManager.getConcurrentSnapshotUsers("myStore_v1", 10), 0);
+  }
+
+  /**
+   * Server rejects a request whose advertised PartitionState/StoreVersionState
+   * schema versions don't match the local binary's, with a 412 PRECONDITION_FAILED,
+   * BEFORE any file work begins. Without this, the client would receive every
+   * file byte and only discover the mismatch at the metadata stage.
+   */
+  @Test
+  public void testRejectRequestWithMismatchedSchemaVersion() throws IOException {
+    // The snapshot dir is set up so that if the schema check were bypassed, file
+    // responses would be produced; assert they are NOT produced here.
+    Path snapshotDir = Paths.get(RocksDBUtils.composeSnapshotDir(baseDir.toString(), "myStore_v1", 10));
+    Files.createDirectories(snapshotDir);
+    Files.write(snapshotDir.resolve("file1").toAbsolutePath(), "hello".getBytes());
+
+    int incompatibleVersion = AvroProtocolDefinition.PARTITION_STATE.getCurrentProtocolVersion() + 100;
+    FullHttpRequest request =
+        new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/myStore/1/10/BLOCK_BASED_TABLE");
+    request.headers().set(BLOB_TRANSFER_PARTITION_STATE_SCHEMA_VERSION, incompatibleVersion);
+    request.headers()
+        .set(
+            BLOB_TRANSFER_STORE_VERSION_STATE_SCHEMA_VERSION,
+            AvroProtocolDefinition.STORE_VERSION_STATE.getCurrentProtocolVersion());
+
+    ch.writeInbound(request);
+
+    Object response = ch.readOutbound();
+    Assert.assertTrue(response instanceof FullHttpResponse);
+    FullHttpResponse rejection = (FullHttpResponse) response;
+    Assert.assertEquals(rejection.status(), HttpResponseStatus.PRECONDITION_FAILED);
+    // No further outbound messages — no file response was produced.
+    Assert.assertNull(ch.readOutbound());
+  }
+
+  /**
+   * Rolling-deploy contract (NEW requester → NEW sender, matching versions):
+   * a request that advertises schema-version headers equal to the server's
+   * local versions must drive a full transfer (file → metadata → STATUS),
+   * with the schema-mismatch marker absent on every response.
+   */
+  @Test
+  public void testRequestWithMatchingSchemaVersionHeadersCompletesTransfer() throws IOException {
+    StorageEngine localStorageEngine = Mockito.mock(StorageEngine.class);
+    Mockito.doReturn(localStorageEngine).when(storageEngineRepository).getLocalStorageEngine(Mockito.any());
+    Mockito.doReturn(true).when(localStorageEngine).containsPartition(Mockito.anyInt());
+
+    StoreVersionState storeVersionState = new StoreVersionState();
+    Mockito.doReturn(storeVersionState).when(storageMetadataService).getStoreVersionState(Mockito.any());
+    InternalAvroSpecificSerializer<PartitionState> partitionStateSerializer =
+        AvroProtocolDefinition.PARTITION_STATE.getSerializer();
+    OffsetRecord offsetRecord = new OffsetRecord(partitionStateSerializer, DEFAULT_PUBSUB_CONTEXT_FOR_UNIT_TESTING);
+    offsetRecord.setOffsetLag(1000L);
+    Mockito.doReturn(offsetRecord).when(storageMetadataService).getLastOffset(Mockito.any(), Mockito.anyInt(), any());
+
+    Path snapshotDir = Paths.get(RocksDBUtils.composeSnapshotDir(baseDir.toString(), "myStore_v1", 10));
+    Files.createDirectories(snapshotDir);
+    Files.write(snapshotDir.resolve("file1").toAbsolutePath(), "hello".getBytes());
+    Mockito.doNothing().when(blobSnapshotManager).createSnapshot(Mockito.anyString(), Mockito.anyInt());
+
+    FullHttpRequest request =
+        new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/myStore/1/10/BLOCK_BASED_TABLE");
+    request.headers()
+        .set(
+            BLOB_TRANSFER_PARTITION_STATE_SCHEMA_VERSION,
+            AvroProtocolDefinition.PARTITION_STATE.getCurrentProtocolVersion());
+    request.headers()
+        .set(
+            BLOB_TRANSFER_STORE_VERSION_STATE_SCHEMA_VERSION,
+            AvroProtocolDefinition.STORE_VERSION_STATE.getCurrentProtocolVersion());
+
+    ch.writeInbound(request);
+
+    // File response
+    Object response = ch.readOutbound();
+    Assert.assertTrue(response instanceof DefaultHttpResponse);
+    DefaultHttpResponse fileResponse = (DefaultHttpResponse) response;
+    Assert.assertEquals(fileResponse.headers().get(BLOB_TRANSFER_TYPE), BlobTransferType.FILE.toString());
+    Assert.assertNotEquals(fileResponse.status(), HttpResponseStatus.PRECONDITION_FAILED);
+    // File chunk
+    response = ch.readOutbound();
+    Assert.assertTrue(response instanceof HttpChunkedInput);
+
+    // Metadata response — request matched, so status is OK (not the mismatch status).
+    response = ch.readOutbound();
+    Assert.assertTrue(response instanceof FullHttpResponse);
+    FullHttpResponse metadataResponse = (FullHttpResponse) response;
+    Assert.assertEquals(metadataResponse.headers().get(BLOB_TRANSFER_TYPE), BlobTransferType.METADATA.toString());
+    Assert.assertEquals(metadataResponse.status(), HttpResponseStatus.OK);
+
+    // STATUS response
+    response = ch.readOutbound();
+    Assert.assertTrue(response instanceof DefaultHttpResponse);
+    Assert.assertEquals(((DefaultHttpResponse) response).headers().get(BLOB_TRANSFER_STATUS), BLOB_TRANSFER_COMPLETED);
+
+    ch.pipeline().fireUserEventTriggered(IdleStateEvent.ALL_IDLE_STATE_EVENT);
+    Assert.assertEquals(blobSnapshotManager.getConcurrentSnapshotUsers("myStore_v1", 10), 0);
+  }
+
+  /**
+   * Backward compatibility: a request that does NOT carry the schema-version
+   * headers (peer is on an older binary) must not be rejected — the server should
+   * fall through to the existing flow.
+   */
+  @Test
+  public void testRequestWithoutSchemaVersionHeadersIsNotRejected() throws IOException {
+    Path snapshotDir = Paths.get(RocksDBUtils.composeSnapshotDir(baseDir.toString(), "myStore_v1", 10));
+    Files.createDirectories(snapshotDir);
+
+    FullHttpRequest request =
+        new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/myStore/1/10/BLOCK_BASED_TABLE");
+    // Intentionally NOT setting BLOB_TRANSFER_*_SCHEMA_VERSION headers.
+
+    ch.writeInbound(request);
+
+    Object response = ch.readOutbound();
+    Assert.assertTrue(response instanceof FullHttpResponse);
+    // Falls through to the existing not-found path because no real metadata service is wired.
+    // The key assertion is that the response is NOT a schema-mismatch rejection.
+    Assert.assertNotEquals(((FullHttpResponse) response).status(), HttpResponseStatus.PRECONDITION_FAILED);
+  }
+
+  /**
+   * Test when fail to get the metadata from storageMetadataService, it should return error to client.
+   * @throws IOException
+   */
+  @Test
+  public void testWhenMetadataCreateError() throws IOException {
+    // prepare the file request
+    Path snapshotDir = Paths.get(RocksDBUtils.composeSnapshotDir(baseDir.toString(), "myStore_v1", 10));
+    Files.createDirectories(snapshotDir);
+    Path file1 = snapshotDir.resolve("file1");
+    Files.write(file1.toAbsolutePath(), "hello".getBytes());
+    FullHttpRequest request =
+        new DefaultFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/myStore/1/10/BLOCK_BASED_TABLE");
+
+    ch.writeInbound(request);
+
+    // metadata in server side has error
+    Object response = ch.readOutbound();
+    Assert.assertTrue(response instanceof DefaultHttpResponse);
+    Assert.assertEquals(((DefaultHttpResponse) response).status(), HttpResponseStatus.NOT_FOUND);
+
+    Assert.assertEquals(blobSnapshotManager.getConcurrentSnapshotUsers("myStore_v1", 10), 0);
+  }
+}

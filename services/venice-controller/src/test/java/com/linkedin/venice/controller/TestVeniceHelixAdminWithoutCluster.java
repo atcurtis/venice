@@ -1,19 +1,26 @@
 package com.linkedin.venice.controller;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.anyBoolean;
 import static org.mockito.Mockito.anyString;
 import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import com.linkedin.venice.common.VeniceSystemStoreType;
 import com.linkedin.venice.exceptions.VeniceException;
+import com.linkedin.venice.exceptions.VeniceNoStoreException;
 import com.linkedin.venice.helix.ZkStoreConfigAccessor;
 import com.linkedin.venice.meta.BufferReplayPolicy;
 import com.linkedin.venice.meta.DataReplicationPolicy;
 import com.linkedin.venice.meta.HybridStoreConfig;
 import com.linkedin.venice.meta.HybridStoreConfigImpl;
+import com.linkedin.venice.meta.PartitionerConfig;
 import com.linkedin.venice.meta.ReadWriteStoreRepository;
 import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.StoreConfig;
@@ -23,10 +30,16 @@ import com.linkedin.venice.pubsub.api.PubSubTopic;
 import com.linkedin.venice.pubsub.manager.TopicManager;
 import com.linkedin.venice.utils.TestUtils;
 import com.linkedin.venice.utils.Utils;
+import com.linkedin.venice.writer.VeniceWriter;
+import com.linkedin.venice.writer.VeniceWriterFactory;
+import com.linkedin.venice.writer.VeniceWriterOptions;
+import java.lang.reflect.Field;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.function.Consumer;
@@ -46,10 +59,12 @@ public class TestVeniceHelixAdminWithoutCluster {
     Optional<Long> rewind = Optional.of(123L);
     Optional<Long> lagOffset = Optional.of(1500L);
     Optional<Long> timeLag = Optional.of(300L);
-    Optional<DataReplicationPolicy> dataReplicationPolicy = Optional.of(DataReplicationPolicy.AGGREGATE);
+    Optional<DataReplicationPolicy> dataReplicationPolicy = Optional.of(DataReplicationPolicy.NON_AGGREGATE);
     Optional<BufferReplayPolicy> bufferReplayPolicy = Optional.of(BufferReplayPolicy.REWIND_FROM_EOP);
-    HybridStoreConfig hybridStoreConfig = VeniceHelixAdmin.mergeNewSettingsIntoOldHybridStoreConfig(
+    Optional<String> realTimeTopicName = Optional.of("storeName_rt");
+    HybridStoreConfig hybridStoreConfig = HybridStoreConfigPolicy.mergeNewSettingsIntoOldHybridStoreConfig(
         store,
+        Optional.empty(),
         Optional.empty(),
         Optional.empty(),
         Optional.empty(),
@@ -59,24 +74,26 @@ public class TestVeniceHelixAdminWithoutCluster {
         hybridStoreConfig,
         "passing empty optionals and a non-hybrid store should generate a null hybrid config");
 
-    hybridStoreConfig = VeniceHelixAdmin.mergeNewSettingsIntoOldHybridStoreConfig(
+    hybridStoreConfig = HybridStoreConfigPolicy.mergeNewSettingsIntoOldHybridStoreConfig(
         store,
         rewind,
         lagOffset,
         timeLag,
         dataReplicationPolicy,
-        bufferReplayPolicy);
+        bufferReplayPolicy,
+        realTimeTopicName);
     Assert.assertNotNull(hybridStoreConfig, "specifying rewind and lagOffset should generate a valid hybrid config");
     Assert.assertEquals(hybridStoreConfig.getRewindTimeInSeconds(), 123L);
     Assert.assertEquals(hybridStoreConfig.getOffsetLagThresholdToGoOnline(), 1500L);
     Assert.assertEquals(hybridStoreConfig.getProducerTimestampLagThresholdToGoOnlineInSeconds(), 300L);
-    Assert.assertEquals(hybridStoreConfig.getDataReplicationPolicy(), DataReplicationPolicy.AGGREGATE);
+    Assert.assertEquals(hybridStoreConfig.getDataReplicationPolicy(), DataReplicationPolicy.NON_AGGREGATE);
 
     // It's okay that time lag threshold or data replication policy is not specified
-    hybridStoreConfig = VeniceHelixAdmin.mergeNewSettingsIntoOldHybridStoreConfig(
+    hybridStoreConfig = HybridStoreConfigPolicy.mergeNewSettingsIntoOldHybridStoreConfig(
         store,
         rewind,
         lagOffset,
+        Optional.empty(),
         Optional.empty(),
         Optional.empty(),
         Optional.empty());
@@ -147,7 +164,7 @@ public class TestVeniceHelixAdminWithoutCluster {
     String clusterName = "cluster1";
     String storeName = Utils.getUniqueString("test_store_recreation");
     Set<PubSubTopic> topics = new HashSet<>();
-    topics.add(pubSubTopicRepository.getTopic(Version.composeRealTimeTopic(storeName)));
+    topics.add(pubSubTopicRepository.getTopic(Utils.composeRealTimeTopic(storeName)));
     topics.add(pubSubTopicRepository.getTopic("unknown_store_v1"));
     testCheckResourceCleanupBeforeStoreCreationWithParams(
         clusterName,
@@ -166,7 +183,7 @@ public class TestVeniceHelixAdminWithoutCluster {
     Set<PubSubTopic> topics = new HashSet<>();
     topics.add(
         pubSubTopicRepository
-            .getTopic(Version.composeRealTimeTopic(VeniceSystemStoreType.META_STORE.getSystemStoreName(storeName))));
+            .getTopic(Utils.composeRealTimeTopic(VeniceSystemStoreType.META_STORE.getSystemStoreName(storeName))));
     topics.add(pubSubTopicRepository.getTopic("unknown_store_v1"));
     testCheckResourceCleanupBeforeStoreCreationWithParams(
         clusterName,
@@ -233,6 +250,7 @@ public class TestVeniceHelixAdminWithoutCluster {
     TopicManager topicManager = mock(TopicManager.class);
     doReturn(topics).when(topicManager).listTopics();
     doReturn(topicManager).when(admin).getTopicManager();
+    doReturn(store.orElse(null)).when(admin).getStore(clusterName, storeName);
 
     doReturn(helixResources).when(admin).getAllLiveHelixResources(clusterName);
 
@@ -248,7 +266,7 @@ public class TestVeniceHelixAdminWithoutCluster {
   public void testSourceRegionSelectionForTargetedRegionPush() {
     // cluster config setup
     VeniceControllerMultiClusterConfig multiClusterConfigs = mock(VeniceControllerMultiClusterConfig.class);
-    VeniceControllerConfig config = mock(VeniceControllerConfig.class);
+    VeniceControllerClusterConfig config = mock(VeniceControllerClusterConfig.class);
     doReturn(config).when(multiClusterConfigs).getControllerConfig("test_cluster");
     doReturn("dc-4").when(config).getNativeReplicationSourceFabric();
 
@@ -307,5 +325,253 @@ public class TestVeniceHelixAdminWithoutCluster {
             Optional.empty(),
             "dc-99, dc-0, dc-4, dc-2"),
         "dc-4");
+  }
+
+  @Test
+  public void isVersionTopicTruncatedWithRecheckReturnsFalseWhenNotTruncated() {
+    PubSubTopic versionTopic = pubSubTopicRepository.getTopic("foo_v1");
+    VeniceHelixAdmin admin = mock(VeniceHelixAdmin.class);
+    TopicManager topicManager = mock(TopicManager.class);
+    doReturn(topicManager).when(admin).getTopicManager();
+    doReturn(false).when(admin).isTopicTruncated(versionTopic.getName());
+    doCallRealMethod().when(admin).isVersionTopicTruncatedWithRecheck(versionTopic);
+
+    Assert.assertFalse(admin.isVersionTopicTruncatedWithRecheck(versionTopic));
+    // No retries; containsTopicWithRetries should not have been consulted.
+    verify(topicManager, times(0)).containsTopicWithRetries(eq(versionTopic), anyInt());
+  }
+
+  @Test
+  public void isVersionTopicTruncatedWithRecheckReturnsTrueWhenTopicVanished() {
+    PubSubTopic versionTopic = pubSubTopicRepository.getTopic("foo_v1");
+    VeniceHelixAdmin admin = mock(VeniceHelixAdmin.class);
+    TopicManager topicManager = mock(TopicManager.class);
+    doReturn(topicManager).when(admin).getTopicManager();
+    doReturn(true).when(admin).isTopicTruncated(versionTopic.getName());
+    doReturn(false).when(topicManager).containsTopicWithRetries(eq(versionTopic), anyInt());
+    doCallRealMethod().when(admin).isVersionTopicTruncatedWithRecheck(versionTopic);
+
+    Assert.assertTrue(admin.isVersionTopicTruncatedWithRecheck(versionTopic));
+    // Single attempt; topic vanished -> accept truncated result without further retries.
+    verify(admin, times(1)).isTopicTruncated(versionTopic.getName());
+  }
+
+  @Test
+  public void isVersionTopicTruncatedWithRecheckReturnsFalseAfterTransientRace() {
+    PubSubTopic versionTopic = pubSubTopicRepository.getTopic("foo_v1");
+    VeniceHelixAdmin admin = mock(VeniceHelixAdmin.class);
+    TopicManager topicManager = mock(TopicManager.class);
+    doReturn(topicManager).when(admin).getTopicManager();
+    // First attempt: truncated==true (transient race). Second attempt: truncated==false.
+    when(admin.isTopicTruncated(versionTopic.getName())).thenReturn(true, false);
+    doReturn(true).when(topicManager).containsTopicWithRetries(eq(versionTopic), anyInt());
+    doCallRealMethod().when(admin).isVersionTopicTruncatedWithRecheck(versionTopic);
+
+    Assert.assertFalse(admin.isVersionTopicTruncatedWithRecheck(versionTopic));
+    verify(admin, times(2)).isTopicTruncated(versionTopic.getName());
+  }
+
+  @Test
+  public void isVersionTopicTruncatedWithRecheckReturnsTrueAfterMaxAttempts() {
+    PubSubTopic versionTopic = pubSubTopicRepository.getTopic("foo_v1");
+    VeniceHelixAdmin admin = mock(VeniceHelixAdmin.class);
+    TopicManager topicManager = mock(TopicManager.class);
+    doReturn(topicManager).when(admin).getTopicManager();
+    // Truncated stays true and topic continues to exist for the entire retry window.
+    doReturn(true).when(admin).isTopicTruncated(versionTopic.getName());
+    doReturn(true).when(topicManager).containsTopicWithRetries(eq(versionTopic), anyInt());
+    doCallRealMethod().when(admin).isVersionTopicTruncatedWithRecheck(versionTopic);
+
+    Assert.assertTrue(admin.isVersionTopicTruncatedWithRecheck(versionTopic));
+    verify(admin, times(VeniceHelixAdmin.MIGRATION_TRUNCATION_RECHECK_MAX_ATTEMPTS))
+        .isTopicTruncated(versionTopic.getName());
+  }
+
+  private VeniceHelixAdmin setupAdminForWriteEndOfPush() throws Exception {
+    VeniceHelixAdmin admin = mock(VeniceHelixAdmin.class);
+    doCallRealMethod().when(admin).writeEndOfPush(anyString(), anyString(), anyInt(), anyBoolean());
+    doCallRealMethod().when(admin).writeEndOfPush(anyString(), anyString(), anyInt(), anyBoolean(), any());
+
+    // Set the private multiClusterConfigs field via reflection since writeEndOfPush accesses it directly
+    VeniceControllerMultiClusterConfig multiClusterConfigs = mock(VeniceControllerMultiClusterConfig.class);
+    doReturn(false).when(multiClusterConfigs).isParent();
+    Field field = VeniceHelixAdmin.class.getDeclaredField("multiClusterConfigs");
+    field.setAccessible(true);
+    field.set(admin, multiClusterConfigs);
+
+    return admin;
+  }
+
+  @Test
+  public void testWriteEndOfPushNoPartitionCounts() throws Exception {
+    String clusterName = "test_cluster";
+    String storeName = "test_store";
+    int versionNumber = 1;
+
+    VeniceHelixAdmin admin = setupAdminForWriteEndOfPush();
+
+    Store store = mock(Store.class);
+    doReturn(0).when(store).getCurrentVersion();
+    Version version = mock(Version.class);
+    doReturn(version).when(store).getVersion(versionNumber);
+    doReturn(Version.PushType.BATCH).when(version).getPushType();
+    doReturn(3).when(version).getPartitionCount();
+    PartitionerConfig partitionerConfig = mock(PartitionerConfig.class);
+    doReturn(1).when(partitionerConfig).getAmplificationFactor();
+    doReturn(partitionerConfig).when(version).getPartitionerConfig();
+    doReturn(store).when(admin).getStore(clusterName, storeName);
+
+    VeniceWriterFactory writerFactory = mock(VeniceWriterFactory.class);
+    VeniceWriter veniceWriter = mock(VeniceWriter.class);
+    doReturn(writerFactory).when(admin).getVeniceWriterFactory();
+    doReturn(veniceWriter).when(writerFactory).createVeniceWriter(any(VeniceWriterOptions.class));
+
+    // Call the original 4-arg overload
+    admin.writeEndOfPush(clusterName, storeName, versionNumber, false);
+
+    // Verify it delegates to the 5-arg overload with empty counts (falls back to no-header EOP in VeniceWriter)
+    verify(veniceWriter).broadcastEndOfPush(any(Map.class), eq(Collections.emptyMap()));
+    verify(veniceWriter).flush();
+  }
+
+  @Test
+  public void testWriteEndOfPushWithPartitionRecordCounts() throws Exception {
+    String clusterName = "test_cluster";
+    String storeName = "test_store";
+    int versionNumber = 1;
+
+    VeniceHelixAdmin admin = setupAdminForWriteEndOfPush();
+
+    Store store = mock(Store.class);
+    doReturn(0).when(store).getCurrentVersion();
+    Version version = mock(Version.class);
+    doReturn(version).when(store).getVersion(versionNumber);
+    doReturn(Version.PushType.BATCH).when(version).getPushType();
+    doReturn(3).when(version).getPartitionCount();
+    PartitionerConfig partitionerConfig = mock(PartitionerConfig.class);
+    doReturn(1).when(partitionerConfig).getAmplificationFactor();
+    doReturn(partitionerConfig).when(version).getPartitionerConfig();
+    doReturn(store).when(admin).getStore(clusterName, storeName);
+
+    VeniceWriterFactory writerFactory = mock(VeniceWriterFactory.class);
+    VeniceWriter veniceWriter = mock(VeniceWriter.class);
+    doReturn(writerFactory).when(admin).getVeniceWriterFactory();
+    doReturn(veniceWriter).when(writerFactory).createVeniceWriter(any(VeniceWriterOptions.class));
+
+    Map<Integer, Long> counts = new HashMap<>();
+    counts.put(0, 100L);
+    counts.put(1, 200L);
+    counts.put(2, 50L);
+
+    admin.writeEndOfPush(clusterName, storeName, versionNumber, false, counts);
+
+    verify(veniceWriter).broadcastEndOfPush(any(Map.class), eq(counts));
+    verify(veniceWriter).flush();
+  }
+
+  @Test(expectedExceptions = VeniceNoStoreException.class)
+  public void testWriteEndOfPushThrowsForNonExistentStore() throws Exception {
+    VeniceHelixAdmin admin = setupAdminForWriteEndOfPush();
+    doReturn(null).when(admin).getStore("cluster", "missing_store");
+
+    admin.writeEndOfPush("cluster", "missing_store", 1, false, null);
+  }
+
+  // ---- StoreSchemaManager.normalizeSchemaForMigration --------------------------------------
+
+  private static final String CLEAN_VALUE_SCHEMA =
+      "{\"type\":\"record\",\"name\":\"Clean\",\"fields\":[" + "{\"name\":\"v\",\"type\":\"string\"}]}";
+
+  // STRICT rejects this (validateNumericDefaultValueTypes), LOOSE_NUMERICS accepts and coerces.
+  private static final String LEGACY_NUMERIC_DEFAULT_SCHEMA = "{\"type\":\"record\",\"name\":\"Scores\",\"fields\":["
+      + "{\"name\":\"score\",\"type\":\"float\",\"default\":0}]}";
+
+  // Union with default whose declared type matches the second branch — STRICT failure that
+  // LOOSE_NUMERICS does NOT relax (it's outside the numeric-default tier).
+  private static final String NON_NUMERIC_STRICT_VIOLATION_SCHEMA = "{\"type\":\"record\",\"name\":\"BadUnion\","
+      + "\"fields\":[{\"name\":\"f\",\"type\":[\"int\",\"null\"],\"default\":null}]}";
+
+  private static StoreSchemaManager newNormalizeManager(String clusterName, String storeName, StoreConfig storeConfig) {
+    VeniceHelixAdmin admin = mock(VeniceHelixAdmin.class);
+    ZkStoreConfigAccessor accessor = mock(ZkStoreConfigAccessor.class);
+    doReturn(storeConfig != null).when(accessor).containsConfig(storeName);
+    doReturn(storeConfig).when(accessor).getStoreConfig(storeName);
+    doReturn(accessor).when(admin).getStoreConfigAccessor(clusterName);
+    return new StoreSchemaManager(admin);
+  }
+
+  @Test
+  public void testNormalizeReturnsInputWhenStoreConfigAbsent() {
+    String cluster = "venice-dest";
+    String store = "legacy_store";
+    StoreSchemaManager manager = newNormalizeManager(cluster, store, null);
+    Assert.assertSame(
+        manager.normalizeSchemaForMigration(cluster, store, LEGACY_NUMERIC_DEFAULT_SCHEMA),
+        LEGACY_NUMERIC_DEFAULT_SCHEMA,
+        "Non-migration context (no storeConfig) must return input by identity to avoid parse cost");
+  }
+
+  @Test
+  public void testNormalizeReturnsInputWhenMigrationDestIsAnotherCluster() {
+    String cluster = "venice-dest";
+    String store = "legacy_store";
+    StoreConfig cfg = mock(StoreConfig.class);
+    doReturn("some_other_dest").when(cfg).getMigrationDestCluster();
+
+    StoreSchemaManager manager = newNormalizeManager(cluster, store, cfg);
+    Assert.assertSame(
+        manager.normalizeSchemaForMigration(cluster, store, LEGACY_NUMERIC_DEFAULT_SCHEMA),
+        LEGACY_NUMERIC_DEFAULT_SCHEMA,
+        "When migrationDestCluster does not match this cluster, input must pass through unchanged");
+  }
+
+  @Test
+  public void testNormalizeReturnsInputWhenStrictAlreadyPasses() {
+    String cluster = "venice-dest";
+    String store = "migrating_store";
+    StoreConfig cfg = mock(StoreConfig.class);
+    doReturn(cluster).when(cfg).getMigrationDestCluster();
+
+    StoreSchemaManager manager = newNormalizeManager(cluster, store, cfg);
+    Assert.assertSame(
+        manager.normalizeSchemaForMigration(cluster, store, CLEAN_VALUE_SCHEMA),
+        CLEAN_VALUE_SCHEMA,
+        "Strict-clean input under migration context must not be reserialized");
+  }
+
+  @Test
+  public void testNormalizeReserializesLegacyNumericDefault() {
+    String cluster = "venice-dest";
+    String store = "migrating_store";
+    StoreConfig cfg = mock(StoreConfig.class);
+    doReturn(cluster).when(cfg).getMigrationDestCluster();
+
+    StoreSchemaManager manager = newNormalizeManager(cluster, store, cfg);
+    String normalized = manager.normalizeSchemaForMigration(cluster, store, LEGACY_NUMERIC_DEFAULT_SCHEMA);
+
+    Assert.assertNotEquals(normalized, LEGACY_NUMERIC_DEFAULT_SCHEMA, "Legacy schema must be reserialized");
+    // The whole point: output must be strict-parse-clean so downstream consumers don't trip.
+    com.linkedin.venice.schema.AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(normalized);
+  }
+
+  @Test
+  public void testNormalizeRejectsNonNumericStrictViolation() {
+    String cluster = "venice-dest";
+    String store = "migrating_store";
+    StoreConfig cfg = mock(StoreConfig.class);
+    doReturn(cluster).when(cfg).getMigrationDestCluster();
+
+    StoreSchemaManager manager = newNormalizeManager(cluster, store, cfg);
+    // Migration context, but the violation is outside the numeric-default tier — must propagate.
+    // The original strict failure must ride along as a suppressed exception so the operator can
+    // see what was actually wrong with the source schema, not just that post-coercion strict tripped.
+    try {
+      manager.normalizeSchemaForMigration(cluster, store, NON_NUMERIC_STRICT_VIOLATION_SCHEMA);
+      Assert.fail("Expected normalize to throw on non-numeric strict violation");
+    } catch (Exception coercedFailure) {
+      Assert.assertTrue(
+          coercedFailure.getSuppressed().length >= 1,
+          "Original strict failure should be attached as a suppressed exception, but none was found");
+    }
   }
 }

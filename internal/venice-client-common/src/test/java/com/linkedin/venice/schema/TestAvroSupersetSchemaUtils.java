@@ -4,15 +4,33 @@ import static com.linkedin.venice.utils.TestWriteUtils.NAME_RECORD_V1_SCHEMA;
 import static com.linkedin.venice.utils.TestWriteUtils.NAME_RECORD_V2_SCHEMA;
 import static com.linkedin.venice.utils.TestWriteUtils.NAME_RECORD_V3_SCHEMA;
 import static com.linkedin.venice.utils.TestWriteUtils.NAME_RECORD_V4_SCHEMA;
+import static com.linkedin.venice.utils.TestWriteUtils.NAME_RECORD_V5_SCHEMA;
+import static com.linkedin.venice.utils.TestWriteUtils.NAME_RECORD_V6_SCHEMA;
+import static com.linkedin.venice.utils.TestWriteUtils.USER_SCHEMA;
+import static com.linkedin.venice.utils.TestWriteUtils.USER_WITH_DEFAULT_SCHEMA;
+import static com.linkedin.venice.utils.TestWriteUtils.USER_WITH_NESTED_RECORD_AND_DEFAULT_SCHEMA;
+import static com.linkedin.venice.utils.TestWriteUtils.USER_WITH_NESTED_RECORD_SCHEMA;
+import static com.linkedin.venice.utils.TestWriteUtils.loadFileAsString;
 
 import com.linkedin.avroutil1.compatibility.AvroCompatibilityHelper;
 import com.linkedin.venice.controllerapi.MultiSchemaResponse;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.schema.avro.DirectionalSchemaCompatibilityType;
+import com.linkedin.venice.serializer.AvroGenericDeserializer;
+import com.linkedin.venice.serializer.AvroSerializer;
 import com.linkedin.venice.utils.AvroSchemaUtils;
 import com.linkedin.venice.utils.AvroSupersetSchemaUtils;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
 import org.apache.avro.Schema;
+import org.apache.avro.generic.GenericData;
+import org.apache.avro.generic.GenericRecord;
 import org.testng.Assert;
 import org.testng.annotations.Test;
 
@@ -34,7 +52,7 @@ public class TestAvroSupersetSchemaUtils {
         AvroSchemaUtils.generateSupersetSchemaFromAllValueSchemas(Arrays.asList(schemaEntry1, schemaEntry2));
 
     final Schema expectedSupersetSchema =
-        AvroSupersetSchemaUtils.generateSuperSetSchema(schemaEntry1.getSchema(), schemaEntry2.getSchema());
+        AvroSupersetSchemaUtils.generateSupersetSchema(schemaEntry1.getSchema(), schemaEntry2.getSchema());
     Assert.assertTrue(
         AvroSchemaUtils.compareSchemaIgnoreFieldOrder(expectedSupersetSchema, supersetSchemaEntry.getSchema()));
     Assert.assertEquals(supersetSchemaEntry.getId(), 2);
@@ -140,7 +158,7 @@ public class TestAvroSupersetSchemaUtils {
 
     Schema newValueSchema = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(valueSchemaStr1);
     Schema existingValueSchema = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(valueSchemaStr2);
-    Schema newSuperSetSchema = AvroSupersetSchemaUtils.generateSuperSetSchema(existingValueSchema, newValueSchema);
+    Schema newSuperSetSchema = AvroSupersetSchemaUtils.generateSupersetSchema(existingValueSchema, newValueSchema);
     Assert.assertTrue(
         new SchemaEntry(1, valueSchemaStr2)
             .isNewSchemaCompatible(new SchemaEntry(2, newSuperSetSchema), DirectionalSchemaCompatibilityType.FULL));
@@ -159,7 +177,7 @@ public class TestAvroSupersetSchemaUtils {
     Assert.assertNotEquals(s1, s2);
     Assert.assertTrue(AvroSchemaUtils.compareSchemaIgnoreFieldOrder(s1, s2));
 
-    Schema s3 = AvroSupersetSchemaUtils.generateSuperSetSchema(s2, s1);
+    Schema s3 = AvroSupersetSchemaUtils.generateSupersetSchema(s2, s1);
     Assert.assertNotNull(s3);
     Assert.assertNotNull(
         AvroCompatibilityHelper.getSchemaPropAsJsonString(s3.getField("name").schema(), "avro.java.string"));
@@ -175,7 +193,7 @@ public class TestAvroSupersetSchemaUtils {
     Schema s2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(schemaStr2);
     Assert.assertTrue(AvroSchemaUtils.compareSchemaIgnoreFieldOrder(s1, s2));
 
-    Schema s3 = AvroSupersetSchemaUtils.generateSuperSetSchema(s1, s2);
+    Schema s3 = AvroSupersetSchemaUtils.generateSupersetSchema(s1, s2);
     Assert.assertNotNull(s3);
   }
 
@@ -185,12 +203,110 @@ public class TestAvroSupersetSchemaUtils {
         "{\"type\":\"record\",\"name\":\"KeyRecord\",\"fields\":[{\"name\":\"name\",\"type\":\"string\",\"doc\":\"name field\"},{\"name\":\"company\",\"type\":\"string\"}]}";
     String schemaStr2 =
         "{\"type\":\"record\",\"name\":\"KeyRecord\",\"fields\":[{\"name\":\"name\",\"type\":\"string\",\"doc\":\"name field\"},{\"name\":\"business\",\"type\":\"string\"}]}";
-
     Schema s1 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(schemaStr1);
     Schema s2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(schemaStr2);
     Assert.assertFalse(AvroSchemaUtils.compareSchemaIgnoreFieldOrder(s1, s2));
-    Schema s3 = AvroSupersetSchemaUtils.generateSuperSetSchema(s1, s2);
+    Schema s3 = AvroSupersetSchemaUtils.generateSupersetSchema(s1, s2);
     Assert.assertNotNull(s3);
+  }
+
+  @Test
+  public void testSchemaMergeEnumSymbols() {
+    // Superset of two schemas whose enum field has diverged symbols should contain all symbols
+    // from both, with existing-schema symbols first (order preserved) and new symbols appended.
+    String existing = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"status\",\"type\":"
+        + "{\"type\":\"enum\",\"name\":\"Status\",\"symbols\":[\"A\",\"B\",\"C\"]}}]}";
+    String newer = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"status\",\"type\":"
+        + "{\"type\":\"enum\",\"name\":\"Status\",\"symbols\":[\"A\",\"B\",\"D\"]}}]}";
+
+    Schema s1 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(existing);
+    Schema s2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(newer);
+    Schema superset = AvroSupersetSchemaUtils.generateSupersetSchema(s1, s2);
+
+    List<String> symbols = superset.getField("status").schema().getEnumSymbols();
+    // All four symbols present; existing order preserved; new symbol appended
+    Assert.assertEquals(symbols, Arrays.asList("A", "B", "C", "D"));
+  }
+
+  /**
+   * newSchema is already a symbol superset of existingSchema (only adds "XL"). Properties are
+   * still merged: existingSchema-only props are preserved, shared props use newSchema's value.
+   */
+  @Test
+  public void testSchemaMergeEnumSymbolsIdentical() {
+    // existingSchema ["S","M","L"] has "old-only" prop; newSchema ["S","M","L","XL"] has "extra-prop".
+    // "shared" exists in both — newSchema wins.
+    String existing = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"size\",\"type\":"
+        + "{\"type\":\"enum\",\"name\":\"Size\",\"symbols\":[\"S\",\"M\",\"L\"],"
+        + "\"old-only\":\"preserved\",\"shared\":\"old-val\"}}]}";
+    String newer = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"size\",\"type\":"
+        + "{\"type\":\"enum\",\"name\":\"Size\",\"symbols\":[\"S\",\"M\",\"L\",\"XL\"],"
+        + "\"default\":\"S\",\"shared\":\"new-val\"}}]}";
+
+    Schema s1 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(existing);
+    Schema s2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(newer);
+    Schema superset = AvroSupersetSchemaUtils.generateSupersetSchema(s1, s2);
+    Schema supersetEnum = superset.getField("size").schema();
+
+    Assert.assertEquals(supersetEnum.getEnumSymbols(), Arrays.asList("S", "M", "L", "XL"));
+    // existingSchema-only prop is preserved even though newSchema is the symbol superset
+    Assert.assertEquals(AvroCompatibilityHelper.getSchemaPropAsJsonString(supersetEnum, "old-only"), "\"preserved\"");
+    // shared prop: newSchema wins
+    Assert.assertEquals(AvroCompatibilityHelper.getSchemaPropAsJsonString(supersetEnum, "shared"), "\"new-val\"");
+    Assert.assertEquals(supersetEnum.getEnumDefault(), "S");
+  }
+
+  /**
+   * Slow-path test: symbols change (both added and dropped between versions) AND properties
+   * differ. A new enum schema is constructed with the union of all symbols and the merged
+   * property set.
+   */
+  @Test
+  public void testSchemaMergeEnumChangedSymbolsAndProps() {
+    // existing ["S","M","L"] vs newer ["M","L","XL"]: "S" is only in existing, "XL" is only in
+    // newer → superset ["S","M","L","XL"] must be built from scratch.
+    String existing = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"size\",\"type\":"
+        + "{\"type\":\"enum\",\"name\":\"Size\",\"symbols\":[\"S\",\"M\",\"L\"]," + "\"extra-prop\":\"old\"}}]}";
+    String newer = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"size\",\"type\":"
+        + "{\"type\":\"enum\",\"name\":\"Size\",\"symbols\":[\"M\",\"L\",\"XL\"],"
+        + "\"default\":\"L\",\"extra-prop\":\"new\"}}]}";
+
+    Schema s1 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(existing);
+    Schema s2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(newer);
+    Schema superset = AvroSupersetSchemaUtils.generateSupersetSchema(s1, s2);
+    Schema supersetEnum = superset.getField("size").schema();
+
+    Assert.assertEquals(supersetEnum.getEnumSymbols(), Arrays.asList("S", "M", "L", "XL"));
+    // newSchema's custom prop and default are carried onto the newly constructed schema.
+    Assert.assertEquals(AvroCompatibilityHelper.getSchemaPropAsJsonString(supersetEnum, "extra-prop"), "\"new\"");
+    Assert.assertEquals(supersetEnum.getEnumDefault(), "L");
+  }
+
+  @Test
+  public void testSchemaMergeEnumSymbolsDivergedPreservesProps() {
+    // When existingSchema has symbols not in newSchema the superset merges props from both:
+    // - prop only in existingSchema → preserved in superset
+    // - prop in both schemas → newSchema value wins
+    // - prop only in newSchema → present in superset
+    String existing = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"status\",\"type\":"
+        + "{\"type\":\"enum\",\"name\":\"Status\",\"symbols\":[\"A\",\"B\",\"C\"],"
+        + "\"old-only\":\"from-old\",\"shared\":\"old-val\"}}]}";
+    String newer = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"status\",\"type\":"
+        + "{\"type\":\"enum\",\"name\":\"Status\",\"symbols\":[\"A\",\"B\",\"D\"],"
+        + "\"new-only\":\"from-new\",\"shared\":\"new-val\"}}]}";
+
+    Schema s1 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(existing);
+    Schema s2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(newer);
+    Schema superset = AvroSupersetSchemaUtils.generateSupersetSchema(s1, s2);
+    Schema supersetEnum = superset.getField("status").schema();
+
+    Assert.assertEquals(supersetEnum.getEnumSymbols(), Arrays.asList("A", "B", "C", "D"));
+    // prop only in existingSchema is preserved
+    Assert.assertEquals(AvroCompatibilityHelper.getSchemaPropAsJsonString(supersetEnum, "old-only"), "\"from-old\"");
+    // prop only in newSchema is present
+    Assert.assertEquals(AvroCompatibilityHelper.getSchemaPropAsJsonString(supersetEnum, "new-only"), "\"from-new\"");
+    // prop in both: newSchema value wins
+    Assert.assertEquals(AvroCompatibilityHelper.getSchemaPropAsJsonString(supersetEnum, "shared"), "\"new-val\"");
   }
 
   @Test
@@ -204,7 +320,7 @@ public class TestAvroSupersetSchemaUtils {
     Schema s2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(schemaStr2);
     Assert.assertFalse(AvroSchemaUtils.compareSchemaIgnoreFieldOrder(s1, s2));
 
-    Schema s3 = AvroSupersetSchemaUtils.generateSuperSetSchema(s1, s2);
+    Schema s3 = AvroSupersetSchemaUtils.generateSupersetSchema(s1, s2);
     Assert.assertNotNull(s3.getField("id1"));
     Assert.assertNotNull(s3.getField("id2"));
   }
@@ -220,9 +336,45 @@ public class TestAvroSupersetSchemaUtils {
     Schema s2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(schemaStr2);
     Assert.assertFalse(AvroSchemaUtils.compareSchemaIgnoreFieldOrder(s1, s2));
 
-    Schema s3 = AvroSupersetSchemaUtils.generateSuperSetSchema(s1, s2);
+    Schema s3 = AvroSupersetSchemaUtils.generateSupersetSchema(s1, s2);
     Assert.assertNotNull(s3.getField("id1"));
     Assert.assertNotNull(s3.getField("id2"));
+  }
+
+  @Test
+  public void testSchemaMergeFixedSameSize() {
+    // FIXED schemas with the same size: properties are merged exactly like ENUM —
+    // existingSchema-only props are preserved, shared props use newSchema's value.
+    String existing = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"hash\",\"type\":"
+        + "{\"type\":\"fixed\",\"name\":\"MD5\",\"size\":16,\"old-only\":\"keep\",\"shared\":\"old-val\"}}]}";
+    String newer = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"hash\",\"type\":"
+        + "{\"type\":\"fixed\",\"name\":\"MD5\",\"size\":16,\"new-only\":\"added\",\"shared\":\"new-val\"}}]}";
+
+    Schema s1 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(existing);
+    Schema s2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(newer);
+    Schema superset = AvroSupersetSchemaUtils.generateSupersetSchema(s1, s2);
+
+    Schema fixedSchema = superset.getField("hash").schema();
+    Assert.assertEquals(fixedSchema.getFixedSize(), 16);
+    // prop only in existingSchema is preserved
+    Assert.assertEquals(AvroCompatibilityHelper.getSchemaPropAsJsonString(fixedSchema, "old-only"), "\"keep\"");
+    // prop only in newSchema is present
+    Assert.assertEquals(AvroCompatibilityHelper.getSchemaPropAsJsonString(fixedSchema, "new-only"), "\"added\"");
+    // shared prop: newSchema wins
+    Assert.assertEquals(AvroCompatibilityHelper.getSchemaPropAsJsonString(fixedSchema, "shared"), "\"new-val\"");
+  }
+
+  @Test(expectedExceptions = VeniceException.class)
+  public void testSchemaMergeFixedDifferentSizeThrows() {
+    // FIXED schemas with mismatched sizes are structurally incompatible — must throw.
+    String existing = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"hash\",\"type\":"
+        + "{\"type\":\"fixed\",\"name\":\"MD5\",\"size\":16}}]}";
+    String newer = "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"hash\",\"type\":"
+        + "{\"type\":\"fixed\",\"name\":\"MD5\",\"size\":32}}]}";
+
+    Schema s1 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(existing);
+    Schema s2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(newer);
+    AvroSupersetSchemaUtils.generateSupersetSchema(s1, s2);
   }
 
   @Test(expectedExceptions = VeniceException.class)
@@ -235,7 +387,7 @@ public class TestAvroSupersetSchemaUtils {
     Schema s2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(schemaStr2);
 
     Assert.assertFalse(AvroSchemaUtils.compareSchemaIgnoreFieldOrder(s1, s2));
-    AvroSupersetSchemaUtils.generateSuperSetSchema(s1, s2);
+    AvroSupersetSchemaUtils.generateSupersetSchema(s1, s2);
   }
 
   @Test
@@ -249,9 +401,24 @@ public class TestAvroSupersetSchemaUtils {
     Schema s2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(schemaStr2);
     Assert.assertFalse(AvroSchemaUtils.compareSchemaIgnoreFieldOrder(s1, s2));
 
-    Schema s3 = AvroSupersetSchemaUtils.generateSuperSetSchema(s1, s2);
+    Schema s3 = AvroSupersetSchemaUtils.generateSupersetSchema(s1, s2);
     Assert.assertNotNull(s3.getField("company"));
     Assert.assertNotNull(s3.getField("organization"));
+  }
+
+  @Test
+  public void testSchemaMergeUnionWithComplexItemType() {
+    Schema s1 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(loadFileAsString("UnionV1.avsc"));
+    Schema s2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(loadFileAsString("UnionV2.avsc"));
+    Assert.assertFalse(AvroSchemaUtils.compareSchemaIgnoreFieldOrder(s1, s2));
+    Schema s3 = AvroSupersetSchemaUtils.generateSupersetSchema(s1, s2);
+    Assert.assertNotNull(s3.getField("age"));
+    Assert.assertNotNull(s3.getField("field"));
+    Schema.Field subFieldInS2 = s2.getField("field");
+    Schema.Field subFieldInS3 = s3.getField("field");
+    Schema unionSubFieldInS2 = subFieldInS2.schema().getTypes().get(1);
+    Schema unionSubFieldInS3 = subFieldInS3.schema().getTypes().get(1);
+    Assert.assertEquals(unionSubFieldInS3, unionSubFieldInS2);
   }
 
   @Test
@@ -278,7 +445,7 @@ public class TestAvroSupersetSchemaUtils {
     Schema s2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(recordSchemaStr2);
     Assert.assertFalse(AvroSchemaUtils.compareSchemaIgnoreFieldOrder(s1, s2));
 
-    Schema s3 = AvroSupersetSchemaUtils.generateSuperSetSchema(s1, s2);
+    Schema s3 = AvroSupersetSchemaUtils.generateSupersetSchema(s1, s2);
     Assert.assertNotNull(s3);
   }
 
@@ -307,12 +474,14 @@ public class TestAvroSupersetSchemaUtils {
     Schema s2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(schemaStr2);
     Assert.assertTrue(AvroSchemaUtils.compareSchemaIgnoreFieldOrder(s1, s2));
 
-    Schema s3 = AvroSupersetSchemaUtils.generateSuperSetSchema(s1, s2);
+    Schema s3 = AvroSupersetSchemaUtils.generateSupersetSchema(s1, s2);
     Assert.assertNotNull(AvroSchemaUtils.getFieldDefault(s3.getField("salary")));
   }
 
-  @Test(expectedExceptions = VeniceException.class)
+  @Test
   public void testWithEnumEvolution() {
+    // s1 has HEART, s2 does not. The superset must preserve HEART (from existing) and keep s2's
+    // symbols in their original order — i.e. all four symbols are present.
     String schemaStr1 = "{\n" + "           \"type\": \"record\",\n" + "           \"name\": \"KeyRecord\",\n"
         + "           \"fields\" : [\n"
         + "               {\"name\": \"name\", \"type\": \"string\", \"doc\": \"name field\"},\n"
@@ -331,7 +500,11 @@ public class TestAvroSupersetSchemaUtils {
     Schema s2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(schemaStr2);
 
     Assert.assertFalse(AvroSchemaUtils.compareSchemaIgnoreFieldOrder(s1, s2));
-    AvroSupersetSchemaUtils.generateSuperSetSchema(s1, s2);
+    Schema superset = AvroSupersetSchemaUtils.generateSupersetSchema(s1, s2);
+    // Superset symbols: existing order first (SPADES, DIAMONDS, HEART, CLUBS), nothing new from s2
+    Assert.assertEquals(
+        superset.getField("Suit").schema().getEnumSymbols(),
+        Arrays.asList("SPADES", "DIAMONDS", "HEART", "CLUBS"));
   }
 
   @Test
@@ -423,8 +596,7 @@ public class TestAvroSupersetSchemaUtils {
 
     Schema schema1 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(valueSchemaStr1);
     Schema schema2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(valueSchemaStr2);
-
-    Schema supersetSchema = AvroSupersetSchemaUtils.generateSuperSetSchema(schema1, schema2);
+    Schema supersetSchema = AvroSupersetSchemaUtils.generateSupersetSchema(schema1, schema2);
 
     Schema.Field intField = supersetSchema.getField("int_field");
     Schema.Field stringField = supersetSchema.getField("string_field");
@@ -482,6 +654,331 @@ public class TestAvroSupersetSchemaUtils {
   }
 
   @Test
+  public void testSupersetSchemaKeepDefault() {
+    Assert.assertEquals(
+        AvroSupersetSchemaUtils.generateSupersetSchema(USER_WITH_DEFAULT_SCHEMA, USER_SCHEMA).toString(),
+        USER_WITH_DEFAULT_SCHEMA.toString());
+    Assert.assertEquals(
+        AvroSupersetSchemaUtils.generateSupersetSchema(USER_SCHEMA, USER_WITH_DEFAULT_SCHEMA).toString(),
+        USER_WITH_DEFAULT_SCHEMA.toString());
+
+    // Test nested record default value carry in both direction.
+    Assert.assertEquals(
+        AvroSupersetSchemaUtils
+            .generateSupersetSchema(USER_WITH_NESTED_RECORD_AND_DEFAULT_SCHEMA, USER_WITH_NESTED_RECORD_SCHEMA)
+            .toString(),
+        USER_WITH_NESTED_RECORD_AND_DEFAULT_SCHEMA.toString());
+    Assert.assertEquals(
+        AvroSupersetSchemaUtils
+            .generateSupersetSchema(USER_WITH_NESTED_RECORD_SCHEMA, USER_WITH_NESTED_RECORD_AND_DEFAULT_SCHEMA)
+            .toString(),
+        USER_WITH_NESTED_RECORD_AND_DEFAULT_SCHEMA.toString());
+  }
+
+  @Test
+  public void testGenerateSupersetSchemaPreservesEmptyBytesDefault() {
+    String existingSchemaStr = "{\"type\":\"record\",\"name\":\"RecordWithBitmap\",\"fields\":["
+        + "{\"name\":\"memberBitmap\",\"type\":\"bytes\",\"default\":\"\"}]}";
+    String newSchemaStr = "{\"type\":\"record\",\"name\":\"RecordWithBitmap\",\"fields\":["
+        + "{\"name\":\"memberBitmap\",\"type\":\"bytes\",\"default\":\"\"},"
+        + "{\"name\":\"newField\",\"type\":\"string\",\"default\":\"\"}]}";
+
+    Schema existingSchema = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(existingSchemaStr);
+    Schema newSchema = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(newSchemaStr);
+
+    Schema supersetSchema = AvroSupersetSchemaUtils.generateSupersetSchema(existingSchema, newSchema);
+
+    Assert.assertNotNull(supersetSchema.getField("newField"));
+    Object memberBitmapDefault = AvroSchemaUtils.getFieldDefault(supersetSchema.getField("memberBitmap"));
+    Assert.assertTrue(memberBitmapDefault instanceof ByteBuffer);
+    Assert.assertEquals(((ByteBuffer) memberBitmapDefault).remaining(), 0);
+  }
+
+  @Test
+  public void testGenerateSupersetSchemaPreservesNestedBytesDefault() {
+    String existingSchemaStr = "{\"type\":\"record\",\"name\":\"RecordWithSettings\",\"fields\":["
+        + "{\"name\":\"settings\",\"type\":{\"type\":\"record\",\"name\":\"Settings\",\"fields\":["
+        + "{\"name\":\"memberBitmap\",\"type\":\"bytes\"}]}," + "\"default\":{\"memberBitmap\":\"\\u0001\\u0002\"}}]}";
+    String newSchemaStr = "{\"type\":\"record\",\"name\":\"RecordWithSettings\",\"fields\":["
+        + "{\"name\":\"settings\",\"type\":{\"type\":\"record\",\"name\":\"Settings\",\"fields\":["
+        + "{\"name\":\"memberBitmap\",\"type\":\"bytes\"}]}," + "\"default\":{\"memberBitmap\":\"\\u0001\\u0002\"}},"
+        + "{\"name\":\"newField\",\"type\":\"string\",\"default\":\"\"}]}";
+
+    Schema existingSchema = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(existingSchemaStr);
+    Schema newSchema = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(newSchemaStr);
+
+    Schema supersetSchema = AvroSupersetSchemaUtils.generateSupersetSchema(existingSchema, newSchema);
+
+    GenericRecord settingsDefault =
+        (GenericRecord) AvroSchemaUtils.getFieldDefault(supersetSchema.getField("settings"));
+    Assert.assertEquals(settingsDefault.get("memberBitmap"), ByteBuffer.wrap(new byte[] { 1, 2 }));
+  }
+
+  @Test
+  public void testGenerateSupersetSchemaWithAnnotatedPrimitiveTypesAndNewEnumField() {
+    // v1: plain primitive types throughout.
+    // - InnerRecord.tag uses a plain null in its union (covers NULL type)
+    // - DateRecord uses plain int/long/boolean/float/double/bytes (covers remaining primitive types)
+    String schemaV1 = "{" + "\"type\":\"record\",\"name\":\"OuterRecord\",\"namespace\":\"com.example\","
+        + "\"fields\":[" + "  {\"name\":\"items\",\"type\":{\"type\":\"array\",\"items\":{"
+        + "    \"type\":\"record\",\"name\":\"InnerRecord\"," + "    \"fields\":["
+        + "      {\"name\":\"id\",\"type\":\"string\"},"
+        // NULL: plain null in union
+        + "      {\"name\":\"tag\",\"type\":[\"null\",\"string\"],\"default\":null}," + "      {\"name\":\"subItems\","
+        + "       \"type\":[\"null\",{\"type\":\"array\",\"items\":{"
+        + "         \"type\":\"record\",\"name\":\"SubItem\"," + "         \"fields\":["
+        + "           {\"name\":\"ref\",\"type\":\"string\"},"
+        + "           {\"name\":\"categoryRef\",\"type\":[\"null\",\"string\"],\"default\":null}" + "         ]"
+        + "       }}],\"default\":null}," + "      {\"name\":\"startDate\"," + "       \"type\":[\"null\",{"
+        + "         \"type\":\"record\",\"name\":\"DateRecord\",\"namespace\":\"com.example.common\","
+        + "         \"fields\":["
+        // INT
+        + "           {\"name\":\"year\",\"type\":[\"null\",\"int\"]},"
+        + "           {\"name\":\"month\",\"type\":[\"null\",\"int\"]},"
+        + "           {\"name\":\"day\",\"type\":[\"null\",\"int\"]},"
+        // LONG
+        + "           {\"name\":\"timestamp\",\"type\":[\"null\",\"long\"]},"
+        // BOOLEAN
+        + "           {\"name\":\"active\",\"type\":[\"null\",\"boolean\"]},"
+        // FLOAT
+        + "           {\"name\":\"score\",\"type\":[\"null\",\"float\"]},"
+        // DOUBLE
+        + "           {\"name\":\"weight\",\"type\":[\"null\",\"double\"]},"
+        // BYTES
+        + "           {\"name\":\"data\",\"type\":[\"null\",\"bytes\"]}" + "         ]" + "       }],\"default\":null},"
+        + "      {\"name\":\"endDate\",\"type\":[\"null\",\"com.example.common.DateRecord\"],\"default\":null}"
+        + "    ]" + "  }}}" + "]}";
+
+    // v2: SubItem gains a new nullable enum field "source" (default null); all primitive types in
+    // InnerRecord and DateRecord carry a custom "proto.fieldType" property — exercising superset
+    // merge and comparison for every annotated primitive type (NULL, INT, LONG, BOOLEAN, FLOAT,
+    // DOUBLE, BYTES).
+    String schemaV2 = "{" + "\"type\":\"record\",\"name\":\"OuterRecord\",\"namespace\":\"com.example\","
+        + "\"fields\":[" + "  {\"name\":\"items\",\"type\":{\"type\":\"array\",\"items\":{"
+        + "    \"type\":\"record\",\"name\":\"InnerRecord\"," + "    \"fields\":["
+        + "      {\"name\":\"id\",\"type\":\"string\"},"
+        // NULL: annotated null in union
+        + "      {\"name\":\"tag\",\"type\":[{\"type\":\"null\",\"proto.nullable\":\"true\"},\"string\"],\"default\":null},"
+        + "      {\"name\":\"subItems\"," + "       \"type\":[\"null\",{\"type\":\"array\",\"items\":{"
+        + "         \"type\":\"record\",\"name\":\"SubItem\"," + "         \"fields\":["
+        + "           {\"name\":\"ref\",\"type\":\"string\"},"
+        + "           {\"name\":\"categoryRef\",\"type\":[\"null\",\"string\"],\"default\":null},"
+        + "           {\"name\":\"source\"," + "            \"type\":[\"null\",{"
+        + "              \"type\":\"enum\",\"name\":\"SourceType\","
+        + "              \"symbols\":[\"UNKNOWN\",\"EXPLICIT\",\"DERIVED\",\"INFERRED\"],"
+        + "              \"default\":\"UNKNOWN\"" + "            }],\"default\":null}" + "         ]"
+        + "       }}],\"default\":null}," + "      {\"name\":\"startDate\"," + "       \"type\":[\"null\",{"
+        + "         \"type\":\"record\",\"name\":\"DateRecord\",\"namespace\":\"com.example.common\","
+        + "         \"fields\":["
+        // INT
+        + "           {\"name\":\"year\",\"type\":[\"null\",{\"type\":\"int\",\"proto.fieldType\":\"sint32\"}],\"proto.fieldNumber\":1},"
+        + "           {\"name\":\"month\",\"type\":[\"null\",{\"type\":\"int\",\"proto.fieldType\":\"sint32\"}],\"proto.fieldNumber\":2},"
+        + "           {\"name\":\"day\",\"type\":[\"null\",{\"type\":\"int\",\"proto.fieldType\":\"sint32\"}],\"proto.fieldNumber\":3},"
+        // LONG
+        + "           {\"name\":\"timestamp\",\"type\":[\"null\",{\"type\":\"long\",\"proto.fieldType\":\"int64\"}],\"proto.fieldNumber\":4},"
+        // BOOLEAN
+        + "           {\"name\":\"active\",\"type\":[\"null\",{\"type\":\"boolean\",\"proto.fieldType\":\"bool\"}],\"proto.fieldNumber\":5},"
+        // FLOAT
+        + "           {\"name\":\"score\",\"type\":[\"null\",{\"type\":\"float\",\"proto.fieldType\":\"float\"}],\"proto.fieldNumber\":6},"
+        // DOUBLE
+        + "           {\"name\":\"weight\",\"type\":[\"null\",{\"type\":\"double\",\"proto.fieldType\":\"double\"}],\"proto.fieldNumber\":7},"
+        // BYTES
+        + "           {\"name\":\"data\",\"type\":[\"null\",{\"type\":\"bytes\",\"proto.fieldType\":\"bytes\"}],\"proto.fieldNumber\":8}"
+        + "         ]" + "       }],\"default\":null},"
+        + "      {\"name\":\"endDate\",\"type\":[\"null\",\"com.example.common.DateRecord\"],\"default\":null}"
+        + "    ]" + "  }}}" + "]}";
+
+    Schema s1 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(schemaV1);
+    Schema s2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(schemaV2);
+
+    // v1 and v2 differ structurally (SubItem gains a "source" field in v2)
+    Assert.assertFalse(AvroSchemaUtils.compareSchemaIgnoreFieldOrder(s1, s2));
+
+    // Superset should be generated successfully in both directions
+    Schema supersetS1S2 = AvroSupersetSchemaUtils.generateSupersetSchema(s1, s2);
+    Assert.assertNotNull(supersetS1S2);
+
+    Schema supersetS2S1 = AvroSupersetSchemaUtils.generateSupersetSchema(s2, s1);
+    Assert.assertNotNull(supersetS2S1);
+
+    // Both orderings should produce equivalent superset schemas
+    Assert.assertTrue(AvroSchemaUtils.compareSchemaIgnoreFieldOrder(supersetS1S2, supersetS2S1));
+
+    // v2 (which contains the "source" field) should be the superset of v1
+    Assert.assertTrue(AvroSupersetSchemaUtils.isSupersetSchema(s2, s1));
+    Assert.assertFalse(AvroSupersetSchemaUtils.isSupersetSchema(s1, s2));
+
+    // The superset schema should contain "source" inside SubItem, and retain "categoryRef" from v1.
+    // Navigation: items (array items -> InnerRecord) -> subItems (union[1] -> array items -> SubItem)
+    Schema subItemSchema = supersetS1S2.getField("items")
+        .schema()
+        .getElementType()
+        .getField("subItems")
+        .schema()
+        .getTypes()
+        .get(1)
+        .getElementType();
+    Assert.assertNotNull(subItemSchema.getField("source"), "Superset schema must contain the 'source' field from v2");
+    Assert.assertNotNull(
+        subItemSchema.getField("categoryRef"),
+        "Superset schema must retain the 'categoryRef' field from v1");
+  }
+
+  /**
+   * Validates that generateSupersetSchema() treats a single-element union wrapping a type
+   * (e.g. {@code [array]}) the same as the bare type ({@code array}), since they are
+   * semantically equivalent in Avro.
+   */
+  @Test
+  public void testSchemaMergeSingleElementUnionVsPlainType() {
+    // v1: opportunityIds as a single-element union wrapping an array
+    String schemaStr1 = "{\"type\":\"record\",\"name\":\"TestRecord\",\"namespace\":\"com.example\","
+        + "\"fields\":[{\"name\":\"opportunityIds\"," + "\"type\":[{\"type\":\"array\",\"items\":\"long\"}],"
+        + "\"doc\":\"List of opportunityIds.\"}]}";
+    // v2: opportunityIds as a plain array (no union wrapper)
+    String schemaStr2 = "{\"type\":\"record\",\"name\":\"TestRecord\",\"namespace\":\"com.example\","
+        + "\"fields\":[{\"name\":\"opportunityIds\"," + "\"type\":{\"type\":\"array\",\"items\":\"long\"},"
+        + "\"doc\":\"List of opportunityIds.\"}]}";
+    Schema s1 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(schemaStr1);
+    Schema s2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(schemaStr2);
+
+    // Should not throw — these are semantically equivalent
+    Schema superset12 = AvroSupersetSchemaUtils.generateSupersetSchema(s1, s2);
+    Assert.assertNotNull(superset12);
+    Assert.assertNotNull(superset12.getField("opportunityIds"));
+
+    // The result should be an array type (the unwrapped form)
+    Assert.assertEquals(superset12.getField("opportunityIds").schema().getType(), Schema.Type.ARRAY);
+
+    // Should also work in the reverse direction
+    Schema superset21 = AvroSupersetSchemaUtils.generateSupersetSchema(s2, s1);
+    Assert.assertNotNull(superset21);
+    Assert.assertEquals(superset21.getField("opportunityIds").schema().getType(), Schema.Type.ARRAY);
+
+    // Both orderings should produce equivalent superset schemas
+    Assert.assertTrue(AvroSchemaUtils.compareSchemaIgnoreFieldOrder(superset12, superset21));
+
+    // Verify that the superset schema can deserialize records serialized with either version
+    List<Long> ids = Collections.singletonList(42L);
+
+    GenericRecord recordV1 = new GenericData.Record(s1);
+    recordV1.put("opportunityIds", ids);
+    byte[] bytesV1 = new AvroSerializer<>(s1).serialize(recordV1);
+    GenericRecord deserializedV1 = (GenericRecord) new AvroGenericDeserializer<>(s1, superset12).deserialize(bytesV1);
+    Assert.assertEquals(new ArrayList<>((Collection<?>) deserializedV1.get("opportunityIds")), ids);
+
+    GenericRecord recordV2 = new GenericData.Record(s2);
+    recordV2.put("opportunityIds", ids);
+    byte[] bytesV2 = new AvroSerializer<>(s2).serialize(recordV2);
+    GenericRecord deserializedV2 = (GenericRecord) new AvroGenericDeserializer<>(s2, superset12).deserialize(bytesV2);
+    Assert.assertEquals(new ArrayList<>((Collection<?>) deserializedV2.get("opportunityIds")), ids);
+  }
+
+  @Test
+  public void testSchemaMergeSingleElementUnionVsPlainTypeWithAdditionalFields() {
+    // Record with additional fields to test that single-element union unwrapping
+    // doesn't interfere with normal superset field merging
+    String schemaStr1 = "{\"type\":\"record\",\"name\":\"TestRecord\"," + "\"namespace\":\"com.example\","
+        + "\"fields\":[" + "{\"name\":\"ids\",\"type\":[{\"type\":\"array\",\"items\":\"long\"}]},"
+        + "{\"name\":\"name\",\"type\":\"string\",\"default\":\"default\"}" + "]}";
+
+    String schemaStr2 = "{\"type\":\"record\",\"name\":\"TestRecord\"," + "\"namespace\":\"com.example\","
+        + "\"fields\":[" + "{\"name\":\"ids\",\"type\":{\"type\":\"array\",\"items\":\"long\"}},"
+        + "{\"name\":\"description\",\"type\":\"string\",\"default\":\"none\"}" + "]}";
+
+    Schema s1 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(schemaStr1);
+    Schema s2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(schemaStr2);
+
+    Schema superset = AvroSupersetSchemaUtils.generateSupersetSchema(s1, s2);
+    Assert.assertNotNull(superset);
+    Assert.assertNotNull(superset.getField("ids"));
+    Assert.assertNotNull(superset.getField("name"));
+    Assert.assertNotNull(superset.getField("description"));
+    Assert.assertEquals(superset.getField("ids").schema().getType(), Schema.Type.ARRAY);
+
+    List<Long> ids = Collections.singletonList(42L);
+
+    GenericRecord recordV1 = new GenericData.Record(s1);
+    recordV1.put("ids", ids);
+    recordV1.put("name", "alice");
+    byte[] bytesV1 = new AvroSerializer<>(s1).serialize(recordV1);
+    GenericRecord deserializedV1 = (GenericRecord) new AvroGenericDeserializer<>(s1, superset).deserialize(bytesV1);
+    // GenericData.Array.equals() only accepts other GenericArray — copy to ArrayList to compare
+    Assert.assertEquals(new ArrayList<>((Collection<?>) deserializedV1.get("ids")), ids);
+
+    GenericRecord recordV2 = new GenericData.Record(s2);
+    recordV2.put("ids", ids);
+    recordV2.put("description", "desc");
+    byte[] bytesV2 = new AvroSerializer<>(s2).serialize(recordV2);
+    GenericRecord deserializedV2 = (GenericRecord) new AvroGenericDeserializer<>(s2, superset).deserialize(bytesV2);
+    Assert.assertEquals(new ArrayList<>((Collection<?>) deserializedV2.get("ids")), ids);
+  }
+
+  @Test
+  public void testSchemaMergeSingleElementUnionMap() {
+    // Test single-element union wrapping a map type
+    String schemaStr1 = "{\"type\":\"record\",\"name\":\"TestRecord\"," + "\"fields\":[{\"name\":\"metadata\","
+        + "\"type\":[{\"type\":\"map\",\"values\":\"string\"}]}]}";
+
+    String schemaStr2 = "{\"type\":\"record\",\"name\":\"TestRecord\"," + "\"fields\":[{\"name\":\"metadata\","
+        + "\"type\":{\"type\":\"map\",\"values\":\"string\"}}]}";
+
+    Schema s1 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(schemaStr1);
+    Schema s2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(schemaStr2);
+
+    Schema superset = AvroSupersetSchemaUtils.generateSupersetSchema(s1, s2);
+    Assert.assertNotNull(superset);
+    Assert.assertEquals(superset.getField("metadata").schema().getType(), Schema.Type.MAP);
+
+    Map<String, String> metadata = Collections.singletonMap("k", "v");
+
+    GenericRecord recordV1 = new GenericData.Record(s1);
+    recordV1.put("metadata", metadata);
+    byte[] bytesV1 = new AvroSerializer<>(s1).serialize(recordV1);
+    GenericRecord deserializedV1 = (GenericRecord) new AvroGenericDeserializer<>(s1, superset).deserialize(bytesV1);
+    // Avro deserializes string keys/values as Utf8 — convert to String for comparison
+    Assert.assertEquals(toStringMap((Map<?, ?>) deserializedV1.get("metadata")), metadata);
+
+    GenericRecord recordV2 = new GenericData.Record(s2);
+    recordV2.put("metadata", metadata);
+    byte[] bytesV2 = new AvroSerializer<>(s2).serialize(recordV2);
+    GenericRecord deserializedV2 = (GenericRecord) new AvroGenericDeserializer<>(s2, superset).deserialize(bytesV2);
+    Assert.assertEquals(toStringMap((Map<?, ?>) deserializedV2.get("metadata")), metadata);
+  }
+
+  @Test
+  public void testSchemaMergeSingleElementUnionVsMultiElementUnion() {
+    // [T] vs ["null", T] must still merge correctly via the union path.
+    // Unwrapping [T] to T before comparison would produce T vs UNION and throw.
+    String schemaStr1 = "{\"type\":\"record\",\"name\":\"TestRecord\"," + "\"fields\":[{\"name\":\"ids\","
+        + "\"type\":[{\"type\":\"array\",\"items\":\"long\"}]}]}";
+
+    String schemaStr2 = "{\"type\":\"record\",\"name\":\"TestRecord\"," + "\"fields\":[{\"name\":\"ids\","
+        + "\"type\":[\"null\",{\"type\":\"array\",\"items\":\"long\"}],\"default\":null}]}";
+
+    Schema s1 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(schemaStr1);
+    Schema s2 = AvroSchemaParseUtils.parseSchemaFromJSONStrictValidation(schemaStr2);
+
+    Schema superset = AvroSupersetSchemaUtils.generateSupersetSchema(s1, s2);
+    Assert.assertNotNull(superset);
+    Assert.assertEquals(superset.getField("ids").schema().getType(), Schema.Type.UNION);
+
+    List<Long> ids = Collections.singletonList(42L);
+
+    GenericRecord recordV1 = new GenericData.Record(s1);
+    recordV1.put("ids", ids);
+    byte[] bytesV1 = new AvroSerializer<>(s1).serialize(recordV1);
+    GenericRecord deserializedV1 = (GenericRecord) new AvroGenericDeserializer<>(s1, superset).deserialize(bytesV1);
+    Assert.assertEquals(new ArrayList<>((Collection<?>) deserializedV1.get("ids")), ids);
+
+    GenericRecord recordV2 = new GenericData.Record(s2);
+    recordV2.put("ids", ids);
+    byte[] bytesV2 = new AvroSerializer<>(s2).serialize(recordV2);
+    GenericRecord deserializedV2 = (GenericRecord) new AvroGenericDeserializer<>(s2, superset).deserialize(bytesV2);
+    Assert.assertEquals(new ArrayList<>((Collection<?>) deserializedV2.get("ids")), ids);
+  }
+
+  @Test
   public void testValidateSubsetSchema() {
     Assert.assertTrue(
         AvroSupersetSchemaUtils.validateSubsetValueSchema(NAME_RECORD_V1_SCHEMA, NAME_RECORD_V2_SCHEMA.toString()));
@@ -489,5 +986,349 @@ public class TestAvroSupersetSchemaUtils {
         AvroSupersetSchemaUtils.validateSubsetValueSchema(NAME_RECORD_V2_SCHEMA, NAME_RECORD_V3_SCHEMA.toString()));
     Assert.assertFalse(
         AvroSupersetSchemaUtils.validateSubsetValueSchema(NAME_RECORD_V3_SCHEMA, NAME_RECORD_V4_SCHEMA.toString()));
+
+    // NAME_RECORD_V5_SCHEMA and NAME_RECORD_V6_SCHEMA are different in props for field.
+    Assert.assertNotEquals(NAME_RECORD_V5_SCHEMA, NAME_RECORD_V6_SCHEMA);
+    // Test validation skip comparing props when checking for subset schema.
+    Schema supersetSchemaForV5AndV4 =
+        AvroSupersetSchemaUtils.generateSupersetSchema(NAME_RECORD_V5_SCHEMA, NAME_RECORD_V4_SCHEMA);
+    Assert.assertTrue(
+        AvroSupersetSchemaUtils.validateSubsetValueSchema(NAME_RECORD_V5_SCHEMA, supersetSchemaForV5AndV4.toString()));
+    Assert.assertTrue(
+        AvroSupersetSchemaUtils.validateSubsetValueSchema(NAME_RECORD_V6_SCHEMA, supersetSchemaForV5AndV4.toString()));
+  }
+
+  @Test
+  public void testValidateSubsetSchemaForProjectionWithNullableSupersetFields() {
+    // Scenario from OpenHouse (OH) schema evolution: the store's initial (target writer) schema declares a
+    // non-nullable field X, but every schema evolution afterwards wraps fields as a nullable union [null, X]. The
+    // input (superset) value schema therefore carries [null, X] while the chosen writer schema keeps X. The
+    // projection check must accept input [null, X] against writer X (and ignore the input's extra fields), while the
+    // strict check must continue to reject the nullability drift.
+    Schema writer = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[" + "{\"name\":\"f1\",\"type\":\"string\"},"
+            + "{\"name\":\"f2\",\"type\":\"int\"}]}");
+    Schema inputNullable = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+            + "{\"name\":\"f1\",\"type\":[\"null\",\"string\"],\"default\":null},"
+            + "{\"name\":\"f2\",\"type\":\"int\"},"
+            + "{\"name\":\"extra\",\"type\":[\"null\",\"string\"],\"default\":null}]}");
+
+    // Strict check rejects the [null,X] (input) vs X (writer) drift.
+    Assert.assertFalse(AvroSupersetSchemaUtils.validateSubsetValueSchema(writer, inputNullable.toString()));
+    // Projection check accepts input [null,X] against writer X and tolerates the input's extra top-level field.
+    Assert.assertTrue(AvroSupersetSchemaUtils.validateSubsetValueSchemaForProjection(writer, inputNullable.toString()));
+  }
+
+  @Test
+  public void testValidateSubsetSchemaForProjectionBlocksReverseNullableDrift() {
+    // The reverse direction (input X, writer [null, X]) is NOT a side effect of OH evolution; it indicates the user
+    // may have messed something up, so it must stay blocked even under the projection check.
+    Schema writerNullable = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+            + "{\"name\":\"f1\",\"type\":[\"null\",\"string\"],\"default\":null}]}");
+    Schema inputNonNull = AvroCompatibilityHelper
+        .parse("{\"type\":\"record\",\"name\":\"R\",\"fields\":[" + "{\"name\":\"f1\",\"type\":\"string\"}]}");
+    Assert.assertFalse(AvroSupersetSchemaUtils.validateSubsetValueSchema(writerNullable, inputNonNull.toString()));
+    Assert.assertFalse(
+        AvroSupersetSchemaUtils.validateSubsetValueSchemaForProjection(writerNullable, inputNonNull.toString()));
+  }
+
+  @Test
+  public void testValidateSubsetSchemaForProjectionStillBlocksOtherDrift() {
+    // Relaxing nullable wrapping must not open the door to unrelated type drift.
+    Schema writer = AvroCompatibilityHelper
+        .parse("{\"type\":\"record\",\"name\":\"R\",\"fields\":[" + "{\"name\":\"f1\",\"type\":\"string\"}]}");
+
+    // Different non-null branch type (int vs string) must not match.
+    Schema inputWrongType = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+            + "{\"name\":\"f1\",\"type\":[\"null\",\"int\"],\"default\":null}]}");
+    Assert
+        .assertFalse(AvroSupersetSchemaUtils.validateSubsetValueSchemaForProjection(writer, inputWrongType.toString()));
+
+    // A non-nullable complex union (not a [null, X] pair) is blocked with a clear error.
+    Schema inputComplexUnion = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+            + "{\"name\":\"f1\",\"type\":[\"null\",\"string\",\"int\"],\"default\":null}]}");
+    Assert.expectThrows(
+        VeniceException.class,
+        () -> AvroSupersetSchemaUtils.validateSubsetValueSchemaForProjection(writer, inputComplexUnion.toString()));
+
+    // A missing writer field in the input still fails (writer not a subset of input).
+    Schema inputMissingField = AvroCompatibilityHelper
+        .parse("{\"type\":\"record\",\"name\":\"R\",\"fields\":[" + "{\"name\":\"other\",\"type\":\"string\"}]}");
+    Assert.assertFalse(
+        AvroSupersetSchemaUtils.validateSubsetValueSchemaForProjection(writer, inputMissingField.toString()));
+  }
+
+  @Test
+  public void testValidateSubsetSchemaForProjectionBlocksNullLastUnion() {
+    // OH wraps optional fields as [null, X] (null FIRST) so the field can default to null. A null-LAST union
+    // ([X, null]) cannot carry a null default and is therefore never produced by OH; it indicates a hand-authored
+    // schema, not the pattern we relax for. The nullable-unwrap must only fire for null-first unions, so [X, null]
+    // (input) vs writer X must stay blocked.
+    Schema writer = AvroCompatibilityHelper
+        .parse("{\"type\":\"record\",\"name\":\"R\",\"fields\":[" + "{\"name\":\"f1\",\"type\":\"int\"}]}");
+    Schema inputNullLast = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+            + "{\"name\":\"f1\",\"type\":[\"int\",\"null\"],\"default\":0}]}");
+    Assert
+        .assertFalse(AvroSupersetSchemaUtils.validateSubsetValueSchemaForProjection(writer, inputNullLast.toString()));
+  }
+
+  @Test
+  public void testValidateSubsetSchemaForProjectionBlocksNestedMultiUnion() {
+    // The complex-union guardrail also applies recursively: a 3-branch union ([null, string, int]) inside a
+    // nested record is not a [null, X] wrap and is blocked with a clear error, mirroring the top-level guardrail.
+    Schema writer = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"nested\",\"type\":"
+            + "{\"type\":\"record\",\"name\":\"N\",\"fields\":[{\"name\":\"city\",\"type\":\"string\"}]}}]}");
+    Schema inputNestedMultiUnion = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"nested\",\"type\":"
+            + "{\"type\":\"record\",\"name\":\"N\",\"fields\":[{\"name\":\"city\",\"type\":[\"null\",\"string\",\"int\"],\"default\":null}]}}]}");
+    Assert.expectThrows(
+        VeniceException.class,
+        () -> AvroSupersetSchemaUtils.validateSubsetValueSchemaForProjection(writer, inputNestedMultiUnion.toString()));
+  }
+
+  @Test
+  public void testValidateSubsetSchemaForProjectionRelaxesNullableUnionWriterEvolvedBranch() {
+    // A nullable-union writer [null, Addr{city}] projects from a nullable-union input whose non-null branch evolved
+    // into a superset ([null, Addr{city, zip}]): the non-null branch is a projection-subset, so this is allowed.
+    Schema writer = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"addr\",\"type\":[\"null\","
+            + "{\"type\":\"record\",\"name\":\"Addr\",\"fields\":[{\"name\":\"city\",\"type\":\"string\"}]}],"
+            + "\"default\":null}]}");
+    Schema input = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"addr\",\"type\":[\"null\","
+            + "{\"type\":\"record\",\"name\":\"Addr\",\"fields\":[{\"name\":\"city\",\"type\":\"string\"},"
+            + "{\"name\":\"zip\",\"type\":[\"null\",\"int\"],\"default\":null}]}],\"default\":null}]}");
+    Assert.assertTrue(AvroSupersetSchemaUtils.validateSubsetValueSchemaForProjection(writer, input.toString()));
+  }
+
+  @Test
+  public void testValidateSubsetSchemaForProjectionBlocksNullableUnionWriterNonSubsetBranch() {
+    // A nullable-union writer still enforces the subset rule on its non-null branch: writer [null, Addr{city}] vs
+    // input [null, Addr{zip}] fails because the writer's `city` field is absent from the input's non-null branch.
+    Schema writer = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"addr\",\"type\":[\"null\","
+            + "{\"type\":\"record\",\"name\":\"Addr\",\"fields\":[{\"name\":\"city\",\"type\":\"string\"}]}],"
+            + "\"default\":null}]}");
+    Schema input = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"addr\",\"type\":[\"null\","
+            + "{\"type\":\"record\",\"name\":\"Addr\",\"fields\":[{\"name\":\"zip\",\"type\":\"int\"}]}],"
+            + "\"default\":null}]}");
+    Assert.assertFalse(AvroSupersetSchemaUtils.validateSubsetValueSchemaForProjection(writer, input.toString()));
+  }
+
+  @Test
+  public void testValidateSubsetSchemaForProjectionBlocksComplexUnionOnWriterSide() {
+    // The complex-union guardrail applies to the writer schema too: a writer field typed [null, string, int] is
+    // blocked with a clear error, mirroring the input-side guardrail.
+    Schema writerComplexUnion = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+            + "{\"name\":\"f1\",\"type\":[\"null\",\"string\",\"int\"],\"default\":null}]}");
+    Schema input = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":["
+            + "{\"name\":\"f1\",\"type\":[\"null\",\"string\",\"int\"],\"default\":null}]}");
+    Assert.expectThrows(
+        VeniceException.class,
+        () -> AvroSupersetSchemaUtils.validateSubsetValueSchemaForProjection(writerComplexUnion, input.toString()));
+  }
+
+  @Test
+  public void testValidateSubsetSchemaForProjectionAllowsEmptyStructWriterAgainstDummyFilledInput() {
+    // An empty-struct writer (fields: []) is a projection-subset of the OH input that fills the struct with a synthetic
+    // dummy field: the writer declares no fields, so the input's dummy filler is a tolerated extra field.
+    Schema writer = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"recordWithEmptyStruct\",\"type\":[\"null\","
+            + "{\"type\":\"record\",\"name\":\"emptyStructRecord\","
+            + "\"namespace\":\"com.linkedin.SchemaWithEmptyStructs.emptyStruct\",\"doc\":\"record with empty struct\","
+            + "\"fields\":[{\"name\":\"emptyStructUnionField\",\"type\":[\"null\","
+            + "{\"type\":\"record\",\"name\":\"emptyStructField\",\"fields\":[]}],\"default\":null}]}],"
+            + "\"default\":null}]}");
+    Schema input = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"recordWithEmptyStruct\",\"type\":[\"null\","
+            + "{\"type\":\"record\",\"name\":\"emptyStructRecord\","
+            + "\"namespace\":\"com.linkedin.SchemaWithEmptyStructs.emptyStruct\",\"doc\":\"record with empty struct\","
+            + "\"fields\":[{\"name\":\"emptyStructUnionField\",\"type\":[\"null\","
+            + "{\"type\":\"record\",\"name\":\"emptyStructField\",\"fields\":[{\"name\":"
+            + "\"__dummy_field_to_fill_empty_struct__\",\"type\":\"int\",\"doc\":"
+            + "\"Dummy field added to handle empty struct records.\",\"default\":-1}]}],\"default\":null}]}],"
+            + "\"default\":null}]}");
+    Assert.assertTrue(AvroSupersetSchemaUtils.validateSubsetValueSchemaForProjection(writer, input.toString()));
+  }
+
+  @Test
+  public void testValidateSubsetSchemaForProjectionAllowsSingleElementUnionWriter() {
+    // Input field: nullable union [null, long]. Writer field: single-element union [long], which is semantically
+    // equivalent to a bare long, so the nullable input projects onto it.
+    Schema writer = AvroCompatibilityHelper
+        .parse("{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"f1\",\"type\":[\"long\"]}]}");
+    Schema input = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"f1\",\"type\":[\"null\",\"long\"],\"default\":null}]}");
+    Assert.assertTrue(AvroSupersetSchemaUtils.validateSubsetValueSchemaForProjection(writer, input.toString()));
+  }
+
+  @Test
+  public void testValidateSubsetSchemaForProjectionKeepsExactMatch() {
+    // Exact matches (X == X and [null, X] == [null, X]) must still pass under the projection check.
+    Schema writer = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[" + "{\"name\":\"f1\",\"type\":\"string\"},"
+            + "{\"name\":\"f2\",\"type\":[\"null\",\"int\"],\"default\":null}]}");
+    Schema input = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[" + "{\"name\":\"f1\",\"type\":\"string\"},"
+            + "{\"name\":\"f2\",\"type\":[\"null\",\"int\"],\"default\":null},"
+            + "{\"name\":\"extra\",\"type\":[\"null\",\"string\"],\"default\":null}]}");
+    Assert.assertTrue(AvroSupersetSchemaUtils.validateSubsetValueSchemaForProjection(writer, input.toString()));
+  }
+
+  @Test
+  public void testValidateSubsetSchemaForProjectionRelaxesNestedNullableAdd() {
+    // OH schema evolution applies recursively: when a field is added to a NESTED record, the input (superset) value
+    // schema carries it as [null, X] while the chosen writer keeps the nested record's fields non-nullable. The
+    // relaxation is NOT top-level only -- the projection check must unwrap [null, X] vs X at every nesting level.
+    Schema writer = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"nested\",\"type\":"
+            + "{\"type\":\"record\",\"name\":\"N\",\"fields\":[{\"name\":\"city\",\"type\":\"string\"}]}}]}");
+    Schema inputNestedNullable = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"nested\",\"type\":"
+            + "{\"type\":\"record\",\"name\":\"N\",\"fields\":[{\"name\":\"city\",\"type\":[\"null\",\"string\"],\"default\":null}]}}]}");
+    Assert.assertTrue(
+        AvroSupersetSchemaUtils.validateSubsetValueSchemaForProjection(writer, inputNestedNullable.toString()));
+  }
+
+  @Test
+  public void testValidateSubsetSchemaForProjectionToleratesNestedExtraField() {
+    // OH never removes columns (no deletion allowlist), so the superset accumulates fields at every level. A nested
+    // record in the input may therefore carry extra fields (a field deleted from the writer but retained in the ASL
+    // superset). The projection check must tolerate these extra nested fields, just as it does at the top level.
+    Schema writer = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"nested\",\"type\":"
+            + "{\"type\":\"record\",\"name\":\"N\",\"fields\":[{\"name\":\"b\",\"type\":\"int\"}]}}]}");
+    Schema inputNestedExtra = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"nested\",\"type\":"
+            + "{\"type\":\"record\",\"name\":\"N\",\"fields\":[{\"name\":\"b\",\"type\":\"int\"},"
+            + "{\"name\":\"c\",\"type\":\"int\",\"default\":5}]}}]}");
+    Assert.assertTrue(
+        AvroSupersetSchemaUtils.validateSubsetValueSchemaForProjection(writer, inputNestedExtra.toString()));
+  }
+
+  @Test
+  public void testValidateSubsetSchemaForProjectionBlocksNestedReverseDrift() {
+    // The guardrails also apply recursively: reverse nullability drift inside a nested record (writer nested field
+    // [null, X], input nested field X) is NOT an OH evolution artifact and must stay blocked at every level.
+    Schema writerNestedNullable = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"nested\",\"type\":"
+            + "{\"type\":\"record\",\"name\":\"N\",\"fields\":[{\"name\":\"city\",\"type\":[\"null\",\"string\"],\"default\":null}]}}]}");
+    Schema inputNestedNonNull = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"nested\",\"type\":"
+            + "{\"type\":\"record\",\"name\":\"N\",\"fields\":[{\"name\":\"city\",\"type\":\"string\"}]}}]}");
+    Assert.assertFalse(
+        AvroSupersetSchemaUtils
+            .validateSubsetValueSchemaForProjection(writerNestedNullable, inputNestedNonNull.toString()));
+  }
+
+  @Test
+  public void testValidateSubsetSchemaForProjectionBlocksReverseDriftInArrayElement() {
+    // Reverse nullability drift must stay blocked inside array element records too (writer element field [null, X],
+    // input element field X).
+    Schema writerNullableElement = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"addresses\",\"type\":"
+            + "{\"type\":\"array\",\"items\":"
+            + "{\"type\":\"record\",\"name\":\"Address\",\"fields\":[{\"name\":\"city\",\"type\":[\"null\",\"string\"],\"default\":null}]}}}]}");
+    Schema inputNonNullElement = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"addresses\",\"type\":"
+            + "{\"type\":\"array\",\"items\":"
+            + "{\"type\":\"record\",\"name\":\"Address\",\"fields\":[{\"name\":\"city\",\"type\":\"string\"}]}}}]}");
+    Assert.assertFalse(
+        AvroSupersetSchemaUtils
+            .validateSubsetValueSchemaForProjection(writerNullableElement, inputNonNullElement.toString()));
+  }
+
+  @Test
+  public void testValidateSubsetSchemaForProjectionBlocksReverseDriftInMapValue() {
+    // Reverse nullability drift must stay blocked inside map value records too.
+    Schema writerNullableValue = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"byId\",\"type\":" + "{\"type\":\"map\",\"values\":"
+            + "{\"type\":\"record\",\"name\":\"Address\",\"fields\":[{\"name\":\"city\",\"type\":[\"null\",\"string\"],\"default\":null}]}}}]}");
+    Schema inputNonNullValue = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"byId\",\"type\":" + "{\"type\":\"map\",\"values\":"
+            + "{\"type\":\"record\",\"name\":\"Address\",\"fields\":[{\"name\":\"city\",\"type\":\"string\"}]}}}]}");
+    Assert.assertFalse(
+        AvroSupersetSchemaUtils
+            .validateSubsetValueSchemaForProjection(writerNullableValue, inputNonNullValue.toString()));
+  }
+
+  @Test
+  public void testValidateSubsetSchemaForProjectionBlocksReverseDriftDeeplyNested() {
+    // Reverse nullability drift must stay blocked no matter how deep the offending field is (here two record levels
+    // down: R -> outer -> inner.leaf), proving the guardrail holds at all nesting levels.
+    Schema writerDeepNullable = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"outer\",\"type\":"
+            + "{\"type\":\"record\",\"name\":\"Outer\",\"fields\":[{\"name\":\"inner\",\"type\":"
+            + "{\"type\":\"record\",\"name\":\"Inner\",\"fields\":[{\"name\":\"leaf\",\"type\":[\"null\",\"string\"],\"default\":null}]}}]}}]}");
+    Schema inputDeepNonNull = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"outer\",\"type\":"
+            + "{\"type\":\"record\",\"name\":\"Outer\",\"fields\":[{\"name\":\"inner\",\"type\":"
+            + "{\"type\":\"record\",\"name\":\"Inner\",\"fields\":[{\"name\":\"leaf\",\"type\":\"string\"}]}}]}}]}");
+    Assert.assertFalse(
+        AvroSupersetSchemaUtils
+            .validateSubsetValueSchemaForProjection(writerDeepNullable, inputDeepNonNull.toString()));
+  }
+
+  @Test
+  public void testValidateSubsetSchemaForProjectionRecursesIntoArrayElements() {
+    // Recursion must descend through array element records too: the element record evolved via OH (a field added as
+    // [null, X] and an extra retained field), while the writer keeps the original non-nullable element record.
+    Schema writer = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"addresses\",\"type\":"
+            + "{\"type\":\"array\",\"items\":"
+            + "{\"type\":\"record\",\"name\":\"Address\",\"fields\":[{\"name\":\"city\",\"type\":\"string\"}]}}}]}");
+    Schema inputEvolvedElement = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"addresses\",\"type\":"
+            + "{\"type\":\"array\",\"items\":"
+            + "{\"type\":\"record\",\"name\":\"Address\",\"fields\":[{\"name\":\"city\",\"type\":\"string\"},"
+            + "{\"name\":\"zip\",\"type\":[\"null\",\"int\"],\"default\":null}]}}}]}");
+    Assert.assertTrue(
+        AvroSupersetSchemaUtils.validateSubsetValueSchemaForProjection(writer, inputEvolvedElement.toString()));
+  }
+
+  @Test
+  public void testValidateSubsetSchemaForProjectionRecursesIntoMapValues() {
+    // Recursion must descend through map value records too, mirroring the array case.
+    Schema writer = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"byId\",\"type\":" + "{\"type\":\"map\",\"values\":"
+            + "{\"type\":\"record\",\"name\":\"Address\",\"fields\":[{\"name\":\"city\",\"type\":\"string\"}]}}}]}");
+    Schema inputEvolvedValue = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"byId\",\"type\":" + "{\"type\":\"map\",\"values\":"
+            + "{\"type\":\"record\",\"name\":\"Address\",\"fields\":[{\"name\":\"city\",\"type\":\"string\"},"
+            + "{\"name\":\"zip\",\"type\":[\"null\",\"int\"],\"default\":null}]}}}]}");
+    Assert.assertTrue(
+        AvroSupersetSchemaUtils.validateSubsetValueSchemaForProjection(writer, inputEvolvedValue.toString()));
+  }
+
+  @Test
+  public void testValidateSubsetSchemaForProjectionRelaxesDeeplyNestedNullableAdd() {
+    // Mirror of the deeply-nested reverse-drift block on the ACCEPT side: a nullable-add two record levels down
+    // (R -> outer -> inner.leaf, input [null, X] vs writer X) must be accepted, proving the relaxation also holds at
+    // arbitrary depth.
+    Schema writer = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"outer\",\"type\":"
+            + "{\"type\":\"record\",\"name\":\"Outer\",\"fields\":[{\"name\":\"inner\",\"type\":"
+            + "{\"type\":\"record\",\"name\":\"Inner\",\"fields\":[{\"name\":\"leaf\",\"type\":\"string\"}]}}]}}]}");
+    Schema inputDeepNullable = AvroCompatibilityHelper.parse(
+        "{\"type\":\"record\",\"name\":\"R\",\"fields\":[{\"name\":\"outer\",\"type\":"
+            + "{\"type\":\"record\",\"name\":\"Outer\",\"fields\":[{\"name\":\"inner\",\"type\":"
+            + "{\"type\":\"record\",\"name\":\"Inner\",\"fields\":[{\"name\":\"leaf\",\"type\":[\"null\",\"string\"],\"default\":null}]}}]}}]}");
+    Assert.assertTrue(
+        AvroSupersetSchemaUtils.validateSubsetValueSchemaForProjection(writer, inputDeepNullable.toString()));
+  }
+
+  private static Map<String, String> toStringMap(Map<?, ?> map) {
+    Map<String, String> result = new HashMap<>();
+    map.forEach((k, v) -> result.put(k.toString(), v.toString()));
+    return result;
   }
 }

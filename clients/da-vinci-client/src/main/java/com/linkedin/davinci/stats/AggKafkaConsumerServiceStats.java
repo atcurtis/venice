@@ -1,5 +1,6 @@
 package com.linkedin.davinci.stats;
 
+import com.linkedin.davinci.kafka.consumer.ConsumerPoolType;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.meta.ReadOnlyStoreRepository;
 import com.linkedin.venice.stats.AbstractVeniceAggStoreStats;
@@ -22,13 +23,21 @@ public class AggKafkaConsumerServiceStats extends AbstractVeniceAggStoreStats<Ka
       MetricsRepository metricsRepository,
       ReadOnlyStoreRepository metadataRepository,
       LongSupplier getMaxElapsedTimeSinceLastPollInConsumerPool,
-      boolean isUnregisterMetricForDeletedStoreEnabled) {
+      boolean isUnregisterMetricForDeletedStoreEnabled,
+      String veniceClusterName,
+      String pubsubRegionAlias,
+      ConsumerPoolType poolType) {
     super(
         regionName,
         metricsRepository,
-        new KafkaConsumerServiceStatsSupplier(getMaxElapsedTimeSinceLastPollInConsumerPool),
+        new KafkaConsumerServiceStatsSupplier(
+            getMaxElapsedTimeSinceLastPollInConsumerPool,
+            veniceClusterName,
+            pubsubRegionAlias,
+            poolType),
         metadataRepository,
-        isUnregisterMetricForDeletedStoreEnabled);
+        isUnregisterMetricForDeletedStoreEnabled,
+        true);
   }
 
   public void recordTotalConsumerIdleTime(double idleTime) {
@@ -79,31 +88,38 @@ public class AggKafkaConsumerServiceStats extends AbstractVeniceAggStoreStats<Ka
     totalStats.recordAvgPartitionsPerConsumer(count);
   }
 
-  public void recordTotalOffsetLagIsAbsent() {
-    totalStats.recordOffsetLagIsAbsent();
+  public void recordTotalSubscribedPartitionsNum(int count) {
+    totalStats.recordSubscribedPartitionsNum(count);
   }
 
-  public void recordTotalOffsetLagIsPresent() {
-    totalStats.recordOffsetLagIsPresent();
-  }
-
-  public void recordTotalLatestOffsetIsAbsent() {
-    totalStats.recordLatestOffsetIsAbsent();
-  }
-
-  public void recordTotalLatestOffsetIsPresent() {
-    totalStats.recordLatestOffsetIsPresent();
+  /**
+   * Records a single per-consumer partition count to the OTel partition assignment histogram
+   * on the total stats instance. Called for each consumer in the pool from
+   * {@link com.linkedin.davinci.kafka.consumer.KafkaConsumerService#recordPartitionsPerConsumerSensor()}.
+   */
+  public void recordTotalPartitionAssignmentForOtel(int partitionCount) {
+    totalStats.recordPartitionAssignmentForOtel(partitionCount);
   }
 
   static class KafkaConsumerServiceStatsSupplier implements StatsSupplier<KafkaConsumerServiceStats> {
     private final LongSupplier getMaxElapsedTimeSinceLastPollInConsumerPool;
+    private final String veniceClusterName;
+    private final String pubsubRegionAlias;
+    private final ConsumerPoolType poolType;
 
-    KafkaConsumerServiceStatsSupplier(LongSupplier getMaxElapsedTimeSinceLastPollInConsumerPool) {
+    KafkaConsumerServiceStatsSupplier(
+        LongSupplier getMaxElapsedTimeSinceLastPollInConsumerPool,
+        String veniceClusterName,
+        String pubsubRegionAlias,
+        ConsumerPoolType poolType) {
       this.getMaxElapsedTimeSinceLastPollInConsumerPool = getMaxElapsedTimeSinceLastPollInConsumerPool;
+      this.veniceClusterName = veniceClusterName;
+      this.pubsubRegionAlias = pubsubRegionAlias;
+      this.poolType = poolType;
     }
 
     @Override
-    public KafkaConsumerServiceStats get(MetricsRepository metricsRepository, String storeName) {
+    public KafkaConsumerServiceStats get(MetricsRepository metricsRepository, String storeName, String clusterName) {
       throw new VeniceException("Should not be called.");
     }
 
@@ -111,13 +127,17 @@ public class AggKafkaConsumerServiceStats extends AbstractVeniceAggStoreStats<Ka
     public KafkaConsumerServiceStats get(
         MetricsRepository metricsRepository,
         String storeName,
+        String clusterName,
         KafkaConsumerServiceStats totalStats) {
       return new KafkaConsumerServiceStats(
           metricsRepository,
           storeName,
           getMaxElapsedTimeSinceLastPollInConsumerPool,
           totalStats,
-          SystemTime.INSTANCE);
+          SystemTime.INSTANCE,
+          veniceClusterName,
+          pubsubRegionAlias,
+          poolType);
     }
   }
 }

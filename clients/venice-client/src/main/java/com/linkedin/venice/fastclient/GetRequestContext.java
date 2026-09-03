@@ -1,19 +1,70 @@
 package com.linkedin.venice.fastclient;
 
-public class GetRequestContext extends RequestContext {
+import com.linkedin.venice.read.RequestType;
+
+
+public class GetRequestContext<K> extends RequestContext {
   int partitionId;
   /**
    * This field is used to store the request uri to the backend.
    */
   String requestUri;
-  RetryContext retryContext;
-  final boolean isTriggeredByBatchGet;
+  RetryContext retryContext; // initialize if needed for retry
 
-  GetRequestContext(boolean isTriggeredByBatchGet) {
+  byte[] serializedKey;
+  String route;
+  K key;
+
+  public GetRequestContext() {
     partitionId = -1;
     requestUri = null;
     retryContext = null;
-    this.isTriggeredByBatchGet = isTriggeredByBatchGet;
+  }
+
+  @Override
+  public RequestType getRequestType() {
+    return RequestType.SINGLE_GET;
+  }
+
+  public void setKey(K key) {
+    this.key = key;
+  }
+
+  public K getKey() {
+    return key;
+  }
+
+  public void setSerializedKey(byte[] serializedKey) {
+    this.serializedKey = serializedKey;
+  }
+
+  public int getPartitionId() {
+    return partitionId;
+  }
+
+  public void setPartitionId(int partitionId) {
+    this.partitionId = partitionId;
+  }
+
+  public byte[] getSerializedKey() {
+    return serializedKey;
+  }
+
+  public void setRoute(String route) {
+    this.route = route;
+  }
+
+  public GetRequestContext<K> createRetryRequestContext() {
+    GetRequestContext<K> retryRequestContext = new GetRequestContext<>();
+    retryRequestContext.partitionId = partitionId;
+    retryRequestContext.currentVersion = currentVersion;
+    retryRequestContext.key = key;
+    retryRequestContext.routeRequestMap = routeRequestMap;
+    retryRequestContext.serializedKey = serializedKey;
+    retryRequestContext.helixGroupId = this.helixGroupId;
+    retryRequestContext.retryRequest = true;
+
+    return retryRequestContext;
   }
 
   static class RetryContext {

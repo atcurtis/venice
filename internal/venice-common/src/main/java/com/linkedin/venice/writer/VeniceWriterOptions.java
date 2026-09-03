@@ -1,10 +1,13 @@
 package com.linkedin.venice.writer;
 
+import com.linkedin.venice.client.schema.StoreSchemaFetcher;
 import com.linkedin.venice.partitioner.DefaultVenicePartitioner;
 import com.linkedin.venice.partitioner.VenicePartitioner;
+import com.linkedin.venice.pubsub.api.PubSubMessageSerializer;
 import com.linkedin.venice.serialization.DefaultSerializer;
 import com.linkedin.venice.serialization.KafkaKeySerializer;
 import com.linkedin.venice.serialization.VeniceKafkaSerializer;
+import com.linkedin.venice.utils.LogContext;
 import com.linkedin.venice.utils.SystemTime;
 import com.linkedin.venice.utils.Time;
 import java.util.Objects;
@@ -17,17 +20,28 @@ import java.util.Objects;
  */
 public class VeniceWriterOptions {
   private final String topicName;
-  // TODO: Update to use generic serializers
-  private final VeniceKafkaSerializer keySerializer;
-  private final VeniceKafkaSerializer valueSerializer;
-  private final VeniceKafkaSerializer writeComputeSerializer;
+  private final VeniceKafkaSerializer keyPayloadSerializer;
+  private final VeniceKafkaSerializer valuePayloadSerializer;
+  private final VeniceKafkaSerializer writeComputePayloadSerializer;
+  private final PubSubMessageSerializer pubSubMessageSerializer;
   private final VenicePartitioner partitioner;
   private final Time time;
   private final Integer partitionCount;
   private final boolean chunkingEnabled;
   private final boolean rmdChunkingEnabled;
+  private final int maxRecordSizeBytes;
   // Set this field if you want to use different broker address than the local broker address
   private final String brokerAddress;
+  private final boolean producerCompressionEnabled;
+  private final int producerCount;
+  private final int producerThreadCount;
+  private final int producerQueueSize;
+  // Batching Venice Writer config
+  private final long batchIntervalInMs;
+  private final int maxBatchSizeInBytes;
+  private final StoreSchemaFetcher storeSchemaFetcher;
+  private final VeniceWriterHook writerHook;
+  private final LogContext logContext;
 
   public String getBrokerAddress() {
     return brokerAddress;
@@ -37,16 +51,16 @@ public class VeniceWriterOptions {
     return topicName;
   }
 
-  public VeniceKafkaSerializer getKeySerializer() {
-    return keySerializer;
+  public VeniceKafkaSerializer getKeyPayloadSerializer() {
+    return keyPayloadSerializer;
   }
 
-  public VeniceKafkaSerializer getValueSerializer() {
-    return valueSerializer;
+  public VeniceKafkaSerializer getValuePayloadSerializer() {
+    return valuePayloadSerializer;
   }
 
-  public VeniceKafkaSerializer getWriteComputeSerializer() {
-    return writeComputeSerializer;
+  public VeniceKafkaSerializer getWriteComputePayloadSerializer() {
+    return writeComputePayloadSerializer;
   }
 
   public VenicePartitioner getPartitioner() {
@@ -69,17 +83,72 @@ public class VeniceWriterOptions {
     return rmdChunkingEnabled;
   }
 
+  public int getMaxRecordSizeBytes() {
+    return maxRecordSizeBytes;
+  }
+
+  public boolean isProducerCompressionEnabled() {
+    return producerCompressionEnabled;
+  }
+
+  public int getProducerCount() {
+    return producerCount;
+  }
+
+  public int getProducerThreadCount() {
+    return producerThreadCount;
+  }
+
+  public int getProducerQueueSize() {
+    return producerQueueSize;
+  }
+
+  public long getBatchIntervalInMs() {
+    return batchIntervalInMs;
+  }
+
+  public int getMaxBatchSizeInBytes() {
+    return maxBatchSizeInBytes;
+  }
+
+  public StoreSchemaFetcher getStoreSchemaFetcher() {
+    return storeSchemaFetcher;
+  }
+
+  public VeniceWriterHook getWriterHook() {
+    return writerHook;
+  }
+
+  public LogContext getLogContext() {
+    return logContext;
+  }
+
+  PubSubMessageSerializer getPubSubMessageSerializer() {
+    return pubSubMessageSerializer;
+  }
+
   private VeniceWriterOptions(Builder builder) {
     topicName = builder.topicName;
-    keySerializer = builder.keySerializer;
-    valueSerializer = builder.valueSerializer;
-    writeComputeSerializer = builder.writeComputeSerializer;
+    keyPayloadSerializer = builder.keyPayloadSerializer;
+    valuePayloadSerializer = builder.valuePayloadSerializer;
+    writeComputePayloadSerializer = builder.writeComputePayloadSerializer;
     partitioner = builder.partitioner;
     time = builder.time;
     partitionCount = builder.partitionCount;
     chunkingEnabled = builder.chunkingEnabled;
     rmdChunkingEnabled = builder.rmdChunkingEnabled;
+    maxRecordSizeBytes = builder.maxRecordSizeBytes;
     brokerAddress = builder.brokerAddress;
+    producerCompressionEnabled = builder.producerCompressionEnabled;
+    producerCount = builder.producerCount;
+    producerThreadCount = builder.producerThreadCount;
+    producerQueueSize = builder.producerQueueSize;
+    pubSubMessageSerializer = builder.pubSubMessageSerializer;
+    batchIntervalInMs = builder.batchIntervalInMs;
+    maxBatchSizeInBytes = builder.maxBatchSizeInBytes;
+    storeSchemaFetcher = builder.storeSchemaFetcher;
+    writerHook = builder.writerHook;
+    logContext = builder.logContext;
   }
 
   @Override
@@ -95,31 +164,66 @@ public class VeniceWriterOptions {
         .append(", ")
         .append("partitionCount:")
         .append(partitionCount != null ? partitionCount : "-")
+        .append(", ")
+        .append("chunkingEnabled:")
+        .append(chunkingEnabled)
+        .append(", ")
+        .append("rmdChunkingEnabled:")
+        .append(rmdChunkingEnabled)
+        .append(", ")
+        .append("maxRecordSizeBytes:")
+        .append(maxRecordSizeBytes)
+        .append(", ")
+        .append("producerCompressionEnabled:")
+        .append(producerCompressionEnabled)
+        .append(", ")
+        .append("producerCount:")
+        .append(producerCount)
+        .append(", ")
+        .append("producerThreadCount:")
+        .append(producerThreadCount)
+        .append(", ")
+        .append("producerQueueSize:")
+        .append(producerQueueSize)
         .append("}")
         .toString();
   }
 
   public static class Builder {
     private final String topicName;
-    private VeniceKafkaSerializer keySerializer = null;
-    private VeniceKafkaSerializer valueSerializer = null;
-    private VeniceKafkaSerializer writeComputeSerializer = null;
+    private VeniceKafkaSerializer keyPayloadSerializer = null;
+    private VeniceKafkaSerializer valuePayloadSerializer = null;
+    private VeniceKafkaSerializer writeComputePayloadSerializer = null;
+    private PubSubMessageSerializer pubSubMessageSerializer = null;
     private VenicePartitioner partitioner = null;
     private Time time = null;
     private Integer partitionCount = null; // default null
     private boolean chunkingEnabled; // default false
     private boolean rmdChunkingEnabled; // default false
+    private int maxRecordSizeBytes = VeniceWriter.UNLIMITED_MAX_RECORD_SIZE; // default -1
     private String brokerAddress = null; // default null
+    private boolean producerCompressionEnabled = true;
+    private int producerCount = 1;
+    private int producerThreadCount = 1;
+    private int producerQueueSize = 5 * 1024 * 1024; // 5MB by default
+    private long batchIntervalInMs = 0; // Not enabled by default
+    private int maxBatchSizeInBytes = 5 * 1024 * 1024; // 5MB batch size by default
+    private StoreSchemaFetcher storeSchemaFetcher;
+    private VeniceWriterHook writerHook;
+    private LogContext logContext;
 
     private void addDefaults() {
-      if (keySerializer == null) {
-        keySerializer = new DefaultSerializer();
+      if (keyPayloadSerializer == null) {
+        keyPayloadSerializer = new DefaultSerializer();
       }
-      if (valueSerializer == null) {
-        valueSerializer = new DefaultSerializer();
+      if (valuePayloadSerializer == null) {
+        valuePayloadSerializer = new DefaultSerializer();
       }
-      if (writeComputeSerializer == null) {
-        writeComputeSerializer = new DefaultSerializer();
+      if (writeComputePayloadSerializer == null) {
+        writeComputePayloadSerializer = new DefaultSerializer();
+      }
+      if (pubSubMessageSerializer == null) {
+        pubSubMessageSerializer = PubSubMessageSerializer.DEFAULT_PUBSUB_SERIALIZER;
       }
       if (partitioner == null) {
         partitioner = new DefaultVenicePartitioner();
@@ -141,7 +245,7 @@ public class VeniceWriterOptions {
 
     public Builder setUseKafkaKeySerializer(boolean useKafkaKeySerializer) {
       if (useKafkaKeySerializer) {
-        this.keySerializer = new KafkaKeySerializer();
+        this.keyPayloadSerializer = new KafkaKeySerializer();
       }
       return this;
     }
@@ -160,18 +264,46 @@ public class VeniceWriterOptions {
       this.topicName = Objects.requireNonNull(topic, "Topic name cannot be null for VeniceWriterOptions");
     }
 
-    public Builder setKeySerializer(VeniceKafkaSerializer keySerializer) {
-      this.keySerializer = keySerializer;
+    /**
+     * Create a new {@link Builder} instance from an existing {@link VeniceWriterOptions} instance.
+     * Having a dummy topic here is to avoid ambiguous constructor match for compiler.
+     */
+    public Builder(String topic, VeniceWriterOptions options) {
+      this.topicName = Objects.requireNonNull(topic, "Topic name cannot be null for VeniceWriterOptions");
+      this.keyPayloadSerializer = options.keyPayloadSerializer;
+      this.valuePayloadSerializer = options.valuePayloadSerializer;
+      this.writeComputePayloadSerializer = options.writeComputePayloadSerializer;
+      this.partitioner = options.partitioner;
+      this.time = options.time;
+      this.partitionCount = options.partitionCount;
+      this.chunkingEnabled = options.chunkingEnabled;
+      this.rmdChunkingEnabled = options.rmdChunkingEnabled;
+      this.maxRecordSizeBytes = options.maxRecordSizeBytes;
+      this.brokerAddress = options.brokerAddress;
+      this.producerCompressionEnabled = options.producerCompressionEnabled;
+      this.producerCount = options.producerCount;
+      this.producerThreadCount = options.producerThreadCount;
+      this.producerQueueSize = options.producerQueueSize;
+      this.pubSubMessageSerializer = options.pubSubMessageSerializer;
+      this.batchIntervalInMs = options.batchIntervalInMs;
+      this.maxBatchSizeInBytes = options.maxBatchSizeInBytes;
+      this.storeSchemaFetcher = options.storeSchemaFetcher;
+      this.writerHook = options.writerHook;
+      this.logContext = options.logContext;
+    }
+
+    public Builder setKeyPayloadSerializer(VeniceKafkaSerializer keyPayloadSerializer) {
+      this.keyPayloadSerializer = keyPayloadSerializer;
       return this;
     }
 
-    public Builder setValueSerializer(VeniceKafkaSerializer valueSerializer) {
-      this.valueSerializer = valueSerializer;
+    public Builder setValuePayloadSerializer(VeniceKafkaSerializer valuePayloadSerializer) {
+      this.valuePayloadSerializer = valuePayloadSerializer;
       return this;
     }
 
-    public Builder setWriteComputeSerializer(VeniceKafkaSerializer writeComputeSerializer) {
-      this.writeComputeSerializer = writeComputeSerializer;
+    public Builder setWriteComputePayloadSerializer(VeniceKafkaSerializer writeComputePayloadSerializer) {
+      this.writeComputePayloadSerializer = writeComputePayloadSerializer;
       return this;
     }
 
@@ -187,6 +319,61 @@ public class VeniceWriterOptions {
 
     public Builder setPartitionCount(Integer partitionCount) {
       this.partitionCount = partitionCount;
+      return this;
+    }
+
+    public Builder setMaxRecordSizeBytes(int maxRecordSizeBytes) {
+      this.maxRecordSizeBytes = maxRecordSizeBytes;
+      return this;
+    }
+
+    public Builder setProducerCompressionEnabled(boolean producerCompressionEnabled) {
+      this.producerCompressionEnabled = producerCompressionEnabled;
+      return this;
+    }
+
+    public Builder setProducerCount(int producerCount) {
+      this.producerCount = producerCount;
+      return this;
+    }
+
+    public Builder setProducerThreadCount(int producerThreadCount) {
+      this.producerThreadCount = producerThreadCount;
+      return this;
+    }
+
+    public Builder setProducerQueueSize(int producerQueueSize) {
+      this.producerQueueSize = producerQueueSize;
+      return this;
+    }
+
+    public Builder setPubSubMessageSerializer(PubSubMessageSerializer pubSubMessageSerializer) {
+      this.pubSubMessageSerializer = pubSubMessageSerializer;
+      return this;
+    }
+
+    public Builder setBatchIntervalInMs(long batchIntervalInMs) {
+      this.batchIntervalInMs = batchIntervalInMs;
+      return this;
+    }
+
+    public Builder setMaxBatchSizeInBytes(int maxBatchSizeInBytes) {
+      this.maxBatchSizeInBytes = maxBatchSizeInBytes;
+      return this;
+    }
+
+    public Builder setStoreSchemaFetcher(StoreSchemaFetcher storeSchemaFetcher) {
+      this.storeSchemaFetcher = storeSchemaFetcher;
+      return this;
+    }
+
+    public Builder setWriterHook(VeniceWriterHook writerHook) {
+      this.writerHook = writerHook;
+      return this;
+    }
+
+    public Builder setLogContext(LogContext logContext) {
+      this.logContext = logContext;
       return this;
     }
   }

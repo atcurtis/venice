@@ -1,18 +1,29 @@
 package com.linkedin.davinci.helix;
 
+import com.linkedin.davinci.config.VeniceServerConfig;
 import com.linkedin.davinci.config.VeniceStoreVersionConfig;
 import com.linkedin.davinci.ingestion.IngestionBackend;
+import com.linkedin.davinci.kafka.consumer.PartitionReplicaIngestionContext;
 import com.linkedin.davinci.kafka.consumer.StoreIngestionService;
+import com.linkedin.davinci.kafka.consumer.StoreIngestionTask;
+import com.linkedin.davinci.stats.ParticipantStateTransitionStats;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.helix.HelixPartitionStatusAccessor;
 import com.linkedin.venice.helix.HelixState;
 import com.linkedin.venice.meta.ReadOnlyStoreRepository;
 import com.linkedin.venice.meta.Store;
+import com.linkedin.venice.meta.VeniceStoreType;
 import com.linkedin.venice.meta.Version;
+import com.linkedin.venice.meta.VersionStatus;
 import com.linkedin.venice.pushmonitor.ExecutionStatus;
 import com.linkedin.venice.pushmonitor.HybridStoreQuotaStatus;
+import com.linkedin.venice.utils.LogContext;
+import com.linkedin.venice.utils.RetryUtils;
 import com.linkedin.venice.utils.Timer;
 import com.linkedin.venice.utils.Utils;
+import java.time.Duration;
+import java.util.Collections;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
@@ -46,6 +57,15 @@ public abstract class AbstractPartitionStateModel extends StateModel {
   private static final int RETRY_COUNT = 5;
   private static final int RETRY_DURATION_MS = 1000;
   private static final int WAIT_PARTITION_ACCESSOR_TIME_OUT_MS = (int) TimeUnit.MINUTES.toMillis(5);
+  // The drop partition consumer action may take longer than expected and eventually timeout if:
+  // 1. The corresponding ingestion task is stuck and unable to process consumer actions.
+  // 2. The corresponding ingestion task died due to errors.
+  // We want to wait for drop partition because consumer actions are executed asynchronously w.r.t. Helix state
+  // transitions. Currently, we open a partition synchronously during OFFLINE->STANDBY. This can be problematic and have
+  // race conditions if we don't wait on the drop partition during X->DROPPED. This is because Helix can send the
+  // following state transitions right after each other for the same partition to the same node:
+  // X->DROPPED, OFFLINE->STANDBY
+  protected static final long WAIT_DROP_PARTITION_TIME_OUT_MS = TimeUnit.MINUTES.toMillis(60);
 
   private final IngestionBackend ingestionBackend;
   private final ReadOnlyStoreRepository storeRepository;
@@ -54,8 +74,11 @@ public abstract class AbstractPartitionStateModel extends StateModel {
   private final String storePartitionDescription;
   private final CompletableFuture<HelixPartitionStatusAccessor> partitionStatusAccessorFuture;
   private final String instanceName;
-
+  private final ParticipantStateTransitionStats stateTransitionStats;
   private HelixPartitionStatusAccessor partitionPushStatusAccessor;
+  private final String storeName;
+  private final int versionNumber;
+  private VeniceStoreType storeVersionType;
 
   public AbstractPartitionStateModel(
       IngestionBackend ingestionBackend,
@@ -63,7 +86,9 @@ public abstract class AbstractPartitionStateModel extends StateModel {
       VeniceStoreVersionConfig storeAndServerConfigs,
       int partition,
       CompletableFuture<HelixPartitionStatusAccessor> accessorFuture,
-      String instanceName) {
+      String instanceName,
+      ParticipantStateTransitionStats stateTransitionStats,
+      String resourceName) {
     this.ingestionBackend = ingestionBackend;
     this.storeRepository = storeRepository;
     this.storeAndServerConfigs = storeAndServerConfigs;
@@ -75,6 +100,15 @@ public abstract class AbstractPartitionStateModel extends StateModel {
      */
     this.partitionStatusAccessorFuture = accessorFuture;
     this.instanceName = instanceName;
+    this.stateTransitionStats = stateTransitionStats;
+
+    // Parse storeName and versionNumber from resourceName
+    try {
+      this.storeName = Version.parseStoreFromKafkaTopicName(resourceName);
+      this.versionNumber = Version.parseVersionFromKafkaTopicName(resourceName);
+    } catch (Exception e) {
+      throw new VeniceException("Failed to parse storeName and versionNumber from resourceName: " + resourceName, e);
+    }
   }
 
   protected void executeStateTransition(Message message, NotificationContext context, Runnable handler) {
@@ -88,42 +122,49 @@ public abstract class AbstractPartitionStateModel extends StateModel {
       boolean rollback) {
     String from = message.getFromState();
     String to = message.getToState();
-    logEntry(from, to, message, context, rollback);
     // Change name to indicate which st is occupied this thread.
+    String currentThreadName = Thread.currentThread().getName();
     Thread.currentThread().setName("Helix-ST-" + message.getResourceName() + "-" + partition + "-" + from + "->" + to);
+    logEntry(from, to, message, context, rollback);
     try {
-      handler.run();
+      LogContext.setLogContext(storeAndServerConfigs.getLogContext());
+      stateTransitionStats.trackStateTransitionStarted(from, to);
+      try {
+        handler.run();
+      } catch (Throwable t) {
+        stateTransitionStats.trackStateTransitionFailed(from, to);
+        throw t;
+      }
+      stateTransitionStats.trackStateTransitionCompleted(from, to);
       logCompletion(from, to, message, context, rollback);
     } finally {
       // Once st is terminated, change the name to indicate this thread will not be occupied by this st.
-      Thread.currentThread().setName("Inactive ST thread.");
+      Thread.currentThread().setName(currentThreadName);
     }
   }
 
   private void logEntry(String from, String to, Message message, NotificationContext context, boolean rollback) {
     logger.info(
-        "{} {} transition from {} to {} for resource: {}, partition: {} invoked with message {} and context {}",
+        "{} replica {} {} transition from {} to {}. Message {} and context: {}",
+        getReplicaTypeDescription(),
         getStorePartitionDescription(),
         rollback ? "rolling back" : "initiating",
         from,
         to,
-        getStoreAndServerConfigs().getStoreVersionName(),
-        partition,
         message,
-        context);
+        HelixTransitionTimingUtils.formatNotificationContext(context));
   }
 
   private void logCompletion(String from, String to, Message message, NotificationContext context, boolean rollback) {
     logger.info(
-        "{} {} transition from {} to {} for resource: {}, partition: {} invoked with message {} and context {}",
+        "{} replica {} {} transition from {} to {}. Message {}. LatencyBreakdown: {}",
+        getReplicaTypeDescription(),
         getStorePartitionDescription(),
         rollback ? "rolled back" : "completed",
         from,
         to,
-        getStoreAndServerConfigs().getStoreVersionName(),
-        partition,
         message,
-        context);
+        HelixTransitionTimingUtils.formatTransitionTiming(message, context));
   }
 
   /**
@@ -156,7 +197,8 @@ public abstract class AbstractPartitionStateModel extends StateModel {
   public void onBecomeDroppedFromError(Message message, NotificationContext context) {
     executeStateTransition(message, context, () -> {
       try {
-        removePartitionFromStoreGracefully();
+        CompletableFuture<Void> dropPartitionFuture = removePartitionFromStoreGracefully();
+        dropPartitionFuture.get(WAIT_DROP_PARTITION_TIME_OUT_MS, TimeUnit.MILLISECONDS);
       } catch (Exception e) {
         // Catch exception here to ensure state transition can complete ana avoid error->dropped->error->... loop
         logger.error("Encountered exception during the transition from ERROR to DROPPED.", e);
@@ -193,9 +235,44 @@ public abstract class AbstractPartitionStateModel extends StateModel {
   }
 
   /**
+   * Waits for the version metadata to become available in the store repository using exponential backoff.
+   * During OFFLINE->STANDBY transitions, version info may not have propagated from ZK yet.
+   * This must be called before the storage engine is created so that the correct partition type
+   * (with or without replication metadata) is used.
+   */
+  protected void waitForVersionToBeAvailable() {
+    String storeVersion = Version.composeKafkaTopic(storeName, versionNumber);
+    long waitTimeMs = storeAndServerConfigs.getStoreVersionMetadataWaitDuringStateTransitionTimeMs();
+    try {
+      RetryUtils.executeWithMaxAttemptAndExponentialBackoff(() -> {
+        Version version = storeRepository.getStoreOrThrow(storeName).getVersion(versionNumber);
+        if (version == null) {
+          throw new VeniceException(storeVersion + " not yet available in store repository");
+        }
+      },
+          Integer.MAX_VALUE,
+          Duration.ofMillis(10),
+          Duration.ofMillis(200),
+          Duration.ofMillis(waitTimeMs),
+          Collections.singletonList(VeniceException.class));
+    } catch (Exception e) {
+      String errorMsg = storeVersion + " did not become available in store repository within " + waitTimeMs + " ms.";
+      logger.error(errorMsg, e);
+      throw new VeniceException(errorMsg, e);
+    }
+  }
+
+  /**
    * set up a new store partition and start the ingestion
    */
   protected void setupNewStorePartition() {
+    /**
+     * Wait for version metadata to become available in the store repository before opening the
+     * storage engine. This ensures the correct partition type (with or without replication metadata)
+     * is determined based on version-level config rather than falling back to store-level config.
+     */
+    waitForVersionToBeAvailable();
+
     /**
      * Waiting for push accessor to get initialized before starting ingestion.
      * Otherwise, it's possible that store ingestion starts without having the
@@ -236,22 +313,24 @@ public abstract class AbstractPartitionStateModel extends StateModel {
       }
     };
     try (Timer t = Timer.run(setupTimeLogging)) {
-      ingestionBackend.startConsumption(storeAndServerConfigs, partition);
+      ingestionBackend.startConsumption(storeAndServerConfigs, partition, Optional.empty(), storePartitionDescription);
     }
   }
 
-  protected void removePartitionFromStoreGracefully() {
+  protected CompletableFuture<Void> removePartitionFromStoreGracefully() {
     // Gracefully drop partition to drain the requests to this partition
     // This method is called during OFFLINE->DROPPED state transition. Due to Zk or other transient issues a store
     // version could miss ONLINE->OFFLINE transition and newer version could come online triggering this transition.
     // Since this removes the storageEngine from the map not doing an un-subscribe and dropping a partition could
     // lead to NPE and other issues.
     // Adding a topic unsubscribe call for those race conditions as a safeguard before dropping the partition.
-    ingestionBackend.dropStoragePartitionGracefully(
+    CompletableFuture<Void> dropPartitionFuture = ingestionBackend.dropStoragePartitionGracefully(
         storeAndServerConfigs,
         partition,
-        getStoreAndServerConfigs().getStopConsumptionTimeoutInSeconds());
+        getStoreAndServerConfigs().getStopConsumptionTimeoutInSeconds(),
+        storePartitionDescription);
     removeCustomizedState();
+    return dropPartitionFuture;
   }
 
   /**
@@ -311,8 +390,7 @@ public abstract class AbstractPartitionStateModel extends StateModel {
       int bootstrapToOnlineTimeoutInHours;
       try {
         bootstrapToOnlineTimeoutInHours =
-            getStoreRepo().getStoreOrThrow(Version.parseStoreFromKafkaTopicName(resourceName))
-                .getBootstrapToOnlineTimeoutInHours();
+            getStoreRepo().getStoreOrThrow(storeName).getBootstrapToOnlineTimeoutInHours();
       } catch (Exception e) {
         logger.warn(
             "Failed to fetch bootstrapToOnlineTimeoutInHours from store config for resource {}, using the default value of {} hours instead",
@@ -330,6 +408,93 @@ public abstract class AbstractPartitionStateModel extends StateModel {
       logger.error(errorMsg, e);
       // Please note, after throwing this exception, this node will become ERROR for this resource.
       throw new VeniceException(errorMsg, e);
+    }
+  }
+
+  /**
+   * Best-effort wait, applicable to a future-version replica whose push is still in progress (i.e. the version's
+   * status is {@link VersionStatus#STARTED}), for the replica's local version topic lag to drop to or below an
+   * acceptable threshold before completing the OFFLINE -> STANDBY transition.
+   *
+   * Callers are expected to only invoke this method when
+   * {@link VeniceServerConfig#isFutureVersionStandbyLagCheckEnabled()} is true.
+   *
+   * Unlike {@link #waitConsumptionCompleted}, this does not wait for ingestion to fully complete: it only waits
+   * until the measured lag is within {@link VeniceServerConfig#getFutureVersionStandbyLagThreshold()}, or until
+   * {@link VeniceServerConfig#getFutureVersionStandbyLagCheckTimeoutMinutes()} elapses, whichever happens first.
+   * If lag cannot be measured, or the ingestion task is not found, this method returns immediately, preserving
+   * the pre-existing (no-wait) behavior for this case.
+   *
+   * The version's status is re-checked on every poll so that a version which transitions away from
+   * {@link VersionStatus#STARTED} while waiting (e.g. to {@link VersionStatus#KILLED} or
+   * {@link VersionStatus#ERROR} due to an asynchronous kill/cleanup racing with this transition) does not
+   * needlessly occupy the state-transition worker thread until the full timeout elapses.
+   */
+  protected void waitUntilFutureVersionLagAcceptable(String resourceName) {
+    VeniceServerConfig serverConfig = storeAndServerConfigs;
+    String replicaId = Utils.getReplicaId(resourceName, partition);
+    StoreIngestionTask ingestionTask = getStoreIngestionService().getStoreIngestionTask(resourceName);
+    if (ingestionTask == null) {
+      logger.warn(
+          "No ingestion task found for replica {} when checking future version standby lag, proceeding to STANDBY without waiting.",
+          replicaId);
+      return;
+    }
+    long lagThreshold = serverConfig.getFutureVersionStandbyLagThreshold();
+    long timeoutMs = TimeUnit.MINUTES.toMillis(serverConfig.getFutureVersionStandbyLagCheckTimeoutMinutes());
+    long pollIntervalMs = TimeUnit.MINUTES.toMillis(serverConfig.getFutureVersionStandbyLagCheckPollIntervalMinutes());
+    long deadlineMs = System.currentTimeMillis() + timeoutMs;
+    while (true) {
+      if (!isVersionStarted(resourceName)) {
+        logger.info(
+            "Future version replica {} is no longer in STARTED status, proceeding to STANDBY without further waiting.",
+            replicaId);
+        return;
+      }
+      long lag = ingestionTask.getLocalVersionTopicLag(partition);
+      if (lag == Long.MAX_VALUE) {
+        logger.warn(
+            "Could not measure local version topic lag for replica {}, proceeding to STANDBY without waiting.",
+            replicaId);
+        return;
+      }
+      if (lag <= lagThreshold) {
+        logger.info(
+            "Future version replica {} local version topic lag {} is within threshold {}, proceeding to STANDBY.",
+            replicaId,
+            lag,
+            lagThreshold);
+        return;
+      }
+      long remainingMs = deadlineMs - System.currentTimeMillis();
+      if (remainingMs <= 0) {
+        logger.warn(
+            "Future version replica {} local version topic lag {} still above threshold {} after {}min timeout, proceeding to STANDBY.",
+            replicaId,
+            lag,
+            lagThreshold,
+            serverConfig.getFutureVersionStandbyLagCheckTimeoutMinutes());
+        return;
+      }
+      Utils.sleep(Math.min(pollIntervalMs, remainingMs));
+    }
+  }
+
+  /**
+   * @return true if the version corresponding to {@code resourceName} currently has status
+   * {@link VersionStatus#STARTED}, false otherwise (including if the store/version can no longer be found).
+   */
+  private boolean isVersionStarted(String resourceName) {
+    try {
+      Store store = getStoreRepo().getStoreOrThrow(getStoreName());
+      Version version = store.getVersion(getVersionNumber());
+      return version != null && version.getStatus() == VersionStatus.STARTED;
+    } catch (VeniceException e) {
+      logger.warn(
+          "Could not determine version status for resource {} while checking future version lag.",
+          resourceName,
+          e);
+      return false;
     }
   }
 
@@ -352,7 +517,8 @@ public abstract class AbstractPartitionStateModel extends StateModel {
   }
 
   protected void stopConsumption(boolean dropCVState) {
-    CompletableFuture<Void> future = ingestionBackend.stopConsumption(storeAndServerConfigs, partition);
+    CompletableFuture<Void> future =
+        ingestionBackend.stopConsumption(storeAndServerConfigs, partition, storePartitionDescription);
     if (dropCVState) {
       future.whenComplete((ignored, throwable) -> {
         if (throwable != null) {
@@ -389,7 +555,91 @@ public abstract class AbstractPartitionStateModel extends StateModel {
     return partition;
   }
 
+  protected String getStoreName() {
+    return storeName;
+  }
+
+  protected int getVersionNumber() {
+    return versionNumber;
+  }
+
   public String getStorePartitionDescription() {
     return storePartitionDescription;
+  }
+
+  /**
+   * Returns a human-readable description of the replica type based on store type and version role.
+   * Examples: "SYSTEM store future version", "BATCH store current version", "HYBRID store", "HYBRID store backup version"
+   */
+  String getReplicaTypeDescription() {
+    VeniceStoreType type = getStoreVersionType();
+    String role = getStoreVersionRole();
+    if (role.isEmpty()) {
+      return type.name() + " store";
+    }
+    return type.name() + " store " + role.toLowerCase() + " version";
+  }
+
+  /**
+   * Returns the role of this store version (CURRENT, BACKUP, or FUTURE) as a string.
+   * This is a best-effort operation - during rollbacks or metadata inconsistencies,
+   * the reported role may be temporarily inaccurate (e.g., a backup version may briefly appear as FUTURE).
+   * @return the store version role name, or empty string if store metadata is unavailable
+   */
+  protected String getStoreVersionRole() {
+    try {
+      Store store = getStoreRepo().getStore(storeName);
+      if (store != null) {
+        return PartitionReplicaIngestionContext.determineStoreVersionRole(versionNumber, store.getCurrentVersion())
+            .name();
+      }
+    } catch (Exception e) {
+      // Ignore exception since this is best-effort and mainly for logging purpose
+    }
+    return "";
+  }
+
+  protected VeniceStoreType getStoreVersionType() {
+    if (storeVersionType == null) {
+      storeVersionType = determineStoreType();
+    }
+    return storeVersionType;
+  }
+
+  /**
+   * Infers the {@link VeniceStoreType} for the current store version.
+   *
+   * <p>This is a best-effort classification intended primarily for logging.
+   * Any parsing or lookup failures are ignored and the method returns
+   * {@link VeniceStoreType#BATCH} as the default, since BATCH is the most common/base case.
+   * Note that {@code BATCH} is a specific store type, not a generic fallback for unknown or error cases.</p>
+   *
+   * <ul>
+   *   <li>{@link VeniceStoreType#SYSTEM} if the store is a system store</li>
+   *   <li>{@link VeniceStoreType#HYBRID} if the referenced version is hybrid</li>
+   *   <li>{@link VeniceStoreType#BATCH} for all other cases or if the type cannot be determined</li>
+   * </ul>
+   */
+  private VeniceStoreType determineStoreType() {
+    try {
+      final String storeVersionName = storeAndServerConfigs.getStoreVersionName();
+      final String storeName = Version.parseStoreFromKafkaTopicName(storeVersionName);
+
+      final Store store = getStoreRepo().getStore(storeName);
+      if (store != null) {
+        if (store.isSystemStore()) {
+          return VeniceStoreType.SYSTEM;
+        }
+
+        final Version version = store.getVersion(versionNumber);
+        if (version != null && version.isHybrid()) {
+          return VeniceStoreType.HYBRID;
+        }
+      }
+    } catch (Exception e) {
+      // Swallow the exception since this is best-effort classification for logging.
+    }
+
+    return VeniceStoreType.BATCH;
   }
 }

@@ -1,62 +1,99 @@
 package com.linkedin.davinci.repository;
 
 import static com.linkedin.venice.ConfigKeys.CLIENT_SYSTEM_STORE_REPOSITORY_REFRESH_INTERVAL_SECONDS;
+import static com.linkedin.venice.ConfigKeys.CLIENT_USE_REQUEST_BASED_METADATA_REPOSITORY;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+import com.linkedin.davinci.stats.NativeMetadataRepositoryStats;
 import com.linkedin.venice.client.store.ClientConfig;
-import com.linkedin.venice.client.store.schemas.TestKeyRecord;
-import com.linkedin.venice.client.store.schemas.TestValueRecord;
 import com.linkedin.venice.exceptions.VeniceNoStoreException;
 import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.StoreConfig;
 import com.linkedin.venice.schema.SchemaData;
-import com.linkedin.venice.system.store.MetaStoreDataType;
-import com.linkedin.venice.systemstore.schemas.StoreKeySchemas;
-import com.linkedin.venice.systemstore.schemas.StoreMetaKey;
-import com.linkedin.venice.systemstore.schemas.StoreMetaValue;
-import com.linkedin.venice.systemstore.schemas.StoreValueSchema;
-import com.linkedin.venice.systemstore.schemas.StoreValueSchemas;
+import com.linkedin.venice.schema.SchemaEntry;
 import com.linkedin.venice.utils.VeniceProperties;
-import java.util.HashMap;
-import java.util.Map;
+import io.tehuti.metrics.MetricConfig;
+import io.tehuti.metrics.MetricsRepository;
+import io.tehuti.metrics.stats.AsyncGauge;
+import java.time.Clock;
 import org.testng.Assert;
-import org.testng.annotations.BeforeClass;
+import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
 
 public class NativeMetadataRepositoryTest {
   private ClientConfig clientConfig;
-  private VeniceProperties backendConfig;
 
+  private VeniceProperties backendConfigThinClient;
+  private VeniceProperties backendConfigRequestBased;
+
+  private AsyncGauge.AsyncGaugeExecutor gaugeExecutor;
+  private MetricsRepository metricsRepository;
+  private Clock clock;
   private static final String STORE_NAME = "hardware_store";
 
-  @BeforeClass
+  @BeforeMethod
   public void setUpMocks() {
     clientConfig = mock(ClientConfig.class);
-    backendConfig = mock(VeniceProperties.class);
-    doReturn(1L).when(backendConfig).getLong(eq(CLIENT_SYSTEM_STORE_REPOSITORY_REFRESH_INTERVAL_SECONDS), anyLong());
+
+    backendConfigThinClient = mock(VeniceProperties.class);
+    doReturn(1L).when(backendConfigThinClient)
+        .getLong(eq(CLIENT_SYSTEM_STORE_REPOSITORY_REFRESH_INTERVAL_SECONDS), anyLong());
+
+    backendConfigRequestBased = mock(VeniceProperties.class);
+    doReturn(1L).when(backendConfigRequestBased)
+        .getLong(eq(CLIENT_SYSTEM_STORE_REPOSITORY_REFRESH_INTERVAL_SECONDS), anyLong());
+    doReturn(true).when(backendConfigRequestBased)
+        .getBoolean(eq(CLIENT_USE_REQUEST_BASED_METADATA_REPOSITORY), anyBoolean());
+
+    // Use a dedicated executor to avoid contention with the shared DEFAULT_ASYNC_GAUGE_EXECUTOR in CI
+    gaugeExecutor = new AsyncGauge.AsyncGaugeExecutor.Builder().build();
+    metricsRepository = new MetricsRepository(new MetricConfig(gaugeExecutor));
+    doReturn(metricsRepository).when(clientConfig).getMetricsRepository();
+    clock = mock(Clock.class);
+    doReturn(0L).when(clock).millis();
+  }
+
+  @org.testng.annotations.AfterMethod
+  public void tearDown() throws Exception {
+    metricsRepository.close();
+    gaugeExecutor.close();
   }
 
   @Test
-  public void testGetInstance() {
+  public void testGetThinClientInstance() {
     NativeMetadataRepository nativeMetadataRepository =
-        NativeMetadataRepository.getInstance(clientConfig, backendConfig);
+        NativeMetadataRepository.getInstance(clientConfig, backendConfigThinClient);
     Assert.assertTrue(nativeMetadataRepository instanceof ThinClientMetaStoreBasedRepository);
 
     Assert.assertThrows(() -> nativeMetadataRepository.subscribe(STORE_NAME));
     nativeMetadataRepository.start();
     nativeMetadataRepository.clear();
     Assert.assertThrows(() -> nativeMetadataRepository.subscribe(STORE_NAME));
-    Assert.assertThrows(() -> nativeMetadataRepository.start());
+    Assert.assertThrows(nativeMetadataRepository::start);
+  }
+
+  @Test
+  public void testGetRequestBasedInstance() {
+    NativeMetadataRepository nativeMetadataRepository =
+        NativeMetadataRepository.getInstance(clientConfig, backendConfigRequestBased);
+    Assert.assertTrue(nativeMetadataRepository instanceof RequestBasedMetaRepository);
+
+    Assert.assertThrows(() -> nativeMetadataRepository.subscribe(STORE_NAME));
+    nativeMetadataRepository.start();
+    nativeMetadataRepository.clear();
+    Assert.assertThrows(() -> nativeMetadataRepository.subscribe(STORE_NAME));
+    Assert.assertThrows(nativeMetadataRepository::start);
   }
 
   @Test
   public void testGetSchemaDataFromReadThroughCache() throws InterruptedException {
-    TestNMR nmr = new TestNMR(clientConfig, backendConfig);
+    TestNMR nmr = new TestNMR(clientConfig, backendConfigThinClient, clock);
     nmr.start();
     Assert.assertThrows(VeniceNoStoreException.class, () -> nmr.getKeySchema(STORE_NAME));
     nmr.subscribe(STORE_NAME);
@@ -65,9 +102,9 @@ public class NativeMetadataRepositoryTest {
 
   @Test
   public void testGetSchemaDataEfficiently() throws InterruptedException {
-    doReturn(Long.MAX_VALUE).when(backendConfig)
+    doReturn(Long.MAX_VALUE).when(backendConfigThinClient)
         .getLong(eq(CLIENT_SYSTEM_STORE_REPOSITORY_REFRESH_INTERVAL_SECONDS), anyLong());
-    TestNMR nmr = new TestNMR(clientConfig, backendConfig);
+    TestNMR nmr = new TestNMR(clientConfig, backendConfigThinClient, clock);
     nmr.start();
     Assert.assertEquals(nmr.keySchemaRequestCount, 0);
     Assert.assertEquals(nmr.valueSchemasRequestCount, 0);
@@ -85,16 +122,57 @@ public class NativeMetadataRepositoryTest {
     Assert.assertEquals(nmr.specificValueSchemaRequestCount, 1);
     Assert.assertNotNull(nmr.getKeySchema(STORE_NAME));
     Assert.assertNotNull(nmr.getValueSchema(STORE_NAME, 1));
-    // Refresh the store a few more times to retrieve value schema v2
     for (int i = 0; i < 10; i++) {
       nmr.refreshOneStore(STORE_NAME);
     }
     Assert.assertEquals(nmr.keySchemaRequestCount, 1);
     Assert.assertEquals(nmr.valueSchemasRequestCount, 12);
-    Assert.assertEquals(nmr.specificValueSchemaRequestCount, 2);
+    Assert.assertEquals(nmr.specificValueSchemaRequestCount, 1);
     Assert.assertNotNull(nmr.getKeySchema(STORE_NAME));
     Assert.assertNotNull(nmr.getValueSchema(STORE_NAME, 1));
     Assert.assertNotNull(nmr.getValueSchema(STORE_NAME, 2));
+  }
+
+  /**
+   * The background scheduler in {@link NativeMetadataRepository#start()} fires with initialDelay=0,
+   * so its {@code refresh()} call can race with the test thread and silently update cache timestamps.
+   * {@link TestNMR} overrides {@code refresh()} with a guard flag so that only explicit test-driven
+   * calls go through, eliminating the race that previously caused flaky "expected 2000 but found 1000"
+   * failures.
+   */
+  @Test
+  public void testNativeMetadataRepositoryStats() throws InterruptedException {
+    doReturn(Long.MAX_VALUE).when(backendConfigThinClient)
+        .getLong(eq(CLIENT_SYSTEM_STORE_REPOSITORY_REFRESH_INTERVAL_SECONDS), anyLong());
+    TestNMR nmr = new TestNMR(clientConfig, backendConfigThinClient, clock);
+    nmr.start();
+    nmr.subscribe(STORE_NAME);
+    doReturn(1000L).when(clock).millis();
+
+    NativeMetadataRepositoryStats nativeMetadataRepository = nmr.getNativeMetadataRepositoryStats();
+    Assert.assertNotNull(nativeMetadataRepository);
+    Assert.assertEquals(nativeMetadataRepository.getMetadataStalenessHighWatermarkMs(), 1000d);
+
+    String anotherStoreName = STORE_NAME + "V2";
+    nmr.subscribe(anotherStoreName);
+    nmr.refreshOneStore(anotherStoreName);
+    // After one store refresh we should still see staleness increase because it reports the max amongst all stores
+    doReturn(2000L).when(clock).millis();
+    Assert.assertEquals(nmr.getNativeMetadataRepositoryStats().getMetadataStalenessHighWatermarkMs(), 2000d);
+
+    // Refresh both stores and staleness should decrease
+    nmr.setBackgroundRefreshEnabled(true);
+    nmr.refresh();
+    nmr.setBackgroundRefreshEnabled(false);
+    Assert.assertEquals(nmr.getNativeMetadataRepositoryStats().getMetadataStalenessHighWatermarkMs(), 0d);
+
+    // Stop the scheduler to prevent any in-flight refresh() from re-adding cache timestamps
+    // after we unsubscribe. Without this, a scheduler thread that passed the guard check before
+    // backgroundRefreshEnabled was set to false can still call updateCacheTimestamp().
+    nmr.clear();
+    nmr.unsubscribe(STORE_NAME);
+    nmr.unsubscribe(anotherStoreName);
+    Assert.assertEquals(nmr.getNativeMetadataRepositoryStats().getMetadataStalenessHighWatermarkMs(), Double.NaN);
   }
 
   static class TestNMR extends NativeMetadataRepository {
@@ -102,58 +180,72 @@ public class NativeMetadataRepositoryTest {
     int valueSchemasRequestCount = 0;
     int specificValueSchemaRequestCount = 0;
 
-    protected TestNMR(ClientConfig clientConfig, VeniceProperties backendConfig) {
-      super(clientConfig, backendConfig);
+    /**
+     * Guard that prevents the background scheduler's periodic {@link #refresh()} from interfering
+     * with test assertions.  The scheduler is started with initialDelay=0, so its first invocation
+     * can race with the test thread and silently update cache timestamps, causing flaky assertions.
+     * Tests must set this to {@code true} before calling {@link #refresh()} explicitly.
+     */
+    private volatile boolean backgroundRefreshEnabled = false;
+
+    private static final String INT_KEY_SCHEMA = "\"int\"";
+
+    private static final String VALUE_SCHEMA_1 = "{\n" + "  \"type\": \"record\",\n" + "  \"name\": \"TestValue\",\n"
+        + "  \"fields\": [\n" + "   {\"name\": \"test_field1\", \"type\": \"string\"}\n" + "  ]\n" + "}";
+    private static final String VALUE_SCHEMA_2 = "{\n" + "  \"type\": \"record\",\n" + "  \"name\": \"TestValue\",\n"
+        + "  \"fields\": [\n" + "   {\"name\": \"test_field1\", \"type\": \"string\"},\n"
+        + "   {\"name\": \"test_field2\", \"type\": \"int\", \"default\": 0}\n" + "  ]\n" + "}";
+
+    protected TestNMR(ClientConfig clientConfig, VeniceProperties backendConfig, Clock clock) {
+      super(clientConfig, backendConfig, clock);
+    }
+
+    void setBackgroundRefreshEnabled(boolean enabled) {
+      this.backgroundRefreshEnabled = enabled;
     }
 
     @Override
-    protected StoreConfig getStoreConfigFromSystemStore(String storeName) {
+    public void refresh() {
+      if (backgroundRefreshEnabled) {
+        super.refresh();
+      }
+    }
+
+    @Override
+    protected StoreConfig fetchStoreConfigFromRemote(String storeName) {
       StoreConfig storeConfig = mock(StoreConfig.class);
       when(storeConfig.isDeleting()).thenReturn(false);
       return storeConfig;
     }
 
     @Override
-    protected Store getStoreFromSystemStore(String storeName, String clusterName) {
+    protected Store fetchStoreFromRemote(String storeName, String clusterName) {
       Store store = mock(Store.class);
-      when(store.getName()).thenReturn(STORE_NAME);
+      when(store.getName()).thenReturn(storeName);
       when(store.getReadQuotaInCU()).thenReturn(1L);
       return store;
     }
 
     @Override
-    protected StoreMetaValue getStoreMetaValue(String storeName, StoreMetaKey key) {
-      StoreMetaValue storeMetaValue = new StoreMetaValue();
-      MetaStoreDataType metaStoreDataType = MetaStoreDataType.valueOf(key.metadataType);
-      switch (metaStoreDataType) {
-        case STORE_KEY_SCHEMAS:
-          Map<CharSequence, CharSequence> keySchemaMap = new HashMap<>();
-          keySchemaMap.put(String.valueOf(1), TestKeyRecord.SCHEMA$.toString());
-          storeMetaValue.storeKeySchemas = new StoreKeySchemas(keySchemaMap);
-          keySchemaRequestCount++;
-          break;
-        case STORE_VALUE_SCHEMAS:
-          Map<CharSequence, CharSequence> valueSchemaMap = new HashMap<>();
-          valueSchemaMap.put(String.valueOf(1), "");
-          if (valueSchemasRequestCount > 1) {
-            valueSchemaMap.put(String.valueOf(2), "");
-          }
-          storeMetaValue.storeValueSchemas = new StoreValueSchemas(valueSchemaMap);
-          valueSchemasRequestCount++;
-          break;
-        case STORE_VALUE_SCHEMA:
-          storeMetaValue.storeValueSchema = new StoreValueSchema(TestValueRecord.SCHEMA$.toString());
-          specificValueSchemaRequestCount++;
-          break;
-        default:
-          // do nothing
+    protected SchemaData getSchemaData(String storeName) {
+      if (schemaMap.containsKey(storeName)) {
+        valueSchemasRequestCount++;
+        return schemaMap.get(storeName);
       }
-      return storeMetaValue;
-    }
 
-    @Override
-    protected SchemaData getSchemaDataFromSystemStore(String storeName) {
-      return getSchemaDataFromMetaSystemStore(storeName);
+      // Mock schemas for testing
+      SchemaEntry schemaEntry = new SchemaEntry(0, INT_KEY_SCHEMA);
+      SchemaData schemaData = new SchemaData(storeName, schemaEntry);
+      schemaData.addValueSchema(new SchemaEntry(1, VALUE_SCHEMA_1));
+      schemaData.addValueSchema(new SchemaEntry(2, VALUE_SCHEMA_2));
+
+      // Mock metrics
+      keySchemaRequestCount++;
+      valueSchemasRequestCount++;
+      specificValueSchemaRequestCount++;
+
+      schemaMap.put(storeName, schemaData);
+      return schemaData;
     }
   }
 }

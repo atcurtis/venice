@@ -1,61 +1,194 @@
 package com.linkedin.venice.listener;
 
+import com.linkedin.venice.authorization.IdentityParser;
 import com.linkedin.venice.stats.ServerConnectionStats;
-import com.linkedin.venice.utils.SslUtils;
+import com.linkedin.venice.stats.dimensions.VeniceConnectionSource;
+import com.linkedin.venice.utils.DaemonThreadFactory;
+import com.linkedin.venice.utils.LatencyUtils;
+import com.linkedin.venice.utils.LogContext;
+import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.handler.ssl.SslHandler;
+import io.netty.handler.ssl.SslHandshakeCompletionEvent;
+import io.netty.util.Attribute;
+import io.netty.util.AttributeKey;
+import java.security.cert.Certificate;
 import java.security.cert.X509Certificate;
-import javax.net.ssl.SSLPeerUnverifiedException;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.ConcurrentSkipListSet;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import javax.net.ssl.SSLSession;
+import javax.security.auth.x500.X500Principal;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 
+@ChannelHandler.Sharable
 public class ServerConnectionStatsHandler extends ChannelInboundHandlerAdapter {
+  private static final Logger LOGGER = LogManager.getLogger(ServerConnectionStatsHandler.class);
+  public static final AttributeKey<Boolean> CHANNEL_ACTIVATED = AttributeKey.valueOf("channelActivated");
+  public static final AttributeKey<Long> CHANNEL_INIT_START_TS = AttributeKey.valueOf("channelInitStartTs");
+
+  /**
+   * Stores the SSL handshake setup latency (ms) computed on the Netty event loop at handshake
+   * completion. The value is consumed by the background {@link #connectionScanner} when the
+   * connection source (router vs client) is identified, so the latency can be recorded with
+   * the correct {@code CONNECTION_SOURCE} dimension. This avoids blocking the event loop with
+   * certificate parsing while still providing per-source latency breakdowns.
+   */
+  static final AttributeKey<Double> SETUP_LATENCY_MS = AttributeKey.valueOf("setupLatencyMs");
+  private final IdentityParser identityParser;
   private final ServerConnectionStats serverConnectionStats;
   private final String routerPrincipalName;
 
-  public ServerConnectionStatsHandler(ServerConnectionStats serverConnectionStats, String routerPrincipalName) {
+  private final Set<ChannelHandlerContext> newConnections =
+      new ConcurrentSkipListSet<>(Comparator.comparingInt(Object::hashCode));
+  private final Set<ChannelHandlerContext> trackedConnections =
+      new ConcurrentSkipListSet<>(Comparator.comparingInt(Object::hashCode));
+
+  private final ScheduledExecutorService connectionScanner;
+
+  public ServerConnectionStatsHandler(
+      IdentityParser identityParser,
+      ServerConnectionStats serverConnectionStats,
+      String routerPrincipalName,
+      LogContext logContext) {
+    this.identityParser = identityParser;
     this.serverConnectionStats = serverConnectionStats;
     this.routerPrincipalName = routerPrincipalName;
+    this.connectionScanner = Executors
+        .newSingleThreadScheduledExecutor(new DaemonThreadFactory("ServerConnectionStatsHandler-Scanner", logContext));
+
+    connectionScanner.scheduleAtFixedRate(() -> {
+      try {
+        if (newConnections.isEmpty()) {
+          return;
+        }
+        Set<ChannelHandlerContext> newConnectionsCopy = new HashSet<>(newConnections);
+        for (ChannelHandlerContext ctx: newConnectionsCopy) {
+          SslHandler sslHandler = extractSslHandler(ctx);
+          if (sslHandler == null) {
+            /**
+             * ssl handler is not available yet, which means the ssl handshake is still in progress, so
+             * we will track it in next iteration.
+             */
+            continue;
+          }
+          String principalName = getPrincipal(sslHandler);
+          if (principalName == null) {
+            /**
+             * principal name is not available yet, which means the ssl handshake is still in progress, so
+             * we will track it in next iteration.
+             */
+            continue;
+          }
+          VeniceConnectionSource source;
+          if (principalName.contains(routerPrincipalName)) {
+            serverConnectionStats.incrementRouterConnectionCount();
+            source = VeniceConnectionSource.ROUTER;
+          } else {
+            serverConnectionStats.incrementClientConnectionCount();
+            source = VeniceConnectionSource.CLIENT;
+          }
+          // Record setup latency (both Tehuti + OTel) with connection source — latency was
+          // computed on the event loop at handshake completion and stored in a channel attribute.
+          Double latencyMs = ctx.channel().attr(SETUP_LATENCY_MS).getAndSet(null);
+          if (latencyMs != null) {
+            serverConnectionStats.recordNewConnectionSetupLatency(latencyMs, source);
+          }
+          trackedConnections.add(ctx);
+          newConnections.remove(ctx);
+          Attribute<Boolean> activated = ctx.channel().attr(CHANNEL_ACTIVATED);
+          activated.set(true);
+        }
+      } catch (Exception e) {
+        LOGGER.error("Got exception when scanning new connections", e);
+      }
+    }, 0, 1, java.util.concurrent.TimeUnit.SECONDS);
   }
 
   @Override
-  public void channelRegistered(ChannelHandlerContext ctx) throws Exception {
-    SslHandler sslHandler = extractSslHandler(ctx);
-    if (sslHandler == null) {
-      // No ssl enabled, record all connections as client connections
-      serverConnectionStats.incrementClientConnectionCount();
-      return;
+  public void channelActive(ChannelHandlerContext ctx) throws Exception {
+    newConnections.add(ctx);
+    /**
+     * The reason to record connection request here is that we want to record all the connection requests,
+     * regardless of whether Server is able to extract a valid cert or not later on.
+     */
+    serverConnectionStats.newConnectionRequest();
+    super.channelActive(ctx);
+  }
+
+  /**
+   * On SSL handshake completion, compute the setup latency and store it in a channel attribute.
+   * The latency is recorded (both Tehuti and OTel) from the {@link #connectionScanner} after the
+   * connection source is identified — same place as connection count metrics. This avoids blocking
+   * the Netty event loop with certificate parsing while providing per-source latency breakdowns.
+   */
+  @Override
+  public void userEventTriggered(ChannelHandlerContext ctx, Object evt) throws Exception {
+    if (evt instanceof SslHandshakeCompletionEvent && ((SslHandshakeCompletionEvent) evt).isSuccess()) {
+      Long initStartTs = ctx.channel().attr(CHANNEL_INIT_START_TS).getAndSet(null);
+      if (initStartTs != null) {
+        ctx.channel().attr(SETUP_LATENCY_MS).set(LatencyUtils.getElapsedTimeFromNSToMS(initStartTs));
+      }
     }
-    String principalName = getPrincipal(sslHandler);
-    if (principalName.equals(routerPrincipalName)) {
-      serverConnectionStats.incrementRouterConnectionCount();
-    } else {
-      serverConnectionStats.incrementClientConnectionCount();
-    }
+    super.userEventTriggered(ctx, evt);
   }
 
   @Override
-  public void channelUnregistered(ChannelHandlerContext ctx) throws Exception {
-    SslHandler sslHandler = extractSslHandler(ctx);
-    if (sslHandler == null) {
-      // No ssl enabled, record all connections as client connections
-      serverConnectionStats.decrementClientConnectionCount();
-      return;
+  public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+    Attribute<Boolean> activated = ctx.channel().attr(CHANNEL_ACTIVATED);
+    if (activated.get() != null && activated.get()) {
+      activated.set(false);
+      SslHandler sslHandler = extractSslHandler(ctx);
+      if (sslHandler == null) {
+        LOGGER.error("Failed to extract ssl handler in function: channelInactive");
+      } else {
+        String principalName = getPrincipal(sslHandler);
+        if (principalName == null) {
+          LOGGER.error("Failed to extract principal name from ssl handler in function: channelInactive");
+        } else if (principalName.contains(routerPrincipalName)) {
+          serverConnectionStats.decrementRouterConnectionCount();
+        } else {
+          serverConnectionStats.decrementClientConnectionCount();
+        }
+      }
     }
-    String principalName = getPrincipal(sslHandler);
-    if (principalName.equals(routerPrincipalName)) {
-      serverConnectionStats.decrementRouterConnectionCount();
-    } else {
-      serverConnectionStats.decrementClientConnectionCount();
-    }
+
+    newConnections.remove(ctx);
+    trackedConnections.remove(ctx);
+    super.channelInactive(ctx);
   }
 
   protected SslHandler extractSslHandler(ChannelHandlerContext ctx) {
     return ServerHandlerUtils.extractSslHandler(ctx);
   }
 
-  private String getPrincipal(SslHandler sslHandler) throws SSLPeerUnverifiedException {
-    X509Certificate clientCert = SslUtils.getX509Certificate(sslHandler.engine().getSession().getPeerCertificates()[0]);
-    return clientCert.getSubjectX500Principal().getName();
+  private String getPrincipal(SslHandler sslHandler) {
+    try {
+      SSLSession session = sslHandler.engine().getSession();
+      String remoteCN = null;
+      for (Certificate cert: session.getPeerCertificates()) {
+        if (cert instanceof X509Certificate) {
+          if (identityParser != null) {
+            remoteCN = identityParser.parseIdentityFromCert((X509Certificate) cert);
+            break;
+          } else {
+            X500Principal cn = ((X509Certificate) cert).getSubjectX500Principal();
+            if (cn != null) {
+              remoteCN = cn.getName();
+              break;
+            }
+          }
+        }
+      }
+      return remoteCN;
+    } catch (Exception e) {
+      return null;
+    }
   }
 }

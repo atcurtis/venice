@@ -25,6 +25,8 @@ import java.time.Duration;
 import java.util.Collections;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 
 /**
@@ -35,6 +37,7 @@ import java.util.concurrent.ExecutionException;
  * @see VeniceProducer
  */
 public class OnlineVeniceProducer<K, V> extends AbstractVeniceProducer<K, V> {
+  private static final Logger LOGGER = LogManager.getLogger(OnlineVeniceProducer.class);
   private static final ObjectMapper OBJECT_MAPPER = ObjectMapperFactory.getInstance();
 
   private final String storeName;
@@ -48,6 +51,7 @@ public class OnlineVeniceProducer<K, V> extends AbstractVeniceProducer<K, V> {
       VeniceProperties producerConfigs,
       MetricsRepository metricsRepository,
       ICProvider icProvider) {
+    LOGGER.info("Creating venice online producer for: {}", storeClientConfig.getStoreName());
     this.storeName = storeClientConfig.getStoreName();
     this.icProvider = icProvider;
 
@@ -57,6 +61,10 @@ public class OnlineVeniceProducer<K, V> extends AbstractVeniceProducer<K, V> {
           Duration.ofSeconds(producerConfigs.getLong(CLIENT_PRODUCER_SCHEMA_REFRESH_INTERVAL_SECONDS));
     } else {
       schemaRefreshPeriod = storeClientConfig.getSchemaRefreshPeriod();
+      if (schemaRefreshPeriod.isZero()) {
+        // Default to refreshing every 5 minutes so a long-lived producer picks up newly registered schemas.
+        schemaRefreshPeriod = Duration.ofMinutes(5);
+      }
     }
 
     ClientConfig clientConfigForSchemaReader = ClientConfig.cloneConfig(storeClientConfig)
@@ -99,6 +107,10 @@ public class OnlineVeniceProducer<K, V> extends AbstractVeniceProducer<K, V> {
         throw new VeniceException(e);
       }
     }
+    LOGGER.info(
+        "Created venice online producer for: {}{}",
+        storeName,
+        needsPartitionRouting ? " with partition routing" : "");
   }
 
   @Override

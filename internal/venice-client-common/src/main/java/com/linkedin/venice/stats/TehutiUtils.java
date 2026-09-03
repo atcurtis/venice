@@ -18,12 +18,9 @@ public class TehutiUtils {
   private static final int DEFAULT_HISTOGRAM_SIZE_IN_BYTES = 40000;
   private static final double DEFAULT_HISTOGRAM_MAX_VALUE = 10000;
   private static final double[] DEFAULT_HISTOGRAM_PERCENTILES = new double[] { 50, 95, 99 };
+  private static final double[] P99_HISTOGRAM_PERCENTILES = new double[] { 99 };
 
-  // a fine grained percentiles. Please use it with cautions as it will emit more 20
-  // metrics. It's likely to degrade critical path performance
-  private static final double[] FINE_GRAINED_HISTOGRAM_PERCENTILES =
-      new double[] { 0.01, 0.1, 1, 2, 3, 4, 5, 10, 20, 30, 40, 50, 60, 70, 80, 90, 95, 99, 99.9 };
-  private static final double[] HISTOGRAM_PERCENTILES_FOR_NETWORK_LATENCY = new double[] { 50, 77, 90, 95, 99, 99.9 };
+  private static final double[] HISTOGRAM_PERCENTILES_FOR_NETWORK_LATENCY = new double[] { 50, 95, 99, 99.9 };
   private static final String ROUND_NUMBER_SUFFIX = ".0";
 
   /**
@@ -40,16 +37,13 @@ public class TehutiUtils {
         new Avg(), new Max() };
   }
 
-  public static MeasurableStat[] getFineGrainedPercentileStatWithAvgAndMax(String sensorName, String storeName) {
+  public static MeasurableStat[] get99PercentileStatWithAvgAndMax(String sensorName, String storeName) {
     String name = sensorName + AbstractVeniceStats.DELIMITER + storeName;
-    return new MeasurableStat[] {
-        getFineGrainedPercentileStat(name, DEFAULT_HISTOGRAM_SIZE_IN_BYTES, DEFAULT_HISTOGRAM_MAX_VALUE), new Avg(),
-        new Max() };
-  }
-
-  public static Percentiles getFineGrainedPercentileStat(String sensorName, String storeName) {
-    String name = sensorName + AbstractVeniceStats.DELIMITER + storeName;
-    return getFineGrainedPercentileStat(name, DEFAULT_HISTOGRAM_SIZE_IN_BYTES, DEFAULT_HISTOGRAM_MAX_VALUE);
+    return new MeasurableStat[] { getPercentileStat(
+        name,
+        DEFAULT_HISTOGRAM_SIZE_IN_BYTES,
+        DEFAULT_HISTOGRAM_MAX_VALUE,
+        P99_HISTOGRAM_PERCENTILES), new Avg(), new Max() };
   }
 
   /**
@@ -91,10 +85,6 @@ public class TehutiUtils {
    */
   public static Percentiles getPercentileStat(String name, int sizeInBytes, double max) {
     return getPercentileStat(name, sizeInBytes, max, DEFAULT_HISTOGRAM_PERCENTILES);
-  }
-
-  public static Percentiles getFineGrainedPercentileStat(String name, int sizeInBytes, double max) {
-    return getPercentileStat(name, sizeInBytes, max, FINE_GRAINED_HISTOGRAM_PERCENTILES);
   }
 
   public static Percentiles getPercentileStat(String name, int sizeInBytes, double max, double... percentiles) {

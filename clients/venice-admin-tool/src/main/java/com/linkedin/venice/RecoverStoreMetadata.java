@@ -20,14 +20,15 @@ import com.linkedin.venice.helix.StoreJSONSerializer;
 import com.linkedin.venice.kafka.protocol.KafkaMessageEnvelope;
 import com.linkedin.venice.kafka.protocol.Put;
 import com.linkedin.venice.kafka.protocol.enums.MessageType;
-import com.linkedin.venice.message.KafkaKey;
 import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.pubsub.PubSubTopicPartitionImpl;
 import com.linkedin.venice.pubsub.PubSubTopicRepository;
+import com.linkedin.venice.pubsub.api.DefaultPubSubMessage;
 import com.linkedin.venice.pubsub.api.PubSubConsumerAdapter;
-import com.linkedin.venice.pubsub.api.PubSubMessage;
+import com.linkedin.venice.pubsub.api.PubSubSymbolicPosition;
 import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
 import com.linkedin.venice.security.SSLFactory;
+import com.linkedin.venice.utils.ConfigCommonUtils;
 import com.linkedin.venice.utils.Utils;
 import java.io.File;
 import java.io.FileOutputStream;
@@ -94,7 +95,7 @@ public class RecoverStoreMetadata {
     PubSubTopicPartition adminTopicPartition = new PubSubTopicPartitionImpl(
         pubSubTopicRepository.getTopic(adminTopic),
         AdminTopicUtils.ADMIN_TOPIC_PARTITION_ID);
-    consumer.subscribe(adminTopicPartition, -1);
+    consumer.subscribe(adminTopicPartition, PubSubSymbolicPosition.EARLIEST, false);
     AdminOperationSerializer deserializer = new AdminOperationSerializer();
     KafkaMessageEnvelope messageEnvelope = null;
 
@@ -104,19 +105,17 @@ public class RecoverStoreMetadata {
     String keySchema = null;
     Map<Integer, String> valueSchemas = null;
     while (true) {
-      Map<PubSubTopicPartition, List<PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long>>> records =
-          consumer.poll(3000); // 3 seconds
+      Map<PubSubTopicPartition, List<DefaultPubSubMessage>> records = consumer.poll(3000); // 3 seconds
       if (records.isEmpty()) {
         break;
       }
 
-      Iterator<PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long>> recordsIterator =
-          Utils.iterateOnMapOfLists(records);
-
+      Iterator<DefaultPubSubMessage> recordsIterator = Utils.iterateOnMapOfLists(records);
+      long consumedRecords = 0;
       while (recordsIterator.hasNext()) {
-        PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> record = recordsIterator.next();
-        if (record.getOffset() % 1000 == 0) {
-          System.out.println("Consumed " + record.getOffset() + " messages");
+        DefaultPubSubMessage record = recordsIterator.next();
+        if (++consumedRecords % 1000 == 0) {
+          System.out.println("Consumed " + consumedRecords + " messages");
         }
         messageEnvelope = record.getValue();
         // check message type
@@ -232,6 +231,7 @@ public class RecoverStoreMetadata {
           updateParams.setEtledProxyUserAccount(deletedStore.getEtlStoreConfig().getEtledUserProxyAccount());
           updateParams.setRegularVersionETLEnabled(deletedStore.getEtlStoreConfig().isRegularVersionETLEnabled());
           updateParams.setFutureVersionETLEnabled(deletedStore.getEtlStoreConfig().isFutureVersionETLEnabled());
+          updateParams.setETLStrategy(deletedStore.getEtlStoreConfig().getETLStrategy());
         }
         updateParams.setCompressionStrategy(deletedStore.getCompressionStrategy())
             .setClientDecompressionEnabled(deletedStore.getClientDecompressionEnabled())
@@ -255,7 +255,22 @@ public class RecoverStoreMetadata {
             .setStorageNodeReadQuotaEnabled(deletedStore.isStorageNodeReadQuotaEnabled())
             .setMinCompactionLagSeconds(deletedStore.getMinCompactionLagSeconds())
             .setMaxCompactionLagSeconds(deletedStore.getMaxCompactionLagSeconds())
-            .setBlobTransferEnabled(deletedStore.isBlobTransferEnabled());
+            .setMaxRecordSizeBytes(deletedStore.getMaxRecordSizeBytes())
+            .setMaxNearlineRecordSizeBytes(deletedStore.getMaxNearlineRecordSizeBytes())
+            .setBlobTransferEnabled(deletedStore.isBlobTransferEnabled())
+            .setBlobTransferInServerEnabled(
+                ConfigCommonUtils.ActivationState.valueOf(deletedStore.getBlobTransferInServerEnabled()))
+            .setTargetRegionSwap(deletedStore.getTargetSwapRegion())
+            .setTargetRegionSwapWaitTime(deletedStore.getTargetSwapRegionWaitTime())
+            .setIsDavinciHeartbeatReported(deletedStore.getIsDavinciHeartbeatReported())
+            .setGlobalRtDivEnabled(deletedStore.isGlobalRtDivEnabled())
+            .setFlinkVeniceViewsEnabled(deletedStore.isFlinkVeniceViewsEnabled());
+        if (deletedStore.getVeniceUnits() != null) {
+          updateParams.setVeniceUnits(deletedStore.getVeniceUnits());
+        }
+        if (deletedStore.getWorkloadType() != null) {
+          updateParams.setWorkloadType(deletedStore.getWorkloadType());
+        }
         System.out.println(
             "Updating store: " + storeName + " in cluster: " + recoverCluster + " with params: "
                 + updateParams.toString());

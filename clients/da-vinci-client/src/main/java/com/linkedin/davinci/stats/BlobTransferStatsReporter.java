@@ -1,0 +1,114 @@
+package com.linkedin.davinci.stats;
+
+import static com.linkedin.venice.stats.StatsErrorCode.NULL_INGESTION_STATS;
+import static com.linkedin.venice.stats.dimensions.VeniceBlobTransferFallbackReason.ALL_HOSTS_FAILED;
+import static com.linkedin.venice.stats.dimensions.VeniceBlobTransferFallbackReason.NO_CANDIDATES;
+import static com.linkedin.venice.stats.dimensions.VeniceBlobTransferSource.DAVINCI_PEER;
+import static com.linkedin.venice.stats.dimensions.VeniceBlobTransferSource.VENICE_SERVER;
+import static com.linkedin.venice.stats.dimensions.VeniceResponseStatusCategory.FAIL;
+import static com.linkedin.venice.stats.dimensions.VeniceResponseStatusCategory.SUCCESS;
+
+import io.tehuti.metrics.MetricsRepository;
+import io.tehuti.metrics.stats.AsyncGauge;
+import java.util.function.DoubleSupplier;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+
+
+/**
+ * This class is the reporting class for stats class {@link BlobTransferStats}
+ * Metrics reporting logics are registered into {@link MetricsRepository} here and send out to external metrics
+ * collection/visualization system.
+ */
+public class BlobTransferStatsReporter extends AbstractVeniceStatsReporter<BlobTransferStats> {
+  private static final Logger LOGGER = LogManager.getLogger(BlobTransferStatsReporter.class);
+
+  public BlobTransferStatsReporter(MetricsRepository metricsRepository, String storeName, String clusterName) {
+    super(metricsRepository, storeName);
+  }
+
+  @Override
+  protected void registerStats() {
+    registerSensor(
+        new IngestionStatsGauge(
+            this,
+            () -> getStats().getBlobTransferTotalNumResponses(),
+            BlobTransferStats.BLOB_TRANSFER_TOTAL_NUM_RESPONSES));
+    registerSensor(
+        new IngestionStatsGauge(
+            this,
+            () -> getStats().getBlobTransferSuccessNumResponses(),
+            BlobTransferStats.BLOB_TRANSFER_SUCCESSFUL_NUM_RESPONSES));
+    registerSensor(
+        new IngestionStatsGauge(
+            this,
+            () -> getStats().getBlobTransferFailedNumResponses(),
+            BlobTransferStats.BLOB_TRANSFER_FAILED_NUM_RESPONSES));
+    registerSensor(
+        new IngestionStatsGauge(
+            this,
+            () -> getStats().getBlobTransferRequestCount(DAVINCI_PEER, SUCCESS),
+            BlobTransferStats.BLOB_TRANSFER_DAVINCI_PEER_SUCCESSFUL_NUM_REQUESTS));
+    registerSensor(
+        new IngestionStatsGauge(
+            this,
+            () -> getStats().getBlobTransferRequestCount(DAVINCI_PEER, FAIL),
+            BlobTransferStats.BLOB_TRANSFER_DAVINCI_PEER_FAILED_NUM_REQUESTS));
+    registerSensor(
+        new IngestionStatsGauge(
+            this,
+            () -> getStats().getBlobTransferRequestCount(VENICE_SERVER, SUCCESS),
+            BlobTransferStats.BLOB_TRANSFER_VENICE_SERVER_SUCCESSFUL_NUM_REQUESTS));
+    registerSensor(
+        new IngestionStatsGauge(
+            this,
+            () -> getStats().getBlobTransferRequestCount(VENICE_SERVER, FAIL),
+            BlobTransferStats.BLOB_TRANSFER_VENICE_SERVER_FAILED_NUM_REQUESTS));
+    registerSensor(
+        new IngestionStatsGauge(
+            this,
+            () -> getStats().getBlobTransferVersionTopicFallbackCount(NO_CANDIDATES),
+            BlobTransferStats.BLOB_TRANSFER_VERSION_TOPIC_FALLBACK_NO_CANDIDATES));
+    registerSensor(
+        new IngestionStatsGauge(
+            this,
+            () -> getStats().getBlobTransferVersionTopicFallbackCount(ALL_HOSTS_FAILED),
+            BlobTransferStats.BLOB_TRANSFER_VERSION_TOPIC_FALLBACK_ALL_HOSTS_FAILED));
+    registerSensor(
+        new IngestionStatsGauge(
+            this,
+            () -> getStats().getBlobTransferFileReceiveThroughput(),
+            BlobTransferStats.BLOB_TRANSFER_THROUGHPUT));
+    registerSensor(
+        new IngestionStatsGauge(this, () -> getStats().getBlobTransferTime(), BlobTransferStats.BLOB_TRANSFER_TIME));
+    registerSensor(
+        new IngestionStatsGauge(
+            this,
+            () -> getStats().getBlobTransferBytesReceived(),
+            BlobTransferStats.BLOB_TRANSFER_BYTES_RECEIVED));
+    registerSensor(
+        new IngestionStatsGauge(
+            this,
+            () -> getStats().getBlobTransferBytesSent(),
+            BlobTransferStats.BLOB_TRANSFER_BYTES_SENT));
+  }
+
+  protected static class IngestionStatsGauge extends AsyncGauge {
+    IngestionStatsGauge(AbstractVeniceStatsReporter reporter, DoubleSupplier supplier, String metricName) {
+      this(reporter, supplier, NULL_INGESTION_STATS.code, metricName);
+    }
+
+    IngestionStatsGauge(
+        AbstractVeniceStatsReporter reporter,
+        DoubleSupplier supplier,
+        int defaultValue,
+        String metricName) {
+      /**
+       * If a version doesn't exist, the corresponding reporter stat doesn't exist after the host restarts,
+       * which is not an error. The users of the stats should decide whether it's reasonable to emit an error
+       * code simply because the version is not created yet.
+       */
+      super((ignored, ignored2) -> reporter.getStats() == null ? defaultValue : supplier.getAsDouble(), metricName);
+    }
+  }
+}

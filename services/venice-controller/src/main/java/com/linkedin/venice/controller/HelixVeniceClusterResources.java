@@ -3,10 +3,15 @@ package com.linkedin.venice.controller;
 import com.linkedin.venice.VeniceResource;
 import com.linkedin.venice.acl.AclCreationDeletionListener;
 import com.linkedin.venice.acl.DynamicAccessController;
+import com.linkedin.venice.annotation.VisibleForTesting;
 import com.linkedin.venice.common.VeniceSystemStoreType;
+import com.linkedin.venice.controller.logcompaction.LogCompactionService;
+import com.linkedin.venice.controller.multitaskscheduler.MultiTaskSchedulerService;
 import com.linkedin.venice.controller.stats.AggPartitionHealthStats;
+import com.linkedin.venice.controller.stats.ProtocolVersionAutoDetectionStats;
 import com.linkedin.venice.controller.stats.VeniceAdminStats;
 import com.linkedin.venice.exceptions.VeniceException;
+import com.linkedin.venice.exceptions.VeniceNoStoreException;
 import com.linkedin.venice.helix.HelixAdapterSerializer;
 import com.linkedin.venice.helix.HelixCustomizedViewOfflinePushRepository;
 import com.linkedin.venice.helix.HelixExternalViewRepository;
@@ -24,17 +29,17 @@ import com.linkedin.venice.ingestion.control.RealTimeTopicSwitcher;
 import com.linkedin.venice.meta.ReadWriteSchemaRepository;
 import com.linkedin.venice.meta.ReadWriteStoreRepository;
 import com.linkedin.venice.meta.Store;
+import com.linkedin.venice.meta.StoreConfig;
 import com.linkedin.venice.pushmonitor.AggPushHealthStats;
 import com.linkedin.venice.pushmonitor.AggPushStatusCleanUpStats;
 import com.linkedin.venice.pushmonitor.LeakedPushStatusCleanUpService;
 import com.linkedin.venice.pushmonitor.PushMonitorDelegator;
 import com.linkedin.venice.stats.HelixMessageChannelStats;
 import com.linkedin.venice.system.store.MetaStoreWriter;
+import com.linkedin.venice.utils.DaemonThreadFactory;
 import com.linkedin.venice.utils.locks.AutoCloseableLock;
 import com.linkedin.venice.utils.locks.ClusterLockManager;
 import io.tehuti.metrics.MetricsRepository;
-import java.util.ArrayList;
-import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.ExecutorService;
@@ -67,33 +72,43 @@ public class HelixVeniceClusterResources implements VeniceResource {
   private final VeniceControllerClusterConfig config;
   private final PushMonitorDelegator pushMonitor;
   private final LeakedPushStatusCleanUpService leakedPushStatusCleanUpService;
+  private final ProtocolVersionAutoDetectionService protocolVersionAutoDetectionService;
+  private final LogCompactionService logCompactionService;
   private final ZkRoutersClusterManager routersClusterManager;
   private final AggPartitionHealthStats aggPartitionHealthStats;
-  private final ZkStoreConfigAccessor storeConfigAccessor;
+  private ZkStoreConfigAccessor storeConfigAccessor;
   private final Optional<DynamicAccessController> accessController;
-  private final ExecutorService errorPartitionResetExecutorService = Executors.newSingleThreadExecutor();
+  private final ExecutorService errorPartitionResetExecutorService;
   private final StoragePersonaRepository storagePersonaRepository;
-
   private ErrorPartitionResetTask errorPartitionResetTask = null;
+  private final ExecutorService deadStoreStatsPreFetchService;
+  private DeadStoreStatsPreFetchTask deadStoreStatsPreFetchTask = null;
   private final Optional<MetaStoreWriter> metaStoreWriter;
   private final VeniceAdminStats veniceAdminStats;
   private final VeniceHelixAdmin admin;
+  private final Optional<MultiTaskSchedulerService> multiTaskSchedulerService;
+  private final VeniceVersionLifecycleEventManager veniceVersionLifecycleEventManager;
 
   public HelixVeniceClusterResources(
       String clusterName,
       ZkClient zkClient,
       HelixAdapterSerializer adapterSerializer,
       SafeHelixManager helixManager,
-      VeniceControllerConfig config,
+      VeniceControllerClusterConfig config,
       VeniceHelixAdmin admin,
       MetricsRepository metricsRepository,
       RealTimeTopicSwitcher realTimeTopicSwitcher,
       Optional<DynamicAccessController> accessController,
-      HelixAdminClient helixAdminClient) {
+      HelixAdminClient helixAdminClient,
+      VeniceVersionLifecycleEventManager veniceVersionLifecycleEventManager) {
     this.clusterName = clusterName;
     this.config = config;
     this.helixManager = helixManager;
     this.admin = admin;
+    this.errorPartitionResetExecutorService = Executors
+        .newSingleThreadExecutor(new DaemonThreadFactory("ErrorPartitionReset-" + clusterName, config.getLogContext()));
+    this.deadStoreStatsPreFetchService = Executors.newSingleThreadExecutor(
+        new DaemonThreadFactory("DeadStoreStatsPreFetch-" + clusterName, config.getLogContext()));
     /**
      * So far, Meta system store doesn't support write from parent cluster.
      */
@@ -102,6 +117,23 @@ public class HelixVeniceClusterResources implements VeniceResource {
     } else {
       metaStoreWriter = Optional.empty();
     }
+
+    /**
+     *  MultiTaskSchedulerService is only initialized parent cluster.
+     */
+    if (config.isParent() && config.isMultiTaskSchedulerServiceEnabled()) {
+
+      this.multiTaskSchedulerService = Optional.of(
+          new MultiTaskSchedulerService(
+              config.getStoreMigrationThreadPoolSize(),
+              config.getStoreMigrationMaxRetryAttempts(),
+              config.getStoreMigrationTaskIntervalInSeconds(),
+              config.getStoreMigrationFabricList(),
+              config.getLogContext()));
+    } else {
+      this.multiTaskSchedulerService = Optional.empty();
+    }
+
     /**
      * ClusterLockManager is created per cluster and shared between {@link VeniceHelixAdmin},
      * {@link com.linkedin.venice.pushmonitor.AbstractPushMonitor} and {@link HelixReadWriteStoreRepository}.
@@ -112,7 +144,8 @@ public class HelixVeniceClusterResources implements VeniceResource {
         adapterSerializer,
         clusterName,
         metaStoreWriter,
-        clusterLockManager);
+        clusterLockManager,
+        config.isPerVersionZnodeEnabled());
     this.storeMetadataRepository = new HelixReadWriteStoreRepositoryAdapter(
         admin.getReadOnlyZKSharedSystemStoreRepository(),
         readWriteStoreRepository,
@@ -124,7 +157,8 @@ public class HelixVeniceClusterResources implements VeniceResource {
             zkClient,
             adapterSerializer,
             clusterName,
-            metaStoreWriter));
+            metaStoreWriter,
+            config.getRefreshAttemptsForZkReconnect()));
 
     SafeHelixManager spectatorManager;
     if (this.helixManager.getInstanceType() == InstanceType.SPECTATOR) {
@@ -132,9 +166,9 @@ public class HelixVeniceClusterResources implements VeniceResource {
       // used directly for external view purposes.
       spectatorManager = this.helixManager;
     } else {
-      // Use a separate helix manger for listening on the external view to prevent it from blocking state transition and
-      // messages.
-      spectatorManager = getSpectatorManager(clusterName, zkClient.getServers());
+      // Use a separate helix manager with specified helix zk address for listening on the external view to prevent it
+      // from blocking state transition and messages.
+      spectatorManager = getSpectatorManager(clusterName, config.getZkAddress());
     }
     this.routingDataRepository = new HelixExternalViewRepository(spectatorManager);
     this.customizedViewRepo =
@@ -147,11 +181,12 @@ public class HelixVeniceClusterResources implements VeniceResource {
         clusterName,
         zkClient,
         adapterSerializer,
-        config.getRefreshAttemptsForZkReconnect(),
-        config.getRefreshIntervalForZkReconnectInMs());
+        config.getLogContext(),
+        config.getRefreshAttemptsForZkReconnect());
     String aggregateRealTimeSourceKafkaUrl =
         config.getChildDataCenterKafkaUrlMap().get(config.getAggregateRealTimeSourceRegion());
     boolean unregisterMetricEnabled = config.isUnregisterMetricForDeletedStoreEnabled();
+    this.veniceVersionLifecycleEventManager = veniceVersionLifecycleEventManager;
 
     this.pushMonitor = new PushMonitorDelegator(
         clusterName,
@@ -163,11 +198,24 @@ public class HelixVeniceClusterResources implements VeniceResource {
         realTimeTopicSwitcher,
         clusterLockManager,
         aggregateRealTimeSourceKafkaUrl,
-        getActiveActiveRealTimeSourceKafkaURLs(config),
+        config.getActiveActiveRealTimeSourceKafkaURLs(),
         helixAdminClient,
         config,
         admin.getPushStatusStoreReader(),
-        admin.getDisabledPartitionStats(clusterName));
+        admin.getDisabledPartitionStats(clusterName),
+        admin.getVeniceWriterFactory(),
+        (updatedStore, updatedClusterName, currentVersion, previousVersion) -> {
+          VeniceVersionLifecycleEventManager.onCurrentVersionChanged(
+              this.veniceVersionLifecycleEventManager,
+              updatedClusterName,
+              updatedStore,
+              currentVersion,
+              previousVersion,
+              true,
+              updatedStore.isMigrating(),
+              this::isSourceCluster);
+        },
+        admin.getStoreLifecycleHooksCache());
 
     this.leakedPushStatusCleanUpService = new LeakedPushStatusCleanUpService(
         clusterName,
@@ -193,7 +241,9 @@ public class HelixVeniceClusterResources implements VeniceResource {
         pushMonitor);
     this.storeConfigAccessor = new ZkStoreConfigAccessor(zkClient, adapterSerializer, metaStoreWriter);
     this.accessController = accessController;
-    if (config.getErrorPartitionAutoResetLimit() > 0) {
+    // Error partition reset is a child-controller-only feature; do not initialize it in the parent controller
+    // regardless of the configured limit.
+    if (!config.isParent() && config.getErrorPartitionAutoResetLimit() > 0) {
       errorPartitionResetTask = new ErrorPartitionResetTask(
           clusterName,
           helixAdminClient,
@@ -204,25 +254,41 @@ public class HelixVeniceClusterResources implements VeniceResource {
           config.getErrorPartitionAutoResetLimit(),
           config.getErrorPartitionProcessingCycleDelay());
     }
-    veniceAdminStats = new VeniceAdminStats(metricsRepository, "venice-admin-" + clusterName);
+
+    if (config.isDeadStoreEndpointEnabled() && config.isPreFetchDeadStoreStatsEnabled()) {
+      LOGGER.info("Dead store stats pre-fetch task is enabled for cluster: {}", clusterName);
+      deadStoreStatsPreFetchTask =
+          new DeadStoreStatsPreFetchTask(clusterName, admin, config.getDeadStoreStatsPreFetchRefreshIntervalInMs());
+    }
+    if (config.isParent() && config.isProtocolVersionAutoDetectionServiceEnabled()) {
+      this.protocolVersionAutoDetectionService = new ProtocolVersionAutoDetectionService(
+          clusterName,
+          admin,
+          new ProtocolVersionAutoDetectionStats(metricsRepository, clusterName),
+          config.getProtocolVersionAutoDetectionSleepMS());
+    } else {
+      this.protocolVersionAutoDetectionService = null;
+    }
+
+    if (config.isParent() && config.isLogCompactionSchedulingEnabled()) {
+      LOGGER.info("[log-compaction] Log compaction service is enabled for cluster: {}", clusterName);
+      this.logCompactionService = new LogCompactionService(admin, clusterName, config);
+    } else {
+      LOGGER.info("[log-compaction] Log compaction service is disabled for cluster: {}", clusterName);
+      this.logCompactionService = null;
+    }
+
+    veniceAdminStats = new VeniceAdminStats(metricsRepository, "venice-admin-", clusterName);
     this.storagePersonaRepository =
         new StoragePersonaRepository(clusterName, this.storeMetadataRepository, adapterSerializer, zkClient);
-  }
-
-  private List<String> getActiveActiveRealTimeSourceKafkaURLs(VeniceControllerConfig config) {
-    List<String> kafkaURLs = new ArrayList<>(config.getActiveActiveRealTimeSourceFabrics().size());
-    for (String fabric: config.getActiveActiveRealTimeSourceFabrics()) {
-      String kafkaURL = config.getChildDataCenterKafkaUrlMap().get(fabric);
-      if (kafkaURL == null) {
-        throw new VeniceException(
-            String.format(
-                "No A/A source Kafka URL found for fabric %s in %s",
-                fabric,
-                config.getChildDataCenterKafkaUrlMap()));
-      }
-      kafkaURLs.add(kafkaURL);
-    }
-    return Collections.unmodifiableList(kafkaURLs);
+    /**
+     * Register the shared AsyncStoreChangeNotifier with this cluster's metadata repository.
+     * The VeniceController maintains a single AsyncStoreChangeNotifier instance that listens to store metadata
+     * changes across all clusters. Each cluster's metadata repository registers this shared notifier to
+     * propagate store lifecycle events (creation, deletion, version changes) to registered PubSub adapters,
+     * which allows event-driven cache invalidation and resource cleanup.
+     */
+    this.storeMetadataRepository.registerStoreDataChangedListener(admin.getStoreChangeNotifier());
   }
 
   /**
@@ -260,7 +326,10 @@ public class HelixVeniceClusterResources implements VeniceResource {
     // Make sure that metadataRepo is initialized first since schemaRepo and pushMonitor depend on it.
     storeMetadataRepository.refresh();
     repairStoreReplicationFactor(storeMetadataRepository);
-
+    if (admin.getStoreChangeNotifier() != null) {
+      // Re-register the shared AsyncStoreChangeNotifier after refresh to continue receiving store lifecycle events.
+      storeMetadataRepository.registerStoreDataChangedListener(admin.getStoreChangeNotifier());
+    }
     // Initialize the dynamic access client and also register the acl creation/deletion listener.
     if (accessController.isPresent()) {
       DynamicAccessController accessClient = accessController.get();
@@ -279,6 +348,10 @@ public class HelixVeniceClusterResources implements VeniceResource {
   @Override
   public void clear() {
     /**
+     * Unregister the shared AsyncStoreChangeNotifier from this cluster's metadata repository.
+     */
+    storeMetadataRepository.unregisterStoreDataChangedListener(admin.getStoreChangeNotifier());
+    /**
      * Also stop monitoring all the pushes; otherwise, the standby controller host will still listen to
      * push status changes and act on the changes which should have been done by leader controller only,
      * like broadcasting StartOfBufferReplay/TopicSwitch messages.
@@ -290,6 +363,35 @@ public class HelixVeniceClusterResources implements VeniceResource {
     customizedViewRepo.clear();
     routersClusterManager.clear();
     admin.clearInstanceMonitor(clusterName);
+  }
+
+  /**
+   * Cause {@link DeadStoreStatsPreFetchTask} service to begin executing.
+   */
+  public void startDeadStoreStatsPreFetchTask() {
+    if (deadStoreStatsPreFetchTask != null) {
+      deadStoreStatsPreFetchService.submit(deadStoreStatsPreFetchTask);
+    }
+  }
+
+  /**
+   * Cause {@link DeadStoreStatsPreFetchTask} service to stop executing.
+   */
+  public void stopDeadStoreStatsPreFetchTask() {
+    if (deadStoreStatsPreFetchTask != null) {
+      deadStoreStatsPreFetchTask.close();
+      deadStoreStatsPreFetchService.shutdown();
+      try {
+        deadStoreStatsPreFetchService.awaitTermination(30, TimeUnit.SECONDS);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+    }
+  }
+
+  @VisibleForTesting
+  ErrorPartitionResetTask getErrorPartitionResetTask() {
+    return errorPartitionResetTask;
   }
 
   /**
@@ -326,6 +428,32 @@ public class HelixVeniceClusterResources implements VeniceResource {
   }
 
   /**
+   * Cause {@link MultiTaskSchedulerService} service to begin executing.
+   */
+  public void startMultiTaskSchedulerService() {
+    if (multiTaskSchedulerService.isPresent()) {
+      try {
+        multiTaskSchedulerService.get().start();
+      } catch (Exception e) {
+        LOGGER.error("Error when starting multitask scheduler service for cluster: {}", clusterName);
+      }
+    }
+  }
+
+  /**
+   * Cause {@link MultiTaskSchedulerService} service to stop executing.
+   */
+  public void stopMultiTaskSchedulerService() {
+    if (multiTaskSchedulerService.isPresent()) {
+      try {
+        multiTaskSchedulerService.get().stop();
+      } catch (Exception e) {
+        LOGGER.error("Error when stopping multitask scheduler service for cluster: {}", clusterName, e);
+      }
+    }
+  }
+
+  /**
    * Cause {@link LeakedPushStatusCleanUpService} service to stop executing.
    */
   public void stopLeakedPushStatusCleanUpService() {
@@ -334,6 +462,50 @@ public class HelixVeniceClusterResources implements VeniceResource {
         leakedPushStatusCleanUpService.stop();
       } catch (Exception e) {
         LOGGER.error("Error when stopping leaked push status clean-up service for cluster: {}", clusterName);
+      }
+    }
+  }
+
+  /**
+   * Cause {@link ProtocolVersionAutoDetectionService} service to begin executing.
+   */
+  public void startProtocolVersionAutoDetectionService() {
+    if (protocolVersionAutoDetectionService != null) {
+      protocolVersionAutoDetectionService.start();
+    }
+  }
+
+  /**
+   * Cause {@link ProtocolVersionAutoDetectionService} service to stop executing.
+   */
+  public void stopProtocolVersionAutoDetectionService() {
+    if (protocolVersionAutoDetectionService != null) {
+      try {
+        protocolVersionAutoDetectionService.stop();
+      } catch (Exception e) {
+        LOGGER.error("Error when stopping protocol version auto detection service for cluster: {}", clusterName);
+      }
+    }
+  }
+
+  /**
+   * Cause {@link LogCompactionService} service to begin executing.
+   */
+  public void startLogCompactionService() {
+    if (logCompactionService != null) {
+      logCompactionService.start();
+    }
+  }
+
+  /**
+   * Cause {@link LogCompactionService} service to stop executing.
+   */
+  public void stopLogCompactionService() {
+    if (logCompactionService != null) {
+      try {
+        logCompactionService.stop();
+      } catch (Exception e) {
+        LOGGER.error("Error when stopping log compaction service for cluster: {}", clusterName);
       }
     }
   }
@@ -383,6 +555,11 @@ public class HelixVeniceClusterResources implements VeniceResource {
     return metaStoreWriter;
   }
 
+  // setStoreConfigAccessor is used for testing only.
+  void setStoreConfigAccessor(ZkStoreConfigAccessor storeConfigAccessor) {
+    this.storeConfigAccessor = storeConfigAccessor;
+  }
+
   public ZkStoreConfigAccessor getStoreConfigAccessor() {
     return storeConfigAccessor;
   }
@@ -399,6 +576,10 @@ public class HelixVeniceClusterResources implements VeniceResource {
     return storagePersonaRepository;
   }
 
+  public Optional<MultiTaskSchedulerService> getMultiTaskSchedulerService() {
+    return multiTaskSchedulerService;
+  }
+
   /**
    * Lock the resource for shutdown operation(leadership handle over and controller shutdown). Once
    * acquired the lock, no other thread could operate for this cluster.
@@ -407,7 +588,24 @@ public class HelixVeniceClusterResources implements VeniceResource {
     return clusterLockManager.createClusterWriteLock();
   }
 
-  private SafeHelixManager getSpectatorManager(String clusterName, String zkAddress) {
+  public VeniceVersionLifecycleEventManager getVeniceVersionLifecycleEventManager() {
+    return veniceVersionLifecycleEventManager;
+  }
+
+  public boolean isSourceCluster(String clusterName, String storeName) {
+    if (clusterName == null) {
+      throw new IllegalArgumentException("clusterName is null, storeName: " + storeName);
+    }
+    StoreConfig storeConfig = storeConfigAccessor.getStoreConfig(storeName);
+    if (storeConfig == null) {
+      throw new VeniceNoStoreException(storeName);
+    }
+    return clusterName.equals(storeConfig.getCluster());
+  }
+
+  // Package-private (not private) so tests can capture the ZK address this is invoked with, verifying the spectator
+  // manager binds to the Helix ZK address from config rather than the Venice-metadata zkClient.
+  SafeHelixManager getSpectatorManager(String clusterName, String zkAddress) {
     SafeHelixManager manager =
         new SafeHelixManager(HelixManagerFactory.getZKHelixManager(clusterName, "", InstanceType.SPECTATOR, zkAddress));
     try {

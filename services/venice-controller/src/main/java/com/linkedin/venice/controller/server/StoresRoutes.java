@@ -1,6 +1,9 @@
 package com.linkedin.venice.controller.server;
 
 import static com.linkedin.venice.controller.server.VeniceRouteHandler.ACL_CHECK_FAILURE_WARN_MESSAGE_PREFIX;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.AUTO_STORE_MIGRATION_ABORT_ON_FAILURE;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.AUTO_STORE_MIGRATION_CURRENT_STEP;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.AUTO_STORE_MIGRATION_PAUSE_AFTER_STEP;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.CLUSTER;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.CLUSTER_DEST;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.FABRIC;
@@ -8,45 +11,51 @@ import static com.linkedin.venice.controllerapi.ControllerApiConstants.FABRIC_A;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.FABRIC_B;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.HEARTBEAT_TIMESTAMP;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.INCLUDE_SYSTEM_STORES;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.IS_ABORT_MIGRATION_CLEANUP;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.LOOK_BACK_MS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.NAME;
-import static com.linkedin.venice.controllerapi.ControllerApiConstants.NATIVE_REPLICATION_SOURCE_FABRIC;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.OPERATION;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.OWNER;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PARTITION_DETAIL_ENABLED;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.READ_OPERATION;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.READ_WRITE_OPERATION;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.REGIONS_FILTER;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.SOURCE_REGION;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.STATUS;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORAGE_MODE;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORE_CONFIG_NAME_FILTER;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORE_CONFIG_VALUE_FILTER;
-import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORE_TYPE;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORE_NAME;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.TOPIC;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.TOPIC_COMPACTION_POLICY;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.VERSION;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.VERSION_STORAGE_MODE_UPDATE_REASON;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.WRITE_OPERATION;
 import static com.linkedin.venice.controllerapi.ControllerRoute.ABORT_MIGRATION;
 import static com.linkedin.venice.controllerapi.ControllerRoute.BACKUP_VERSION;
 import static com.linkedin.venice.controllerapi.ControllerRoute.CLUSTER_HEALTH_STORES;
 import static com.linkedin.venice.controllerapi.ControllerRoute.COMPARE_STORE;
 import static com.linkedin.venice.controllerapi.ControllerRoute.COMPLETE_MIGRATION;
-import static com.linkedin.venice.controllerapi.ControllerRoute.CONFIGURE_ACTIVE_ACTIVE_REPLICATION_FOR_CLUSTER;
-import static com.linkedin.venice.controllerapi.ControllerRoute.CONFIGURE_NATIVE_REPLICATION_FOR_CLUSTER;
 import static com.linkedin.venice.controllerapi.ControllerRoute.DELETE_ALL_VERSIONS;
 import static com.linkedin.venice.controllerapi.ControllerRoute.DELETE_KAFKA_TOPIC;
 import static com.linkedin.venice.controllerapi.ControllerRoute.DELETE_STORE;
 import static com.linkedin.venice.controllerapi.ControllerRoute.ENABLE_STORE;
 import static com.linkedin.venice.controllerapi.ControllerRoute.FUTURE_VERSION;
+import static com.linkedin.venice.controllerapi.ControllerRoute.GET_DEAD_STORES;
 import static com.linkedin.venice.controllerapi.ControllerRoute.GET_DELETABLE_STORE_TOPICS;
 import static com.linkedin.venice.controllerapi.ControllerRoute.GET_HEARTBEAT_TIMESTAMP_FROM_SYSTEM_STORE;
 import static com.linkedin.venice.controllerapi.ControllerRoute.GET_INUSE_SCHEMA_IDS;
+import static com.linkedin.venice.controllerapi.ControllerRoute.GET_PER_REGION_STORAGE_MODE;
 import static com.linkedin.venice.controllerapi.ControllerRoute.GET_REGION_PUSH_DETAILS;
 import static com.linkedin.venice.controllerapi.ControllerRoute.GET_REPUSH_INFO;
 import static com.linkedin.venice.controllerapi.ControllerRoute.GET_STALE_STORES_IN_CLUSTER;
+import static com.linkedin.venice.controllerapi.ControllerRoute.GET_STORES_FOR_COMPACTION;
 import static com.linkedin.venice.controllerapi.ControllerRoute.GET_STORES_IN_CLUSTER;
 import static com.linkedin.venice.controllerapi.ControllerRoute.LIST_STORES;
 import static com.linkedin.venice.controllerapi.ControllerRoute.LIST_STORE_PUSH_INFO;
 import static com.linkedin.venice.controllerapi.ControllerRoute.MIGRATE_STORE;
 import static com.linkedin.venice.controllerapi.ControllerRoute.REMOVE_STORE_FROM_GRAVEYARD;
+import static com.linkedin.venice.controllerapi.ControllerRoute.REPUSH_STORE;
 import static com.linkedin.venice.controllerapi.ControllerRoute.ROLLBACK_TO_BACKUP_VERSION;
 import static com.linkedin.venice.controllerapi.ControllerRoute.ROLL_FORWARD_TO_FUTURE_VERSION;
 import static com.linkedin.venice.controllerapi.ControllerRoute.SEND_HEARTBEAT_TIMESTAMP_TO_SYSTEM_STORE;
@@ -56,14 +65,22 @@ import static com.linkedin.venice.controllerapi.ControllerRoute.SET_VERSION;
 import static com.linkedin.venice.controllerapi.ControllerRoute.STORAGE_ENGINE_OVERHEAD_RATIO;
 import static com.linkedin.venice.controllerapi.ControllerRoute.STORE;
 import static com.linkedin.venice.controllerapi.ControllerRoute.UPDATE_STORE;
+import static com.linkedin.venice.controllerapi.ControllerRoute.UPDATE_STORE_VERSION_STORAGE_MODE;
+import static com.linkedin.venice.controllerapi.ControllerRoute.VALIDATE_STORE_DELETED;
 
 import com.linkedin.venice.HttpConstants;
 import com.linkedin.venice.acl.DynamicAccessController;
 import com.linkedin.venice.controller.Admin;
 import com.linkedin.venice.controller.AdminCommandExecutionTracker;
+import com.linkedin.venice.controller.VeniceControllerClusterConfig;
+import com.linkedin.venice.controller.VeniceHelixAdmin;
+import com.linkedin.venice.controller.VeniceParentHelixAdmin;
 import com.linkedin.venice.controller.kafka.TopicCleanupService;
+import com.linkedin.venice.controller.repush.RepushJobRequest;
+import com.linkedin.venice.controllerapi.CleanExecutionIdsResponse;
 import com.linkedin.venice.controllerapi.ClusterStaleDataAuditResponse;
 import com.linkedin.venice.controllerapi.ControllerResponse;
+import com.linkedin.venice.controllerapi.MultiRegionStorageModeResponse;
 import com.linkedin.venice.controllerapi.MultiStoreInfoResponse;
 import com.linkedin.venice.controllerapi.MultiStoreResponse;
 import com.linkedin.venice.controllerapi.MultiStoreStatusResponse;
@@ -74,10 +91,12 @@ import com.linkedin.venice.controllerapi.PartitionResponse;
 import com.linkedin.venice.controllerapi.RegionPushDetailsResponse;
 import com.linkedin.venice.controllerapi.RepushInfo;
 import com.linkedin.venice.controllerapi.RepushInfoResponse;
+import com.linkedin.venice.controllerapi.RepushJobResponse;
 import com.linkedin.venice.controllerapi.SchemaUsageResponse;
 import com.linkedin.venice.controllerapi.StorageEngineOverheadRatioResponse;
 import com.linkedin.venice.controllerapi.StoreComparisonInfo;
 import com.linkedin.venice.controllerapi.StoreComparisonResponse;
+import com.linkedin.venice.controllerapi.StoreDeletedValidationResponse;
 import com.linkedin.venice.controllerapi.StoreHealthAuditResponse;
 import com.linkedin.venice.controllerapi.StoreMigrationResponse;
 import com.linkedin.venice.controllerapi.StoreResponse;
@@ -90,40 +109,59 @@ import com.linkedin.venice.exceptions.ResourceStillExistsException;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.exceptions.VeniceNoStoreException;
 import com.linkedin.venice.meta.RegionPushDetails;
+import com.linkedin.venice.meta.StorageMode;
 import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.StoreDataAudit;
 import com.linkedin.venice.meta.StoreInfo;
-import com.linkedin.venice.meta.VeniceUserStoreType;
 import com.linkedin.venice.meta.Version;
-import com.linkedin.venice.meta.ZKStore;
+import com.linkedin.venice.meta.VersionStorageModeUpdateReason;
+import com.linkedin.venice.protocols.controller.ClusterStoreGrpcInfo;
+import com.linkedin.venice.protocols.controller.ListStoresGrpcRequest;
+import com.linkedin.venice.protocols.controller.ListStoresGrpcResponse;
+import com.linkedin.venice.protocols.controller.ValidateStoreDeletedGrpcRequest;
+import com.linkedin.venice.protocols.controller.ValidateStoreDeletedGrpcResponse;
 import com.linkedin.venice.pubsub.PubSubTopicRepository;
 import com.linkedin.venice.pubsub.api.PubSubTopic;
 import com.linkedin.venice.pubsub.api.exceptions.PubSubTopicDoesNotExistException;
 import com.linkedin.venice.pubsub.manager.TopicManager;
-import com.linkedin.venice.systemstore.schemas.StoreProperties;
+import com.linkedin.venice.stats.dimensions.StoreRepushTriggerSource;
 import com.linkedin.venice.utils.Utils;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
-import org.apache.avro.Schema;
 import org.apache.http.HttpStatus;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import spark.Request;
 import spark.Route;
 
 
 public class StoresRoutes extends AbstractRoute {
+  private static final Logger LOGGER = LogManager.getLogger(StoresRoutes.class);
+
   private final PubSubTopicRepository pubSubTopicRepository;
+  private final StoreRequestHandler storeRequestHandler;
 
   public StoresRoutes(
       boolean sslEnabled,
       Optional<DynamicAccessController> accessController,
       PubSubTopicRepository pubSubTopicRepository) {
+    this(sslEnabled, accessController, pubSubTopicRepository, null);
+  }
+
+  public StoresRoutes(
+      boolean sslEnabled,
+      Optional<DynamicAccessController> accessController,
+      PubSubTopicRepository pubSubTopicRepository,
+      StoreRequestHandler storeRequestHandler) {
     super(sslEnabled, accessController);
     this.pubSubTopicRepository = pubSubTopicRepository;
+    this.storeRequestHandler = storeRequestHandler;
   }
 
   /**
@@ -136,117 +174,53 @@ public class StoresRoutes extends AbstractRoute {
       @Override
       public void internalHandle(Request request, MultiStoreResponse veniceResponse) {
         AdminSparkServer.validateParams(request, LIST_STORES.getParams(), admin);
-        veniceResponse.setCluster(request.queryParams(CLUSTER));
+        String clusterName = request.queryParams(CLUSTER);
+        veniceResponse.setCluster(clusterName);
         veniceResponse.setName(request.queryParams(NAME));
 
-        // Potentially filter out the system stores
+        // Build gRPC request from HTTP parameters
+        ListStoresGrpcRequest.Builder grpcRequestBuilder =
+            ListStoresGrpcRequest.newBuilder().setClusterName(clusterName);
+
         String includeSystemStores = request.queryParams(INCLUDE_SYSTEM_STORES);
-        // If the param is not provided, the default is to include them
-        boolean excludeSystemStores = (includeSystemStores != null && !Boolean.parseBoolean(includeSystemStores));
-        Optional<String> storeConfigNameFilter =
-            Optional.ofNullable(request.queryParamOrDefault(STORE_CONFIG_NAME_FILTER, null));
-        Optional<String> storeConfigValueFilter =
-            Optional.ofNullable(request.queryParamOrDefault(STORE_CONFIG_VALUE_FILTER, null));
-        if (storeConfigNameFilter.isPresent() ^ storeConfigValueFilter.isPresent()) {
-          throw new VeniceException(
-              "Missing parameter: "
-                  + (storeConfigNameFilter.isPresent() ? "store_config_value_filter" : "store_config_name_filter"));
-        }
-        boolean isDataReplicationPolicyConfigFilter = false;
-        Schema.Field configFilterField = null;
-        if (storeConfigNameFilter.isPresent()) {
-          configFilterField = StoreProperties.getClassSchema().getField(storeConfigNameFilter.get());
-          if (configFilterField == null) {
-            isDataReplicationPolicyConfigFilter = storeConfigNameFilter.get().equalsIgnoreCase("dataReplicationPolicy");
-            if (!isDataReplicationPolicyConfigFilter) {
-              throw new VeniceException(
-                  "The config name filter " + storeConfigNameFilter.get() + " is not a valid store config.");
-            }
-          }
+        if (includeSystemStores != null) {
+          grpcRequestBuilder.setIncludeSystemStores(Boolean.parseBoolean(includeSystemStores));
         }
 
-        List<Store> storeList = admin.getAllStores(veniceResponse.getCluster());
-        List<Store> selectedStoreList;
-        if (excludeSystemStores || storeConfigNameFilter.isPresent()) {
-          selectedStoreList = new ArrayList<>();
-          for (Store store: storeList) {
-            if (excludeSystemStores && store.isSystemStore()) {
-              continue;
-            }
-            if (storeConfigValueFilter.isPresent()) {
-              boolean configValueMatch = false;
-              if (isDataReplicationPolicyConfigFilter) {
-                if (!store.isHybrid() || store.getHybridStoreConfig().getDataReplicationPolicy() == null) {
-                  continue;
-                }
-                configValueMatch = store.getHybridStoreConfig()
-                    .getDataReplicationPolicy()
-                    .name()
-                    .equalsIgnoreCase(storeConfigValueFilter.get());
-              } else {
-                ZKStore cloneStore = new ZKStore(store);
-                Object configValue = cloneStore.dataModel().get(storeConfigNameFilter.get());
-                if (configValue == null) {
-                  // If the store doesn't have the config, it fails the match
-                  continue;
-                }
-                // Compare based on schema type
-                Schema fieldSchema = configFilterField.schema();
-                switch (fieldSchema.getType()) {
-                  case BOOLEAN:
-                    configValueMatch = Boolean.valueOf(storeConfigValueFilter.get()).equals((Boolean) configValue);
-                    break;
-                  case INT:
-                    configValueMatch = Integer.valueOf(storeConfigValueFilter.get()).equals((Integer) configValue);
-                    break;
-                  case LONG:
-                    configValueMatch = Long.valueOf(storeConfigValueFilter.get()).equals((Long) configValue);
-                    break;
-                  case FLOAT:
-                    configValueMatch = Float.valueOf(storeConfigValueFilter.get()).equals(configValue);
-                    break;
-                  case DOUBLE:
-                    configValueMatch = Double.valueOf(storeConfigValueFilter.get()).equals(configValue);
-                    break;
-                  case STRING:
-                    configValueMatch = storeConfigValueFilter.get().equals(configValue);
-                    break;
-                  case ENUM:
-                    configValueMatch = storeConfigValueFilter.get().equals(configValue.toString());
-                    break;
-                  case UNION:
-                    /**
-                     * For union field, return match as long as the union field is not null
-                     */
-                    configValueMatch = (configValue != null);
-                    break;
-                  case ARRAY:
-                  case MAP:
-                  case FIXED:
-                  case BYTES:
-                  case RECORD:
-                  case NULL:
-                  default:
-                    throw new VeniceException(
-                        "Store config filtering for Schema type " + fieldSchema.getType().toString()
-                            + " is not supported");
-                }
-              }
-              if (!configValueMatch) {
-                continue;
-              }
-            }
-            selectedStoreList.add(store);
-          }
+        String storeConfigNameFilter = request.queryParamOrDefault(STORE_CONFIG_NAME_FILTER, null);
+        if (storeConfigNameFilter != null) {
+          grpcRequestBuilder.setStoreConfigNameFilter(storeConfigNameFilter);
+        }
+
+        String storeConfigValueFilter = request.queryParamOrDefault(STORE_CONFIG_VALUE_FILTER, null);
+        if (storeConfigValueFilter != null) {
+          grpcRequestBuilder.setStoreConfigValueFilter(storeConfigValueFilter);
+        }
+
+        ListStoresGrpcResponse grpcResponse = storeRequestHandler.listStores(grpcRequestBuilder.build());
+        veniceResponse.setStores(grpcResponse.getStoreNamesList().toArray(new String[0]));
+      }
+    };
+  }
+
+  public Route cleanExecutionIds(Admin admin) {
+    return new VeniceRouteHandler<CleanExecutionIdsResponse>(CleanExecutionIdsResponse.class) {
+      @Override
+      public void internalHandle(Request request, CleanExecutionIdsResponse veniceResponse) {
+        String cluster = request.queryParams(CLUSTER);
+        VeniceHelixAdmin veniceHelixAdmin;
+        if (admin instanceof VeniceParentHelixAdmin) {
+          veniceHelixAdmin = ((VeniceParentHelixAdmin) admin).getVeniceHelixAdmin();
         } else {
-          selectedStoreList = storeList;
+          veniceHelixAdmin = (VeniceHelixAdmin) admin;
         }
 
-        String[] storeNameList = new String[selectedStoreList.size()];
-        for (int i = 0; i < selectedStoreList.size(); i++) {
-          storeNameList[i] = selectedStoreList.get(i).getName();
-        }
-        veniceResponse.setStores(storeNameList);
+        Set<String> allStores =
+            veniceHelixAdmin.getAllStores(cluster).stream().map(Store::getName).collect(Collectors.toSet());
+        Map<String, Long> executionIdsCleaned =
+            veniceHelixAdmin.getExecutionIdAccessor().cleanExecutionIdMap(cluster, allStores);
+
+        veniceResponse.setCleanedExecutionIds(executionIdsCleaned);
       }
     };
   }
@@ -261,9 +235,9 @@ public class StoresRoutes extends AbstractRoute {
       public void internalHandle(Request request, MultiStoreStatusResponse veniceResponse) {
         AdminSparkServer.validateParams(request, CLUSTER_HEALTH_STORES.getParams(), admin);
         String clusterName = request.queryParams(CLUSTER);
+
         veniceResponse.setCluster(clusterName);
-        Map<String, String> storeStatusMap = admin.getAllStoreStatuses(clusterName);
-        veniceResponse.setStoreStatusMap(storeStatusMap);
+        veniceResponse.setStoreStatusMap(storeRequestHandler.getStoreStatuses(clusterName));
       }
     };
   }
@@ -291,15 +265,18 @@ public class StoresRoutes extends AbstractRoute {
       @Override
       public void internalHandle(Request request, RepushInfoResponse veniceResponse) {
         AdminSparkServer.validateParams(request, GET_REPUSH_INFO.getParams(), admin);
+
+        // Extract primitives from HTTP request
         String clusterName = request.queryParams(CLUSTER);
         String storeName = request.queryParams(NAME);
         String fabricName = request.queryParams(FABRIC);
+        Optional<String> fabric = fabricName != null ? Optional.of(fabricName) : Optional.empty();
 
         veniceResponse.setCluster(clusterName);
         veniceResponse.setName(storeName);
 
-        RepushInfo repushInfo = admin.getRepushInfo(clusterName, storeName, Optional.ofNullable(fabricName));
-
+        // Call handler - returns RepushInfo POJO directly
+        RepushInfo repushInfo = storeRequestHandler.getRepushInfo(clusterName, storeName, fabric);
         veniceResponse.setRepushInfo(repushInfo);
       }
     };
@@ -316,21 +293,12 @@ public class StoresRoutes extends AbstractRoute {
         AdminSparkServer.validateParams(request, STORE.getParams(), admin);
         String storeName = request.queryParams(NAME);
         String clusterName = request.queryParams(CLUSTER);
+
         veniceResponse.setCluster(clusterName);
         veniceResponse.setName(storeName);
-        Store store = admin.getStore(clusterName, storeName);
-        if (store == null) {
-          throw new VeniceNoStoreException(storeName);
-        }
-        StoreInfo storeInfo = StoreInfo.fromStore(store);
-        // Make sure store info will have right default retention time for Nuage UI display.
-        if (storeInfo.getBackupVersionRetentionMs() < 0) {
-          storeInfo.setBackupVersionRetentionMs(admin.getBackupVersionDefaultRetentionMs());
-        }
-        storeInfo.setColoToCurrentVersions(admin.getCurrentVersionsForMultiColos(clusterName, storeName));
-        boolean isSSL = admin.isSSLEnabledForPush(clusterName, storeName);
-        storeInfo.setKafkaBrokerUrl(admin.getKafkaBootstrapServers(isSSL));
 
+        // Call handler with primitives
+        StoreInfo storeInfo = storeRequestHandler.getStore(clusterName, storeName);
         veniceResponse.setStore(storeInfo);
       }
     };
@@ -402,18 +370,32 @@ public class StoresRoutes extends AbstractRoute {
         veniceResponse.setCluster(destClusterName);
         veniceResponse.setName(storeName);
 
-        String clusterDiscovered = admin.discoverCluster(storeName).getFirst();
+        String clusterDiscovered = admin.discoverCluster(storeName);
         // Store should belong to src cluster already
         if (!clusterDiscovered.equals(srcClusterName)) {
           veniceResponse.setError(
-              "Store " + storeName + " belongs to cluster " + clusterDiscovered
-                  + ", which is different from the given src cluster name " + srcClusterName);
+              String.format(
+                  "Store %s belongs to cluster %s, which is different from the given src cluster name %s",
+                  storeName,
+                  clusterDiscovered,
+                  srcClusterName));
           veniceResponse.setErrorType(ErrorType.BAD_REQUEST);
           return;
         }
         // Store should not belong to dest cluster already
         if (clusterDiscovered.equals(destClusterName)) {
-          veniceResponse.setError("Store " + storeName + " already belongs to cluster " + destClusterName);
+          veniceResponse.setError(String.format("Store %s already belongs to cluster %s", storeName, destClusterName));
+          veniceResponse.setErrorType(ErrorType.BAD_REQUEST);
+          return;
+        }
+        VeniceControllerClusterConfig destClusterConfig = admin.getControllerConfig(destClusterName);
+        // Both source and destination clusters should either have RT versioning enabled or disabled
+        if (destClusterConfig == null) {
+          LOGGER.warn("ClusterConfig for destination cluster {} not found.", destClusterName);
+        } else if (admin.getControllerConfig(srcClusterName).isRealTimeTopicVersioningEnabled() != destClusterConfig
+            .isRealTimeTopicVersioningEnabled()) {
+          veniceResponse
+              .setError("Source cluster and destination cluster both should have RT versioning enabled or disabled.");
           veniceResponse.setErrorType(ErrorType.BAD_REQUEST);
           return;
         }
@@ -443,7 +425,7 @@ public class StoresRoutes extends AbstractRoute {
         veniceResponse.setCluster(destClusterName);
         veniceResponse.setName(storeName);
 
-        String clusterDiscovered = admin.discoverCluster(storeName).getFirst();
+        String clusterDiscovered = admin.discoverCluster(storeName);
         // Store should belong to src cluster already
         if (!clusterDiscovered.equals(srcClusterName)) {
           veniceResponse.setError(
@@ -483,12 +465,12 @@ public class StoresRoutes extends AbstractRoute {
 
           veniceResponse.setName(storeName);
 
-          String clusterDiscovered = admin.discoverCluster(storeName).getFirst();
+          String clusterDiscovered = admin.discoverCluster(storeName);
           veniceResponse.setSrcClusterName(clusterDiscovered);
 
           admin.abortMigration(srcClusterName, destClusterName, storeName);
 
-          clusterDiscovered = admin.discoverCluster(storeName).getFirst();
+          clusterDiscovered = admin.discoverCluster(storeName);
           veniceResponse.setCluster(clusterDiscovered);
         } catch (Throwable e) {
           veniceResponse.setError(e);
@@ -498,35 +480,113 @@ public class StoresRoutes extends AbstractRoute {
   }
 
   /**
-   * @see Admin#deleteStore(String, String, int, boolean)
+   * Automates the store migration process between source and destination clusters.
+   * Supports step-by-step execution with optional pause points and failure handling.
+   *
+   * @see Admin#autoMigrateStore(String, String, String, Optional, Optional, Optional)
+   */
+  public Route autoMigrateStore(Admin admin) {
+    return new VeniceRouteHandler<StoreMigrationResponse>(StoreMigrationResponse.class) {
+      @Override
+      public void internalHandle(Request request, StoreMigrationResponse storeMigrationResponse) {
+        try {
+          // Only allow allowlist users to run this command
+          if (!checkIsAllowListUser(request, storeMigrationResponse, () -> isAllowListUser(request))) {
+            return;
+          }
+          AdminSparkServer.validateParams(request, MIGRATE_STORE.getParams(), admin);
+          String srcClusterName = request.queryParams(CLUSTER);
+          String destClusterName = request.queryParams(CLUSTER_DEST);
+          String storeName = request.queryParams(STORE_NAME);
+
+          Optional<Integer> currStep =
+              Optional.ofNullable(request.queryParams(AUTO_STORE_MIGRATION_CURRENT_STEP)).map(Integer::parseInt);
+          Optional<Integer> pauseAfterStep =
+              Optional.ofNullable(request.queryParams(AUTO_STORE_MIGRATION_PAUSE_AFTER_STEP)).map(Integer::parseInt);
+          Optional<Boolean> abortOnFailure =
+              Optional.ofNullable(request.queryParams(AUTO_STORE_MIGRATION_ABORT_ON_FAILURE))
+                  .map(Boolean::parseBoolean);
+
+          storeMigrationResponse.setSrcClusterName(srcClusterName);
+          storeMigrationResponse.setCluster(destClusterName);
+          storeMigrationResponse.setName(storeName);
+
+          String clusterDiscovered = admin.discoverCluster(storeName);
+          // Store should not belong to dest cluster already
+          if (clusterDiscovered.equals(destClusterName)) {
+            storeMigrationResponse
+                .setError(String.format("Store %s already belongs to cluster %s.", storeName, destClusterName));
+            storeMigrationResponse.setErrorType(ErrorType.BAD_REQUEST);
+            return;
+          }
+          // The store should belong to the source cluster.
+          if (!clusterDiscovered.equals(srcClusterName)) {
+            storeMigrationResponse.setError(
+                String.format(
+                    "Store %s belongs to cluster %s, which is different from the given src cluster name %s.",
+                    storeName,
+                    clusterDiscovered,
+                    srcClusterName));
+            storeMigrationResponse.setErrorType(ErrorType.BAD_REQUEST);
+            return;
+          }
+
+          VeniceControllerClusterConfig destClusterConfig = admin.getControllerConfig(destClusterName);
+          // Both source and destination clusters should either have RT versioning enabled or disabled
+          if (destClusterConfig == null) {
+            LOGGER.warn("ClusterConfig for destination cluster {} not found.", destClusterName);
+          } else if (admin.getControllerConfig(srcClusterName).isRealTimeTopicVersioningEnabled() != destClusterConfig
+              .isRealTimeTopicVersioningEnabled()) {
+            storeMigrationResponse
+                .setError("Source cluster and destination cluster both should have RT versioning enabled or disabled.");
+            storeMigrationResponse.setErrorType(ErrorType.BAD_REQUEST);
+            return;
+          }
+          admin.autoMigrateStore(srcClusterName, destClusterName, storeName, currStep, pauseAfterStep, abortOnFailure);
+        } catch (Throwable e) {
+          // Catch all exceptions and set the error in the response
+          storeMigrationResponse.setError(e);
+        }
+      }
+    };
+  }
+
+  /**
+   * @see Admin#deleteStore(String, String, boolean, int, boolean)
    */
   public Route deleteStore(Admin admin) {
     return new VeniceRouteHandler<TrackableControllerResponse>(TrackableControllerResponse.class) {
       @Override
       public void internalHandle(Request request, TrackableControllerResponse veniceResponse) {
-        // Only allow allowlist users to run this command
-        if (!checkIsAllowListUser(request, veniceResponse, () -> isAllowListUser(request))) {
-          return;
-        }
-        AdminSparkServer.validateParams(request, DELETE_STORE.getParams(), admin);
-        String clusterName = request.queryParams(CLUSTER);
-        String storeName = request.queryParams(NAME);
-
-        veniceResponse.setCluster(clusterName);
-        veniceResponse.setName(storeName);
-
-        Optional<AdminCommandExecutionTracker> adminCommandExecutionTracker =
-            admin.getAdminCommandExecutionTracker(clusterName);
-        if (adminCommandExecutionTracker.isPresent()) {
-          // Lock the tracker to get the execution id for the last admin command.
-          // If will not make our performance worse, because we lock the whole cluster while handling the admin
-          // operation in parent admin.
-          synchronized (adminCommandExecutionTracker) {
-            admin.deleteStore(clusterName, storeName, Store.IGNORE_VERSION, false);
-            veniceResponse.setExecutionId(adminCommandExecutionTracker.get().getLastExecutionId());
+        try {
+          // Only allow allowlist users to run this command
+          if (!checkIsAllowListUser(request, veniceResponse, () -> isAllowListUser(request))) {
+            return;
           }
-        } else {
-          admin.deleteStore(clusterName, storeName, Store.IGNORE_VERSION, false);
+          AdminSparkServer.validateParams(request, DELETE_STORE.getParams(), admin);
+          String clusterName = request.queryParams(CLUSTER);
+          String storeName = request.queryParams(NAME);
+          boolean abortMigratingStore =
+              Utils.parseBooleanOrFalse(request.queryParams(IS_ABORT_MIGRATION_CLEANUP), IS_ABORT_MIGRATION_CLEANUP);
+          veniceResponse.setCluster(clusterName);
+          veniceResponse.setName(storeName);
+
+          Optional<AdminCommandExecutionTracker> adminCommandExecutionTracker =
+              admin.getAdminCommandExecutionTracker(clusterName);
+
+          if (adminCommandExecutionTracker.isPresent()) {
+            // Lock the tracker to get the execution id for the last admin command.
+            // It will not make our performance worse, because we lock the whole cluster while handling the admin
+            // operation in parent admin.
+            synchronized (adminCommandExecutionTracker) {
+              admin.deleteStore(clusterName, storeName, abortMigratingStore, Store.IGNORE_VERSION, false);
+              veniceResponse.setExecutionId(adminCommandExecutionTracker.get().getLastExecutionId());
+            }
+          } else {
+            admin.deleteStore(clusterName, storeName, abortMigratingStore, Store.IGNORE_VERSION, false);
+          }
+        } catch (Throwable e) {
+          veniceResponse.setError(e);
         }
       }
     };
@@ -660,7 +720,11 @@ public class StoresRoutes extends AbstractRoute {
         String clusterName = request.queryParams(CLUSTER);
         String storeName = request.queryParams(NAME);
         String regionFilter = request.queryParamOrDefault(REGIONS_FILTER, "");
-        admin.rollForwardToFutureVersion(clusterName, storeName, regionFilter);
+        try {
+          admin.rollForwardToFutureVersion(clusterName, storeName, regionFilter);
+        } catch (Exception e) {
+          veniceResponse.setError("Roll forward failed for store " + storeName, e);
+        }
 
         veniceResponse.setCluster(clusterName);
         veniceResponse.setName(storeName);
@@ -683,7 +747,7 @@ public class StoresRoutes extends AbstractRoute {
         String cluster = request.queryParams(CLUSTER);
         String storeName = request.queryParams(NAME);
         String operation = request.queryParams(OPERATION);
-        boolean status = Utils.parseBooleanFromString(request.queryParams(STATUS), "storeAccessStatus");
+        boolean status = Utils.parseBooleanOrThrow(request.queryParams(STATUS), "storeAccessStatus");
 
         veniceResponse.setCluster(cluster);
         veniceResponse.setName(storeName);
@@ -782,73 +846,6 @@ public class StoresRoutes extends AbstractRoute {
   }
 
   /**
-   * @see Admin#configureNativeReplication(String, VeniceUserStoreType, Optional, boolean, Optional, Optional)
-   */
-  public Route enableNativeReplicationForCluster(Admin admin) {
-    return new VeniceRouteHandler<ControllerResponse>(ControllerResponse.class) {
-      @Override
-      public void internalHandle(Request request, ControllerResponse veniceResponse) {
-        // Only allow allowlist users to run this command
-        if (!checkIsAllowListUser(request, veniceResponse, () -> isAllowListUser(request))) {
-          return;
-        }
-
-        AdminSparkServer.validateParams(request, CONFIGURE_NATIVE_REPLICATION_FOR_CLUSTER.getParams(), admin);
-
-        VeniceUserStoreType storeType = VeniceUserStoreType.valueOf(request.queryParams(STORE_TYPE).toUpperCase());
-
-        String cluster = request.queryParams(CLUSTER);
-        boolean enableNativeReplicationForCluster = Utils.parseBooleanFromString(request.queryParams(STATUS), STATUS);
-        String sourceRegionParams = request.queryParamOrDefault(NATIVE_REPLICATION_SOURCE_FABRIC, null);
-        String regionsFilterParams = request.queryParamOrDefault(REGIONS_FILTER, null);
-
-        admin.configureNativeReplication(
-            cluster,
-            storeType,
-            Optional.empty(),
-            enableNativeReplicationForCluster,
-            Optional.ofNullable(sourceRegionParams),
-            Optional.ofNullable(regionsFilterParams));
-
-        veniceResponse.setCluster(cluster);
-      }
-    };
-  }
-
-  /**
-   * @see Admin#configureActiveActiveReplication(String, VeniceUserStoreType, Optional, boolean, Optional)
-   */
-  public Route enableActiveActiveReplicationForCluster(Admin admin) {
-    return new VeniceRouteHandler<ControllerResponse>(ControllerResponse.class) {
-      @Override
-      public void internalHandle(Request request, ControllerResponse veniceResponse) {
-        // Only allow allowlist users to run this command
-        if (!checkIsAllowListUser(request, veniceResponse, () -> isAllowListUser(request))) {
-          return;
-        }
-
-        AdminSparkServer.validateParams(request, CONFIGURE_ACTIVE_ACTIVE_REPLICATION_FOR_CLUSTER.getParams(), admin);
-
-        VeniceUserStoreType storeType = VeniceUserStoreType.valueOf(request.queryParams(STORE_TYPE).toUpperCase());
-
-        String cluster = request.queryParams(CLUSTER);
-        boolean enableActiveActiveReplicationForCluster =
-            Utils.parseBooleanFromString(request.queryParams(STATUS), STATUS);
-        String regionsFilterParams = request.queryParamOrDefault(REGIONS_FILTER, null);
-
-        admin.configureActiveActiveReplication(
-            cluster,
-            storeType,
-            Optional.empty(),
-            enableActiveActiveReplicationForCluster,
-            Optional.ofNullable(regionsFilterParams));
-
-        veniceResponse.setCluster(cluster);
-      }
-    };
-  }
-
-  /**
    * @see TopicManager#updateTopicCompactionPolicy(PubSubTopic, boolean)
    */
   public Route setTopicCompaction(Admin admin) {
@@ -889,7 +886,15 @@ public class StoresRoutes extends AbstractRoute {
           List<String> deletableTopicsList = new ArrayList<>();
           int minNumberOfUnusedKafkaTopicsToPreserve = admin.getMinNumberOfUnusedKafkaTopicsToPreserve();
           allStoreTopics.forEach((storeName, topicsWithRetention) -> {
-            PubSubTopic realTimeTopic = pubSubTopicRepository.getTopic(Version.composeRealTimeTopic(storeName));
+            String cluster;
+            try {
+              cluster = admin.discoverCluster(storeName);
+            } catch (VeniceNoStoreException e) {
+              LOGGER.warn("Store " + storeName + " does not exist. Skipping it.");
+              return;
+            }
+            Store store = admin.getStore(cluster, storeName);
+            PubSubTopic realTimeTopic = pubSubTopicRepository.getTopic(Utils.getRealTimeTopicName(store));
             if (topicsWithRetention.containsKey(realTimeTopic)) {
               if (admin.isTopicTruncatedBasedOnRetention(topicsWithRetention.get(realTimeTopic))) {
                 deletableTopicsList.add(realTimeTopic.getName());
@@ -970,7 +975,45 @@ public class StoresRoutes extends AbstractRoute {
   }
 
   /**
-   * @see Admin#getLargestUsedVersionFromStoreGraveyard(String, String)
+   * @see Admin#getStoresForCompaction(String)
+   */
+  public Route getStoresForCompaction(Admin admin) {
+    return new VeniceRouteHandler<MultiStoreInfoResponse>(MultiStoreInfoResponse.class) {
+      @Override
+      public void internalHandle(Request request, MultiStoreInfoResponse veniceResponse) {
+        AdminSparkServer.validateParams(request, GET_STORES_FOR_COMPACTION.getParams(), admin);
+        String cluster = request.queryParams(CLUSTER);
+        List<StoreInfo> response = admin.getStoresForCompaction(cluster);
+        veniceResponse.setStoreInfoList(response);
+        veniceResponse.setCluster(cluster);
+      }
+    };
+  }
+
+  /**
+   * @see Admin#repushStore(RepushJobRequest)
+   */
+  public Route repushStore(Admin admin) {
+    return new VeniceRouteHandler<RepushJobResponse>(RepushJobResponse.class) {
+      @Override
+      public void internalHandle(Request request, RepushJobResponse veniceResponse) {
+        AdminSparkServer.validateParams(request, REPUSH_STORE.getParams(), admin);
+        String clusterName = request.queryParams(CLUSTER);
+        String storeName = request.queryParams(STORE_NAME);
+        String sourceRegion = request.queryParamOrDefault(SOURCE_REGION, null);
+        try {
+          veniceResponse.copyValueOf(
+              admin.repushStore(
+                  new RepushJobRequest(clusterName, storeName, sourceRegion, StoreRepushTriggerSource.MANUAL)));
+        } catch (Exception e) {
+          veniceResponse.setError("Failed to compact store: " + storeName, e);
+        }
+      }
+    };
+  }
+
+  /**
+   * @see Admin#getLargestUsedVersion(String, String)
    */
   public Route getStoreLargestUsedVersion(Admin admin) {
     return new VeniceRouteHandler<VersionResponse>(VersionResponse.class) {
@@ -978,8 +1021,41 @@ public class StoresRoutes extends AbstractRoute {
       public void internalHandle(Request request, VersionResponse veniceResponse) {
         AdminSparkServer.validateParams(request, GET_STORES_IN_CLUSTER.getParams(), admin);
         String cluster = request.queryParams(CLUSTER);
+        String storeName = request.queryParams(STORE_NAME);
+        veniceResponse.setVersion(admin.getLargestUsedVersion(cluster, storeName));
+      }
+    };
+  }
+
+  /**
+   * @see Admin#getDeadStores(String, String, Map)
+   */
+  public Route getDeadStores(Admin admin) {
+    return new VeniceRouteHandler<MultiStoreInfoResponse>(MultiStoreInfoResponse.class) {
+      @Override
+      public void internalHandle(Request request, MultiStoreInfoResponse veniceResponse) {
+        AdminSparkServer.validateParams(request, GET_DEAD_STORES.getParams(), admin);
+        String cluster = request.queryParams(CLUSTER);
         String storeName = request.queryParams(NAME);
-        veniceResponse.setVersion(admin.getLargestUsedVersionFromStoreGraveyard(cluster, storeName));
+
+        // Collect all parameters into a map for extensibility
+        Map<String, String> params = new HashMap<>();
+
+        // Include system stores parameter
+        String includeSystemStoresParam = request.queryParams(INCLUDE_SYSTEM_STORES);
+        if (includeSystemStoresParam != null && !includeSystemStoresParam.isEmpty()) {
+          params.put(INCLUDE_SYSTEM_STORES, includeSystemStoresParam);
+        }
+
+        // Look back MS parameter
+        String lookBackMSParam = request.queryParams(LOOK_BACK_MS);
+        if (lookBackMSParam != null && !lookBackMSParam.isEmpty()) {
+          params.put(LOOK_BACK_MS, lookBackMSParam);
+        }
+
+        List<StoreInfo> storeList = admin.getDeadStores(cluster, storeName, params);
+        veniceResponse.setCluster(cluster);
+        veniceResponse.setStoreInfoList(storeList);
       }
     };
   }
@@ -1017,6 +1093,65 @@ public class StoresRoutes extends AbstractRoute {
         boolean isPartitionDetailEnabled = Boolean.valueOf(request.queryParams(PARTITION_DETAIL_ENABLED));
         RegionPushDetails details = admin.getRegionPushDetails(cluster, store, isPartitionDetailEnabled);
         veniceResponse.setRegionPushDetails(details);
+      }
+    };
+  }
+
+  /**
+   * @see Admin#getStorageModePerRegion(String, String)
+   */
+  public Route getPerRegionStorageMode(Admin admin) {
+    return new VeniceRouteHandler<MultiRegionStorageModeResponse>(MultiRegionStorageModeResponse.class) {
+      @Override
+      public void internalHandle(Request request, MultiRegionStorageModeResponse veniceResponse) {
+        AdminSparkServer.validateParams(request, GET_PER_REGION_STORAGE_MODE.getParams(), admin);
+        String cluster = request.queryParams(CLUSTER);
+        String store = request.queryParams(NAME);
+        Map<String, StorageMode> modes = admin.getStorageModePerRegion(cluster, store);
+        Map<String, String> serialized = new HashMap<>();
+        for (Map.Entry<String, StorageMode> entry: modes.entrySet()) {
+          serialized.put(entry.getKey(), entry.getValue().name());
+        }
+        veniceResponse.setName(store);
+        veniceResponse.setCluster(cluster);
+        veniceResponse.setRegionToStorageMode(serialized);
+      }
+    };
+  }
+
+  /**
+   * @see Admin#updateStoreVersionStorageMode(String, String, int, StorageMode, String, VersionStorageModeUpdateReason)
+   */
+  public Route updateStoreVersionStorageMode(Admin admin) {
+    return new VeniceRouteHandler<ControllerResponse>(ControllerResponse.class) {
+      @Override
+      public void internalHandle(Request request, ControllerResponse veniceResponse) {
+        if (!checkIsAllowListUser(
+            request,
+            veniceResponse,
+            () -> isAllowListUser(request) || hasWriteAccessToTopic(request))) {
+          return;
+        }
+        AdminSparkServer.validateParams(request, UPDATE_STORE_VERSION_STORAGE_MODE.getParams(), admin);
+        String clusterName = request.queryParams(CLUSTER);
+        String storeName = request.queryParams(NAME);
+        veniceResponse.setCluster(clusterName);
+        veniceResponse.setName(storeName);
+
+        try {
+          int version = Integer.parseInt(request.queryParams(VERSION));
+          StorageMode storageMode = StorageMode.valueOf(request.queryParams(STORAGE_MODE));
+          String regionsFilter = request.queryParamOrDefault(REGIONS_FILTER, "");
+          // An absent or unrecognized reason resolves to UNSPECIFIED so an older client never fails here.
+          VersionStorageModeUpdateReason reason = VersionStorageModeUpdateReason
+              .parseOrDefault(request.queryParamOrDefault(VERSION_STORAGE_MODE_UPDATE_REASON, ""));
+          admin.updateStoreVersionStorageMode(clusterName, storeName, version, storageMode, regionsFilter, reason);
+        } catch (Exception e) {
+          veniceResponse.setError(
+              "Failed when updating version storage mode for store " + storeName + ". Exception type: "
+                  + e.getClass().toString() + ". Detailed message = " + e.getMessage(),
+              e);
+        }
       }
     };
   }
@@ -1110,11 +1245,41 @@ public class StoresRoutes extends AbstractRoute {
         responseObject.setCluster(clusterName);
         responseObject.setName(storeName);
         responseObject.setHeartbeatTimestamp(admin.getHeartbeatFromSystemStore(clusterName, storeName));
-        responseObject.setHeartbeatTimestamp(0);
       } catch (Throwable e) {
         responseObject.setError(e);
       }
       return AdminSparkServer.OBJECT_MAPPER.writeValueAsString(responseObject);
+    };
+  }
+
+  /**
+   * @see Admin#validateStoreDeleted(String, String)
+   */
+  public Route validateStoreDeleted(Admin admin) {
+    return new VeniceRouteHandler<StoreDeletedValidationResponse>(StoreDeletedValidationResponse.class) {
+      @Override
+      public void internalHandle(Request request, StoreDeletedValidationResponse veniceResponse) {
+        // Only allow allowlist users to run this command
+        if (!checkIsAllowListUser(request, veniceResponse, () -> isAllowListUser(request))) {
+          return;
+        }
+        AdminSparkServer.validateParams(request, VALIDATE_STORE_DELETED.getParams(), admin);
+        String clusterName = request.queryParams(CLUSTER);
+        String storeName = request.queryParams(STORE_NAME);
+
+        ClusterStoreGrpcInfo storeInfo =
+            ClusterStoreGrpcInfo.newBuilder().setClusterName(clusterName).setStoreName(storeName).build();
+        ValidateStoreDeletedGrpcRequest grpcRequest =
+            ValidateStoreDeletedGrpcRequest.newBuilder().setStoreInfo(storeInfo).build();
+        ValidateStoreDeletedGrpcResponse grpcResponse = storeRequestHandler.validateStoreDeleted(grpcRequest);
+
+        veniceResponse.setCluster(grpcResponse.getStoreInfo().getClusterName());
+        veniceResponse.setName(grpcResponse.getStoreInfo().getStoreName());
+        veniceResponse.setStoreDeleted(grpcResponse.getStoreDeleted());
+        if (grpcResponse.hasReason()) {
+          veniceResponse.setReason(grpcResponse.getReason());
+        }
+      }
     };
   }
 }

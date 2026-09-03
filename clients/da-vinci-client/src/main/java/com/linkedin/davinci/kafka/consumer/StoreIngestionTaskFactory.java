@@ -1,16 +1,18 @@
 package com.linkedin.davinci.kafka.consumer;
 
-import com.linkedin.davinci.client.DaVinciRecordTransformer;
+import com.linkedin.davinci.blobtransfer.BlobTransferManager;
+import com.linkedin.davinci.client.InternalDaVinciRecordTransformerConfig;
 import com.linkedin.davinci.compression.StorageEngineBackedCompressorFactory;
 import com.linkedin.davinci.config.VeniceServerConfig;
 import com.linkedin.davinci.config.VeniceStoreVersionConfig;
+import com.linkedin.davinci.ingestion.utils.IngestionTaskReusableObjects;
 import com.linkedin.davinci.notifier.VeniceNotifier;
 import com.linkedin.davinci.stats.AggHostLevelIngestionStats;
 import com.linkedin.davinci.stats.AggVersionedDIVStats;
 import com.linkedin.davinci.stats.AggVersionedIngestionStats;
 import com.linkedin.davinci.stats.ingestion.heartbeat.HeartbeatMonitoringService;
-import com.linkedin.davinci.storage.StorageEngineRepository;
 import com.linkedin.davinci.storage.StorageMetadataService;
+import com.linkedin.davinci.storage.StorageService;
 import com.linkedin.davinci.store.cache.backend.ObjectCacheBackend;
 import com.linkedin.davinci.store.view.VeniceViewWriterFactory;
 import com.linkedin.venice.kafka.protocol.state.PartitionState;
@@ -18,17 +20,20 @@ import com.linkedin.venice.meta.ReadOnlySchemaRepository;
 import com.linkedin.venice.meta.ReadOnlyStoreRepository;
 import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.Version;
-import com.linkedin.venice.pubsub.PubSubTopicRepository;
-import com.linkedin.venice.pubsub.manager.TopicManagerRepository;
+import com.linkedin.venice.pubsub.PubSubContext;
 import com.linkedin.venice.serialization.avro.InternalAvroSpecificSerializer;
 import com.linkedin.venice.system.store.MetaStoreWriter;
 import com.linkedin.venice.utils.DiskUsage;
+import com.linkedin.venice.utils.lazy.Lazy;
 import com.linkedin.venice.writer.VeniceWriterFactory;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
 import java.util.function.BooleanSupplier;
-import java.util.function.Function;
+import java.util.function.Supplier;
+import org.apache.helix.manager.zk.ZKHelixAdmin;
 
 
 public class StoreIngestionTaskFactory {
@@ -43,17 +48,19 @@ public class StoreIngestionTaskFactory {
   }
 
   public StoreIngestionTask getNewIngestionTask(
+      StorageService storageService,
       Store store,
       Version version,
       Properties kafkaConsumerProperties,
       BooleanSupplier isCurrentVersion,
       VeniceStoreVersionConfig storeConfig,
       int partitionId,
-      boolean isIsolatedIngestion,
       Optional<ObjectCacheBackend> cacheBackend,
-      Function<Integer, DaVinciRecordTransformer> getRecordTransformer) {
+      InternalDaVinciRecordTransformerConfig internalRecordTransformerConfig,
+      Lazy<ZKHelixAdmin> zkHelixAdmin) {
     if (version.isActiveActiveReplicationEnabled()) {
       return new ActiveActiveStoreIngestionTask(
+          storageService,
           builder,
           store,
           version,
@@ -61,11 +68,12 @@ public class StoreIngestionTaskFactory {
           isCurrentVersion,
           storeConfig,
           partitionId,
-          isIsolatedIngestion,
           cacheBackend,
-          getRecordTransformer);
+          internalRecordTransformerConfig,
+          zkHelixAdmin);
     }
     return new LeaderFollowerStoreIngestionTask(
+        storageService,
         builder,
         store,
         version,
@@ -73,9 +81,9 @@ public class StoreIngestionTaskFactory {
         isCurrentVersion,
         storeConfig,
         partitionId,
-        isIsolatedIngestion,
         cacheBackend,
-        getRecordTransformer);
+        internalRecordTransformerConfig,
+        zkHelixAdmin);
   }
 
   /**
@@ -96,12 +104,10 @@ public class StoreIngestionTaskFactory {
 
     private HeartbeatMonitoringService heartbeatMonitoringService;
     private VeniceViewWriterFactory veniceViewWriterFactory;
-    private StorageEngineRepository storageEngineRepository;
     private StorageMetadataService storageMetadataService;
     private Queue<VeniceNotifier> leaderFollowerNotifiers;
     private ReadOnlySchemaRepository schemaRepo;
     private ReadOnlyStoreRepository metadataRepo;
-    private TopicManagerRepository topicManagerRepository;
     private AggHostLevelIngestionStats ingestionStats;
     private AggVersionedDIVStats versionedDIVStats;
     private AggVersionedIngestionStats versionedStorageIngestionStats;
@@ -114,8 +120,13 @@ public class StoreIngestionTaskFactory {
     private RemoteIngestionRepairService remoteIngestionRepairService;
     private MetaStoreWriter metaStoreWriter;
     private StorageEngineBackedCompressorFactory compressorFactory;
-    private PubSubTopicRepository pubSubTopicRepository;
-    private Runnable runnableForKillIngestionTasksForNonCurrentVersions;
+    private PubSubContext pubSubContext;
+    private ExecutorService aaWCWorkLoadProcessingThreadPool;
+    private ExecutorService aaWCIngestionStorageLookupThreadPool;
+    private Supplier<IngestionTaskReusableObjects> reusableObjectsSupplier;
+    private Supplier<BlobTransferManager> blobTransferManagerSupplier;
+    private Set<String> blobTransferDisabledStores;
+    private volatile BlobTransferIngestionHelper blobTransferHelper;
 
     private interface Setter {
       void apply();
@@ -174,16 +185,8 @@ public class StoreIngestionTaskFactory {
       return this.metaStoreWriter;
     }
 
-    public StorageEngineRepository getStorageEngineRepository() {
-      return storageEngineRepository;
-    }
-
     public StorageMetadataService getStorageMetadataService() {
       return storageMetadataService;
-    }
-
-    public Builder setStorageEngineRepository(StorageEngineRepository storageEngineRepository) {
-      return set(() -> this.storageEngineRepository = storageEngineRepository);
     }
 
     public Builder setStorageMetadataService(StorageMetadataService storageMetadataService) {
@@ -214,12 +217,12 @@ public class StoreIngestionTaskFactory {
       return set(() -> this.metadataRepo = metadataRepo);
     }
 
-    public TopicManagerRepository getTopicManagerRepository() {
-      return topicManagerRepository;
+    public Builder setPubSubContext(PubSubContext pubSubContext) {
+      return set(() -> this.pubSubContext = pubSubContext);
     }
 
-    public Builder setTopicManagerRepository(TopicManagerRepository topicManagerRepository) {
-      return set(() -> this.topicManagerRepository = topicManagerRepository);
+    public PubSubContext getPubSubContext() {
+      return pubSubContext;
     }
 
     public AggHostLevelIngestionStats getIngestionStats() {
@@ -303,20 +306,70 @@ public class StoreIngestionTaskFactory {
       return set(() -> this.compressorFactory = compressorFactory);
     }
 
-    public PubSubTopicRepository getPubSubTopicRepository() {
-      return pubSubTopicRepository;
+    public Builder setAAWCWorkLoadProcessingThreadPool(ExecutorService executorService) {
+      return set(() -> this.aaWCWorkLoadProcessingThreadPool = executorService);
     }
 
-    public Builder setPubSubTopicRepository(PubSubTopicRepository pubSubTopicRepository) {
-      return set(() -> this.pubSubTopicRepository = pubSubTopicRepository);
+    public Builder setAAWCIngestionStorageLookupThreadPool(ExecutorService executorService) {
+      return set(() -> this.aaWCIngestionStorageLookupThreadPool = executorService);
     }
 
-    public Runnable getRunnableForKillIngestionTasksForNonCurrentVersions() {
-      return runnableForKillIngestionTasksForNonCurrentVersions;
+    public ExecutorService getAaWCIngestionStorageLookupThreadPool() {
+      return aaWCIngestionStorageLookupThreadPool;
     }
 
-    public Builder setRunnableForKillIngestionTasksForNonCurrentVersions(Runnable runnable) {
-      return set(() -> this.runnableForKillIngestionTasksForNonCurrentVersions = runnable);
+    public ExecutorService getAAWCWorkLoadProcessingThreadPool() {
+      return this.aaWCWorkLoadProcessingThreadPool;
+    }
+
+    public Builder setReusableObjectsSupplier(Supplier<IngestionTaskReusableObjects> reusableObjectsSupplier) {
+      return set(() -> this.reusableObjectsSupplier = reusableObjectsSupplier);
+    }
+
+    public Supplier<IngestionTaskReusableObjects> getReusableObjectsSupplier() {
+      return this.reusableObjectsSupplier;
+    }
+
+    /**
+     * Sets a supplier for the blob transfer manager. Uses a supplier because the blob transfer
+     * manager is created after the factory is built (due to initialization ordering), so it
+     * needs to be resolved lazily when each SIT is constructed.
+     */
+    public Builder setBlobTransferManagerSupplier(Supplier<BlobTransferManager> blobTransferManagerSupplier) {
+      return set(() -> this.blobTransferManagerSupplier = blobTransferManagerSupplier);
+    }
+
+    public BlobTransferManager getBlobTransferManager() {
+      return blobTransferManagerSupplier != null ? blobTransferManagerSupplier.get() : null;
+    }
+
+    /**
+     * Sets the shared set of store names for which blob transfer is disabled
+     * (e.g., version-specific or stateless DaVinci clients). The set is checked live at decision time.
+     */
+    public Builder setBlobTransferDisabledStores(Set<String> blobTransferDisabledStores) {
+      return set(() -> this.blobTransferDisabledStores = blobTransferDisabledStores);
+    }
+
+    /**
+     * Returns the shared {@link BlobTransferIngestionHelper} singleton, creating it lazily on first call.
+     * Returns null if blob transfer is not configured.
+     */
+    public BlobTransferIngestionHelper getBlobTransferHelper(StorageService storageService) {
+      if (blobTransferHelper != null) {
+        return blobTransferHelper;
+      }
+      BlobTransferManager blobTransferManager = getBlobTransferManager();
+      if (blobTransferManager == null) {
+        return null;
+      }
+      blobTransferHelper = new BlobTransferIngestionHelper(
+          blobTransferManager,
+          storageService,
+          storageMetadataService,
+          serverConfig,
+          blobTransferDisabledStores);
+      return blobTransferHelper;
     }
   }
 }

@@ -8,6 +8,7 @@ import static com.linkedin.venice.pushmonitor.ExecutionStatus.TOPIC_SWITCH_RECEI
 import static com.linkedin.venice.pushmonitor.ExecutionStatus.isIncrementalPushStatus;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.linkedin.venice.utils.Pair;
 import java.time.LocalDateTime;
@@ -16,7 +17,6 @@ import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Objects;
-import org.apache.commons.lang.StringUtils;
 
 
 /**
@@ -27,7 +27,6 @@ public class ReplicaStatus {
   public static final long NO_PROGRESS = -1;
   private final String instanceId;
   private ExecutionStatus currentStatus = STARTED;
-  private long currentProgress = 0;
   /**
    *  This field is only used by incremental push status
    *  Check out {@link ExecutionStatus#START_OF_INCREMENTAL_PUSH_RECEIVED} and
@@ -47,14 +46,16 @@ public class ReplicaStatus {
     this.statusHistory = enableStatusHistory ? new LinkedList<>() : null;
   }
 
-  public void updateStatus(ExecutionStatus newStatus) {
-    currentStatus = newStatus;
-    addHistoricStatus(newStatus);
-  }
-
   public void updateStatus(ExecutionStatus newStatus, String incrementalPushVersion) {
     setIncrementalPushVersion(incrementalPushVersion);
-    updateStatus(newStatus);
+    if (!isIncrementalPushStatus(newStatus)) {
+      setCurrentStatus(newStatus);
+    }
+    addHistoricStatus(newStatus, incrementalPushVersion);
+  }
+
+  void updateStatus(ExecutionStatus newStatus) {
+    updateStatus(newStatus, "");
   }
 
   public String getInstanceId() {
@@ -70,14 +71,24 @@ public class ReplicaStatus {
     this.currentStatus = currentStatus;
   }
 
+  /**
+   * @deprecated This field has been removed. Always returns 0 for backward compatibility.
+   * @return 0 (for backward compatibility)
+   */
+  @Deprecated
+  @JsonIgnore
   public long getCurrentProgress() {
-    return currentProgress;
+    return 0;
   }
 
+  /**
+   * @deprecated This field has been removed. This method is kept for JSON deserialization compatibility.
+   * @param currentProgress ignored parameter
+   */
+  @Deprecated
+  @JsonProperty("currentProgress")
   public void setCurrentProgress(long currentProgress) {
-    if (currentProgress != NO_PROGRESS) {
-      this.currentProgress = currentProgress;
-    }
+    // No-op: field has been removed but setter kept for backward compatibility during deserialization
   }
 
   public String getIncrementalPushVersion() {
@@ -97,7 +108,7 @@ public class ReplicaStatus {
     this.statusHistory = statusHistory;
   }
 
-  private void addHistoricStatus(ExecutionStatus status) {
+  private void addHistoricStatus(ExecutionStatus status, String incrementalPushVersion) {
     if (statusHistory == null) {
       // Status history is disabled
       return;
@@ -120,7 +131,7 @@ public class ReplicaStatus {
     removeOldStatuses();
 
     StatusSnapshot snapshot = new StatusSnapshot(status, LocalDateTime.now().toString());
-    if (!StringUtils.isEmpty(incrementalPushVersion)) {
+    if (isIncrementalPushStatus(status)) {
       snapshot.setIncrementalPushVersion(incrementalPushVersion);
     }
     statusHistory.add(snapshot);
@@ -204,9 +215,6 @@ public class ReplicaStatus {
 
     ReplicaStatus that = (ReplicaStatus) o;
 
-    if (currentProgress != that.currentProgress) {
-      return false;
-    }
     if (!instanceId.equals(that.instanceId)) {
       return false;
     }
@@ -224,7 +232,6 @@ public class ReplicaStatus {
     int result = instanceId.hashCode();
     result = 31 * result + currentStatus.hashCode();
     result = 31 * result + incrementalPushVersion.hashCode();
-    result = 31 * result + (int) (currentProgress ^ (currentProgress >>> 32));
     result = 31 * result + Objects.hashCode(statusHistory);
     return result;
   }

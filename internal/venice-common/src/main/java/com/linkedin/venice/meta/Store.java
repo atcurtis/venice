@@ -1,13 +1,14 @@
 package com.linkedin.venice.meta;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.linkedin.venice.common.VeniceSystemStoreType;
 import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.exceptions.StoreVersionNotFoundException;
+import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
+import it.unimi.dsi.fastutil.ints.IntSet;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 import javax.annotation.Nonnull;
 import javax.annotation.Nullable;
 
@@ -41,20 +42,7 @@ public interface Store {
 
   long DEFAULT_RT_RETENTION_TIME = TimeUnit.DAYS.toMillis(5);
 
-  int DEFAULT_BATCH_GET_LIMIT = 150;
-
-  /**
-   * Store name rules:
-   *  1.  Only letters, numbers, underscore or dash
-   *  2. No double dashes
-   */
-
-  Pattern storeNamePattern = Pattern.compile("^[a-zA-Z0-9_-]+$");
-
-  static boolean isValidStoreName(String name) {
-    Matcher matcher = storeNamePattern.matcher(name);
-    return matcher.matches() && !name.contains("--");
-  }
+  int DEFAULT_BATCH_GET_LIMIT = 500;
 
   static boolean isSystemStore(String storeName) {
     return storeName.startsWith(SYSTEM_STORE_NAME_PREFIX);
@@ -92,6 +80,10 @@ public interface Store {
 
   void setLargestUsedVersionNumber(int largestUsedVersionNumber);
 
+  int getLargestUsedRTVersionNumber();
+
+  void setLargestUsedRTVersionNumber(int largestUsedRTVersionNumber);
+
   long getStorageQuotaInByte();
 
   void setStorageQuotaInByte(long storageQuotaInByte);
@@ -124,6 +116,10 @@ public interface Store {
 
   void setViewConfigs(Map<String, ViewConfig> viewConfigMap);
 
+  boolean isFlinkVeniceViewsEnabled();
+
+  void setFlinkVeniceViewsEnabled(boolean flinkVeniceViewsEnabled);
+
   boolean isHybrid();
 
   CompressionStrategy getCompressionStrategy();
@@ -149,6 +145,10 @@ public interface Store {
   boolean isIncrementalPushEnabled();
 
   void setIncrementalPushEnabled(boolean incrementalPushEnabled);
+
+  boolean isSeparateRealTimeTopicEnabled();
+
+  void setSeparateRealTimeTopicEnabled(boolean separateRealTimeTopicEnabled);
 
   boolean isAccessControlled();
 
@@ -189,6 +189,48 @@ public interface Store {
   BackupStrategy getBackupStrategy();
 
   void setBackupStrategy(BackupStrategy value);
+
+  IngestionPauseMode getIngestionPauseMode();
+
+  void setIngestionPauseMode(IngestionPauseMode value);
+
+  List<String> getIngestionPausedRegions();
+
+  void setIngestionPausedRegions(List<String> regions);
+
+  /**
+   * Store-level read routing for clients backed by both Venice local storage and a configured external storage
+   * system. Defaults to {@link ExternalStorageReadMode#VENICE_ONLY} (no external-storage involvement). Mirrors the
+   * {@code externalStorageReadMode} field staged on {@code StoreProperties} (StoreMetaValue v44) by PR #2814.
+   *
+   */
+  ExternalStorageReadMode getExternalStorageReadMode();
+
+  void setExternalStorageReadMode(ExternalStorageReadMode externalStorageReadMode);
+
+  /**
+   * Store-level default storage mode. The controller copies this value into {@code StoreVersion.storageMode} when a
+   * new store version is created; existing versions are unaffected. Defaults to {@link StorageMode#INTERNAL}.
+   * Mirrors the {@code storageMode} field staged on {@code StoreProperties} (StoreMetaValue v44).
+   *
+   */
+  StorageMode getStorageMode();
+
+  void setStorageMode(StorageMode storageMode);
+
+  /**
+   * The forecasted Venice Units (VU) capacity ask for this store, or null when it has not been provided.
+   */
+  Integer getVeniceUnits();
+
+  void setVeniceUnits(Integer veniceUnits);
+
+  /**
+   * The requested class of service for this store, or null when it has not been provided.
+   */
+  String getWorkloadType();
+
+  void setWorkloadType(String workloadType);
 
   boolean isSchemaAutoRegisterFromPushJobEnabled();
 
@@ -254,11 +296,21 @@ public interface Store {
 
   List<Version> getVersions();
 
+  @JsonIgnore
+  default IntSet getVersionNumbers() {
+    List<Version> versions = getVersions();
+    IntSet versionNumbers = new IntOpenHashSet(versions.size());
+    for (Version version: versions) {
+      versionNumbers.add(version.getNumber());
+    }
+    return versionNumbers;
+  }
+
   void setVersions(List<Version> versions);
 
   void addVersion(Version version);
 
-  void addVersion(Version version, boolean isClonedVersion);
+  void addVersion(Version version, boolean isClonedVersion, int currentRTVersionNumber);
 
   void forceAddVersion(Version version, boolean isClonedVersion);
 
@@ -270,7 +322,20 @@ public interface Store {
 
   void updateVersionStatus(int versionNumber, VersionStatus status);
 
-  Version peekNextVersion();
+  default void setVersionTargetRegionPromoted(int versionNumber, boolean targetRegionPromoted) {
+    // No-op default (unlike updateVersionStatus, this silently does nothing when the version is not found).
+    // AbstractStore overrides this using storeVersionsSupplier.getForUpdate() to bypass the ReadOnlyVersion
+    // wrapper returned by getVersion().
+    // ReadOnlyStore overrides to throw UnsupportedOperationException.
+  }
+
+  default void setVersionStorageMode(int versionNumber, StorageMode storageMode) {
+    // No-op default. AbstractStore overrides this using storeVersionsSupplier.getForUpdate() to bypass the
+    // ReadOnlyVersion wrapper returned by getVersion(). ReadOnlyStore overrides to throw
+    // UnsupportedOperationException.
+  }
+
+  int peekNextVersionNumber();
 
   /**
    * @param versionNumber for which to get the {@link Version}
@@ -294,6 +359,22 @@ public interface Store {
 
   void setStorageNodeReadQuotaEnabled(boolean storageNodeReadQuotaEnabled);
 
+  boolean isCompactionEnabled();
+
+  void setCompactionEnabled(boolean compactionEnabled);
+
+  long getCompactionThresholdMilliseconds();
+
+  void setCompactionThresholdMilliseconds(long compactionThreshold);
+
+  boolean isEncryptionEnabled();
+
+  void setEncryptionEnabled(boolean encryptionEnabled);
+
+  String getPubSubEncryptionKeyUrn();
+
+  void setPubSubEncryptionKeyUrn(String pubSubEncryptionKeyUrn);
+
   long getMinCompactionLagSeconds();
 
   void setMinCompactionLagSeconds(long minCompactionLagSeconds);
@@ -302,6 +383,22 @@ public interface Store {
 
   void setMaxCompactionLagSeconds(long maxCompactionLagSeconds);
 
+  int getMaxRecordSizeBytes();
+
+  void setMaxRecordSizeBytes(int maxRecordSizeBytes);
+
+  int getMaxNearlineRecordSizeBytes();
+
+  void setMaxNearlineRecordSizeBytes(int maxNearlineRecordSizeBytes);
+
+  long getThroughputQuotaInBytes();
+
+  void setThroughputQuotaInBytes(long throughputQuotaInBytes);
+
+  long getThroughputQuotaInRecords();
+
+  void setThroughputQuotaInRecords(long throughputQuotaInRecords);
+
   void setUnusedSchemaDeletionEnabled(boolean unusedSchemaDeletionEnabled);
 
   boolean isUnusedSchemaDeletionEnabled();
@@ -309,4 +406,62 @@ public interface Store {
   boolean isBlobTransferEnabled();
 
   void setBlobTransferEnabled(boolean blobTransferEnabled);
+
+  void setBlobTransferInServerEnabled(String blobTransferInServerEnabled);
+
+  String getBlobTransferInServerEnabled();
+
+  void setBlobDbEnabled(String blobDbEnabled);
+
+  String getBlobDbEnabled();
+
+  boolean isNearlineProducerCompressionEnabled();
+
+  void setNearlineProducerCompressionEnabled(boolean compressionEnabled);
+
+  int getNearlineProducerCountPerWriter();
+
+  void setNearlineProducerCountPerWriter(int producerCnt);
+
+  String getTargetSwapRegion();
+
+  int getTargetSwapRegionWaitTime();
+
+  void setTargetSwapRegion(String targetRegion);
+
+  void setTargetSwapRegionWaitTime(int waitTime);
+
+  void setIsDavinciHeartbeatReported(boolean isReported);
+
+  boolean getIsDavinciHeartbeatReported();
+
+  void updateVersionForDaVinciHeartbeat(int versionNumber, boolean reported);
+
+  boolean isGlobalRtDivEnabled();
+
+  void setGlobalRtDivEnabled(boolean globalRtDivEnabled);
+
+  boolean isTTLRepushEnabled();
+
+  void setTTLRepushEnabled(boolean ttlRepushEnabled);
+
+  boolean isEnumSchemaEvolutionAllowed();
+
+  void setEnumSchemaEvolutionAllowed(boolean enumSchemaEvolutionAllowed);
+
+  List<LifecycleHooksRecord> getStoreLifecycleHooks();
+
+  void setStoreLifecycleHooks(List<LifecycleHooksRecord> storeLifecycleHooks);
+
+  void setKeyUrnCompressionEnabled(boolean keyUrnCompressionEnabled);
+
+  boolean isKeyUrnCompressionEnabled();
+
+  void setKeyUrnFields(List<String> keyUrnFields);
+
+  List<String> getKeyUrnFields();
+
+  int getPreviousCurrentVersion();
+
+  void setPreviousCurrentVersion(int previousCurrentVersion);
 }

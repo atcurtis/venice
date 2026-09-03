@@ -1,32 +1,46 @@
 package com.linkedin.venice.controller;
 
 import static com.linkedin.venice.utils.TestUtils.assertCommand;
+import static com.linkedin.venice.utils.TestWriteUtils.getTempDataDirectory;
 import static java.util.Objects.requireNonNull;
 import static org.testng.Assert.assertEquals;
 
+import com.linkedin.venice.acl.VeniceComponent;
+import com.linkedin.venice.controllerapi.ControllerClient;
 import com.linkedin.venice.controllerapi.StoreResponse;
 import com.linkedin.venice.controllerapi.UpdateStoreQueryParams;
 import com.linkedin.venice.controllerapi.VersionCreationResponse;
+import com.linkedin.venice.helix.HelixAdapterSerializer;
+import com.linkedin.venice.helix.VeniceOfflinePushMonitorAccessor;
+import com.linkedin.venice.helix.ZkClientFactory;
 import com.linkedin.venice.integration.utils.ServiceFactory;
 import com.linkedin.venice.integration.utils.VeniceClusterCreateOptions;
 import com.linkedin.venice.integration.utils.VeniceClusterWrapper;
 import com.linkedin.venice.meta.BackupStrategy;
+import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.StoreInfo;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.pushmonitor.ExecutionStatus;
+import com.linkedin.venice.pushmonitor.OfflinePushStatus;
+import com.linkedin.venice.utils.IntegrationTestPushUtils;
+import com.linkedin.venice.utils.LogContext;
 import com.linkedin.venice.utils.TestUtils;
+import com.linkedin.venice.utils.TestWriteUtils;
 import com.linkedin.venice.utils.Time;
 import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.writer.VeniceWriter;
+import java.io.File;
+import java.io.IOException;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Optional;
+import java.util.Properties;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import org.apache.helix.zookeeper.impl.client.ZkClient;
 import org.testng.Assert;
 import org.testng.annotations.AfterClass;
-import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeClass;
-import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
 
@@ -35,7 +49,6 @@ import org.testng.annotations.Test;
  */
 public class TestIncrementalPush {
   private VeniceClusterWrapper cluster;
-  private String storeName;
   private static final int PARTITION_SIZE = 1000;
 
   @BeforeClass(alwaysRun = true)
@@ -46,6 +59,7 @@ public class TestIncrementalPush {
             .replicationFactor(3)
             .partitionSize(PARTITION_SIZE)
             .build());
+
   }
 
   @AfterClass(alwaysRun = true)
@@ -53,9 +67,79 @@ public class TestIncrementalPush {
     cluster.close();
   }
 
-  @BeforeMethod(alwaysRun = true)
-  public void setUp() {
-    storeName = Utils.getUniqueString("testIncPushStore");
+  @Test(timeOut = 2 * Time.MS_PER_MINUTE)
+  public void testIncrementalPushStatusNotUpdateReplicaCurrentStatus() throws IOException {
+    String storeName = Utils.getUniqueString("testIncPushStore");
+    cluster.getNewStore(storeName);
+    AtomicReference<StoreInfo> storeInfo = new AtomicReference<>();
+    cluster.useControllerClient(controllerClient -> {
+      StoreResponse storeResponse = TestUtils.assertCommand(controllerClient.getStore(storeName));
+      storeInfo.set(storeResponse.getStore());
+    });
+    UpdateStoreQueryParams params = new UpdateStoreQueryParams();
+    params.setIncrementalPushEnabled(true)
+        .setStorageQuotaInByte(Store.UNLIMITED_STORAGE_QUOTA)
+        .setHybridRewindSeconds(1000)
+        .setHybridOffsetLagThreshold(1000);
+    cluster.updateStore(storeName, params);
+
+    File inputDirBatch = getTempDataDirectory();
+    String inputDirPathBatch = "file:" + inputDirBatch.getAbsolutePath();
+    Properties propsBatch = IntegrationTestPushUtils.defaultVPJProps(cluster, inputDirPathBatch, storeName);
+    TestWriteUtils.writeSimpleAvroFileWithStringToStringSchema(inputDirBatch);
+    ControllerClient controllerClient = new ControllerClient(cluster.getClusterName(), cluster.getAllControllersURLs());
+    IntegrationTestPushUtils.runVPJ(propsBatch, 1, controllerClient);
+    String incPushTopic = "TEST_INC_PUSH";
+
+    storeInfo.set(controllerClient.getStore(storeName).getStore());
+    VeniceWriter<String, String, byte[]> veniceWriterRt =
+        cluster.getVeniceWriter(Utils.getRealTimeTopicName(storeInfo.get()));
+    veniceWriterRt.broadcastStartOfIncrementalPush(incPushTopic, new HashMap<>());
+
+    TestUtils.waitForNonDeterministicCompletion(
+        30,
+        TimeUnit.SECONDS,
+        () -> cluster.getLeaderVeniceController()
+            .getVeniceAdmin()
+            .getOffLinePushStatus(
+                cluster.getClusterName(),
+                Version.composeKafkaTopic(storeName, 1),
+                Optional.of(incPushTopic),
+                null,
+                null,
+                false)
+            .getExecutionStatus()
+            .equals(ExecutionStatus.START_OF_INCREMENTAL_PUSH_RECEIVED));
+
+    ZkClient zkClient = ZkClientFactory.newZkClient(cluster.getZk().getAddress());
+    VeniceOfflinePushMonitorAccessor accessor = new VeniceOfflinePushMonitorAccessor(
+        cluster.getClusterName(),
+        zkClient,
+        new HelixAdapterSerializer(),
+        LogContext.newBuilder()
+            .setComponentName(VeniceComponent.CONTROLLER.name())
+            .setRegionName("test-region")
+            .build(),
+        1);
+
+    // Even after consuming SOIP, we should see replica current status not flipped to non-terminal status
+    TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, () -> {
+      OfflinePushStatus offlinePushStatus =
+          accessor.getOfflinePushStatusAndItsPartitionStatuses(Version.composeKafkaTopic(storeName, 1));
+      Assert.assertTrue(
+          offlinePushStatus.getPartitionStatuses()
+              .stream()
+              .allMatch(
+                  partition -> partition.getReplicaStatuses()
+                      .stream()
+                      .allMatch(replica -> replica.getCurrentStatus().equals(ExecutionStatus.COMPLETED))));
+    });
+  }
+
+  @Test(timeOut = 2 * Time.MS_PER_MINUTE)
+  public void testGetOfflineStatusIncrementalPush() {
+
+    String storeName = Utils.getUniqueString("testIncPushStore");
     cluster.getNewStore(storeName);
     long storageQuota = 2L * PARTITION_SIZE;
     UpdateStoreQueryParams params = new UpdateStoreQueryParams();
@@ -66,15 +150,7 @@ public class TestIncrementalPush {
         .setBackupStrategy(BackupStrategy.KEEP_MIN_VERSIONS)
         .setNumVersionsToPreserve(3);
     cluster.updateStore(storeName, params);
-  }
 
-  @AfterMethod(alwaysRun = true)
-  public void cleanUp() {
-    cluster.useControllerClient(controllerClient -> controllerClient.deleteStore(storeName));
-  }
-
-  @Test(timeOut = 2 * Time.MS_PER_MINUTE)
-  public void testGetOfflineStatusIncrementalPush() {
     // store version 1
     VersionCreationResponse v1Response = cluster.getNewVersion(storeName);
     Assert.assertFalse(v1Response.isError());
@@ -93,7 +169,7 @@ public class TestIncrementalPush {
         TimeUnit.SECONDS,
         () -> cluster.getLeaderVeniceController()
             .getVeniceAdmin()
-            .getOffLinePushStatus(cluster.getClusterName(), versionTopic1, Optional.of(incPushV1), null, null)
+            .getOffLinePushStatus(cluster.getClusterName(), versionTopic1, Optional.of(incPushV1), null, null, false)
             .getExecutionStatus()
             .equals(ExecutionStatus.END_OF_INCREMENTAL_PUSH_RECEIVED));
 
@@ -121,7 +197,7 @@ public class TestIncrementalPush {
         TimeUnit.SECONDS,
         () -> cluster.getLeaderVeniceController()
             .getVeniceAdmin()
-            .getOffLinePushStatus(cluster.getClusterName(), versionTopic2, Optional.of(incPushV1), null, null)
+            .getOffLinePushStatus(cluster.getClusterName(), versionTopic2, Optional.of(incPushV1), null, null, false)
             .getExecutionStatus()
             .equals(ExecutionStatus.END_OF_INCREMENTAL_PUSH_RECEIVED));
 
@@ -133,7 +209,7 @@ public class TestIncrementalPush {
         TimeUnit.SECONDS,
         () -> cluster.getLeaderVeniceController()
             .getVeniceAdmin()
-            .getOffLinePushStatus(cluster.getClusterName(), versionTopic2, Optional.of(incPush2), null, null)
+            .getOffLinePushStatus(cluster.getClusterName(), versionTopic2, Optional.of(incPush2), null, null, false)
             .getExecutionStatus()
             .equals(ExecutionStatus.START_OF_INCREMENTAL_PUSH_RECEIVED));
   }

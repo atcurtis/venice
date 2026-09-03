@@ -1,14 +1,16 @@
 package com.linkedin.venice.controller.kafka.consumer;
 
 import com.linkedin.venice.controller.kafka.protocol.admin.AdminOperation;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
 
 
 public class AdminOperationWrapper {
-  private AdminOperation adminOperation;
-  private long offset;
-  private long producerTimestamp;
-  private long localBrokerTimestamp;
-  private long delegateTimestamp;
+  private final AdminOperation adminOperation;
+  private final PubSubPosition position;
+  private final long executionId;
+  private final long producerTimestamp;
+  private final long localBrokerTimestamp;
+  private final long delegateTimestamp;
 
   private Long startProcessingTimestamp = null;
 
@@ -16,19 +18,23 @@ public class AdminOperationWrapper {
    * Constructor for the wrapper of an {@link AdminOperation}, the wrapper includes additional information about the
    * operation that is used for processing and metrics emission.
    * @param adminOperation of this wrapper.
-   * @param offset for the corresponding {@link AdminOperation}.
+   * @param position for the corresponding {@link AdminOperation}.
    * @param producerTimestamp the time when this admin operation was first produced in the parent controller.
-   * @param localBrokerTimestamp the time when this admin operation arrived at the local admin kafka topic or broker.
+   * @param localBrokerTimestamp the best-available pub-sub message timestamp for this admin operation.
+   *                            This may be the broker timestamp (when available) or the producer timestamp
+   *                            (when the pub-sub system does not provide per-message timestamps).
    * @param delegateTimestamp the time when this admin operation was read and placed in the in-memory topics.
    */
   AdminOperationWrapper(
       AdminOperation adminOperation,
-      long offset,
+      PubSubPosition position,
+      long executionId,
       long producerTimestamp,
       long localBrokerTimestamp,
       long delegateTimestamp) {
     this.adminOperation = adminOperation;
-    this.offset = offset;
+    this.position = position;
+    this.executionId = executionId;
     this.producerTimestamp = producerTimestamp;
     this.localBrokerTimestamp = localBrokerTimestamp;
     this.delegateTimestamp = delegateTimestamp;
@@ -38,8 +44,12 @@ public class AdminOperationWrapper {
     return adminOperation;
   }
 
-  public long getOffset() {
-    return offset;
+  public PubSubPosition getPosition() {
+    return position;
+  }
+
+  public long getExecutionId() {
+    return executionId;
   }
 
   public long getProducerTimestamp() {

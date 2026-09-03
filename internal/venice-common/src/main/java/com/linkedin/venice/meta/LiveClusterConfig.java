@@ -18,6 +18,12 @@ public class LiveClusterConfig {
   @JsonProperty(ConfigKeys.CHILD_CONTROLLER_ADMIN_TOPIC_CONSUMPTION_ENABLED)
   private boolean childControllerAdminTopicConsumptionEnabled = true;
 
+  @JsonProperty(ConfigKeys.DEGRADED_MODE_ENABLED)
+  private boolean degradedModeEnabled = false;
+
+  @JsonProperty("degraded.datacenters")
+  private Map<String, DegradedDcInfo> degradedDatacenters;
+
   public LiveClusterConfig() {
   }
 
@@ -27,6 +33,13 @@ public class LiveClusterConfig {
     }
     storeMigrationAllowed = clone.storeMigrationAllowed;
     childControllerAdminTopicConsumptionEnabled = clone.childControllerAdminTopicConsumptionEnabled;
+    degradedModeEnabled = clone.degradedModeEnabled;
+    if (clone.degradedDatacenters != null) {
+      degradedDatacenters = new HashMap<>();
+      for (Map.Entry<String, DegradedDcInfo> entry: clone.degradedDatacenters.entrySet()) {
+        degradedDatacenters.put(entry.getKey(), new DegradedDcInfo(entry.getValue()));
+      }
+    }
   }
 
   // ------------------------ Getter/Setter for Jackson to ser/de LiveClusterConfig ------------------------
@@ -53,6 +66,42 @@ public class LiveClusterConfig {
 
   public void setChildControllerAdminTopicConsumptionEnabled(boolean childControllerAdminTopicConsumptionEnabled) {
     this.childControllerAdminTopicConsumptionEnabled = childControllerAdminTopicConsumptionEnabled;
+  }
+
+  public boolean isDegradedModeEnabled() {
+    return degradedModeEnabled;
+  }
+
+  public void setDegradedModeEnabled(boolean degradedModeEnabled) {
+    this.degradedModeEnabled = degradedModeEnabled;
+  }
+
+  public Map<String, DegradedDcInfo> getDegradedDatacenters() {
+    return degradedDatacenters;
+  }
+
+  public void setDegradedDatacenters(Map<String, DegradedDcInfo> degradedDatacenters) {
+    this.degradedDatacenters = degradedDatacenters;
+  }
+
+  @JsonIgnore
+  public boolean isDatacenterDegraded(String datacenterName) {
+    return degradedDatacenters != null && degradedDatacenters.containsKey(datacenterName);
+  }
+
+  @JsonIgnore
+  public void addDegradedDatacenter(String datacenterName, DegradedDcInfo info) {
+    if (degradedDatacenters == null) {
+      degradedDatacenters = new HashMap<>();
+    }
+    degradedDatacenters.put(datacenterName, info);
+  }
+
+  @JsonIgnore
+  public void removeDegradedDatacenter(String datacenterName) {
+    if (degradedDatacenters != null) {
+      degradedDatacenters.remove(datacenterName);
+    }
   }
 
   // -------------------------------------- Default Values for config --------------------------------------
@@ -94,6 +143,14 @@ public class LiveClusterConfig {
         .append(ConfigKeys.CHILD_CONTROLLER_ADMIN_TOPIC_CONSUMPTION_ENABLED)
         .append('=')
         .append(childControllerAdminTopicConsumptionEnabled)
+        .append(Utils.NEW_LINE_CHAR)
+        .append(ConfigKeys.DEGRADED_MODE_ENABLED)
+        .append('=')
+        .append(degradedModeEnabled)
+        .append(Utils.NEW_LINE_CHAR)
+        .append("degraded.datacenters")
+        .append('=')
+        .append(degradedDatacenters)
         .append(Utils.NEW_LINE_CHAR)
         .toString();
   }

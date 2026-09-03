@@ -1,10 +1,16 @@
 package com.linkedin.venice.meta;
 
+import static com.linkedin.venice.utils.ConfigCommonUtils.ActivationState;
 import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertNull;
+import static org.testng.Assert.assertTrue;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.io.IOException;
+import java.util.Arrays;
+import java.util.Collections;
 import org.testng.annotations.Test;
 
 
@@ -33,5 +39,142 @@ public class TestStoreInfo {
   @Test
   public void nullStore() {
     assertNull(StoreInfo.fromStore(null)); // should not throw a NPE!
+  }
+
+  @Test
+  public void testSetAndGetIsStoreDead() {
+    StoreInfo storeInfo = new StoreInfo();
+    assertFalse(storeInfo.getIsStoreDead(), "Default should be false");
+
+    storeInfo.setIsStoreDead(true);
+    assertTrue(storeInfo.getIsStoreDead(), "Should reflect store is dead");
+
+    storeInfo.setIsStoreDead(false);
+    assertFalse(storeInfo.getIsStoreDead(), "Should allow unsetting dead flag");
+  }
+
+  @Test
+  public void testSetAndGetStoreDeadStatusReasons() {
+    StoreInfo storeInfo = new StoreInfo();
+    assertNotNull(storeInfo.getStoreDeadStatusReasons(), "Default should be empty list");
+    assertTrue(storeInfo.getStoreDeadStatusReasons().isEmpty(), "Default should be empty");
+
+    storeInfo.setStoreDeadStatusReasons(Arrays.asList("No versions", "Metadata corrupted"));
+    assertEquals(2, storeInfo.getStoreDeadStatusReasons().size());
+    assertEquals("No versions", storeInfo.getStoreDeadStatusReasons().get(0));
+
+    storeInfo.setStoreDeadStatusReasons(null);
+    assertNotNull(storeInfo.getStoreDeadStatusReasons(), "Null input should be handled");
+    assertTrue(storeInfo.getStoreDeadStatusReasons().isEmpty(), "Null input should be treated as empty list");
+
+    storeInfo.setStoreDeadStatusReasons(Collections.singletonList("Store deleted"));
+    assertEquals(1, storeInfo.getStoreDeadStatusReasons().size());
+    assertEquals("Store deleted", storeInfo.getStoreDeadStatusReasons().get(0));
+  }
+
+  @Test
+  public void testSetAndGetStoreLifecycleHooks() {
+    StoreInfo storeInfo = new StoreInfo();
+    assertNotNull(storeInfo.getStoreLifecycleHooks(), "Default should be empty list");
+    assertTrue(storeInfo.getStoreLifecycleHooks().isEmpty(), "Default should be empty");
+
+    LifecycleHooksRecordImpl lifecycleHooksRecord = new LifecycleHooksRecordImpl();
+    lifecycleHooksRecord.setStoreLifecycleHooksClassName("test");
+    lifecycleHooksRecord.setStoreLifecycleHooksParams(Collections.emptyMap());
+    storeInfo.setStoreLifecycleHooks(Arrays.asList(lifecycleHooksRecord));
+    assertEquals(1, storeInfo.getStoreLifecycleHooks().size());
+  }
+
+  @Test
+  public void testBlobTransferStoreLevelConfigs() {
+    StoreInfo storeInfo = new StoreInfo();
+    // check default value
+    assertNotNull(storeInfo.getBlobTransferInServerEnabled());
+    assertEquals(ActivationState.NOT_SPECIFIED.name(), storeInfo.getBlobTransferInServerEnabled());
+    assertFalse(storeInfo.isBlobTransferEnabled());
+    // setting value
+    storeInfo.setBlobTransferInServerEnabled(ActivationState.ENABLED.name());
+    storeInfo.setBlobTransferEnabled(true);
+    // check updated value
+    assertNotNull(storeInfo.getBlobTransferInServerEnabled());
+    assertEquals(ActivationState.ENABLED.name(), storeInfo.getBlobTransferInServerEnabled());
+    assertTrue(storeInfo.isBlobTransferEnabled());
+  }
+
+  @Test
+  public void testBlobDbEnabledConfig() {
+    StoreInfo storeInfo = new StoreInfo();
+    // check default value
+    assertNotNull(storeInfo.getBlobDbEnabled());
+    assertEquals(ActivationState.NOT_SPECIFIED.name(), storeInfo.getBlobDbEnabled());
+
+    // setting value to ENABLED
+    storeInfo.setBlobDbEnabled(ActivationState.ENABLED.name());
+    assertEquals(ActivationState.ENABLED.name(), storeInfo.getBlobDbEnabled());
+
+    // setting value to DISABLED
+    storeInfo.setBlobDbEnabled(ActivationState.DISABLED.name());
+    assertEquals(ActivationState.DISABLED.name(), storeInfo.getBlobDbEnabled());
+
+    // setting value back to NOT_SPECIFIED
+    storeInfo.setBlobDbEnabled(ActivationState.NOT_SPECIFIED.name());
+    assertEquals(ActivationState.NOT_SPECIFIED.name(), storeInfo.getBlobDbEnabled());
+  }
+
+  @Test
+  public void testFlinkVeniceViewsEnabled() {
+    StoreInfo storeInfo = new StoreInfo();
+    // check default value
+    assertFalse(storeInfo.isFlinkVeniceViewsEnabled());
+    // setting value
+    storeInfo.setFlinkVeniceViewsEnabled(true);
+    // check updated value
+    assertTrue(storeInfo.isFlinkVeniceViewsEnabled());
+  }
+
+  @Test
+  public void testExternalStorageReadModeDefaultsToVeniceOnly() {
+    StoreInfo storeInfo = new StoreInfo();
+    assertEquals(storeInfo.getExternalStorageReadMode(), ExternalStorageReadMode.VENICE_ONLY);
+  }
+
+  @Test
+  public void testExternalStorageReadModeRoundTripsAllValues() {
+    StoreInfo storeInfo = new StoreInfo();
+    for (ExternalStorageReadMode mode: ExternalStorageReadMode.values()) {
+      storeInfo.setExternalStorageReadMode(mode);
+      assertEquals(storeInfo.getExternalStorageReadMode(), mode);
+    }
+  }
+
+  @Test
+  public void testExternalStorageReadModeNullCoercesToVeniceOnly() {
+    StoreInfo storeInfo = new StoreInfo();
+    storeInfo.setExternalStorageReadMode(ExternalStorageReadMode.DUAL_MODE_EARLY_RETURN);
+    storeInfo.setExternalStorageReadMode(null);
+    assertEquals(storeInfo.getExternalStorageReadMode(), ExternalStorageReadMode.VENICE_ONLY);
+  }
+
+  @Test
+  public void testStorageModeDefaultsToInternal() {
+    StoreInfo storeInfo = new StoreInfo();
+    assertEquals(storeInfo.getStorageMode(), StorageMode.INTERNAL);
+  }
+
+  @Test
+  public void testStorageModeRoundTripsAllValues() {
+    StoreInfo storeInfo = new StoreInfo();
+    for (StorageMode mode: StorageMode.values()) {
+      storeInfo.setStorageMode(mode);
+      assertEquals(storeInfo.getStorageMode(), mode);
+    }
+  }
+
+  @Test
+  public void testStorageModeNullCoercesToInternal() {
+    StoreInfo storeInfo = new StoreInfo();
+    storeInfo.setStorageMode(StorageMode.EXTERNAL);
+    storeInfo.setStorageMode(null);
+    assertEquals(storeInfo.getStorageMode(), StorageMode.INTERNAL);
   }
 }

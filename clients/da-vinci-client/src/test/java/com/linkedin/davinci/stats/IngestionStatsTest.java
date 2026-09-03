@@ -1,43 +1,37 @@
 package com.linkedin.davinci.stats;
 
-import static com.linkedin.venice.ConfigKeys.CLUSTER_NAME;
-import static com.linkedin.venice.ConfigKeys.KAFKA_BOOTSTRAP_SERVERS;
-import static com.linkedin.venice.ConfigKeys.ZOOKEEPER_ADDRESS;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+import static org.testng.Assert.assertEquals;
 
 import com.linkedin.davinci.config.VeniceServerConfig;
 import com.linkedin.davinci.kafka.consumer.StoreIngestionTask;
-import com.linkedin.venice.utils.PropertyBuilder;
-import com.linkedin.venice.utils.VeniceProperties;
 import io.tehuti.metrics.MetricConfig;
-import org.mockito.Mockito;
-import org.testng.Assert;
+import io.tehuti.metrics.stats.AsyncGauge;
+import it.unimi.dsi.fastutil.ints.Int2ObjectArrayMap;
+import java.io.IOException;
+import org.testng.annotations.AfterMethod;
+import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
 
 public class IngestionStatsTest {
-  @Test
-  public void testGetLeaderStalledHybridIngestion() {
-    PropertyBuilder builder = new PropertyBuilder();
-    builder.put(CLUSTER_NAME, "testCluster");
-    builder.put(ZOOKEEPER_ADDRESS, "fake");
-    builder.put(KAFKA_BOOTSTRAP_SERVERS, "faker");
-    VeniceProperties veniceProperties = new VeniceProperties(builder.build().toProperties());
-    VeniceServerConfig serverConfig = new VeniceServerConfig(veniceProperties);
-    IngestionStats ingestionStats = new IngestionStats(serverConfig);
+  // Dedicated AsyncGauge executor: the default static singleton can be shut down by other tests
+  // calling MetricsRepository.close() in the same JVM, which makes AsyncGauge.measure() return 0.0
+  // permanently.
+  private AsyncGauge.AsyncGaugeExecutor asyncGaugeExecutor;
 
-    StoreIngestionTask caughtUpMockIngestionTask = mock(StoreIngestionTask.class);
-    Mockito.when(caughtUpMockIngestionTask.getHybridLeaderOffsetLag()).thenReturn(0L);
-    Mockito.when(caughtUpMockIngestionTask.isRunning()).thenReturn(true);
-    ingestionStats.setIngestionTask(caughtUpMockIngestionTask);
-    Assert.assertEquals(ingestionStats.getLeaderStalledHybridIngestion(), 0.0);
+  @BeforeMethod
+  public void setUp() {
+    asyncGaugeExecutor = new AsyncGauge.AsyncGaugeExecutor.Builder().build();
+  }
 
-    StoreIngestionTask stuckIngestionTask = mock(StoreIngestionTask.class);
-    Mockito.when(stuckIngestionTask.getHybridLeaderOffsetLag()).thenReturn(1L);
-    Mockito.when(stuckIngestionTask.isRunning()).thenReturn(true);
-    ingestionStats.setIngestionTask(stuckIngestionTask);
-    Assert.assertEquals(ingestionStats.getLeaderStalledHybridIngestion(), 1.0);
+  @AfterMethod
+  public void tearDown() throws IOException {
+    if (asyncGaugeExecutor != null) {
+      asyncGaugeExecutor.close();
+    }
   }
 
   @Test
@@ -46,6 +40,23 @@ public class IngestionStatsTest {
     doReturn(mock(IngestionStats.class)).when(mockReporter).getStats();
     IngestionStatsReporter.IngestionStatsGauge gauge =
         new IngestionStatsReporter.IngestionStatsGauge(mockReporter, () -> 1.0, "testIngestionStatsGauge");
-    Assert.assertEquals(gauge.measure(new MetricConfig(), System.currentTimeMillis()), 1.0);
+    assertEquals(gauge.measure(new MetricConfig(asyncGaugeExecutor), System.currentTimeMillis()), 1.0);
+  }
+
+  @Test
+  public void testGetUniqueKeyCount() {
+    VeniceServerConfig serverConfig = mock(VeniceServerConfig.class);
+    when(serverConfig.getKafkaClusterIdToAliasMap()).thenReturn(new Int2ObjectArrayMap<>());
+    IngestionStats stats = new IngestionStats(serverConfig);
+
+    // No task set — should return 0
+    assertEquals(stats.getUniqueKeyCount(), 0L);
+
+    // Set a mock task that returns a known count
+    StoreIngestionTask mockTask = mock(StoreIngestionTask.class);
+    when(mockTask.isRunning()).thenReturn(true);
+    when(mockTask.getEstimatedUniqueIngestedKeyCount()).thenReturn(42_000L);
+    stats.setIngestionTask(mockTask);
+    assertEquals(stats.getUniqueKeyCount(), 42_000L);
   }
 }

@@ -1,5 +1,8 @@
 package com.linkedin.venice.hadoop.mapreduce.counter;
 
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
 import org.apache.hadoop.mapred.Counters;
 import org.apache.hadoop.mapred.Reporter;
 
@@ -24,6 +27,8 @@ public class MRJobCounterHelper {
   private static final String EMPTY_RECORD = "empty record";
   private static final String AUTHORIZATION_FAILURES = "authorization failures";
   private static final String RECORD_TOO_LARGE_FAILURES = "record too large failures";
+  private static final String UNCOMPRESSED_RECORD_TOO_LARGE_FAILURES = "uncompressed record too large failures";
+  private static final String INCREMENTAL_PUSH_THROTTLE_TIME_MS = "incremental push throttle time (ms)";
 
   private static final String COUNTER_GROUP_DATA_QUALITY = "Data quality";
   private static final String DUPLICATE_KEY_WITH_IDENTICAL_VALUE = "duplicate key with identical value";
@@ -34,18 +39,21 @@ public class MRJobCounterHelper {
   private static final String REDUCER_JOB_CLOSED_COUNT = "Reducer job closed count";
   private static final String MAPPER_SPRAY_ALL_PARTITIONS_TRIGGERED_COUNT =
       "Mapper spray all partitions triggered count";
-  private static final String MAPPER_NUM_RECORDS_SUCCESSFULLY_PROCESSED = "Mapper num records successfully processed";
-  private static final String MAPPER_ZSTD_DICT_TRAIN_SUCCESS = "Mapper Zstd dict train success";
-  /** Error Counters */
-  private static final String MAPPER_ERROR_DATA_MODIFIED_DURING_PUSH_JOB =
-      "Mapper Error: Data modified during push job";
-  private static final String MAPPER_INVALID_INPUT_IDX = "Mapper invalid input index";
-  private static final String MAPPER_INVALID_INPUT_FILE = "Mapper invalid input file";
-  private static final String MAPPER_SCHEMA_INCONSISTENCY_FAILURE = "Mapper schema inconsistency failure";
-  private static final String MAPPER_ZSTD_DICT_TRAIN_FAILURE = "Mapper Zstd dict train failure";
-  private static final String MAPPER_ZSTD_DICT_TRAIN_SKIPPED = "Mapper Zstd dict train skipped";
   private static final String COUNTER_GROUP_KAFKA_INPUT_FORMAT = "KafkaInputFormat";
   private static final String COUNTER_PUT_OR_DELETE_RECORDS = "put or delete records";
+  private static final String COUNTER_GROUP_EXTERNAL_STORAGE = "External storage";
+  private static final String EXTERNAL_STORAGE_FAILED_REGION_COUNTER_NAME_PREFIX = "failed region: ";
+  /**
+   * Summed across every successful reducer of the job: wall-clock time spent in the external-storage
+   * write path, including throttling wait, batchPut retries/backoff, flush and close. This is
+   * a sum of per-task durations, not the job's wall-clock duration.
+   */
+  private static final String EXTERNAL_STORAGE_WRITE_TIME_MS = "external storage write time (ms)";
+  /**
+   * Summed across every successful reducer of the job: wall-clock time spent invoking the Venice/Kafka writes
+   * and flushing/closing the Venice writer. Sum of per-task durations, not job wall-clock duration.
+   */
+  private static final String VENICE_WRITE_TIME_MS = "venice write time (ms)";
 
   private static final String REPUSH_TTL_FILTERED_COUNT = "Repush ttl filtered count";
 
@@ -76,6 +84,9 @@ public class MRJobCounterHelper {
   public static final GroupAndCounterNames RECORD_TOO_LARGE_FAILURE_GROUP_COUNTER_NAME =
       new GroupAndCounterNames(COUNTER_GROUP_DATA_QUALITY, RECORD_TOO_LARGE_FAILURES);
 
+  public static final GroupAndCounterNames UNCOMPRESSED_RECORD_TOO_LARGE_FAILURE_GROUP_COUNTER_NAME =
+      new GroupAndCounterNames(COUNTER_GROUP_DATA_QUALITY, UNCOMPRESSED_RECORD_TOO_LARGE_FAILURES);
+
   public static final GroupAndCounterNames OUTPUT_RECORD_COUNT_GROUP_COUNTER_NAME =
       new GroupAndCounterNames(COUNTER_GROUP_KAFKA, COUNTER_OUTPUT_RECORDS);
 
@@ -91,32 +102,17 @@ public class MRJobCounterHelper {
   public static final GroupAndCounterNames TOTAL_PUT_OR_DELETE_COUNT_GROUP_COUNTER_NAME =
       new GroupAndCounterNames(COUNTER_GROUP_KAFKA_INPUT_FORMAT, COUNTER_PUT_OR_DELETE_RECORDS);
 
-  public static final GroupAndCounterNames MAPPER_ERROR_DATA_MODIFIED_DURING_PUSH_JOB_GROUP_COUNTER_NAME =
-      new GroupAndCounterNames(MR_JOB_STATUS, MAPPER_ERROR_DATA_MODIFIED_DURING_PUSH_JOB);
-
-  public static final GroupAndCounterNames MAPPER_INVALID_INPUT_IDX_GROUP_COUNTER_NAME =
-      new GroupAndCounterNames(MR_JOB_STATUS, MAPPER_INVALID_INPUT_IDX);
-
-  public static final GroupAndCounterNames MAPPER_INVALID_INPUT_FILE_GROUP_COUNTER_NAME =
-      new GroupAndCounterNames(MR_JOB_STATUS, MAPPER_INVALID_INPUT_FILE);
-
-  public static final GroupAndCounterNames MAPPER_SCHEMA_INCONSISTENCY_FAILURE_GROUP_COUNTER_NAME =
-      new GroupAndCounterNames(MR_JOB_STATUS, MAPPER_SCHEMA_INCONSISTENCY_FAILURE);
-
-  public static final GroupAndCounterNames MAPPER_ZSTD_DICT_TRAIN_SUCCESS_GROUP_COUNTER_NAME =
-      new GroupAndCounterNames(MR_JOB_STATUS, MAPPER_ZSTD_DICT_TRAIN_SUCCESS);
-
-  public static final GroupAndCounterNames MAPPER_ZSTD_DICT_TRAIN_FAILURE_GROUP_COUNTER_NAME =
-      new GroupAndCounterNames(MR_JOB_STATUS, MAPPER_ZSTD_DICT_TRAIN_FAILURE);
-
-  public static final GroupAndCounterNames MAPPER_ZSTD_DICT_TRAIN_SKIPPED_GROUP_COUNTER_NAME =
-      new GroupAndCounterNames(MR_JOB_STATUS, MAPPER_ZSTD_DICT_TRAIN_SKIPPED);
-
-  public static final GroupAndCounterNames MAPPER_NUM_RECORDS_SUCCESSFULLY_PROCESSED_GROUP_COUNTER_NAME =
-      new GroupAndCounterNames(MR_JOB_STATUS, MAPPER_NUM_RECORDS_SUCCESSFULLY_PROCESSED);
-
   public static final GroupAndCounterNames REPUSH_TTL_FILTER_COUNT_GROUP_COUNTER_NAME =
       new GroupAndCounterNames(MR_JOB_STATUS, REPUSH_TTL_FILTERED_COUNT);
+
+  public static final GroupAndCounterNames INCREMENTAL_PUSH_THROTTLE_TIME_GROUP_COUNTER_NAME =
+      new GroupAndCounterNames(COUNTER_GROUP_KAFKA, INCREMENTAL_PUSH_THROTTLE_TIME_MS);
+
+  public static final GroupAndCounterNames EXTERNAL_STORAGE_WRITE_TIME_GROUP_COUNTER_NAME =
+      new GroupAndCounterNames(COUNTER_GROUP_EXTERNAL_STORAGE, EXTERNAL_STORAGE_WRITE_TIME_MS);
+
+  public static final GroupAndCounterNames VENICE_WRITE_TIME_GROUP_COUNTER_NAME =
+      new GroupAndCounterNames(COUNTER_GROUP_KAFKA, VENICE_WRITE_TIME_MS);
 
   private MRJobCounterHelper() {
     // Util class
@@ -136,6 +132,10 @@ public class MRJobCounterHelper {
 
   public static void incrRecordTooLargeFailureCount(Reporter reporter, long amount) {
     incrAmountWithGroupCounterName(reporter, RECORD_TOO_LARGE_FAILURE_GROUP_COUNTER_NAME, amount);
+  }
+
+  public static void incrUncompressedRecordTooLargeFailureCount(Reporter reporter, long amount) {
+    incrAmountWithGroupCounterName(reporter, UNCOMPRESSED_RECORD_TOO_LARGE_FAILURE_GROUP_COUNTER_NAME, amount);
   }
 
   public static void incrTotalKeySize(Reporter reporter, long amount) {
@@ -178,6 +178,44 @@ public class MRJobCounterHelper {
     incrAmountWithGroupCounterName(reporter, TOTAL_PUT_OR_DELETE_COUNT_GROUP_COUNTER_NAME, amount);
   }
 
+  public static void incrIncrementalPushThrottleTime(Reporter reporter, long amount) {
+    incrAmountWithGroupCounterName(reporter, INCREMENTAL_PUSH_THROTTLE_TIME_GROUP_COUNTER_NAME, amount);
+  }
+
+  public static void incrFailedExternalStorageRegionCount(Reporter reporter, String regionName, long amount) {
+    if (regionName == null || regionName.isEmpty()) {
+      return;
+    }
+    incrAmountWithGroupCounterName(
+        reporter,
+        new GroupAndCounterNames(COUNTER_GROUP_EXTERNAL_STORAGE, getFailedExternalStorageRegionCounterName(regionName)),
+        amount);
+  }
+
+  public static void incrExternalStorageWriteTime(Reporter reporter, long amount) {
+    incrAmountWithGroupCounterName(reporter, EXTERNAL_STORAGE_WRITE_TIME_GROUP_COUNTER_NAME, amount);
+  }
+
+  public static void incrVeniceWriteTime(Reporter reporter, long amount) {
+    incrAmountWithGroupCounterName(reporter, VENICE_WRITE_TIME_GROUP_COUNTER_NAME, amount);
+  }
+
+  public static long getExternalStorageWriteTimeMs(Reporter reporter) {
+    return getCountWithGroupCounterName(reporter, EXTERNAL_STORAGE_WRITE_TIME_GROUP_COUNTER_NAME);
+  }
+
+  public static long getExternalStorageWriteTimeMs(Counters counters) {
+    return getCountFromCounters(counters, EXTERNAL_STORAGE_WRITE_TIME_GROUP_COUNTER_NAME);
+  }
+
+  public static long getVeniceWriteTimeMs(Reporter reporter) {
+    return getCountWithGroupCounterName(reporter, VENICE_WRITE_TIME_GROUP_COUNTER_NAME);
+  }
+
+  public static long getVeniceWriteTimeMs(Counters counters) {
+    return getCountFromCounters(counters, VENICE_WRITE_TIME_GROUP_COUNTER_NAME);
+  }
+
   public static long getWriteAclAuthorizationFailureCount(Reporter reporter) {
     return getCountWithGroupCounterName(reporter, WRITE_ACL_FAILURE_GROUP_COUNTER_NAME);
   }
@@ -188,6 +226,10 @@ public class MRJobCounterHelper {
 
   public static long getRecordTooLargeFailureCount(Reporter reporter) {
     return getCountWithGroupCounterName(reporter, RECORD_TOO_LARGE_FAILURE_GROUP_COUNTER_NAME);
+  }
+
+  public static long getUncompressedRecordTooLargeFailureCount(Reporter reporter) {
+    return getCountWithGroupCounterName(reporter, UNCOMPRESSED_RECORD_TOO_LARGE_FAILURE_GROUP_COUNTER_NAME);
   }
 
   public static long getTotalKeySize(Reporter reporter) {
@@ -226,6 +268,10 @@ public class MRJobCounterHelper {
     return getCountFromCounters(counters, RECORD_TOO_LARGE_FAILURE_GROUP_COUNTER_NAME);
   }
 
+  public static long getUncompressedRecordTooLargeFailureCount(Counters counters) {
+    return getCountFromCounters(counters, UNCOMPRESSED_RECORD_TOO_LARGE_FAILURE_GROUP_COUNTER_NAME);
+  }
+
   public static long getTotalKeySize(Counters counters) {
     return getCountFromCounters(counters, TOTAL_KEY_SIZE_GROUP_COUNTER_NAME);
   }
@@ -248,6 +294,32 @@ public class MRJobCounterHelper {
 
   public static long getTotalPutOrDeleteRecordsCount(Counters counters) {
     return getCountFromCounters(counters, TOTAL_PUT_OR_DELETE_COUNT_GROUP_COUNTER_NAME);
+  }
+
+  public static long getIncrementalPushThrottleTimeMs(Reporter reporter) {
+    return getCountWithGroupCounterName(reporter, INCREMENTAL_PUSH_THROTTLE_TIME_GROUP_COUNTER_NAME);
+  }
+
+  public static long getIncrementalPushThrottleTimeMs(Counters counters) {
+    return getCountFromCounters(counters, INCREMENTAL_PUSH_THROTTLE_TIME_GROUP_COUNTER_NAME);
+  }
+
+  public static Set<String> getFailedExternalStorageRegions(Counters counters) {
+    if (counters == null) {
+      return Collections.emptySet();
+    }
+    Set<String> regions = new HashSet<>();
+    Counters.Group group = counters.getGroup(COUNTER_GROUP_EXTERNAL_STORAGE);
+    if (group == null) {
+      return Collections.emptySet();
+    }
+    for (Counters.Counter counter: group) {
+      if (counter.getCounter() > 0
+          && counter.getName().startsWith(EXTERNAL_STORAGE_FAILED_REGION_COUNTER_NAME_PREFIX)) {
+        regions.add(counter.getName().substring(EXTERNAL_STORAGE_FAILED_REGION_COUNTER_NAME_PREFIX.length()));
+      }
+    }
+    return Collections.unmodifiableSet(regions);
   }
 
   private static long getCountFromCounters(Counters counters, GroupAndCounterNames groupAndCounterNames) {
@@ -274,76 +346,16 @@ public class MRJobCounterHelper {
     reporter.incrCounter(groupAndCounterNames.getGroupName(), groupAndCounterNames.getCounterName(), amount);
   }
 
-  public static void incrMapperErrorDataModifiedDuringPushJobCount(Reporter reporter, long amount) {
-    incrAmountWithGroupCounterName(reporter, MAPPER_ERROR_DATA_MODIFIED_DURING_PUSH_JOB_GROUP_COUNTER_NAME, amount);
-  }
-
-  public static long getMapperErrorDataModifiedDuringPushJobCount(Counters counters) {
-    return getCountFromCounters(counters, MAPPER_ERROR_DATA_MODIFIED_DURING_PUSH_JOB_GROUP_COUNTER_NAME);
-  }
-
-  public static void incrMapperInvalidInputIdxCount(Reporter reporter, long amount) {
-    incrAmountWithGroupCounterName(reporter, MAPPER_INVALID_INPUT_IDX_GROUP_COUNTER_NAME, amount);
-  }
-
-  public static long getMapperInvalidInputIdxCount(Counters counters) {
-    return getCountFromCounters(counters, MAPPER_INVALID_INPUT_IDX_GROUP_COUNTER_NAME);
-  }
-
-  public static void incrMapperInvalidInputFileCount(Reporter reporter, long amount) {
-    incrAmountWithGroupCounterName(reporter, MAPPER_INVALID_INPUT_FILE_GROUP_COUNTER_NAME, amount);
-  }
-
-  public static long getMapperInvalidInputFileCount(Counters counters) {
-    return getCountFromCounters(counters, MAPPER_INVALID_INPUT_FILE_GROUP_COUNTER_NAME);
-  }
-
-  public static void incrMapperSchemaInconsistencyFailureCount(Reporter reporter, long amount) {
-    incrAmountWithGroupCounterName(reporter, MAPPER_SCHEMA_INCONSISTENCY_FAILURE_GROUP_COUNTER_NAME, amount);
-  }
-
-  public static long getMapperSchemaInconsistencyFailureCount(Counters counters) {
-    return getCountFromCounters(counters, MAPPER_SCHEMA_INCONSISTENCY_FAILURE_GROUP_COUNTER_NAME);
-  }
-
-  public static void incrMapperZstdDictTrainSuccessCount(Reporter reporter, long amount) {
-    incrAmountWithGroupCounterName(reporter, MAPPER_ZSTD_DICT_TRAIN_SUCCESS_GROUP_COUNTER_NAME, amount);
-  }
-
-  public static long getMapperZstdDictTrainSuccessCount(Counters counters) {
-    return getCountFromCounters(counters, MAPPER_ZSTD_DICT_TRAIN_SUCCESS_GROUP_COUNTER_NAME);
-  }
-
-  public static void incrMapperZstdDictTrainFailureCount(Reporter reporter, long amount) {
-    incrAmountWithGroupCounterName(reporter, MAPPER_ZSTD_DICT_TRAIN_FAILURE_GROUP_COUNTER_NAME, amount);
-  }
-
-  public static long getMapperZstdDictTrainFailureCount(Counters counters) {
-    return getCountFromCounters(counters, MAPPER_ZSTD_DICT_TRAIN_FAILURE_GROUP_COUNTER_NAME);
-  }
-
-  public static void incrMapperZstdDictTrainSkippedCount(Reporter reporter, long amount) {
-    incrAmountWithGroupCounterName(reporter, MAPPER_ZSTD_DICT_TRAIN_SKIPPED_GROUP_COUNTER_NAME, amount);
-  }
-
-  public static long getMapperZstdDictTrainSkippedCount(Counters counters) {
-    return getCountFromCounters(counters, MAPPER_ZSTD_DICT_TRAIN_SKIPPED_GROUP_COUNTER_NAME);
-  }
-
-  public static void incrMapperNumRecordsSuccessfullyProcessedCount(Reporter reporter, long amount) {
-    incrAmountWithGroupCounterName(reporter, MAPPER_NUM_RECORDS_SUCCESSFULLY_PROCESSED_GROUP_COUNTER_NAME, amount);
-  }
-
-  public static long getMapperNumRecordsSuccessfullyProcessedCount(Counters counters) {
-    return getCountFromCounters(counters, MAPPER_NUM_RECORDS_SUCCESSFULLY_PROCESSED_GROUP_COUNTER_NAME);
-  }
-
   public static long getRepushTtlFilterCount(Counters counters) {
     return getCountFromCounters(counters, REPUSH_TTL_FILTER_COUNT_GROUP_COUNTER_NAME);
   }
 
   public static void incrRepushTtlFilterCount(Reporter reporter, long amount) {
     incrAmountWithGroupCounterName(reporter, REPUSH_TTL_FILTER_COUNT_GROUP_COUNTER_NAME, amount);
+  }
+
+  private static String getFailedExternalStorageRegionCounterName(String regionName) {
+    return EXTERNAL_STORAGE_FAILED_REGION_COUNTER_NAME_PREFIX + regionName;
   }
 
   /**

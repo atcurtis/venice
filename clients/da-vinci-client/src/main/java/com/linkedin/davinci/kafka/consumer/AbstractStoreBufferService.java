@@ -1,10 +1,10 @@
 package com.linkedin.davinci.kafka.consumer;
 
-import com.linkedin.venice.kafka.protocol.KafkaMessageEnvelope;
-import com.linkedin.venice.message.KafkaKey;
-import com.linkedin.venice.pubsub.api.PubSubMessage;
+import com.linkedin.davinci.validation.PartitionTracker;
+import com.linkedin.venice.pubsub.api.DefaultPubSubMessage;
 import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
 import com.linkedin.venice.service.AbstractVeniceService;
+import java.util.concurrent.CompletableFuture;
 
 
 /**
@@ -12,7 +12,7 @@ import com.linkedin.venice.service.AbstractVeniceService;
  */
 public abstract class AbstractStoreBufferService extends AbstractVeniceService {
   public abstract void putConsumerRecord(
-      PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> consumerRecord,
+      DefaultPubSubMessage consumerRecord,
       StoreIngestionTask ingestionTask,
       LeaderProducedRecordContext leaderProducedRecordContext,
       int partition,
@@ -20,10 +20,14 @@ public abstract class AbstractStoreBufferService extends AbstractVeniceService {
       long beforeProcessingRecordTimestampNs) throws InterruptedException;
 
   /**
-   * This method will wait for all the messages to be processed (persisted to disk) that are already
-   * queued up to drainer till now.
+   * Waits for all messages already queued to the drainer for this partition to be processed (persisted to disk).
+   * Returns when the drainer queue is empty. Throws VeniceException if the timeout is reached before the queue
+   * is fully drained.
+   *
+   * @param timeoutMs maximum time in milliseconds to wait for the drain to complete
+   * @throws InterruptedException if the waiting thread is interrupted
    */
-  public abstract void drainBufferedRecordsFromTopicPartition(PubSubTopicPartition topicPartition)
+  public abstract void drainBufferedRecordsFromTopicPartition(PubSubTopicPartition topicPartition, long timeoutMs)
       throws InterruptedException;
 
   public abstract long getTotalMemoryUsage();
@@ -33,4 +37,18 @@ public abstract class AbstractStoreBufferService extends AbstractVeniceService {
   public abstract long getMaxMemoryUsagePerDrainer();
 
   public abstract long getMinMemoryUsagePerDrainer();
+
+  public abstract CompletableFuture<Void> execSyncOffsetCommandAsync(
+      PubSubTopicPartition topicPartition,
+      StoreIngestionTask ingestionTask) throws InterruptedException;
+
+  public abstract CompletableFuture<Void> execSyncGlobalRtDivAsync(
+      PubSubTopicPartition topicPartition,
+      StoreIngestionTask ingestionTask) throws InterruptedException;
+
+  public abstract CompletableFuture<Void> execSyncOffsetFromSnapshotAsync(
+      PubSubTopicPartition topicPartition,
+      PartitionTracker vtDivSnapshot,
+      CompletableFuture<Void> lastRecordPersistedFuture,
+      StoreIngestionTask ingestionTask) throws InterruptedException;
 }

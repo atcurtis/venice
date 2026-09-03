@@ -1,51 +1,84 @@
 package com.linkedin.davinci.store.rocksdb;
 
-import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.*;
-import static com.linkedin.venice.ConfigKeys.INGESTION_MEMORY_LIMIT;
-import static com.linkedin.venice.ConfigKeys.INGESTION_USE_DA_VINCI_CLIENT;
+import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_BLOB_FILES_ENABLED;
+import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_BLOB_FILE_SIZE_IN_BYTES;
+import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_BLOB_FILE_STARTING_LEVEL;
+import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_BLOCK_CACHE_IMPLEMENTATION;
+import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_LEVEL0_COMPACTION_TUNING_FOR_READ_WRITE_LEADER_ENABLED;
+import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_LEVEL0_FILE_NUM_COMPACTION_TRIGGER;
+import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_LEVEL0_FILE_NUM_COMPACTION_TRIGGER_FOR_READ_WRITE_LEADER;
+import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_LEVEL0_FILE_NUM_COMPACTION_TRIGGER_WRITE_ONLY_VERSION;
+import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_LEVEL0_SLOWDOWN_WRITES_TRIGGER;
+import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_LEVEL0_SLOWDOWN_WRITES_TRIGGER_FOR_READ_WRITE_LEADER;
+import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_LEVEL0_SLOWDOWN_WRITES_TRIGGER_WRITE_ONLY_VERSION;
+import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_LEVEL0_STOPS_WRITES_TRIGGER;
+import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_LEVEL0_STOPS_WRITES_TRIGGER_FOR_READ_WRITE_LEADER;
+import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_LEVEL0_STOPS_WRITES_TRIGGER_WRITE_ONLY_VERSION;
+import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_MEMTABLE_SIZE_IN_BYTES;
+import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_MIN_BLOB_SIZE_IN_BYTES;
+import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_PLAIN_TABLE_FORMAT_ENABLED;
+import static com.linkedin.venice.ConfigKeys.BLOB_TRANSFER_MANAGER_ENABLED;
 import static com.linkedin.venice.ConfigKeys.PERSISTENCE_TYPE;
-import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.Mockito.mock;
+import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertTrue;
 import static org.testng.AssertJUnit.assertFalse;
 
+import com.linkedin.davinci.callback.BytesStreamingCallback;
 import com.linkedin.davinci.config.VeniceServerConfig;
 import com.linkedin.davinci.config.VeniceStoreVersionConfig;
-import com.linkedin.davinci.stats.RocksDBMemoryStats;
 import com.linkedin.davinci.store.AbstractStorageEngineTest;
 import com.linkedin.davinci.store.StoragePartitionConfig;
-import com.linkedin.venice.exceptions.MemoryLimitExhaustedException;
+import com.linkedin.venice.exceptions.DiskLimitExhaustedException;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.kafka.validation.checksum.CheckSum;
 import com.linkedin.venice.kafka.validation.checksum.CheckSumType;
 import com.linkedin.venice.meta.PersistenceType;
 import com.linkedin.venice.meta.Version;
-import com.linkedin.venice.serialization.avro.AvroProtocolDefinition;
+import com.linkedin.venice.store.rocksdb.RocksDBUtils;
 import com.linkedin.venice.utils.ByteUtils;
+import com.linkedin.venice.utils.ConfigCommonUtils.ActivationState;
 import com.linkedin.venice.utils.DataProviderUtils;
 import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.VeniceProperties;
 import java.io.File;
+import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.TreeMap;
+import java.util.concurrent.BrokenBarrierException;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.CyclicBarrier;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Supplier;
+import org.apache.commons.io.FileUtils;
 import org.apache.commons.lang.RandomStringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.mockito.MockedStatic;
 import org.mockito.Mockito;
+import org.rocksdb.Checkpoint;
 import org.rocksdb.ComparatorOptions;
 import org.rocksdb.Options;
+import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
 import org.rocksdb.util.BytewiseComparator;
 import org.testng.Assert;
-import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
 
@@ -56,7 +89,18 @@ public class RocksDBStoragePartitionTest {
   private static final String VALUE_PREFIX = "value_";
   private static final RocksDBThrottler ROCKSDB_THROTTLER = new RocksDBThrottler(3);
 
+  private static final String BLOB_GARBAGE_METRIC = "rocksdb.live-blob-file-garbage-size";
+  private static final List<String> BLOB_METRIC_LIST = Arrays.asList(
+      "rocksdb.num-blob-files",
+      "rocksdb.total-blob-file-size",
+      "rocksdb.live-blob-file-size",
+      BLOB_GARBAGE_METRIC);
+
   private Map<String, String> generateInput(int recordCnt, boolean sorted, int padLength) {
+    return generateInput(recordCnt, sorted, padLength, 0);
+  }
+
+  private Map<String, String> generateInput(int recordCnt, boolean sorted, int padLength, int startIdx) {
     Map<String, String> records;
     if (sorted) {
       BytewiseComparator comparator = new BytewiseComparator(new ComparatorOptions());
@@ -68,7 +112,7 @@ public class RocksDBStoragePartitionTest {
     } else {
       records = new HashMap<>();
     }
-    for (int i = 0; i < recordCnt; ++i) {
+    for (int i = startIdx; i < recordCnt + startIdx; ++i) {
       String value = VALUE_PREFIX + i;
       if (padLength > 0) {
         value += RandomStringUtils.random(padLength, true, true);
@@ -94,26 +138,222 @@ public class RocksDBStoragePartitionTest {
     }
   }
 
-  @DataProvider(name = "testIngestionDataProvider")
-  public Object[][] testIngestionDataProvider() {
-    return new Object[][] { { true, false, false, true }, // Sorted input without interruption, with verifyChecksum
-        { true, false, false, false }, // Sorted input without interruption, without verifyChecksum
-        { true, true, true, false }, // Sorted input with interruption, without verifyChecksum
-        { true, true, false, false }, // Sorted input with storage node re-boot, without verifyChecksum
-        { true, true, true, true }, // Sorted input with interruption, with verifyChecksum
-        { true, true, false, true }, // Sorted input with storage node re-boot, with verifyChecksum
-        { false, false, false, false }, // Unsorted input without interruption, without verifyChecksum
-        { false, true, false, false }, // Unsorted input with interruption, without verifyChecksum
-        { false, true, true, false } // Unsorted input with storage node re-boot, without verifyChecksum
-    };
+  @Test
+  public void testOpenDatabaseWithReplicationMetadataColumnFamily() throws RocksDBException {
+    String storeName = Version.composeKafkaTopic(Utils.getUniqueString("test_store"), 1);
+    String storeDir = getTempDatabaseDir(storeName);
+    StoragePartitionConfig partitionConfig = new StoragePartitionConfig(storeName, 0);
+    VeniceProperties veniceServerProperties = AbstractStorageEngineTest.getServerProperties(PersistenceType.ROCKS_DB);
+    RocksDBServerConfig rocksDBServerConfig = new RocksDBServerConfig(veniceServerProperties);
+    RocksDBStorageEngineFactory factory =
+        new RocksDBStorageEngineFactory(new VeniceServerConfig(veniceServerProperties));
+
+    byte[] key = "key".getBytes(StandardCharsets.UTF_8);
+    byte[] value = "value".getBytes(StandardCharsets.UTF_8);
+    ReplicationMetadataRocksDBStoragePartition serverPartition = new ReplicationMetadataRocksDBStoragePartition(
+        partitionConfig,
+        factory,
+        DATA_BASE_DIR,
+        null,
+        ROCKSDB_THROTTLER,
+        rocksDBServerConfig);
+    serverPartition.putWithReplicationMetadata(key, value, "replication-metadata".getBytes(StandardCharsets.UTF_8));
+    serverPartition.close();
+
+    RocksDBStoragePartition daVinciPartition = new RocksDBStoragePartition(
+        partitionConfig,
+        factory,
+        DATA_BASE_DIR,
+        null,
+        ROCKSDB_THROTTLER,
+        rocksDBServerConfig);
+    Assert.assertEquals(daVinciPartition.get(key), value);
+    Assert.assertEquals(daVinciPartition.getColumnFamilyHandleList().size(), 2);
+    Assert.assertEquals(
+        daVinciPartition.getColumnFamilyHandleList().get(1).getName(),
+        RocksDBStoragePartition.REPLICATION_METADATA_COLUMN_FAMILY);
+
+    daVinciPartition.drop();
+    removeDir(storeDir);
   }
 
-  @Test(dataProvider = "testIngestionDataProvider")
+  @Test
+  public void testRejectDatabaseWithUnknownColumnFamily() {
+    String storeName = Version.composeKafkaTopic(Utils.getUniqueString("test_store"), 1);
+    String storeDir = getTempDatabaseDir(storeName);
+    StoragePartitionConfig partitionConfig = new StoragePartitionConfig(storeName, 0);
+    VeniceProperties veniceServerProperties = AbstractStorageEngineTest.getServerProperties(PersistenceType.ROCKS_DB);
+    RocksDBServerConfig rocksDBServerConfig = new RocksDBServerConfig(veniceServerProperties);
+    RocksDBStorageEngineFactory factory =
+        new RocksDBStorageEngineFactory(new VeniceServerConfig(veniceServerProperties));
+    byte[] unknownColumnFamily = "unknown".getBytes(StandardCharsets.UTF_8);
+
+    RocksDBStoragePartition sourcePartition = new RocksDBStoragePartition(
+        partitionConfig,
+        factory,
+        DATA_BASE_DIR,
+        null,
+        ROCKSDB_THROTTLER,
+        rocksDBServerConfig,
+        Arrays.asList(RocksDB.DEFAULT_COLUMN_FAMILY, unknownColumnFamily));
+    sourcePartition.close();
+
+    VeniceException exception = Assert.expectThrows(
+        VeniceException.class,
+        () -> new RocksDBStoragePartition(
+            partitionConfig,
+            factory,
+            DATA_BASE_DIR,
+            null,
+            ROCKSDB_THROTTLER,
+            rocksDBServerConfig));
+    Assert.assertTrue(exception.getMessage().contains("Unsupported RocksDB column family"));
+    Assert.assertTrue(exception.getMessage().contains("unknown"));
+
+    sourcePartition.drop();
+    removeDir(storeDir);
+  }
+
+  @Test
+  public void testBlobDBCompatibility() {
+    String storeName = Version.composeKafkaTopic(Utils.getUniqueString("test_store"), 1);
+    String storeDir = getTempDatabaseDir(storeName);
+    int partitionId = 0;
+    String dbFolder = RocksDBUtils.composePartitionDbDir(DATA_BASE_DIR, storeName, partitionId);
+    File dbDir = new File(dbFolder);
+
+    Supplier<String[]> sstFileFinder = () -> dbDir.list(((dir, name) -> name.endsWith(".sst")));
+    Supplier<String[]> blobFileFinder = () -> dbDir.list(((dir, name) -> name.endsWith(".blob")));
+
+    StoragePartitionConfig partitionConfig = new StoragePartitionConfig(storeName, partitionId);
+
+    int largeRecordPaddingLength = 10000;
+    Map<String, String> largeInputRecords = generateInput(1000, false, largeRecordPaddingLength, 0);
+    Map<String, String> smallInputRecords = generateInput(1000, false, 10, 10000);
+    List<Map.Entry<String, String>> largeEntryList = new ArrayList<>(largeInputRecords.entrySet());
+    List<Map.Entry<String, String>> smallEntryList = new ArrayList<>(smallInputRecords.entrySet());
+    Properties extraProps = new Properties();
+    // Disable blob files
+    extraProps.put(ROCKSDB_BLOB_FILES_ENABLED, "false");
+    extraProps.put(ROCKSDB_MIN_BLOB_SIZE_IN_BYTES, "1000"); // make sure the threshold is larger than small records
+                                                            // generated
+    extraProps.put(ROCKSDB_BLOB_FILE_SIZE_IN_BYTES, "2097152");
+    extraProps.put(ROCKSDB_BLOB_FILE_STARTING_LEVEL, "0");
+    extraProps.put(ROCKSDB_MEMTABLE_SIZE_IN_BYTES, "1048576"); // 1MB
+
+    VeniceProperties veniceServerProperties =
+        AbstractStorageEngineTest.getServerProperties(PersistenceType.ROCKS_DB, extraProps);
+    RocksDBServerConfig rocksDBServerConfig = new RocksDBServerConfig(veniceServerProperties);
+    VeniceServerConfig serverConfig = new VeniceServerConfig(veniceServerProperties);
+    RocksDBStorageEngineFactory factory = new RocksDBStorageEngineFactory(serverConfig);
+    RocksDBStoragePartition storagePartition = new RocksDBStoragePartition(
+        partitionConfig,
+        factory,
+        DATA_BASE_DIR,
+        null,
+        ROCKSDB_THROTTLER,
+        rocksDBServerConfig);
+    // Insert the first 300 [0, 300) entries with blob db disabled
+    for (int i = 0; i < 300; i++) {
+      storagePartition.put(largeEntryList.get(i).getKey().getBytes(), largeEntryList.get(i).getValue().getBytes());
+      storagePartition.put(smallEntryList.get(i).getKey().getBytes(), smallEntryList.get(i).getValue().getBytes());
+    }
+    storagePartition.close();
+    // Make sure no blob files were generated
+    assertTrue(sstFileFinder.get().length > 0);
+    assertTrue(blobFileFinder.get().length == 0);
+
+    // Enable blob files
+    extraProps.put(ROCKSDB_BLOB_FILES_ENABLED, "true");
+
+    veniceServerProperties = AbstractStorageEngineTest.getServerProperties(PersistenceType.ROCKS_DB, extraProps);
+    rocksDBServerConfig = new RocksDBServerConfig(veniceServerProperties);
+    serverConfig = new VeniceServerConfig(veniceServerProperties);
+    factory = new RocksDBStorageEngineFactory(serverConfig);
+    storagePartition = new RocksDBStoragePartition(
+        partitionConfig,
+        factory,
+        DATA_BASE_DIR,
+        null,
+        ROCKSDB_THROTTLER,
+        rocksDBServerConfig);
+    // Insert [300, 700) entries with blob db enabled
+    for (int i = 300; i < 700; i++) {
+      storagePartition.put(largeEntryList.get(i).getKey().getBytes(), largeEntryList.get(i).getValue().getBytes());
+      storagePartition.put(smallEntryList.get(i).getKey().getBytes(), smallEntryList.get(i).getValue().getBytes());
+    }
+    storagePartition.sync();
+    // Make sure blob files were generated
+    assertTrue(sstFileFinder.get().length > 0);
+    int blobFileCnt = blobFileFinder.get().length;
+    assertTrue(blobFileCnt > 0);
+    // Validate all the entries inserted so far
+    for (int i = 0; i < 700; i++) {
+      Assert.assertEquals(
+          storagePartition.get(largeEntryList.get(i).getKey().getBytes()),
+          largeEntryList.get(i).getValue().getBytes());
+      Assert.assertEquals(
+          storagePartition.get(smallEntryList.get(i).getKey().getBytes()),
+          smallEntryList.get(i).getValue().getBytes());
+    }
+    storagePartition.sync();
+    assertTrue(
+        storagePartition.getPartitionSizeInBytes() > 700l
+            * (KEY_PREFIX.length() + VALUE_PREFIX.length() * 2 + largeRecordPaddingLength));
+
+    storagePartition.close();
+
+    // Disable blob files
+    extraProps.put(ROCKSDB_BLOB_FILES_ENABLED, "false");
+
+    veniceServerProperties = AbstractStorageEngineTest.getServerProperties(PersistenceType.ROCKS_DB, extraProps);
+    rocksDBServerConfig = new RocksDBServerConfig(veniceServerProperties);
+    serverConfig = new VeniceServerConfig(veniceServerProperties);
+    factory = new RocksDBStorageEngineFactory(serverConfig);
+    storagePartition = new RocksDBStoragePartition(
+        partitionConfig,
+        factory,
+        DATA_BASE_DIR,
+        null,
+        ROCKSDB_THROTTLER,
+        rocksDBServerConfig);
+    // Insert [700, 1000) entries with blob db enabled
+    for (int i = 700; i < 1000; i++) {
+      storagePartition.put(largeEntryList.get(i).getKey().getBytes(), largeEntryList.get(i).getValue().getBytes());
+      storagePartition.put(smallEntryList.get(i).getKey().getBytes(), smallEntryList.get(i).getValue().getBytes());
+    }
+
+    storagePartition.sync();
+    assertTrue(
+        storagePartition.getPartitionSizeInBytes() > 1000l
+            * (KEY_PREFIX.length() + VALUE_PREFIX.length() * 2 + largeRecordPaddingLength));
+    // Make sure no new blob files were generated
+    assertEquals(blobFileFinder.get().length, blobFileCnt);
+    // Validate all the entries inserted previously
+    for (Map.Entry<String, String> entry: largeEntryList) {
+      Assert.assertEquals(storagePartition.get(entry.getKey().getBytes()), entry.getValue().getBytes());
+    }
+    for (Map.Entry<String, String> entry: smallEntryList) {
+      Assert.assertEquals(storagePartition.get(entry.getKey().getBytes()), entry.getValue().getBytes());
+    }
+
+    storagePartition.close();
+    storagePartition.drop();
+    removeDir(storeDir);
+  }
+
+  /**
+   * This test takes way too long... both per-permutation and because there are so many permutations.
+   * TODO: Speed it up, or else refactor the permutations into several subclasses so they can run concurrently.
+   */
+  @Test(dataProvider = "Six-True-and-False", dataProviderClass = DataProviderUtils.class)
   public void testIngestion(
       boolean sorted,
       boolean interrupted,
       boolean reopenDatabaseDuringInterruption,
-      boolean verifyChecksum) {
+      boolean verifyChecksum,
+      boolean enableBlobFile,
+      boolean enablePlainTable) {
     CheckSum runningChecksum = CheckSum.getInstance(CheckSumType.MD5);
     String storeName = Version.composeKafkaTopic(Utils.getUniqueString("test_store"), 1);
     String storeDir = getTempDatabaseDir(storeName);
@@ -122,21 +362,34 @@ public class RocksDBStoragePartitionTest {
     partitionConfig.setDeferredWrite(sorted);
     Options options = new Options();
     options.setCreateIfMissing(true);
-    Map<String, String> inputRecords = generateInput(1010, sorted, 0);
-    VeniceProperties veniceServerProperties = AbstractStorageEngineTest.getServerProperties(PersistenceType.ROCKS_DB);
+
+    int padding = 100;
+    // TODO: decide if we really need this many records? this might be the cause of the slowness...
+    int numberOfRecords = 10000;
+    Map<String, String> inputRecords = generateInput(numberOfRecords, sorted, padding);
+    Properties extraProps = new Properties();
+    if (enableBlobFile) {
+      extraProps.put(ROCKSDB_BLOB_FILES_ENABLED, "true");
+      extraProps.put(ROCKSDB_MIN_BLOB_SIZE_IN_BYTES, "10");
+      extraProps.put(ROCKSDB_BLOB_FILE_SIZE_IN_BYTES, "102400");
+      extraProps.put(ROCKSDB_BLOB_FILE_STARTING_LEVEL, "0");
+    }
+    if (enablePlainTable) {
+      extraProps.put(ROCKSDB_PLAIN_TABLE_FORMAT_ENABLED, "true");
+    }
+    VeniceProperties veniceServerProperties =
+        AbstractStorageEngineTest.getServerProperties(PersistenceType.ROCKS_DB, extraProps);
     RocksDBServerConfig rocksDBServerConfig = new RocksDBServerConfig(veniceServerProperties);
 
     VeniceServerConfig serverConfig = new VeniceServerConfig(veniceServerProperties);
     RocksDBStorageEngineFactory factory = new RocksDBStorageEngineFactory(serverConfig);
-    VeniceStoreVersionConfig storeConfig = new VeniceStoreVersionConfig(storeName, veniceServerProperties);
     RocksDBStoragePartition storagePartition = new RocksDBStoragePartition(
         partitionConfig,
         factory,
         DATA_BASE_DIR,
         null,
         ROCKSDB_THROTTLER,
-        rocksDBServerConfig,
-        storeConfig);
+        rocksDBServerConfig);
     final int syncPerRecords = 100;
     final int interruptedRecord = 345;
 
@@ -163,7 +416,7 @@ public class RocksDBStoragePartitionTest {
       }
       if (++currentRecordNum % syncPerRecords == 0) {
         checkpointingInfo = storagePartition.sync();
-        if (sorted) {
+        if (sorted && !enablePlainTable) {
           Assert.assertEquals(
               checkpointingInfo.get(RocksDBSstFileWriter.ROCKSDB_LAST_FINISHED_SST_FILE_NO),
               String.valueOf(currentFileNo++));
@@ -182,12 +435,11 @@ public class RocksDBStoragePartitionTest {
                 DATA_BASE_DIR,
                 null,
                 ROCKSDB_THROTTLER,
-                rocksDBServerConfig,
-                storeConfig);
+                rocksDBServerConfig);
             Options storeOptions = storagePartition.getOptions();
             Assert.assertEquals(storeOptions.level0FileNumCompactionTrigger(), 100);
           }
-          if (sorted) {
+          if (sorted && !enablePlainTable) {
             storagePartition.beginBatchWrite(checkpointingInfo, checksumSupplier);
           }
 
@@ -215,7 +467,7 @@ public class RocksDBStoragePartitionTest {
       }
     }
 
-    if (sorted) {
+    if (sorted && !enablePlainTable) {
       Assert.assertFalse(storagePartition.validateBatchIngestion());
       storagePartition.endBatchWrite();
       assertTrue(storagePartition.validateBatchIngestion());
@@ -224,6 +476,27 @@ public class RocksDBStoragePartitionTest {
     // Verify all the key/value pairs
     for (Map.Entry<String, String> entry: inputRecords.entrySet()) {
       Assert.assertEquals(storagePartition.get(entry.getKey().getBytes()), entry.getValue().getBytes());
+    }
+
+    if (sorted && !enablePlainTable) {
+      if (enableBlobFile) {
+        // Verify some Blob file related metrics
+        for (String metric: BLOB_METRIC_LIST) {
+          Assert.assertEquals(storagePartition.getRocksDBStatValue(metric), 0);
+        }
+      }
+    } else {
+      if (enableBlobFile && !enablePlainTable) {
+        // Verify some Blob file related metrics
+        for (String metric: BLOB_METRIC_LIST) {
+          if (!metric.equals(BLOB_GARBAGE_METRIC)) {
+            Assert.assertTrue(storagePartition.getRocksDBStatValue(metric) > 0);
+          } else {
+            // No garbage so far.
+            Assert.assertEquals(storagePartition.getRocksDBStatValue(metric), 0);
+          }
+        }
+      }
     }
 
     // Verify current ingestion mode is in deferred-write mode
@@ -239,8 +512,7 @@ public class RocksDBStoragePartitionTest {
         DATA_BASE_DIR,
         null,
         ROCKSDB_THROTTLER,
-        rocksDBServerConfig,
-        storeConfig);
+        rocksDBServerConfig);
 
     // Test deletion
     String toBeDeletedKey = KEY_PREFIX + 10;
@@ -248,12 +520,14 @@ public class RocksDBStoragePartitionTest {
     storagePartition.delete(toBeDeletedKey.getBytes());
     Assert.assertNull(storagePartition.get(toBeDeletedKey.getBytes()));
 
-    assertTrue(storagePartition.getPartitionSizeInBytes() > 0);
+    long minimalPartitionSize = (long) numberOfRecords * (KEY_PREFIX.length() + VALUE_PREFIX.length() + padding);
+    long maxPartitionSize = 2 * minimalPartitionSize; // Add some buffer;
+    long partitionSize = storagePartition.getPartitionSizeInBytes();
+    assertTrue(partitionSize > minimalPartitionSize && partitionSize < maxPartitionSize);
 
     Options storeOptions = storagePartition.getOptions();
     Assert.assertEquals(storeOptions.level0FileNumCompactionTrigger(), 40);
     storagePartition.drop();
-    options.close();
     removeDir(storeDir);
   }
 
@@ -273,15 +547,13 @@ public class RocksDBStoragePartitionTest {
 
     VeniceServerConfig serverConfig = new VeniceServerConfig(veniceServerProperties);
     RocksDBStorageEngineFactory factory = new RocksDBStorageEngineFactory(serverConfig);
-    VeniceStoreVersionConfig storeConfig = new VeniceStoreVersionConfig(storeName, veniceServerProperties);
     RocksDBStoragePartition storagePartition = new RocksDBStoragePartition(
         partitionConfig,
         factory,
         DATA_BASE_DIR,
         null,
         ROCKSDB_THROTTLER,
-        rocksDBServerConfig,
-        storeConfig);
+        rocksDBServerConfig);
     final int syncPerRecords = 100;
     final int interruptedRecord1 = 345;
     final int interruptedRecord2 = 645;
@@ -320,8 +592,7 @@ public class RocksDBStoragePartitionTest {
             DATA_BASE_DIR,
             null,
             ROCKSDB_THROTTLER,
-            rocksDBServerConfig,
-            storeConfig);
+            rocksDBServerConfig);
         Options storeOptions = storagePartition.getOptions();
         Assert.assertEquals(storeOptions.level0FileNumCompactionTrigger(), 100);
         if (sorted) {
@@ -362,7 +633,7 @@ public class RocksDBStoragePartitionTest {
     // Verify current ingestion mode is in deferred-write mode
     assertTrue(storagePartition.verifyConfig(partitionConfig));
 
-    storagePartition.rocksDB.compactRange();
+    storagePartition.compactRange();
     // Re-open it in read/write mode
     storagePartition.close();
     partitionConfig.setDeferredWrite(false);
@@ -375,10 +646,9 @@ public class RocksDBStoragePartitionTest {
         DATA_BASE_DIR,
         null,
         ROCKSDB_THROTTLER,
-        rocksDBServerConfig,
-        storeConfig);
+        rocksDBServerConfig);
 
-    storagePartition.rocksDB.compactRange();
+    storagePartition.compactRange();
 
     // Verify all the key/value pairs can be read using the new format
     for (Map.Entry<String, String> entry: inputRecords.entrySet()) {
@@ -429,7 +699,7 @@ public class RocksDBStoragePartitionTest {
     removeDir(storeDir);
   }
 
-  @Test(dataProvider = "testIngestionDataProvider")
+  @Test(dataProvider = "Four-True-and-False", dataProviderClass = DataProviderUtils.class)
   public void testIngestionWithClockCache(
       boolean sorted,
       boolean interrupted,
@@ -452,15 +722,13 @@ public class RocksDBStoragePartitionTest {
 
     VeniceServerConfig serverConfig = new VeniceServerConfig(veniceServerProperties);
     RocksDBStorageEngineFactory factory = new RocksDBStorageEngineFactory(serverConfig);
-    VeniceStoreVersionConfig storeConfig = new VeniceStoreVersionConfig(storeName, veniceServerProperties);
     RocksDBStoragePartition storagePartition = new RocksDBStoragePartition(
         partitionConfig,
         factory,
         DATA_BASE_DIR,
         null,
         ROCKSDB_THROTTLER,
-        rocksDBServerConfig,
-        storeConfig);
+        rocksDBServerConfig);
     final int syncPerRecords = 100;
     final int interruptedRecord = 345;
 
@@ -505,8 +773,7 @@ public class RocksDBStoragePartitionTest {
                 DATA_BASE_DIR,
                 null,
                 ROCKSDB_THROTTLER,
-                rocksDBServerConfig,
-                storeConfig);
+                rocksDBServerConfig);
             Options storeOptions = storagePartition.getOptions();
             Assert.assertEquals(storeOptions.level0FileNumCompactionTrigger(), 100);
           }
@@ -562,8 +829,7 @@ public class RocksDBStoragePartitionTest {
         DATA_BASE_DIR,
         null,
         ROCKSDB_THROTTLER,
-        rocksDBServerConfig,
-        storeConfig);
+        rocksDBServerConfig);
     // Test deletion
     String toBeDeletedKey = KEY_PREFIX + 10;
     Assert.assertNotNull(storagePartition.get(toBeDeletedKey.getBytes()));
@@ -589,15 +855,13 @@ public class RocksDBStoragePartitionTest {
 
     VeniceServerConfig serverConfig = new VeniceServerConfig(veniceServerProperties);
     RocksDBStorageEngineFactory factory = new RocksDBStorageEngineFactory(serverConfig);
-    VeniceStoreVersionConfig storeConfig = new VeniceStoreVersionConfig(storeName, veniceServerProperties);
     RocksDBStoragePartition storagePartition = new RocksDBStoragePartition(
         partitionConfig,
         factory,
         DATA_BASE_DIR,
         null,
         ROCKSDB_THROTTLER,
-        rocksDBServerConfig,
-        storeConfig);
+        rocksDBServerConfig);
 
     Optional<Supplier<byte[]>> checksumSupplier = Optional.of(() -> new byte[16]);
     storagePartition.beginBatchWrite(new HashMap<>(), checksumSupplier);
@@ -625,15 +889,13 @@ public class RocksDBStoragePartitionTest {
 
     VeniceServerConfig serverConfig = new VeniceServerConfig(veniceServerProperties);
     RocksDBStorageEngineFactory factory = new RocksDBStorageEngineFactory(serverConfig);
-    VeniceStoreVersionConfig storeConfig = new VeniceStoreVersionConfig(storeName, veniceServerProperties);
     RocksDBStoragePartition storagePartition = new RocksDBStoragePartition(
         partitionConfig,
         factory,
         DATA_BASE_DIR,
         null,
         ROCKSDB_THROTTLER,
-        rocksDBServerConfig,
-        storeConfig);
+        rocksDBServerConfig);
 
     storagePartition.close();
     try {
@@ -664,15 +926,13 @@ public class RocksDBStoragePartitionTest {
     partitionConfig.setWriteOnlyConfig(true);
     VeniceServerConfig serverConfig = new VeniceServerConfig(veniceServerProperties);
     RocksDBStorageEngineFactory factory = new RocksDBStorageEngineFactory(serverConfig);
-    VeniceStoreVersionConfig storeConfig = new VeniceStoreVersionConfig(storeName, veniceServerProperties);
     RocksDBStoragePartition storagePartition = new RocksDBStoragePartition(
         partitionConfig,
         factory,
         DATA_BASE_DIR,
         null,
         ROCKSDB_THROTTLER,
-        rocksDBServerConfig,
-        storeConfig);
+        rocksDBServerConfig);
 
     StoragePartitionConfig testConfig = new StoragePartitionConfig(storeName, partitionId);
     testConfig.setReadWriteLeaderForRMDCF(true);
@@ -695,15 +955,13 @@ public class RocksDBStoragePartitionTest {
         new RocksDBServerConfig(AbstractStorageEngineTest.getServerProperties(PersistenceType.ROCKS_DB, properties));
     serverConfig = new VeniceServerConfig(veniceServerProperties);
     factory = new RocksDBStorageEngineFactory(serverConfig);
-    storeConfig = new VeniceStoreVersionConfig(storeName, veniceServerProperties);
     storagePartition = new RocksDBStoragePartition(
         partitionConfig,
         factory,
         DATA_BASE_DIR,
         null,
         ROCKSDB_THROTTLER,
-        rocksDBServerConfig,
-        storeConfig);
+        rocksDBServerConfig);
 
     testConfig = new StoragePartitionConfig(storeName, partitionId);
     testConfig.setReadWriteLeaderForRMDCF(true);
@@ -745,15 +1003,13 @@ public class RocksDBStoragePartitionTest {
     partitionConfig.setWriteOnlyConfig(true);
     VeniceServerConfig serverConfig = new VeniceServerConfig(veniceServerProperties);
     RocksDBStorageEngineFactory factory = new RocksDBStorageEngineFactory(serverConfig);
-    VeniceStoreVersionConfig storeConfig = new VeniceStoreVersionConfig(storeName, veniceServerProperties);
     RocksDBStoragePartition storagePartition = new RocksDBStoragePartition(
         partitionConfig,
         factory,
         DATA_BASE_DIR,
         null,
         ROCKSDB_THROTTLER,
-        rocksDBServerConfig,
-        storeConfig);
+        rocksDBServerConfig);
 
     // By default, it is write only
     Options writeOnlyOptions = storagePartition.getOptions();
@@ -774,8 +1030,7 @@ public class RocksDBStoragePartitionTest {
         DATA_BASE_DIR,
         null,
         ROCKSDB_THROTTLER,
-        rocksDBServerConfig,
-        storeConfig);
+        rocksDBServerConfig);
     Options readWriteOptions = storagePartition.getOptions();
     Assert.assertEquals(readWriteOptions.level0FileNumCompactionTrigger(), 10);
     Assert.assertEquals(readWriteOptions.level0SlowdownWritesTrigger(), 20);
@@ -814,92 +1069,700 @@ public class RocksDBStoragePartitionTest {
   }
 
   @Test
-  public void checkMemoryLimitAtDatabaseOpen() {
+  public void testCreateSnapshot() {
     String storeName = Version.composeKafkaTopic(Utils.getUniqueString("test_store"), 1);
     String storeDir = getTempDatabaseDir(storeName);
-    RocksDBStoragePartition storagePartition = null;
-    try {
-      Properties extraProps = new Properties();
-      extraProps.setProperty(INGESTION_USE_DA_VINCI_CLIENT, "true");
-      extraProps.setProperty(INGESTION_MEMORY_LIMIT, "1MB");
-      extraProps.setProperty(ROCKSDB_MAX_MEMTABLE_COUNT, "2");
-      extraProps.setProperty(ROCKSDB_MEMTABLE_SIZE_IN_BYTES, "128KB");
-      extraProps.setProperty(ROCKSDB_TOTAL_MEMTABLE_USAGE_CAP_IN_BYTES, "512KB");
-      extraProps.setProperty(ROCKSDB_PLAIN_TABLE_FORMAT_ENABLED, "true");
+    int partitionId = 0;
+    StoragePartitionConfig partitionConfig = new StoragePartitionConfig(storeName, partitionId);
+    partitionConfig.setDeferredWrite(false);
+    Properties extraProps = new Properties();
+    extraProps.setProperty(BLOB_TRANSFER_MANAGER_ENABLED, "true");
+    VeniceProperties veniceServerProperties =
+        AbstractStorageEngineTest.getServerProperties(PersistenceType.ROCKS_DB, extraProps);
+    RocksDBServerConfig rocksDBServerConfig = new RocksDBServerConfig(veniceServerProperties);
 
-      VeniceProperties veniceServerProperties =
-          AbstractStorageEngineTest.getServerProperties(PersistenceType.ROCKS_DB, extraProps);
-      RocksDBServerConfig rocksDBServerConfig = new RocksDBServerConfig(veniceServerProperties);
+    VeniceServerConfig serverConfig = new VeniceServerConfig(veniceServerProperties);
+    RocksDBStorageEngineFactory factory = new RocksDBStorageEngineFactory(serverConfig);
 
-      int partitionId = 0;
-      StoragePartitionConfig partitionConfig = new StoragePartitionConfig(storeName, partitionId);
+    RocksDBStoragePartition storagePartition = new RocksDBStoragePartition(
+        partitionConfig,
+        factory,
+        DATA_BASE_DIR,
+        null,
+        ROCKSDB_THROTTLER,
+        rocksDBServerConfig);
 
-      RocksDBMemoryStats mockMemoryStats = mock(RocksDBMemoryStats.class);
-      VeniceServerConfig serverConfig = new VeniceServerConfig(veniceServerProperties);
-      VeniceStoreVersionConfig storeConfig = new VeniceStoreVersionConfig(storeName, veniceServerProperties);
-      RocksDBStorageEngineFactory factory = new RocksDBStorageEngineFactory(
-          serverConfig,
-          mockMemoryStats,
-          AvroProtocolDefinition.STORE_VERSION_STATE.getSerializer(),
-          AvroProtocolDefinition.PARTITION_STATE.getSerializer());
-      Mockito.verify(mockMemoryStats).setMemoryLimit(anyLong());
-      Mockito.verify(mockMemoryStats).setSstFileManager(factory.getSstFileManagerForMemoryLimiter());
-      storagePartition = new RocksDBStoragePartition(
-          partitionConfig,
-          factory,
-          DATA_BASE_DIR,
-          null,
-          ROCKSDB_THROTTLER,
-          rocksDBServerConfig,
-          storeConfig);
-      RocksDBStoragePartition finalStoragePartition = storagePartition;
-      Assert.expectThrows(MemoryLimitExhaustedException.class, () -> {
-        String keyPrefix = "key_prefix_";
-        String valuePrefix = "value_prefix________________________________________";
-        for (int i = 0; i < 100000; ++i) {
-          finalStoragePartition.put((keyPrefix + i).getBytes(), (valuePrefix + i).getBytes());
-        }
-        ;
-      });
+    try (MockedStatic<RocksDBStoragePartition> rocksDBStoragePartition =
+        Mockito.mockStatic(RocksDBStoragePartition.class)) {
+      rocksDBStoragePartition
+          .when(() -> RocksDBStoragePartition.createSnapshot(Mockito.any(), Mockito.any(), Mockito.any()))
+          .thenAnswer(invocation -> {
+            return null;
+          });
+      storagePartition.createSnapshot();
 
-      Assert.expectThrows(MemoryLimitExhaustedException.class, () -> {
-        String keyPrefix = "key_prefix1_";
-        for (int i = 0; i < 100000; ++i) {
-          finalStoragePartition.delete((keyPrefix + i).getBytes());
-        }
-        ;
-      });
+      rocksDBStoragePartition.verify(
+          () -> RocksDBStoragePartition.createSnapshot(Mockito.any(), Mockito.any(), Mockito.any()),
+          Mockito.times(1));
+    }
 
-      Assert.expectThrows(MemoryLimitExhaustedException.class, () -> finalStoragePartition.sync());
+    if (storagePartition != null) {
       storagePartition.close();
+      storagePartition.drop();
+    }
+    removeDir(storeDir);
+  }
 
-      extraProps.setProperty(INGESTION_MEMORY_LIMIT, "800KB");
-      // With a tighter memory limiter, the database open should fail
-      veniceServerProperties = AbstractStorageEngineTest.getServerProperties(PersistenceType.ROCKS_DB, extraProps);
-      RocksDBServerConfig finalRocksDBServerConfig = new RocksDBServerConfig(veniceServerProperties);
+  @Test
+  public void testCreateSnapshotForBatch() throws RocksDBException {
+    String basePath = Utils.getUniqueTempPath("sstTest");
+    String storeName = "test-store";
+    int version = 1;
+    int partition = 0;
+    String dir = basePath + "/" + storeName + "_v" + version + "/"
+        + RocksDBUtils.getPartitionDbName(storeName + "_v" + version, partition);
 
-      serverConfig = new VeniceServerConfig(veniceServerProperties);
-      RocksDBStorageEngineFactory finalFactory = new RocksDBStorageEngineFactory(
-          serverConfig,
-          mockMemoryStats,
-          AvroProtocolDefinition.STORE_VERSION_STATE.getSerializer(),
-          AvroProtocolDefinition.PARTITION_STATE.getSerializer());
-      Assert.expectThrows(
-          MemoryLimitExhaustedException.class,
-          () -> new RocksDBStoragePartition(
-              partitionConfig,
-              finalFactory,
-              DATA_BASE_DIR,
-              null,
-              ROCKSDB_THROTTLER,
-              finalRocksDBServerConfig,
-              storeConfig));
-    } finally {
+    try (MockedStatic<Checkpoint> checkpointMockedStatic = Mockito.mockStatic(Checkpoint.class)) {
+      try (MockedStatic<FileUtils> fileUtilsMockedStatic = Mockito.mockStatic(FileUtils.class)) {
+        // test prepare
+        RocksDB mockRocksDB = mock(RocksDB.class);
+        Checkpoint mockCheckpoint = mock(Checkpoint.class);
+        checkpointMockedStatic.when(() -> Checkpoint.create(mockRocksDB)).thenReturn(mockCheckpoint);
+        String fullSnapshotPath = dir + "/.snapshot_files";
+        File file = Mockito.spy(new File(fullSnapshotPath));
+        Mockito.doNothing().when(mockCheckpoint).createCheckpoint(fullSnapshotPath);
+
+        // case 1: snapshot file not exists
+        // test execute
+        RocksDBStoragePartition.createSnapshot(mockRocksDB, fullSnapshotPath, "test-replica");
+        // test verify
+        Mockito.verify(mockCheckpoint, Mockito.times(1)).createCheckpoint(fullSnapshotPath);
+        fileUtilsMockedStatic
+            .verify(() -> FileUtils.deleteDirectory(Mockito.eq(file.getAbsoluteFile())), Mockito.times(0));
+
+        // case 2: snapshot file exists
+        // test prepare
+        File fullSnapshotDir = new File(fullSnapshotPath);
+        if (!fullSnapshotDir.exists()) {
+          fullSnapshotDir.mkdirs();
+        }
+        // test execute
+        RocksDBStoragePartition.createSnapshot(mockRocksDB, fullSnapshotPath, "test-replica");
+        // test verify
+        Mockito.verify(mockCheckpoint, Mockito.times(2)).createCheckpoint(fullSnapshotPath);
+        fileUtilsMockedStatic
+            .verify(() -> FileUtils.deleteDirectory(Mockito.eq(file.getAbsoluteFile())), Mockito.times(1));
+
+        // case 3: delete snapshot file fail
+        // test prepare
+        fileUtilsMockedStatic.when(() -> FileUtils.deleteDirectory(Mockito.any(File.class)))
+            .thenThrow(new IOException("Delete snapshot file failed."));
+        // test execute
+        try {
+          RocksDBStoragePartition.createSnapshot(mockRocksDB, fullSnapshotPath, "test-replica");
+          Assert.fail("Should throw exception");
+        } catch (VeniceException e) {
+          // test verify
+          Mockito.verify(mockCheckpoint, Mockito.times(2)).createCheckpoint(fullSnapshotPath);
+          fileUtilsMockedStatic
+              .verify(() -> FileUtils.deleteDirectory(Mockito.eq(file.getAbsoluteFile())), Mockito.times(2));
+          Assert.assertEquals(e.getMessage(), "Failed to delete the existing snapshot directory: " + fullSnapshotPath);
+        }
+
+        // case 4: create createCheckpoint failed
+        // test prepare
+        fullSnapshotDir.delete();
+        fileUtilsMockedStatic.reset();
+        Mockito.doThrow(new RocksDBException("Create checkpoint failed."))
+            .when(mockCheckpoint)
+            .createCheckpoint(fullSnapshotPath);
+        // test execute
+        try {
+          RocksDBStoragePartition.createSnapshot(mockRocksDB, fullSnapshotPath, "test-replica");
+          Assert.fail("Should throw exception");
+        } catch (VeniceException e) {
+          // test verify
+          Mockito.verify(mockCheckpoint, Mockito.times(3)).createCheckpoint(fullSnapshotPath);
+          fileUtilsMockedStatic
+              .verify(() -> FileUtils.deleteDirectory(Mockito.eq(file.getAbsoluteFile())), Mockito.times(0));
+          Assert.assertEquals(
+              e.getMessage(),
+              "Received exception during RocksDB's snapshot creation in directory " + fullSnapshotPath);
+        }
+      }
+    }
+  }
+
+  @Test
+  public void testCheckAndThrowSpecificException() {
+    String storeName = Version.composeKafkaTopic(Utils.getUniqueString("test_store"), 1);
+    String storeDir = getTempDatabaseDir(storeName);
+    int partitionId = 0;
+    StoragePartitionConfig partitionConfig = new StoragePartitionConfig(storeName, partitionId);
+    partitionConfig.setDeferredWrite(false);
+    Properties extraProps = new Properties();
+    extraProps.setProperty(BLOB_TRANSFER_MANAGER_ENABLED, "true");
+    VeniceProperties veniceServerProperties =
+        AbstractStorageEngineTest.getServerProperties(PersistenceType.ROCKS_DB, extraProps);
+    RocksDBServerConfig rocksDBServerConfig = new RocksDBServerConfig(veniceServerProperties);
+
+    VeniceServerConfig serverConfig = new VeniceServerConfig(veniceServerProperties);
+    RocksDBStorageEngineFactory factory = new RocksDBStorageEngineFactory(serverConfig);
+    VeniceStoreVersionConfig storeConfig = new VeniceStoreVersionConfig(storeName, veniceServerProperties);
+
+    // Set the blob transfer enabled flag
+    storeConfig.setBlobTransferEnabled(false);
+
+    RocksDBStoragePartition storagePartition = new RocksDBStoragePartition(
+        partitionConfig,
+        factory,
+        DATA_BASE_DIR,
+        null,
+        ROCKSDB_THROTTLER,
+        rocksDBServerConfig);
+
+    // DiskLimitExhaustedException
+    try {
+      storagePartition.checkAndThrowDiskLimitException(
+          new RocksDBException(RocksDBStoragePartition.ROCKSDB_ERROR_MESSAGE_FOR_RUNNING_OUT_OF_DISK_QUOTA));
+    } catch (Exception e) {
+      Assert.assertTrue(e instanceof DiskLimitExhaustedException, "Unexpected exception type: " + e);
+
       if (storagePartition != null) {
         storagePartition.close();
         storagePartition.drop();
       }
       removeDir(storeDir);
+    }
+  }
+
+  /**
+   * Test that store-level blobDbEnabled config overrides cluster-level config.
+   * When store-level is ENABLED, blob files should be created regardless of cluster-level setting.
+   * When store-level is DISABLED, blob files should not be created regardless of cluster-level setting.
+   * When store-level is NOT_SPECIFIED, cluster-level config should be used.
+   */
+  @Test
+  public void testStoreLevelBlobDbConfigOverridesClusterLevel() {
+    String storeName = Version.composeKafkaTopic(Utils.getUniqueString("test_store_blob_db"), 1);
+    String storeDir = getTempDatabaseDir(storeName);
+    int partitionId = 0;
+    String dbFolder = RocksDBUtils.composePartitionDbDir(DATA_BASE_DIR, storeName, partitionId);
+    File dbDir = new File(dbFolder);
+
+    Supplier<String[]> blobFileFinder = () -> dbDir.list(((dir, name) -> name.endsWith(".blob")));
+
+    int largeRecordPaddingLength = 10000;
+    Map<String, String> largeInputRecords = generateInput(100, false, largeRecordPaddingLength, 0);
+    List<Map.Entry<String, String>> largeEntryList = new ArrayList<>(largeInputRecords.entrySet());
+
+    Properties extraProps = new Properties();
+    // Cluster-level: blob files DISABLED
+    extraProps.put(ROCKSDB_BLOB_FILES_ENABLED, "false");
+    extraProps.put(ROCKSDB_MIN_BLOB_SIZE_IN_BYTES, "1000");
+    extraProps.put(ROCKSDB_BLOB_FILE_SIZE_IN_BYTES, "2097152");
+    extraProps.put(ROCKSDB_BLOB_FILE_STARTING_LEVEL, "0");
+    extraProps.put(ROCKSDB_MEMTABLE_SIZE_IN_BYTES, "1048576");
+
+    VeniceProperties veniceServerProperties =
+        AbstractStorageEngineTest.getServerProperties(PersistenceType.ROCKS_DB, extraProps);
+    RocksDBServerConfig rocksDBServerConfig = new RocksDBServerConfig(veniceServerProperties);
+    VeniceServerConfig serverConfig = new VeniceServerConfig(veniceServerProperties);
+    RocksDBStorageEngineFactory factory = new RocksDBStorageEngineFactory(serverConfig);
+
+    // Test 1: Store-level ENABLED should override cluster-level DISABLED
+    StoragePartitionConfig partitionConfig = new StoragePartitionConfig(storeName, partitionId);
+    partitionConfig.setBlobDbEnabled(ActivationState.ENABLED);
+
+    RocksDBStoragePartition storagePartition = new RocksDBStoragePartition(
+        partitionConfig,
+        factory,
+        DATA_BASE_DIR,
+        null,
+        ROCKSDB_THROTTLER,
+        rocksDBServerConfig);
+
+    for (int i = 0; i < 50; i++) {
+      storagePartition.put(largeEntryList.get(i).getKey().getBytes(), largeEntryList.get(i).getValue().getBytes());
+    }
+    storagePartition.sync();
+
+    // Blob files should be created because store-level is ENABLED
+    assertTrue(blobFileFinder.get().length > 0, "Blob files should be created when store-level is ENABLED");
+
+    storagePartition.close();
+    storagePartition.drop();
+
+    // Test 2: Store-level DISABLED should override cluster-level ENABLED
+    extraProps.put(ROCKSDB_BLOB_FILES_ENABLED, "true"); // Cluster-level ENABLED
+    veniceServerProperties = AbstractStorageEngineTest.getServerProperties(PersistenceType.ROCKS_DB, extraProps);
+    rocksDBServerConfig = new RocksDBServerConfig(veniceServerProperties);
+    serverConfig = new VeniceServerConfig(veniceServerProperties);
+    factory = new RocksDBStorageEngineFactory(serverConfig);
+
+    partitionConfig = new StoragePartitionConfig(storeName, partitionId);
+    partitionConfig.setBlobDbEnabled(ActivationState.DISABLED);
+
+    storagePartition = new RocksDBStoragePartition(
+        partitionConfig,
+        factory,
+        DATA_BASE_DIR,
+        null,
+        ROCKSDB_THROTTLER,
+        rocksDBServerConfig);
+
+    for (int i = 50; i < 100; i++) {
+      storagePartition.put(largeEntryList.get(i).getKey().getBytes(), largeEntryList.get(i).getValue().getBytes());
+    }
+    storagePartition.sync();
+
+    // No blob files should be created because store-level is DISABLED
+    assertEquals(blobFileFinder.get().length, 0, "No blob files should be created when store-level is DISABLED");
+
+    storagePartition.close();
+    storagePartition.drop();
+
+    // Test 3: Store-level NOT_SPECIFIED should use cluster-level (which is ENABLED)
+    partitionConfig = new StoragePartitionConfig(storeName, partitionId);
+    partitionConfig.setBlobDbEnabled(ActivationState.NOT_SPECIFIED);
+
+    storagePartition = new RocksDBStoragePartition(
+        partitionConfig,
+        factory,
+        DATA_BASE_DIR,
+        null,
+        ROCKSDB_THROTTLER,
+        rocksDBServerConfig);
+
+    for (int i = 0; i < 50; i++) {
+      storagePartition.put(largeEntryList.get(i).getKey().getBytes(), largeEntryList.get(i).getValue().getBytes());
+    }
+    storagePartition.sync();
+
+    // Blob files should be created because cluster-level is ENABLED
+    assertTrue(
+        blobFileFinder.get().length > 0,
+        "Blob files should be created when store-level is NOT_SPECIFIED and cluster-level is ENABLED");
+
+    storagePartition.close();
+    storagePartition.drop();
+    removeDir(storeDir);
+  }
+
+  /**
+   * Regression safety net: verifies that read, write, and stats methods throw
+   * VeniceException (not SIGSEGV) after the partition is closed.
+   *
+   * If a new method is added that accesses the RocksDB handle without lifecycle
+   * guards, this test will crash the JVM instead of throwing — making the bug
+   * immediately visible in CI.
+   */
+  @Test
+  public void testAllMethodsThrowAfterClose() {
+    String storeName = Version.composeKafkaTopic(Utils.getUniqueString("test_store"), 1);
+    String storeDir = getTempDatabaseDir(storeName);
+    int partitionId = 0;
+    StoragePartitionConfig partitionConfig = new StoragePartitionConfig(storeName, partitionId);
+    partitionConfig.setDeferredWrite(false);
+
+    VeniceProperties veniceServerProperties = AbstractStorageEngineTest.getServerProperties(PersistenceType.ROCKS_DB);
+    RocksDBServerConfig rocksDBServerConfig = new RocksDBServerConfig(veniceServerProperties);
+    VeniceServerConfig serverConfig = new VeniceServerConfig(veniceServerProperties);
+    RocksDBStorageEngineFactory factory = new RocksDBStorageEngineFactory(serverConfig);
+    RocksDBStoragePartition partition = new RocksDBStoragePartition(
+        partitionConfig,
+        factory,
+        DATA_BASE_DIR,
+        null,
+        ROCKSDB_THROTTLER,
+        rocksDBServerConfig);
+
+    // Put a value so the partition has data
+    partition.put("key".getBytes(), "value".getBytes());
+
+    // Close the partition — native RocksDB handle is freed
+    partition.close();
+
+    // Every method that accesses rocksDB must throw VeniceException, not crash the JVM.
+    // If any of these cause SIGSEGV instead of VeniceException, the lifecycle guard is missing.
+
+    // Read-path methods
+    Assert.assertThrows(VeniceException.class, () -> partition.get("key".getBytes()));
+    Assert.assertThrows(VeniceException.class, () -> partition.get("key".getBytes(), ByteBuffer.allocate(64)));
+    Assert.assertThrows(VeniceException.class, () -> partition.get(ByteBuffer.wrap("key".getBytes())));
+    Assert.assertThrows(VeniceException.class, () -> partition.multiGet(Collections.singletonList("key".getBytes())));
+    Assert.assertThrows(VeniceException.class, () -> {
+      List<ByteBuffer> bbKeys = Collections.singletonList(ByteBuffer.wrap("key".getBytes()));
+      List<ByteBuffer> bbValues = Collections.singletonList(ByteBuffer.allocateDirect(64));
+      partition.multiGet(bbKeys, bbValues);
+    });
+    Assert
+        .assertThrows(VeniceException.class, () -> partition.getByKeyPrefix(null, mock(BytesStreamingCallback.class)));
+    Assert.assertThrows(VeniceException.class, () -> partition.getRocksDBStatValue("rocksdb.estimate-num-keys"));
+    Assert.assertThrows(VeniceException.class, partition::getIterator);
+    Assert.assertThrows(VeniceException.class, partition::getPartitionSizeInBytes);
+    Assert.assertThrows(VeniceException.class, () -> partition.getApproximateMemoryUsageByType(Collections.emptySet()));
+
+    // Write-path methods
+    Assert.assertThrows(VeniceException.class, () -> partition.put("key".getBytes(), "value".getBytes()));
+    Assert.assertThrows(VeniceException.class, () -> partition.delete("key".getBytes()));
+    Assert.assertThrows(VeniceException.class, partition::sync);
+    Assert.assertThrows(VeniceException.class, partition::createSnapshot);
+    Assert.assertThrows(VeniceException.class, partition::getKeyCountEstimate);
+
+    partition.drop();
+    removeDir(storeDir);
+  }
+
+  /**
+   * Verifies exception type contracts for read-only mode. All write methods must throw
+   * VeniceException when the partition is opened read-only.
+   */
+  @Test
+  public void testWriteMethodsThrowOnReadOnly() {
+    String storeName = Version.composeKafkaTopic(Utils.getUniqueString("test_store"), 1);
+    String storeDir = getTempDatabaseDir(storeName);
+    VeniceProperties props = AbstractStorageEngineTest.getServerProperties(PersistenceType.ROCKS_DB);
+    RocksDBServerConfig rocksDBServerConfig = new RocksDBServerConfig(props);
+    VeniceServerConfig serverConfig = new VeniceServerConfig(props);
+    RocksDBStorageEngineFactory factory = new RocksDBStorageEngineFactory(serverConfig);
+
+    // First create and populate a writable partition so the DB files exist on disk.
+    StoragePartitionConfig writeConfig = new StoragePartitionConfig(storeName, 0);
+    writeConfig.setDeferredWrite(false);
+    RocksDBStoragePartition writable =
+        new RocksDBStoragePartition(writeConfig, factory, DATA_BASE_DIR, null, ROCKSDB_THROTTLER, rocksDBServerConfig);
+    writable.put("seed".getBytes(), "data".getBytes());
+    writable.close();
+
+    // Reopen the same partition in read-only mode.
+    StoragePartitionConfig roConfig = new StoragePartitionConfig(storeName, 0);
+    roConfig.setDeferredWrite(false);
+    roConfig.setReadOnly(true);
+    RocksDBStoragePartition readOnly =
+        new RocksDBStoragePartition(roConfig, factory, DATA_BASE_DIR, null, ROCKSDB_THROTTLER, rocksDBServerConfig);
+
+    try {
+      // Reads should work
+      assertEquals(readOnly.get("seed".getBytes()), "data".getBytes());
+
+      // Writes must throw VeniceException
+      Assert.assertThrows(VeniceException.class, () -> readOnly.put("k".getBytes(), "v".getBytes()));
+      Assert.assertThrows(VeniceException.class, () -> readOnly.delete("k".getBytes()));
+    } finally {
+      readOnly.drop();
+      removeDir(storeDir);
+    }
+  }
+
+  /**
+   * Verifies that getRocksDBStatValue throws VeniceException (not raw RocksDBException)
+   * when querying an invalid property.
+   */
+  @Test
+  public void testGetRocksDBStatValueThrowsOnInvalidProperty() {
+    RocksDBStoragePartition partition = createPartition(false);
+    String storeDir = lastCreatedStoreDir;
+    try {
+      Assert.assertThrows(VeniceException.class, () -> partition.getRocksDBStatValue("rocksdb.nonexistent"));
+    } finally {
+      partition.drop();
+      removeDir(storeDir);
+    }
+  }
+
+  /**
+   * Verifies that read methods return correct results when the partition is open (not just
+   * that they don't crash). Ensures the helpers don't silently swallow data.
+   */
+  @Test
+  public void testReadWriteRoundTrip() {
+    RocksDBStoragePartition partition = createPartition(false);
+    String storeDir = lastCreatedStoreDir;
+    try {
+      byte[] key = "testKey".getBytes();
+      byte[] value = "testValue".getBytes();
+      partition.put(key, value);
+
+      // get(byte[])
+      byte[] result = partition.get(key);
+      assertEquals(result, value);
+
+      // get(ByteBuffer)
+      byte[] result2 = partition.get(ByteBuffer.wrap(key));
+      assertEquals(result2, value);
+
+      // get(byte[], ByteBuffer) — buffer large enough
+      ByteBuffer buf = ByteBuffer.allocate(64);
+      ByteBuffer returned = partition.get(key, buf);
+      byte[] actual = new byte[returned.limit()];
+      returned.get(actual);
+      assertEquals(actual, value);
+
+      // get(byte[], ByteBuffer) — buffer too small, triggers reallocation
+      ByteBuffer tinyBuf = ByteBuffer.allocate(1);
+      ByteBuffer reallocated = partition.get(key, tinyBuf);
+      byte[] reallocResult = new byte[reallocated.limit()];
+      reallocated.get(reallocResult);
+      assertEquals(reallocResult, value);
+
+      // multiGet
+      List<byte[]> results = partition.multiGet(Collections.singletonList(key));
+      assertEquals(results.size(), 1);
+      assertEquals(results.get(0), value);
+
+      // get nonexistent key
+      Assert.assertNull(partition.get("noSuchKey".getBytes()));
+    } finally {
+      partition.drop();
+      removeDir(storeDir);
+    }
+  }
+
+  /** Tracks the storeDir from the most recent {@link #createPartition} call for cleanup. */
+  private String lastCreatedStoreDir;
+
+  private RocksDBStoragePartition createPartition(boolean deferredWrite) {
+    String storeName = Version.composeKafkaTopic(Utils.getUniqueString("test_store"), 1);
+    lastCreatedStoreDir = getTempDatabaseDir(storeName);
+    StoragePartitionConfig config = new StoragePartitionConfig(storeName, 0);
+    config.setDeferredWrite(deferredWrite);
+    Properties extraProps = new Properties();
+    VeniceProperties props = AbstractStorageEngineTest.getServerProperties(PersistenceType.ROCKS_DB, extraProps);
+    RocksDBServerConfig rocksDBServerConfig = new RocksDBServerConfig(props);
+    VeniceServerConfig serverConfig = new VeniceServerConfig(props);
+    RocksDBStorageEngineFactory factory = new RocksDBStorageEngineFactory(serverConfig);
+    return new RocksDBStoragePartition(config, factory, DATA_BASE_DIR, null, ROCKSDB_THROTTLER, rocksDBServerConfig);
+  }
+
+  private void assertFutureCompletes(Future<?> f, int timeoutSeconds) {
+    try {
+      f.get(timeoutSeconds, TimeUnit.SECONDS);
+    } catch (TimeoutException e) {
+      Assert.fail("Deadlock detected — thread did not complete within " + timeoutSeconds + "s");
+    } catch (ExecutionException e) {
+      // VeniceException is expected when operations race with close()
+      if (!(e.getCause() instanceof VeniceException)) {
+        Assert.fail("Unexpected exception: " + e.getCause());
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      Assert.fail("Test interrupted");
+    }
+  }
+
+  /**
+   * Concurrent reads and stats collection during close — reproduces the use-after-free crash.
+   * Before the fix: SIGSEGV. After: VeniceException caught gracefully.
+   * Timeout detects deadlock between readCloseRWLock and partition monitor.
+   */
+  @Test(timeOut = 30_000)
+  public void testConcurrentReadsAndStatsDuringClose() throws Exception {
+    RocksDBStoragePartition partition = createPartition(false);
+    String storeDir = lastCreatedStoreDir;
+    AtomicBoolean stopped = new AtomicBoolean(false);
+    AtomicInteger unexpectedErrors = new AtomicInteger(0);
+    int numReaders = 4;
+    CyclicBarrier barrier = new CyclicBarrier(numReaders + 1);
+    CountDownLatch workersActive = new CountDownLatch(numReaders);
+    ExecutorService executor = Executors.newFixedThreadPool(numReaders + 1);
+    boolean terminated = false;
+
+    try {
+      for (int i = 0; i < 100; i++) {
+        partition.put(("key_" + i).getBytes(), ("value_" + i).getBytes());
+      }
+
+      for (int i = 0; i < numReaders; i++) {
+        final int threadId = i;
+        executor.submit(() -> {
+          try {
+            barrier.await();
+            workersActive.countDown();
+            while (!stopped.get()) {
+              try {
+                switch (threadId % 3) {
+                  case 0:
+                    partition.get(("key_" + (threadId * 10)).getBytes());
+                    break;
+                  case 1:
+                    partition.getRocksDBStatValue("rocksdb.estimate-num-keys");
+                    break;
+                  default:
+                    partition.getPartitionSizeInBytes();
+                    break;
+                }
+              } catch (VeniceException e) {
+                break;
+              } catch (Exception e) {
+                unexpectedErrors.incrementAndGet();
+                break;
+              }
+            }
+          } catch (InterruptedException | BrokenBarrierException e) {
+            Thread.currentThread().interrupt();
+          }
+        });
+      }
+
+      executor.submit(() -> {
+        try {
+          barrier.await();
+          workersActive.await();
+          partition.close();
+          stopped.set(true);
+        } catch (InterruptedException | BrokenBarrierException e) {
+          Thread.currentThread().interrupt();
+        }
+      });
+
+      executor.shutdown();
+      terminated = executor.awaitTermination(25, TimeUnit.SECONDS);
+      assertTrue(terminated, "Deadlock detected — threads did not complete within timeout");
+      assertEquals(unexpectedErrors.get(), 0, "Unexpected non-VeniceException errors");
+    } finally {
+      stopped.set(true);
+      if (!terminated) {
+        executor.shutdownNow();
+      }
+      partition.drop();
+      removeDir(storeDir);
+    }
+  }
+
+  /**
+   * Concurrent writes during close — verifies no deadlock between the partition
+   * monitor (synchronized put) and readCloseRWLock (writeLock in close).
+   */
+  @Test(timeOut = 30_000)
+  public void testConcurrentWritesDuringClose() throws Exception {
+    RocksDBStoragePartition partition = createPartition(false);
+    String storeDir = lastCreatedStoreDir;
+    AtomicBoolean stopped = new AtomicBoolean(false);
+    AtomicInteger unexpectedErrors = new AtomicInteger(0);
+    int numWriters = 3;
+    CyclicBarrier barrier = new CyclicBarrier(numWriters + 1);
+    CountDownLatch workersActive = new CountDownLatch(numWriters);
+    ExecutorService executor = Executors.newFixedThreadPool(numWriters + 1);
+    boolean terminated = false;
+
+    try {
+      partition.put("seed".getBytes(), "data".getBytes());
+
+      for (int i = 0; i < numWriters; i++) {
+        final int writerId = i;
+        executor.submit(() -> {
+          try {
+            barrier.await();
+            workersActive.countDown();
+            int count = 0;
+            while (!stopped.get() && count < 10_000) {
+              try {
+                partition.put(("wkey_" + writerId + "_" + count).getBytes(), "val".getBytes());
+                count++;
+              } catch (VeniceException e) {
+                break;
+              } catch (Exception e) {
+                unexpectedErrors.incrementAndGet();
+                break;
+              }
+            }
+          } catch (InterruptedException | BrokenBarrierException e) {
+            Thread.currentThread().interrupt();
+          }
+        });
+      }
+
+      executor.submit(() -> {
+        try {
+          barrier.await();
+          workersActive.await();
+          partition.close();
+          stopped.set(true);
+        } catch (InterruptedException | BrokenBarrierException e) {
+          Thread.currentThread().interrupt();
+        }
+      });
+
+      executor.shutdown();
+      terminated = executor.awaitTermination(25, TimeUnit.SECONDS);
+      assertTrue(terminated, "Deadlock detected — threads did not complete within timeout");
+      assertEquals(unexpectedErrors.get(), 0);
+    } finally {
+      stopped.set(true);
+      if (!terminated) {
+        executor.shutdownNow();
+      }
+      partition.drop();
+      removeDir(storeDir);
+    }
+  }
+
+  /**
+   * Repeated open-use-close cycles under concurrent access. Exercises all lock
+   * combinations across 20 rounds — any lock ordering violation deadlocks within
+   * a few iterations.
+   */
+  @Test(timeOut = 60_000)
+  public void testRepeatedCloseUnderConcurrentAccess() throws Exception {
+    for (int round = 0; round < 20; round++) {
+      RocksDBStoragePartition partition = createPartition(false);
+      String storeDir = lastCreatedStoreDir;
+      ExecutorService executor = Executors.newFixedThreadPool(3);
+
+      try {
+        partition.put("key".getBytes(), "value".getBytes());
+
+        CountDownLatch start = new CountDownLatch(1);
+
+        Future<?> reader = executor.submit(() -> {
+          try {
+            start.await();
+          } catch (InterruptedException e) {
+            return;
+          }
+          for (int i = 0; i < 200; i++) {
+            try {
+              partition.get("key".getBytes());
+            } catch (VeniceException e) {
+              break;
+            }
+          }
+        });
+
+        Future<?> stats = executor.submit(() -> {
+          try {
+            start.await();
+          } catch (InterruptedException e) {
+            return;
+          }
+          for (int i = 0; i < 200; i++) {
+            try {
+              partition.getRocksDBStatValue("rocksdb.estimate-num-keys");
+            } catch (VeniceException e) {
+              break;
+            }
+          }
+        });
+
+        Future<?> closer = executor.submit(() -> {
+          try {
+            start.await();
+          } catch (InterruptedException e) {
+            return;
+          }
+          partition.close();
+        });
+
+        start.countDown();
+        assertFutureCompletes(reader, 5);
+        assertFutureCompletes(stats, 5);
+        assertFutureCompletes(closer, 5);
+      } finally {
+        executor.shutdownNow();
+        partition.drop();
+        removeDir(storeDir);
+      }
     }
   }
 }

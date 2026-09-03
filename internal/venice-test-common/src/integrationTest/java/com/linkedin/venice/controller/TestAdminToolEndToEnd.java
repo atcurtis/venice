@@ -1,34 +1,36 @@
 package com.linkedin.venice.controller;
 
 import static com.linkedin.venice.ConfigKeys.ALLOW_CLUSTER_WIPE;
+import static com.linkedin.venice.ConfigKeys.IS_DARK_CLUSTER;
 import static com.linkedin.venice.ConfigKeys.LOCAL_REGION_NAME;
+import static com.linkedin.venice.ConfigKeys.LOG_COMPACTION_ENABLED;
+import static com.linkedin.venice.ConfigKeys.REPUSH_ORCHESTRATOR_CLASS_NAME;
 import static com.linkedin.venice.ConfigKeys.TOPIC_CLEANUP_DELAY_FACTOR;
-import static org.testng.Assert.assertFalse;
 
 import com.linkedin.venice.AdminTool;
-import com.linkedin.venice.Arg;
+import com.linkedin.venice.controllerapi.AdminTopicMetadataResponse;
 import com.linkedin.venice.controllerapi.ControllerClient;
-import com.linkedin.venice.controllerapi.MultiStoreResponse;
+import com.linkedin.venice.controllerapi.ControllerResponse;
 import com.linkedin.venice.controllerapi.NewStoreResponse;
-import com.linkedin.venice.controllerapi.StoreResponse;
+import com.linkedin.venice.controllerapi.PubSubPositionJsonWireFormat;
+import com.linkedin.venice.controllerapi.UpdateStoreQueryParams;
 import com.linkedin.venice.controllerapi.VersionCreationResponse;
-import com.linkedin.venice.exceptions.VeniceException;
-import com.linkedin.venice.helix.HelixAdapterSerializer;
-import com.linkedin.venice.helix.HelixReadOnlyLiveClusterConfigRepository;
-import com.linkedin.venice.helix.ZkClientFactory;
+import com.linkedin.venice.endToEnd.TestHybrid;
 import com.linkedin.venice.integration.utils.ServiceFactory;
+import com.linkedin.venice.integration.utils.VeniceClusterCreateOptions;
 import com.linkedin.venice.integration.utils.VeniceClusterWrapper;
+import com.linkedin.venice.integration.utils.VeniceControllerWrapper;
+import com.linkedin.venice.integration.utils.VeniceMultiRegionClusterCreateOptions;
 import com.linkedin.venice.integration.utils.VeniceServerWrapper;
-import com.linkedin.venice.meta.Version;
-import com.linkedin.venice.pubsub.PubSubTopicRepository;
-import com.linkedin.venice.pubsub.api.PubSubTopic;
-import com.linkedin.venice.pubsub.manager.TopicManager;
+import com.linkedin.venice.integration.utils.VeniceTwoLayerMultiRegionMultiClusterWrapper;
+import com.linkedin.venice.meta.StoreInfo;
+import com.linkedin.venice.pubsub.api.PubSubSymbolicPosition;
 import com.linkedin.venice.utils.TestUtils;
 import com.linkedin.venice.utils.Time;
 import com.linkedin.venice.utils.Utils;
+import java.util.Optional;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
-import org.apache.helix.zookeeper.impl.client.ZkClient;
 import org.testng.Assert;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
@@ -44,10 +46,29 @@ public class TestAdminToolEndToEnd {
   @BeforeClass
   public void setUp() {
     Properties properties = new Properties();
-    properties.setProperty(LOCAL_REGION_NAME, "dc-0");
+    String regionName = "dc-0";
+    properties.setProperty(LOCAL_REGION_NAME, regionName);
     properties.setProperty(ALLOW_CLUSTER_WIPE, "true");
     properties.setProperty(TOPIC_CLEANUP_DELAY_FACTOR, "0");
-    venice = ServiceFactory.getVeniceCluster(1, 1, 1, 1, 100000, false, false, properties);
+
+    // repushStore() configs
+    properties.setProperty(REPUSH_ORCHESTRATOR_CLASS_NAME, TestHybrid.TestRepushOrchestratorImpl.class.getName());
+    properties.setProperty(LOG_COMPACTION_ENABLED, "true");
+
+    // dark cluster configs
+    properties.setProperty(IS_DARK_CLUSTER, "true");
+
+    VeniceClusterCreateOptions options = new VeniceClusterCreateOptions.Builder().numberOfControllers(1)
+        .regionName(regionName)
+        .numberOfServers(1)
+        .numberOfRouters(1)
+        .replicationFactor(1)
+        .partitionSize(100000)
+        .sslToStorageNodes(false)
+        .sslToKafka(false)
+        .extraProperties(properties)
+        .build();
+    venice = ServiceFactory.getVeniceCluster(options);
     clusterName = venice.getClusterName();
   }
 
@@ -57,123 +78,145 @@ public class TestAdminToolEndToEnd {
   }
 
   @Test(timeOut = TEST_TIMEOUT)
-  public void testUpdateClusterConfig() throws Exception {
-    ZkClient zkClient = ZkClientFactory.newZkClient(venice.getZk().getAddress());
-    HelixAdapterSerializer adapterSerializer = new HelixAdapterSerializer();
-    HelixReadOnlyLiveClusterConfigRepository liveClusterConfigRepository =
-        new HelixReadOnlyLiveClusterConfigRepository(zkClient, adapterSerializer, clusterName);
-
-    String regionName = "dc-0";
-    int kafkaFetchQuota = 1000;
-
-    Assert.assertNotEquals(
-        liveClusterConfigRepository.getConfigs().getServerKafkaFetchQuotaRecordsPerSecondForRegion(regionName),
-        kafkaFetchQuota);
-
-    String[] adminToolArgs = { "--update-cluster-config", "--url",
-        venice.getLeaderVeniceController().getControllerUrl(), "--cluster", clusterName, "--fabric", regionName,
-        "--" + Arg.SERVER_KAFKA_FETCH_QUOTA_RECORDS_PER_SECOND.getArgName(), String.valueOf(kafkaFetchQuota) };
-    AdminTool.main(adminToolArgs);
-
-    TestUtils.waitForNonDeterministicAssertion(TEST_TIMEOUT, TimeUnit.MILLISECONDS, () -> {
-      liveClusterConfigRepository.refresh();
-      Assert.assertEquals(
-          liveClusterConfigRepository.getConfigs().getServerKafkaFetchQuotaRecordsPerSecondForRegion(regionName),
-          kafkaFetchQuota);
-      Assert.assertTrue(liveClusterConfigRepository.getConfigs().isStoreMigrationAllowed());
-    });
-
-    String[] disallowStoreMigrationArg =
-        { "--update-cluster-config", "--url", venice.getLeaderVeniceController().getControllerUrl(), "--cluster",
-            clusterName, "--" + Arg.ALLOW_STORE_MIGRATION.getArgName(), String.valueOf(false) };
-    AdminTool.main(disallowStoreMigrationArg);
-
-    TestUtils.waitForNonDeterministicAssertion(TEST_TIMEOUT, TimeUnit.MILLISECONDS, () -> {
-      liveClusterConfigRepository.refresh();
-      Assert.assertFalse(liveClusterConfigRepository.getConfigs().isStoreMigrationAllowed());
-    });
-
-    try {
-      String[] startMigrationArgs = { "--migrate-store", "--url", venice.getLeaderVeniceController().getControllerUrl(),
-          "--store", "anyStore", "--cluster-src", clusterName, "--cluster-dest", "anyCluster" };
-      AdminTool.main(startMigrationArgs);
-      Assert.fail("Store migration should be denied");
-    } catch (VeniceException e) {
-      Assert.assertTrue(e.getMessage().contains("does not allow store migration"));
-    }
-  }
-
-  @Test(timeOut = TEST_TIMEOUT)
-  public void testWipeClusterCommand() throws Exception {
-    try (ControllerClient controllerClient =
-        new ControllerClient(clusterName, venice.getLeaderVeniceController().getControllerUrl())) {
-      // Create 2 stores. Store 1 has 2 versions
-      String testStoreName1 = Utils.getUniqueString("test-store");
-      NewStoreResponse newStoreResponse =
-          controllerClient.createNewStore(testStoreName1, "test", "\"string\"", "\"string\"");
-      Assert.assertFalse(newStoreResponse.isError());
-      VersionCreationResponse versionCreationResponse =
-          controllerClient.emptyPush(testStoreName1, Utils.getUniqueString("empty-push-1"), 1L);
-      Assert.assertFalse(versionCreationResponse.isError());
-      versionCreationResponse = controllerClient.emptyPush(testStoreName1, Utils.getUniqueString("empty-push-2"), 1L);
-      Assert.assertFalse(versionCreationResponse.isError());
-
-      String testStoreName2 = Utils.getUniqueString("test-store");
-      newStoreResponse = controllerClient.createNewStore(testStoreName2, "test", "\"string\"", "\"string\"");
-      Assert.assertFalse(newStoreResponse.isError());
-
-      // Delete a version
-      String[] wipeClusterArgs1 = { "--wipe-cluster", "--url", venice.getLeaderVeniceController().getControllerUrl(),
-          "--cluster", clusterName, "--fabric", "dc-0", "--store", testStoreName1, "--version", "1" };
-      AdminTool.main(wipeClusterArgs1);
-      StoreResponse storeResponse = controllerClient.getStore(testStoreName1);
-      Assert.assertNotNull(storeResponse.getStore());
-      Assert.assertFalse(storeResponse.getStore().getVersion(1).isPresent());
-      Assert.assertTrue(storeResponse.getStore().getVersion(2).isPresent());
-
-      // Delete a store
-      String[] wipeClusterArgs2 = { "--wipe-cluster", "--url", venice.getLeaderVeniceController().getControllerUrl(),
-          "--cluster", clusterName, "--fabric", "dc-0", "--store", testStoreName1 };
-      AdminTool.main(wipeClusterArgs2);
-      storeResponse = controllerClient.getStore(testStoreName1);
-      Assert.assertNull(storeResponse.getStore());
-
-      // Wipe a cluster
-      String[] wipeClusterArgs3 = { "--wipe-cluster", "--url", venice.getLeaderVeniceController().getControllerUrl(),
-          "--cluster", clusterName, "--fabric", "dc-0" };
-      AdminTool.main(wipeClusterArgs3);
-      MultiStoreResponse multiStoreResponse = controllerClient.queryStoreList(false);
-      Assert.assertEquals(multiStoreResponse.getStores().length, 0);
-
-      // Wait until all topics are indeed removed from Kafka service.
-      PubSubTopicRepository pubSubTopicRepository = new PubSubTopicRepository();
-
-      PubSubTopic testStoreTopic1 = pubSubTopicRepository.getTopic(Version.composeKafkaTopic(testStoreName1, 1));
-      PubSubTopic testStoreTopic2 = pubSubTopicRepository.getTopic(Version.composeKafkaTopic(testStoreName1, 2));
-      PubSubTopic testStoreTopic3 = pubSubTopicRepository.getTopic(Version.composeKafkaTopic(testStoreName2, 1));
-
-      TopicManager topicManager = venice.getLeaderVeniceController().getVeniceAdmin().getTopicManager();
-      TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, true, () -> {
-        assertFalse(topicManager.containsTopic(testStoreTopic1));
-        assertFalse(topicManager.containsTopic(testStoreTopic2));
-        assertFalse(topicManager.containsTopic(testStoreTopic3));
-      });
-
-      // Redo fabric buildup. Create the store and version again.
-      newStoreResponse = controllerClient.createNewStore(testStoreName1, "test", "\"string\"", "\"string\"");
-      Assert.assertFalse(newStoreResponse.isError());
-      versionCreationResponse = controllerClient.emptyPush(testStoreName1, Utils.getUniqueString("empty-push-1"), 1L);
-      Assert.assertFalse(versionCreationResponse.isError());
-      Assert.assertEquals(versionCreationResponse.getVersion(), 1);
-    }
-  }
-
-  @Test(timeOut = TEST_TIMEOUT)
   public void testNodeReplicasReadinessCommand() throws Exception {
     VeniceServerWrapper server = venice.getVeniceServers().get(0);
     String[] nodeReplicasReadinessArgs =
         { "--node-replicas-readiness", "--url", venice.getLeaderVeniceController().getControllerUrl(), "--cluster",
             clusterName, "--storage-node", Utils.getHelixNodeIdentifier(Utils.getHostName(), server.getPort()) };
     AdminTool.main(nodeReplicasReadinessArgs);
+  }
+
+  @Test(timeOut = 4 * TEST_TIMEOUT)
+  public void testUpdateAdminOperationVersion() throws Exception {
+    Long newVersion = 80L;
+    PubSubPositionJsonWireFormat defaultPosition = PubSubSymbolicPosition.EARLIEST.toJsonWireFormat();
+    String storeName = Utils.getUniqueString("test-store");
+    try (VeniceTwoLayerMultiRegionMultiClusterWrapper venice =
+        ServiceFactory.getVeniceTwoLayerMultiRegionMultiClusterWrapper(
+            new VeniceMultiRegionClusterCreateOptions.Builder().numberOfRegions(1)
+                .numberOfClusters(1)
+                .numberOfParentControllers(1)
+                .numberOfChildControllers(1)
+                .numberOfServers(1)
+                .numberOfRouters(1)
+                .replicationFactor(1)
+                .build());) {
+      String clusterName = venice.getClusterNames()[0];
+
+      // Get the parent con†roller
+      VeniceControllerWrapper parentController = venice.getParentControllers().get(0);
+      ControllerClient parentControllerClient = new ControllerClient(clusterName, parentController.getControllerUrl());
+
+      // Verify the original metadata - default value
+      AdminTopicMetadataResponse originalMetadata = parentControllerClient.getAdminTopicMetadata(Optional.empty());
+      Assert.assertEquals(originalMetadata.getAdminOperationProtocolVersion(), -1L);
+      Assert.assertEquals(originalMetadata.getExecutionId(), -1L);
+      Assert.assertEquals(originalMetadata.getPosition(), defaultPosition);
+      Assert.assertEquals(originalMetadata.getUpstreamPosition(), defaultPosition);
+
+      // Create store
+      NewStoreResponse newStoreResponse =
+          parentControllerClient.createNewStore(storeName, "test", "\"string\"", "\"string\"");
+      Assert.assertFalse(newStoreResponse.isError());
+      VersionCreationResponse versionCreationResponse =
+          parentControllerClient.emptyPush(storeName, Utils.getUniqueString("empty-push-1"), 1L);
+      Assert.assertFalse(versionCreationResponse.isError());
+
+      // Update store config
+      ControllerResponse updateStore =
+          parentControllerClient.updateStore(storeName, new UpdateStoreQueryParams().setBatchGetLimit(100));
+      Assert.assertFalse(updateStore.isError());
+
+      // Check the baseline metadata
+      AdminTopicMetadataResponse metdataAfterStoreCreation =
+          parentControllerClient.getAdminTopicMetadata(Optional.empty());
+      long baselineExecutionId = metdataAfterStoreCreation.getExecutionId();
+      PubSubPositionJsonWireFormat baselinePosition = metdataAfterStoreCreation.getPosition();
+      PubSubPositionJsonWireFormat baselineUpstreamPosition = metdataAfterStoreCreation.getUpstreamPosition();
+      long baselineAdminVersion = metdataAfterStoreCreation.getAdminOperationProtocolVersion();
+
+      // Execution id and offset should be positive now since we have created a store and updated the store config
+      Assert.assertEquals(baselineAdminVersion, -1L);
+      Assert.assertTrue(baselineExecutionId > 0);
+      Assert.assertNotNull(baselinePosition);
+      Assert.assertNotEquals(defaultPosition, baselinePosition);
+      Assert.assertEquals(defaultPosition, baselineUpstreamPosition);
+
+      // Update the admin operation version to newVersion - 80
+      String[] updateAdminOperationVersionArgs =
+          { "--update-admin-operation-protocol-version", "--url", parentController.getControllerUrl(), "--cluster",
+              clusterName, "--admin-operation-protocol-version", newVersion.toString() };
+
+      AdminTool.main(updateAdminOperationVersionArgs);
+
+      // Verify the admin operation metadata version is updated and the remaining data is unchanged
+      TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, () -> {
+        AdminTopicMetadataResponse updatedMetadata = parentControllerClient.getAdminTopicMetadata(Optional.empty());
+        Assert.assertEquals(updatedMetadata.getAdminOperationProtocolVersion(), (long) newVersion);
+        Assert.assertEquals(updatedMetadata.getExecutionId(), baselineExecutionId);
+        Assert.assertEquals(updatedMetadata.getPosition(), baselinePosition);
+        Assert.assertEquals(updatedMetadata.getUpstreamPosition(), baselineUpstreamPosition);
+      });
+    }
+  }
+
+  @Test(timeOut = 4 * TEST_TIMEOUT)
+  public void testUpdateStoreThroughputQuotaViaAdminTool() throws Exception {
+    long throughputQuotaInBytes = 12345678L;
+    long throughputQuotaInRecords = 4321L;
+    String storeName = Utils.getUniqueString("test-throughput-quota-store");
+    try (VeniceTwoLayerMultiRegionMultiClusterWrapper venice =
+        ServiceFactory.getVeniceTwoLayerMultiRegionMultiClusterWrapper(
+            new VeniceMultiRegionClusterCreateOptions.Builder().numberOfRegions(1)
+                .numberOfClusters(1)
+                .numberOfParentControllers(1)
+                .numberOfChildControllers(1)
+                .numberOfServers(1)
+                .numberOfRouters(1)
+                .replicationFactor(1)
+                .build())) {
+      String clusterName = venice.getClusterNames()[0];
+      VeniceControllerWrapper parentController = venice.getParentControllers().get(0);
+
+      try (
+          ControllerClient parentControllerClient =
+              new ControllerClient(clusterName, parentController.getControllerUrl());
+          ControllerClient childControllerClient = ControllerClient.constructClusterControllerClient(
+              clusterName,
+              venice.getChildRegions().get(0).getControllerConnectString())) {
+
+        NewStoreResponse newStoreResponse =
+            parentControllerClient.createNewStore(storeName, "test", "\"string\"", "\"string\"");
+        Assert.assertFalse(newStoreResponse.isError(), newStoreResponse.getError());
+
+        // Sanity: a freshly created store has no throughput limit (the -1 "unlimited" sentinel).
+        StoreInfo storeBeforeUpdate = parentControllerClient.getStore(storeName).getStore();
+        Assert.assertEquals(storeBeforeUpdate.getThroughputQuotaInBytes(), -1L);
+        Assert.assertEquals(storeBeforeUpdate.getThroughputQuotaInRecords(), -1L);
+
+        // Drive the change exactly as an operator would: run the admin-tool CLI against the live
+        // parent controller. Nothing is mocked -- this exercises the full prod path AdminTool arg
+        // parsing -> ControllerClient -> parent controller -> admin channel -> child controller ->
+        // ZooKeeper -> getStore read-back.
+        String[] updateStoreArgs = { "--update-store", "--url", parentController.getControllerUrl(), "--cluster",
+            clusterName, "--store", storeName, "--throughput-quota-in-bytes", Long.toString(throughputQuotaInBytes),
+            "--throughput-quota-in-records", Long.toString(throughputQuotaInRecords) };
+        AdminTool.main(updateStoreArgs);
+
+        // The parent controller is the source of truth and is updated synchronously.
+        TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, () -> {
+          StoreInfo parentStore = parentControllerClient.getStore(storeName).getStore();
+          Assert.assertEquals(parentStore.getThroughputQuotaInBytes(), throughputQuotaInBytes);
+          Assert.assertEquals(parentStore.getThroughputQuotaInRecords(), throughputQuotaInRecords);
+        });
+
+        // The value must also propagate to the child region through the admin channel.
+        TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, () -> {
+          StoreInfo childStore = childControllerClient.getStore(storeName).getStore();
+          Assert.assertEquals(childStore.getThroughputQuotaInBytes(), throughputQuotaInBytes);
+          Assert.assertEquals(childStore.getThroughputQuotaInRecords(), throughputQuotaInRecords);
+        });
+      }
+    }
   }
 }

@@ -1,20 +1,23 @@
 package com.linkedin.venice.fastclient.meta;
 
 import static org.apache.hc.core5.http.HttpStatus.SC_GONE;
-import static org.apache.hc.core5.http.HttpStatus.SC_METHOD_NOT_ALLOWED;
-import static org.apache.hc.core5.http.HttpStatus.SC_NOT_FOUND;
-import static org.apache.hc.core5.http.HttpStatus.SC_OK;
 import static org.apache.hc.core5.http.HttpStatus.SC_SERVICE_UNAVAILABLE;
-import static org.apache.hc.core5.http.HttpStatus.SC_TOO_MANY_REQUESTS;
 
+import com.google.common.collect.ImmutableSet;
+import com.linkedin.alpini.base.concurrency.Executors;
+import com.linkedin.alpini.base.concurrency.ScheduledExecutorService;
 import com.linkedin.alpini.base.concurrency.TimeoutProcessor;
 import com.linkedin.venice.client.exceptions.VeniceClientHttpException;
 import com.linkedin.venice.client.store.transport.TransportClientResponse;
-import com.linkedin.venice.fastclient.ClientConfig;
+import com.linkedin.venice.fastclient.transport.R2TransportClient;
+import com.linkedin.venice.meta.QueryAction;
+import com.linkedin.venice.utils.DaemonThreadFactory;
+import com.linkedin.venice.utils.RedundantExceptionFilter;
 import com.linkedin.venice.utils.concurrent.ChainedCompletableFuture;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -26,33 +29,54 @@ import org.apache.logging.log4j.Logger;
 
 
 /**
- * The class is used to measure the healthiness about the cluster the store belongs to.
- * So far, it is per store because of the following reasons:
- * 1. Simplify the logic in this class since we don't need to maintain the per-store status, such as quota related responses.
- * 2. Isolate the healthiness decision among different stores to reduce the impact of false signal.
- * There are concerns with this approach as well, for example, the mis-behaving instances will take a longer time to be discovered
- * in each store.
- *
- * This class is using the pending requests + response status of each Route to decide the healthiness.
- * 1. For the good response, the pending request counter will be reset when receiving the response.
- * 2. For the error response, the pending request counter reset will be delayed, which is a way to downgrade the instance.
- * 3. When the pending request counter exceeds the pre-defined threshold, the instance will be completely blocked.
- *
+ * This class is used to track the health of the instances Fast Client is talking to.
+ * Here is the strategy:
+ * 1. It is maintaining a pending request map to track the pending request count per instance.
+ * 2. If the pending request count exceeds the configured threshold, the instance will be blocked.
+ * 3. If the request is timed out based on the configured timeout threshold, this instance will be put
+ *    into suspicious instance set.
+ * 4. The embedded heart-beat runnable will send heartbeat request to the suspicious/unhealthy instances
+ *    periodically, and if the heartbeat request still times out or receives error response, the instance
+ *    will be put into the unhealthy instance set. Otherwise, the instance will be removed from the suspicious
+ *    and unhealthy instance set.
+ * 5. Fast Client won't send user requests to the blocked instances and unhealthy instances.
  */
 public class InstanceHealthMonitor implements Closeable {
+  private static final RedundantExceptionFilter REDUNDANT_EXCEPTION_FILTER =
+      RedundantExceptionFilter.getRedundantExceptionFilter();
   private static final Logger LOGGER = LogManager.getLogger(InstanceHealthMonitor.class);
-  private final ClientConfig clientConfig;
+  private final InstanceHealthMonitorConfig config;
 
-  // Map/set of per store replica instances
   private final Map<String, Integer> pendingRequestCounterMap = new VeniceConcurrentHashMap<>();
   private final Set<String> unhealthyInstanceSet = new ConcurrentSkipListSet<>();
+  private final Set<String> suspiciousInstanceSet = new ConcurrentSkipListSet<>();
+
+  /**
+   * The store's ready-to-serve instances from the metadata routing table, replaced on each metadata refresh via
+   * {@link #updateLiveInstanceSet(Set)}; empty before the first refresh (see {@link #isInstanceLive(String)}).
+   *
+   * <p>The {@link ImmutableSet} type plus a volatile reference is the whole thread-safety story (no lock needed): the
+   * value can never be mutated in place, so the metadata thread may swap the reference at any time and concurrent
+   * reads in {@link #isInstanceLive(String)} stay safe.
+   */
+  private volatile ImmutableSet<String> liveInstanceSet = ImmutableSet.of();
 
   private final TimeoutProcessor timeoutProcessor;
+
+  private final ScheduledExecutorService heartBeatScheduler =
+      Executors.newSingleThreadScheduledExecutor(new DaemonThreadFactory("VeniceFastClient-HeartBeat"));
+  private final R2TransportClient heartBeatClient;
+
   private final Consumer<String> counterResetConsumer;
 
-  public InstanceHealthMonitor(ClientConfig clientConfig) {
-    this.clientConfig = clientConfig;
+  private final InstanceLoadController loadController;
+
+  public InstanceHealthMonitor(InstanceHealthMonitorConfig config) {
+    this.config = config;
     this.timeoutProcessor = new TimeoutProcessor(null, true, 1);
+    this.heartBeatClient = new R2TransportClient(config.getClient());
+    this.heartBeatScheduler
+        .scheduleAtFixedRate(this::heartBeat, 0, config.getHeartBeatIntervalSeconds(), TimeUnit.SECONDS);
 
     this.counterResetConsumer = (instance) -> {
       pendingRequestCounterMap.compute(instance, (k, v) -> {
@@ -70,6 +94,56 @@ public class InstanceHealthMonitor implements Closeable {
         return v - 1;
       });
     };
+    this.loadController = new InstanceLoadController(config);
+  }
+
+  private void heartBeat() {
+    Set<String> heartBeatInstances = new HashSet<>(suspiciousInstanceSet);
+    heartBeatInstances.addAll(unhealthyInstanceSet);
+    if (heartBeatInstances.isEmpty()) {
+      return;
+    }
+    for (String instance: heartBeatInstances) {
+      String heartBeatUrl = instance + "/" + QueryAction.HEALTH.toString().toLowerCase();
+      CompletableFuture<TransportClientResponse> heartBeatFuture = heartBeatClient.get(heartBeatUrl);
+      TimeoutProcessor.TimeoutFuture timeoutFuture = null;
+      if (heartBeatFuture != null) {
+        timeoutFuture = timeoutProcessor.schedule(
+            /** Using a special http status to indicate the timed-out request */
+            () -> {
+              heartBeatFuture
+                  .completeExceptionally(new VeniceClientHttpException("Heartbeat request timed out", SC_GONE));
+              LOGGER.warn(
+                  "Heartbeat request to instance: {} timed out after {} ms",
+                  instance,
+                  config.getHeartBeatRequestTimeoutMS());
+            },
+            config.getHeartBeatRequestTimeoutMS(),
+            TimeUnit.MILLISECONDS);
+
+        TimeoutProcessor.TimeoutFuture finalTimeoutFuture = timeoutFuture;
+        heartBeatFuture.whenComplete((response, throwable) -> {
+          if (finalTimeoutFuture != null && !finalTimeoutFuture.isDone()) {
+            finalTimeoutFuture.cancel();
+          }
+          if (throwable != null) {
+            // Skip hosts removed since the last refresh, so a heartbeat in flight during a prune does not re-add them.
+            if (isInstanceLive(instance) && !unhealthyInstanceSet.contains(instance)) {
+              LOGGER.warn(
+                  "Heartbeat to instance: {} failed with exception: {}, will add it to unhealthy instance set",
+                  instance,
+                  throwable.getMessage());
+              unhealthyInstanceSet.add(instance);
+            }
+            suspiciousInstanceSet.remove(instance);
+            return;
+          }
+          LOGGER.info("Heartbeat to instance: {} succeeded, will remove it from unhealthy instance set", instance);
+          unhealthyInstanceSet.remove(instance);
+          suspiciousInstanceSet.remove(instance);
+        });
+      }
+    }
   }
 
   public TimeoutProcessor getTimeoutProcessor() {
@@ -106,75 +180,52 @@ public class InstanceHealthMonitor implements Closeable {
     TimeoutProcessor.TimeoutFuture timeoutFuture = null;
     if (transportFuture != null) {
       timeoutFuture = timeoutProcessor.schedule(
-          /** Using a special http status to indicate the leaked request */
+          /** Using a special http status to indicate the timed out request */
           () -> {
             transportFuture.completeExceptionally(new VeniceClientHttpException("Request timed out", SC_GONE));
+            // Only track a host still in the fleet, so a timeout to a removed host does not resurrect heartbeats.
+            if (isInstanceLive(instance)) {
+              String logMessage = String.format(
+                  "Request to instance: %s timed out after %d ms, will start sending heart-beat to this instance to check whether it is healthy or not",
+                  instance,
+                  config.getRoutingRequestDefaultTimeoutMS());
+              if (!REDUNDANT_EXCEPTION_FILTER.isRedundantException(logMessage)) {
+                LOGGER.warn(logMessage);
+              }
+              suspiciousInstanceSet.add(instance);
+            }
           },
-          clientConfig.getRoutingLeakedRequestCleanupThresholdMS(),
+          config.getRoutingRequestDefaultTimeoutMS(),
           TimeUnit.MILLISECONDS);
     }
 
     TimeoutProcessor.TimeoutFuture finalTimeoutFuture = timeoutFuture;
     CompletableFuture<Integer> resultFuture = requestFuture.whenComplete((httpStatus, throwable) -> {
+      if (finalTimeoutFuture != null && !finalTimeoutFuture.isDone()) {
+        finalTimeoutFuture.cancel();
+      }
+
       if (throwable != null) {
         httpStatus = (throwable instanceof VeniceClientHttpException)
             ? ((VeniceClientHttpException) throwable).getHttpStatus()
             : SC_SERVICE_UNAVAILABLE;
       }
 
-      if (finalTimeoutFuture != null && !finalTimeoutFuture.isDone()) {
-        finalTimeoutFuture.cancel();
-      }
-
-      long counterResetDelayMS = 0;
-      boolean unhealthyInstance = false;
-      switch (httpStatus) {
-        case SC_OK:
-        case SC_NOT_FOUND:
-          break;
-        case SC_TOO_MANY_REQUESTS:
-          /**
-           * Specific to a store.
-           * This case will fall under blocked instances as there are too many requests waiting on
-           * them, so will be implicitly marked under blocked instances and so not marked unhealthy.
-            */
-          counterResetDelayMS = clientConfig.getRoutingQuotaExceededRequestCounterResetDelayMS();
-          break;
-        case SC_GONE:
-        case SC_SERVICE_UNAVAILABLE:
-          counterResetDelayMS = clientConfig.getRoutingUnavailableRequestCounterResetDelayMS();
-          unhealthyInstance = true;
-          break;
-        case SC_METHOD_NOT_ALLOWED:
-          // Use the same delay as service unavailable without marking the instance as unhealthy
-          counterResetDelayMS = clientConfig.getRoutingUnavailableRequestCounterResetDelayMS();
-          break;
-        default:
-          // All other error statuses
-          counterResetDelayMS = clientConfig.getRoutingErrorRequestCounterResetDelayMS();
-          unhealthyInstance = true;
-      }
-      if (counterResetDelayMS == 0) {
-        counterResetConsumer.accept(instance);
-      } else {
+      if (httpStatus.equals(SC_GONE)) {
         /**
-         * Even when httpStatus is not 200/404, we want to reset the counter after some delay: to
-         * recheck for health once in a while rather than being permanently blocking it
+         * For timeout cases, we would like to delay the pending request counter reset to reduce the traffic
+         * to this suspicious instance before heartbeat makes a decision about whether this instance is indeed
+         * unhealthy or not.
          */
         timeoutProcessor.schedule(
             () -> counterResetConsumer.accept(instance),
-            counterResetDelayMS,
-            TimeUnit.MILLISECONDS.MILLISECONDS);
-      }
-      if (unhealthyInstance) {
-        if (unhealthyInstanceSet.add(instance)) {
-          LOGGER.info("Marked instance: {} as unhealthy because of error response", instance);
-        }
+            config.getRoutingTimedOutRequestCounterResetDelayMS(),
+            TimeUnit.MILLISECONDS);
       } else {
-        if (unhealthyInstanceSet.remove(instance)) {
-          LOGGER.info("Marked instance: {} as healthy because of good response", instance);
-        }
+        counterResetConsumer.accept(instance);
       }
+
+      loadController.recordResponse(instance, httpStatus);
     });
 
     return new ChainedCompletableFuture<>(requestFuture, resultFuture);
@@ -186,7 +237,7 @@ public class InstanceHealthMonitor implements Closeable {
    * eventually become blocked when it reaches the threshold for pendingRequestCounter. This
    * provides some break between continuously sending requests to these instances.
    */
-  public boolean isInstanceHealthy(String instance) {
+  boolean isInstanceHealthy(String instance) {
     return !unhealthyInstanceSet.contains(instance);
   }
 
@@ -194,28 +245,82 @@ public class InstanceHealthMonitor implements Closeable {
    * If an instance is blocked, it won't be considered for new requests until the requests are closed either
    * in a proper manner or closed by {@link #trackHealthBasedOnRequestToInstance#timeoutFuture}
    */
-  public boolean isInstanceBlocked(String instance) {
-    return getPendingRequestCounter(instance) >= clientConfig.getRoutingPendingRequestCounterInstanceBlockThreshold();
+  boolean isInstanceBlocked(String instance) {
+    return getPendingRequestCounter(instance) >= config.getRoutingPendingRequestCounterInstanceBlockThreshold();
+  }
+
+  boolean shouldRejectRequest(String instance) {
+    return loadController.shouldRejectRequest(instance);
+  }
+
+  public boolean isRequestAllowed(String instance) {
+    return isInstanceHealthy(instance) && !isInstanceBlocked(instance) && !shouldRejectRequest(instance);
   }
 
   public int getBlockedInstanceCount() {
     int blockedInstanceCount = 0;
     // TODO: need to evaluate whether it is too expensive to emit a metric per request for this.
     for (int count: pendingRequestCounterMap.values()) {
-      if (count >= clientConfig.getRoutingPendingRequestCounterInstanceBlockThreshold()) {
+      if (count >= config.getRoutingPendingRequestCounterInstanceBlockThreshold()) {
         ++blockedInstanceCount;
       }
     }
     return blockedInstanceCount;
   }
 
+  public int getOverloadedInstanceCount() {
+    return loadController.getTotalNumberOfOverLoadedInstances();
+  }
+
+  public double getRejectionRatio(String instance) {
+    return loadController.getRejectionRatio(instance);
+  }
+
   public int getUnhealthyInstanceCount() {
     return unhealthyInstanceSet.size();
+  }
+
+  /**
+   * Reconcile all per-instance state (suspicious/unhealthy sets, pending-request counters, load controllers) with the
+   * store's current serving set on every metadata refresh, dropping hosts that left the fleet — otherwise they would
+   * be tracked and sent heart-beat indefinitely. A null or empty set means "not yet known" and is ignored, so a
+   * transient empty refresh cannot wipe accumulated state.
+   */
+  void updateLiveInstanceSet(Set<String> liveInstances) {
+    if (liveInstances == null || liveInstances.isEmpty()) {
+      return;
+    }
+    // Own a private immutable snapshot so a caller mutating its set can't affect the hb flow.
+    ImmutableSet<String> liveSnapshot = ImmutableSet.copyOf(liveInstances);
+    liveInstanceSet = liveSnapshot;
+    unhealthyInstanceSet.retainAll(liveSnapshot);
+    suspiciousInstanceSet.retainAll(liveSnapshot);
+    // Drop counters for departed hosts, but keep in-flight (non-zero) ones so their completion reset stays correct.
+    for (String instance: pendingRequestCounterMap.keySet()) {
+      if (!liveSnapshot.contains(instance)) {
+        pendingRequestCounterMap.computeIfPresent(instance, (k, count) -> count == 0 ? null : count);
+      }
+    }
+    loadController.retainInstances(liveSnapshot);
+  }
+
+  /**
+   * Whether {@code instance} still serves this store. Returns {@code true} when the serving set is empty (before the
+   * first metadata refresh): a defensive check so a host is never excluded before the serving set is known;
+   */
+  private boolean isInstanceLive(String instance) {
+    Set<String> liveInstances = liveInstanceSet;
+    return liveInstances.isEmpty() || liveInstances.contains(instance);
   }
 
   public int getPendingRequestCounter(String instance) {
     Integer pendingRequestCounter = pendingRequestCounterMap.get(instance);
     return pendingRequestCounter == null ? 0 : pendingRequestCounter;
+  }
+
+  /** Visible for testing: whether a pending-request counter entry currently exists for the instance. */
+  boolean hasPendingRequestCounter(String instance) {
+    return pendingRequestCounterMap.containsKey(instance);
   }
 
   @Override
@@ -228,5 +333,15 @@ public class InstanceHealthMonitor implements Closeable {
         Thread.currentThread().interrupt();
       }
     }
+
+    if (heartBeatScheduler != null) {
+      heartBeatScheduler.shutdownNow();
+      try {
+        heartBeatScheduler.awaitTermination(30, TimeUnit.SECONDS);
+      } catch (InterruptedException e) {
+        Thread.currentThread().interrupt();
+      }
+    }
   }
+
 }

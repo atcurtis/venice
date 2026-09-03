@@ -1,38 +1,85 @@
 package com.linkedin.davinci.kafka.consumer;
 
+import static java.util.concurrent.TimeUnit.MINUTES;
+
 import com.linkedin.davinci.helix.LeaderFollowerPartitionStateModel;
+import com.linkedin.davinci.stats.ingestion.heartbeat.HeartbeatKey;
 import com.linkedin.davinci.utils.ByteArrayKey;
 import com.linkedin.venice.kafka.protocol.GUID;
 import com.linkedin.venice.kafka.protocol.Put;
+import com.linkedin.venice.kafka.protocol.TopicSwitch;
+import com.linkedin.venice.kafka.protocol.state.IncrementalPushReplicaStatus;
 import com.linkedin.venice.kafka.validation.checksum.CheckSum;
 import com.linkedin.venice.kafka.validation.checksum.CheckSumType;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.offsets.OffsetRecord;
+import com.linkedin.venice.pubsub.PubSubContext;
 import com.linkedin.venice.pubsub.PubSubTopicPartitionImpl;
-import com.linkedin.venice.pubsub.PubSubTopicRepository;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
+import com.linkedin.venice.pubsub.api.PubSubSymbolicPosition;
 import com.linkedin.venice.pubsub.api.PubSubTopic;
 import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
 import com.linkedin.venice.serialization.avro.AvroProtocolDefinition;
+import com.linkedin.venice.stats.dimensions.VeniceChunkingStatus;
+import com.linkedin.venice.stats.dimensions.VeniceRegionLocality;
+import com.linkedin.venice.stats.dimensions.VeniceReplicationMode;
+import com.linkedin.venice.stats.dimensions.VeniceStoreWriteType;
 import com.linkedin.venice.storage.protocol.ChunkedValueManifest;
+import com.linkedin.venice.utils.ArrayUtils;
+import com.linkedin.venice.utils.LatencyUtils;
+import com.linkedin.venice.utils.RegionUtils;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
+import com.linkedin.venice.utils.lazy.Lazy;
 import com.linkedin.venice.writer.LeaderCompleteState;
+import com.linkedin.venice.writer.VeniceWriter;
 import java.nio.ByteBuffer;
-import java.util.HashMap;
+import java.util.Collections;
+import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import org.apache.avro.generic.GenericRecord;
+import org.apache.avro.util.Utf8;
+import org.apache.datasketches.hll.HllSketch;
+import org.apache.datasketches.hll.TgtHllType;
+import org.apache.datasketches.memory.Memory;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 
 /**
- * This class is used to maintain internal state for consumption of each partition.
+ * In-memory state that represents a replica's view of partition consumption.
+ *
+ * <p>This class tracks everything the replica cares about: how far it's consumed
+ * from the real-time (RT) and version topics (VT), what data has been processed,
+ * and what's been committed.
+ *
+ * <p>This state is not durable — it's periodically checkpointed by updating the
+ * {@link OffsetRecord}, which wraps the persisted {@code PartitionState} on disk.
+ * Note: OffsetRecord is not persisted to disk until the flush/sync operation is called.
+ *
+ * <p>When the replica is the leader for the partition, RT and remote VT positions are
+ * updated by directly consuming from the corresponding topics. For followers, these
+ * positions are derived from the leader footer attached to every version topic message,
+ * or from global DIV snapshots — if global DIV is enabled.
  */
 public class PartitionConsumptionState {
-  private final String replicaId;
-  private final int partition;
+  private static final Logger LOGGER = LogManager.getLogger(PartitionConsumptionState.class);
+  private static final int MAX_INCREMENTAL_PUSH_ENTRY_NUM = 50;
+  private static final long DEFAULT_HEARTBEAT_LAG_THRESHOLD_MS = MINUTES.toMillis(2); // Default is 2 minutes.
+  private static final long MAX_RETENTION_DAYS_IN_MS = TimeUnit.DAYS.toMillis(2);
+  private static final CharSequence PREVIOUSLY_READY_TO_SERVE = new Utf8("previouslyReadyToServe");
+  private static final String TRUE = "true";
+
+  private final PubSubTopicPartition partitionReplica;
   private final boolean hybrid;
   private final OffsetRecord offsetRecord;
+  private final PubSubContext pubSubContext;
 
   private GUID leaderGUID;
 
@@ -40,7 +87,7 @@ public class PartitionConsumptionState {
 
   /**
    * whether the ingestion of current partition is deferred-write.
-   * Refer {@link com.linkedin.davinci.store.rocksdb.RocksDBStoragePartition#deferredWrite}
+   * Refer {@code com.linkedin.davinci.store.rocksdb.RocksDBStoragePartition#deferredWrite}
    */
   private boolean deferredWrite;
   private boolean errorReported;
@@ -51,12 +98,26 @@ public class PartitionConsumptionState {
    * getting caught up after a push.
    */
   private long lagCaughtUpTimeInMs;
-  private boolean completionReported;
+  private volatile boolean completionReported;
   private boolean isSubscribed;
   private boolean isDataRecoveryCompleted;
   private LeaderFollowerStateType leaderFollowerState;
 
-  private CompletableFuture<Void> lastVTProduceCallFuture;
+  /**
+   * The VT produce future should be read/set by the same consumer thread during normal operation. Making it volatile
+   * since the SIT thread might want to shortcircuit this future when closing {@link LeaderFollowerStoreIngestionTask}.
+   */
+  private volatile CompletableFuture<Void> lastVTProduceCallFuture;
+
+  /**
+   * State machine that can only transition to LATCH_CREATED if LatchStatus is NONE, and transition to LATCH_RELEASED
+   * if LatchStatus is LATCH_CREATED. The latch will only be created in {@link LeaderFollowerPartitionStateModel} if
+   * consumption begins on a partition that is the current version. It will not be created if the future version
+   * (being consumed) later becomes the current version.
+   */
+  enum LatchStatus {
+    NONE, LATCH_CREATED, LATCH_RELEASED
+  }
 
   /**
    * Only used in L/F model. Check if the partition has released the latch.
@@ -67,7 +128,35 @@ public class PartitionConsumptionState {
    * See {@link LeaderFollowerPartitionStateModel} for the
    * details why we need latch for certain resources.
    */
-  private boolean isLatchReleased = false;
+  private final AtomicReference<LatchStatus> latchStatus = new AtomicReference<>(LatchStatus.NONE);
+
+  /**
+   * Tracks DoL state during STANDBY to LEADER transition. Null when not in transition or DoL not enabled.
+   *
+   * <p>Thread access patterns:
+   * <ul>
+   *   <li>State machine thread: calls setDolState(), getDolState(), clearDolState(), isDolComplete()</li>
+   *   <li>Producer callback thread: calls getDolState(), then setDolProduced() on the DolStamp</li>
+   *   <li>Drainer thread: calls getDolState(), then setDolConsumed() on the DolStamp</li>
+   * </ul>
+   *
+   * <p>Thread safety: The volatile reference ensures proper publication. The DolStamp's internal flags
+   * (dolProduced, dolConsumed) are also volatile. Since flags only transition one-way (false → true),
+   * stale reads are safe - they just delay completion detection until the next check.
+   */
+  private volatile DolStamp dolStamp = null;
+
+  /**
+   * Optional per-partition ingestion monitor. Only non-null when a gRPC monitoring session is active.
+   * The volatile read (~1-2ns) is negligible overhead on the hot path.
+   */
+  private volatile PartitionIngestionMonitor ingestionMonitor = null;
+
+  /**
+   * The highest leadership term observed by this replica. Currently used only
+   * for troubleshooting. This will eventually become part of the durable state.
+   */
+  private volatile long highestLeadershipTerm = -1;
 
   /**
    * This future is completed in drainer thread after persisting the associated record and offset to DB.
@@ -85,6 +174,27 @@ public class PartitionConsumptionState {
    * update offset db for every record.
    */
   private long processedRecordSizeSinceLastSync;
+
+  /**
+   * Tracks bytes consumed per source key (VT name or RT broker URL) since the last Global RT DIV sync.
+   * Stored per-partition so that each partition's sync cadence is independent.
+   */
+  private final Map<String, Long> consumedBytesSinceLastGlobalRtDivSync = new VeniceConcurrentHashMap<>();
+
+  /** Minimum lgK supported by DataSketches HllSketch (mirrors package-private HllUtil.MIN_LOG_K). */
+  static final int HLL_MIN_LOG_K = 4;
+  /** Maximum lgK supported by DataSketches HllSketch (mirrors package-private HllUtil.MAX_LOG_K). */
+  static final int HLL_MAX_LOG_K = 21;
+  /** Default lgK for HLL sketches. ~8KB memory, ~1.15% error. */
+  public static final int HLL_DEFAULT_LOG_K = 13;
+
+  /**
+   * HyperLogLog sketch estimating unique keys ever put or deleted in this partition.
+   * Monotonically increasing; resets on new version push.
+   * Null when HLL tracking is disabled. Set via {@link #initializeUniqueKeyCountHll(int)}
+   * or {@link #restoreUniqueKeyCountHll(int)}.
+   */
+  private HllSketch uniqueIngestedKeyCountHll;
 
   /**
    * An in-memory state to track whether the leader consumer is consuming from remote or not; it will be updated with
@@ -117,17 +227,28 @@ public class PartitionConsumptionState {
    * and check timeout in the consumption state check function which runs regularly:
    * {@link LeaderFollowerStoreIngestionTask#checkLongRunningTaskState()}
    */
-  private final long consumptionStartTimeInMs;
+  private long consumptionStartTimeInMs;
+
+  /**
+   * Tracks whether this partition is currently paused due to a store-level
+   * {@link com.linkedin.venice.meta.IngestionPauseMode} other than NOT_PAUSED. Distinct from the
+   * disk-quota pause managed by {@link StorageUtilizationManager} — when this flag is true, quota
+   * resume callbacks must no-op so they don't fight the store-level pause.
+   * <p>
+   * Written by the SIT thread but read by disk-quota callbacks invoked from other threads, so it
+   * is {@code volatile} for cross-thread visibility.
+   */
+  private volatile boolean storeLevelPaused = false;
 
   /**
    * This hash map will keep a temporary mapping between a key and it's value.
-   * get {@link #getTransientRecord(byte[])} and put {@link #setTransientRecord(int, long, byte[], int, GenericRecord)}
+   * get {@link #getTransientRecord(byte[])} and put {@link #setTransientRecord(int, PubSubPosition, byte[], int, GenericRecord)}
    * operation on this map will be invoked from kafka consumer thread.
-   * delete {@link #mayRemoveTransientRecord(int, long, byte[])} operation will be invoked from drainer thread after persisting it in DB.
+   * delete {@link #mayRemoveTransientRecord(int, PubSubPosition, byte[])} operation will be invoked from drainer thread after persisting it in DB.
    * because of the properties of the above operations the caller is guaranteed to get the latest value for a key either from
    * this map or from the DB.
    */
-  private final ConcurrentMap<ByteArrayKey, TransientRecord> transientRecordMap = new VeniceConcurrentHashMap<>();
+  private final Map<ByteArrayKey, TransientRecord> transientRecordMap = new VeniceConcurrentHashMap<>();
 
   /**
    * This field is used to track whether the last queued record has been fully processed or not.
@@ -143,15 +264,6 @@ public class PartitionConsumptionState {
    */
   private boolean skipKafkaMessage = false;
 
-  /**
-   * This is an in-memory only map which will track the consumed offset from each kafka cluster. Currently used in
-   * measuring hybrid offset lag for each prod region during RT consumption.
-   *
-   * Key: source Kafka url
-   * Value: Latest upstream RT offsets of a specific source consumed by leader
-   */
-  private final ConcurrentMap<String, Long> consumedUpstreamRTOffsetMap;
-
   // stores the SOP control message's producer timestamp.
   private long startOfPushTimestamp = 0;
 
@@ -159,55 +271,171 @@ public class PartitionConsumptionState {
   private long endOfPushTimestamp = 0;
 
   /**
-   * Latest local version topic offset processed by drainer.
-   */
-  private long latestProcessedLocalVersionTopicOffset;
-  /**
-   * Latest upstream version topic offset processed by drainer; if batch native replication source is the same as local
-   * region, this tracking offset should remain as -1.
-   */
-  private long latestProcessedUpstreamVersionTopicOffset;
-
-  /**
-   * This keeps track of those offsets which have been screened during conflict resolution. This needs to be kept
-   * separate from the drainers notion of per colo offsets because the ingestion task will screen offsets at a higher
-   * offset then those which have been drained.  This is used for determining the lag of a leader consumer relative
-   * to a source topic when the latest messages have been consumed but not applied due to certain writes not getting
-   * applied after losing on conflict resolution to a pre-existing/conflicting write.
+   * Tracks the latest real-time topic position consumed by the leader from each upstream PubSub source.
    *
-   * key: source Kafka url
-   * value: Latest ignored upstream RT offset
-   */
-  private Map<String, Long> latestIgnoredUpstreamRTOffsetMap;
-
-  /**
-   * This keeps track of the latest RT offsets from a specific broker which have been produced to VT. When a message
-   * is consumed out of RT it can be produced to VT but not yet committed to local storage for the leader.  We only
-   * commit a message to a drainer queue after we've produced to the local VT.  This map tracks what messages have been
-   * produced.  To find what messages have been committed refer to latestProcessedUpstreamRTOffsetMap.  This map is used
-   * for determining if a leader replica is ready to serve or not to avoid the edge case that the end of the RT is full
-   * of events which we want to ignore or not apply.  NOTE: This is updated 'before' an ACK is received from Kafka,
-   * an offset in this map does not guarantee that the message has successfully made it to VT yet.
+   * This is an in-memory-only map used primarily for measuring hybrid offset lag per region during
+   * real-time (RT) consumption. The values reflect the most recent positions observed by the consumer,
+   * regardless of whether they have been persisted or validated.
    *
-   * key: source Kafka url
-   * Value: Latest upstream RT offset which has been published to VT
+   * Key: source PubSub broker address
+   * Value: latest consumed real-time topic position from that source
    */
-  private Map<String, Long> latestRTOffsetTriedToProduceToVTMap;
+  private final Map<String, PubSubPosition> latestConsumedRtPositions;
 
   /**
-   * Key: source Kafka url
-   * Value: Latest upstream RT offsets of a specific source processed by drainer
+   * Tracks the last real-time topic position consumed from each upstream broker
+   * till which Global RT Data Integrity Validation (DIV) has been successfully generated.
+   *
+   * This in-memory map reflects the highest position per broker up to which both
+   * record consumption and DIV checkpointing were completed. It is restored from
+   * disk during startup and used when the client subscribes to real-time topics,
+   * if Global RT DIV is enabled.
+   *
+   * Key: source PubSub broker address
+   * Value: last consumed real-time topic position with valid DIV
    */
-  private Map<String, Long> latestProcessedUpstreamRTOffsetMap;
+  private final Map<String, PubSubPosition> divRtCheckpointPositions;
+
+  /**
+   * Tracks the position of the last local version topic record processed
+   * and committed to the database by the drainer. This value is not durable
+   * until explicitly persisted, which happens periodically via offset record
+   * updates and checkpointing to disk.
+   */
+  private PubSubPosition latestProcessedVtPosition;
+  /**
+   * Tracks the latest upstream  (remote) version topic position processed by the drainer.
+   * If the batch native replication source is the same as the local region,
+   * this should remain {@link PubSubSymbolicPosition#EARLIEST}. Otherwise, it
+   * should be updated to reflect the actual upstream position.
+   */
+  private PubSubPosition latestProcessedRemoteVtPosition;
+
+  /**
+   * Tracks the latest real-time topic position processed by the drainer for each upstream source.
+   *
+   * Keyed by the source PubSub broker address (see {@link com.linkedin.venice.ConfigKeys#PUBSUB_BROKER_ADDRESS}),
+   * this in-memory map reflects the most recent real-time message position received from each upstream region.
+   *
+   * This state is not durable until it's flushed—typically done by updating the corresponding
+   * offset records and checkpointing them to disk. If the drainer has not yet received any messages
+   * from a given source, its entry may be absent or initialized to {@link PubSubSymbolicPosition#EARLIEST}.
+   */
+  private final Map<String, PubSubPosition> latestProcessedRtPositions;
 
   private LeaderCompleteState leaderCompleteState;
   private long lastLeaderCompleteStateUpdateInMs;
 
-  public PartitionConsumptionState(String replicaId, int partition, OffsetRecord offsetRecord, boolean hybrid) {
-    this.replicaId = replicaId;
-    this.partition = partition;
+  /**
+   * Set when this replica became ready to serve via the dead-leader fallback rather than a fresh leader-complete signal.
+   * Guards the one-time WARN log and annotates the completion notification.
+   */
+  private boolean readyToServeViaDeadLeaderFallback;
+
+  private List<String> pendingReportIncPushVersionList;
+
+  // veniceWriterLazyRef could be set and get in different threads, mark it volatile.
+  private volatile Lazy<VeniceWriter<byte[], byte[], byte[]>> veniceWriterLazyRef;
+
+  private BooleanSupplier isCurrentVersion;
+
+  private long readyToServeTimeLagThresholdInMs = DEFAULT_HEARTBEAT_LAG_THRESHOLD_MS;
+
+  private Map<String, IncrementalPushReplicaStatus> trackingIncrementalPushStatus;
+  /**
+   * Indicates whether a bootstrapping current version replica has resubscribed after bootstrap completed.
+   * In a replica's lifetime, this will only be flipped at most once.
+   */
+  private boolean hasResubscribedAfterBootstrapAsCurrentVersion;
+
+  /**
+   * Tracks an in-progress blob transfer for this partition. When non-null, blob transfer is in progress
+   * and Kafka subscribe has not yet happened. The SIT main loop's checkLongRunningTaskState() will poll
+   * this future for completion and then perform Kafka subscribe.
+   *
+   * Set during SUBSCRIBE action processing when blob transfer is needed.
+   * Cleared when blob transfer completes (success or failure) or when UNSUBSCRIBE cancels it.
+   */
+  private volatile CompletableFuture<Void> pendingBlobTransfer;
+
+  /**
+   * Tracks an in-progress record transformer recovery after blob transfer completes.
+   * Set when blob transfer finishes and record transformer recovery is submitted to the thread pool.
+   * Cleared when record transformer recovery completes and Kafka subscribe proceeds.
+   */
+  private volatile CompletableFuture<Void> pendingRecordTransformerRecovery;
+
+  /**
+   * The original consumer action that triggered the record transformer recovery, if any.
+   * Stored so that checkLongRunningTaskState can pass it to validateAndSubscribePartition
+   * when the record transformer future completes. Null for the post-blob-transfer path.
+   */
+  private volatile ConsumerAction postRecordTransformerConsumerAction;
+
+  /**
+   * Cached HeartbeatKey references keyed by region, populated during lag monitor setup.
+   * Eliminates HeartbeatKey creation and hash computation on the per-record recording path.
+   */
+  private final Map<String, HeartbeatKey> cachedHeartbeatKeys;
+
+  /**
+   * Active logical key count. Batch phase: incremented per logical PUT. RT phase (hybrid A/A):
+   * adjusted by +1/-1 signals from conflict resolution. {@link OffsetRecord#ACTIVE_KEY_COUNT_NOT_TRACKED} = not tracked
+   * (no batch baseline); RT signals are skipped when not tracked. AtomicLong for AA/WC parallel processing.
+   */
+  private final AtomicLong activeKeyCount = new AtomicLong(OffsetRecord.ACTIVE_KEY_COUNT_NOT_TRACKED);
+  /**
+   * Last PUT key for batch dedup. Not persisted; used by {@link #incrementActiveKeyCountForBatchRecord}.
+   *  Single-threaded: only accessed from the drainer thread during batch (pre-EOP). */
+  private byte[] lastBatchKeyForDedup;
+
+  /**
+   * SLO classification labels resolved once at PCS construction by the SIT (which knows the
+   * {@link Version} and the server's local region). Used by {@link #getOrCreateCachedHeartbeatKey(String)}
+   * so each cached HeartbeatKey carries pre-resolved enum references — no per-record string allocation.
+   */
+  private final VeniceStoreWriteType writeType;
+  private final VeniceChunkingStatus chunkingStatus;
+  private final VeniceReplicationMode replicationMode;
+  private final String localRegionName;
+
+  /**
+   * Logical-record count for batch-push verification — one increment per user-data record
+   * ingested in this partition before End-of-Push. For chunked records only the chunk manifest
+   * is counted (not the individual chunk fragments); regular PUT and DELETE messages each count
+   * once. Global RT DIV PUTs and other internal/control messages are not counted. Compared at EOP
+   * against the producer-side count carried on the EOP message's "prc" PubSub header (VPJ's
+   * {@code messageSent} — one increment per logical {@code writer.put}/{@code writer.delete}
+   * call; UPDATE is not consumed in batch ingestion so it doesn't contribute on either side). The
+   * counter uses {@link AtomicLong} for safety, though in practice writes come from the single
+   * drainer thread per partition. Persisted in {@link com.linkedin.venice.offsets.OffsetRecord}
+   * so the count survives server restarts mid-push.
+   */
+  private final AtomicLong batchPushRecordCount = new AtomicLong(0);
+
+  /** Lazily allocated per-partition detector for partial-update amplification. */
+  private volatile PartialUpdateAmplificationDetector partialUpdateAmplificationDetector;
+
+  public PartitionConsumptionState(
+      PubSubTopicPartition partitionReplica,
+      OffsetRecord offsetRecord,
+      PubSubContext pubSubContext,
+      boolean hybrid,
+      boolean isWriteComputationEnabled,
+      boolean isChunked,
+      boolean isActiveActiveReplicationEnabled,
+      String localRegionName) {
+    LOGGER.info("Creating PCS for replica: {}", partitionReplica);
+
+    this.partitionReplica = Objects.requireNonNull(partitionReplica, "TopicPartition cannot be null when creating PCS");
+    if (!Version.isATopicThatIsVersioned(partitionReplica.getTopicName())) {
+      throw new IllegalArgumentException(
+          "PartitionConsumptionState should be created only for versioned topics, but got: "
+              + partitionReplica.getTopicName());
+    }
     this.hybrid = hybrid;
     this.offsetRecord = offsetRecord;
+    this.pubSubContext = pubSubContext;
     this.errorReported = false;
     this.lagCaughtUp = false;
     this.lagCaughtUpTimeInMs = 0;
@@ -225,31 +453,223 @@ public class PartitionConsumptionState {
     this.latestPolledMessageTimestampInMs = currentTimeInMs;
     this.consumptionStartTimeInMs = currentTimeInMs;
 
-    // Restore in-memory consumption RT upstream offset map and latest processed RT upstream offset map from the
-    // checkpoint upstream offset map
-    consumedUpstreamRTOffsetMap = new VeniceConcurrentHashMap<>();
-    latestProcessedUpstreamRTOffsetMap = new VeniceConcurrentHashMap<>();
-    if (offsetRecord.getLeaderTopic() != null && Version.isRealTimeTopic(offsetRecord.getLeaderTopic())) {
-      offsetRecord.cloneUpstreamOffsetMap(consumedUpstreamRTOffsetMap);
-      offsetRecord.cloneUpstreamOffsetMap(latestProcessedUpstreamRTOffsetMap);
+    // Restore in-memory consumption RT positions and latest processed RT
+    // positions from the checkpoint upstream positions map.
+    // Batch-only stores never consume from RT topics, so skip allocating
+    // these maps to reduce per-partition heap overhead.
+    if (hybrid) {
+      latestConsumedRtPositions = new VeniceConcurrentHashMap<>(3);
+      divRtCheckpointPositions = new VeniceConcurrentHashMap<>(3);
+      latestProcessedRtPositions = new VeniceConcurrentHashMap<>(3);
+      if (offsetRecord.getLeaderTopic() != null && Version.isRealTimeTopic(offsetRecord.getLeaderTopic())) {
+        offsetRecord.cloneRtPositionCheckpoints(latestConsumedRtPositions);
+        offsetRecord.cloneRtPositionCheckpoints(latestProcessedRtPositions);
+      }
+      trackingIncrementalPushStatus = new VeniceConcurrentHashMap<>(3);
+    } else {
+      latestConsumedRtPositions = Collections.emptyMap();
+      divRtCheckpointPositions = Collections.emptyMap();
+      latestProcessedRtPositions = Collections.emptyMap();
+      trackingIncrementalPushStatus = Collections.emptyMap();
     }
-    // Restore in-memory latest consumed version topic offset and leader info from the checkpoint version topic offset
-    this.latestProcessedLocalVersionTopicOffset = offsetRecord.getLocalVersionTopicOffset();
-    this.latestProcessedUpstreamVersionTopicOffset = offsetRecord.getCheckpointUpstreamVersionTopicOffset();
+    cachedHeartbeatKeys = new VeniceConcurrentHashMap<>(3);
+    this.writeType = isWriteComputationEnabled ? VeniceStoreWriteType.WRITE_COMPUTE : VeniceStoreWriteType.REGULAR;
+    this.chunkingStatus = isChunked ? VeniceChunkingStatus.CHUNKED : VeniceChunkingStatus.UNCHUNKED;
+    this.replicationMode = isActiveActiveReplicationEnabled
+        ? VeniceReplicationMode.ACTIVE_ACTIVE
+        : VeniceReplicationMode.NON_ACTIVE_ACTIVE;
+    this.localRegionName = localRegionName;
+    // Restore in-memory latest consumed version topic position and leader info from the checkpoint version topic
+    // position
+    this.latestProcessedVtPosition = offsetRecord.getCheckpointedLocalVtPosition();
+    this.latestProcessedRemoteVtPosition = offsetRecord.getCheckpointedRemoteVtPosition();
     this.leaderHostId = offsetRecord.getLeaderHostId();
     this.leaderGUID = offsetRecord.getLeaderGUID();
-    // We don't restore ignored offsets from the persisted offset record today. Doing so would only be useful
-    // if it was useful to skip ahead through a large number of dropped offsets at the start of consumption.
-    this.latestIgnoredUpstreamRTOffsetMap = new HashMap<>();
-    // On start we haven't sent anything
-    this.latestRTOffsetTriedToProduceToVTMap = new HashMap<>();
     this.lastVTProduceCallFuture = CompletableFuture.completedFuture(null);
     this.leaderCompleteState = LeaderCompleteState.LEADER_NOT_COMPLETED;
     this.lastLeaderCompleteStateUpdateInMs = 0;
+    this.readyToServeViaDeadLeaderFallback = false;
+    this.pendingReportIncPushVersionList = offsetRecord.getPendingReportIncPushVersionList();
+    this.hasResubscribedAfterBootstrapAsCurrentVersion = false;
+    this.activeKeyCount.set(offsetRecord.getActiveKeyCount());
+    this.batchPushRecordCount.set(offsetRecord.getBatchPushRecordCount());
+  }
+
+  /** Create a fresh HLL sketch with {@link #HLL_DEFAULT_LOG_K}. */
+  public void initializeUniqueKeyCountHll() {
+    initializeUniqueKeyCountHll(HLL_DEFAULT_LOG_K);
+  }
+
+  /**
+   * Create a fresh HLL sketch for a new partition subscription.
+   *
+   * @param lgK log-base-2 of K (clamped to [{@link #HLL_MIN_LOG_K}, {@link #HLL_MAX_LOG_K}])
+   */
+  public void initializeUniqueKeyCountHll(int lgK) {
+    lgK = clampLgK(lgK);
+    this.uniqueIngestedKeyCountHll = new HllSketch(lgK, TgtHllType.HLL_4);
+  }
+
+  /** Restore the HLL sketch from checkpoint using {@link #HLL_DEFAULT_LOG_K} for mismatch detection. */
+  public void restoreUniqueKeyCountHll() {
+    restoreUniqueKeyCountHll(HLL_DEFAULT_LOG_K);
+  }
+
+  /**
+   * Restore the HLL sketch from the offset record checkpoint.
+   * Logs a warning if the restored lgK differs from the configured lgK.
+   *
+   * @param lgK configured log-base-2 of K (used only for mismatch detection)
+   */
+  public void restoreUniqueKeyCountHll(int lgK) {
+    lgK = clampLgK(lgK);
+    ByteBuffer hllBytes = offsetRecord.getUniqueIngestedKeyCountHllSketch();
+    if (hllBytes == null || hllBytes.remaining() == 0) {
+      LOGGER.warn("Replica: {} has no HLL checkpoint data to restore.", getReplicaId());
+      return;
+    }
+    restoreUniqueKeyCountHllFromCheckpoint(lgK, hllBytes);
+  }
+
+  public long getActiveKeyCount() {
+    return activeKeyCount.get();
+  }
+
+  public void setActiveKeyCount(long count) {
+    activeKeyCount.set(count);
+  }
+
+  public void incrementActiveKeyCount() {
+    activeKeyCount.incrementAndGet();
+  }
+
+  public long getBatchPushRecordCount() {
+    return batchPushRecordCount.get();
+  }
+
+  public void incrementBatchPushRecordCount() {
+    batchPushRecordCount.incrementAndGet();
+  }
+
+  /**
+   * Called at SOP to mark this partition as actively counting. Without this, a mid-batch
+   * restart with a newly enabled config would start counting partway through, producing
+   * an inaccurate partial count. On restart, SOP is not re-processed (already past the
+   * checkpoint), so the count stays at {@link OffsetRecord#ACTIVE_KEY_COUNT_NOT_TRACKED} and batch
+   * records are skipped by {@link #incrementActiveKeyCountForBatchRecord}.
+   */
+  public void initializeActiveKeyCount() {
+    activeKeyCount.compareAndSet(OffsetRecord.ACTIVE_KEY_COUNT_NOT_TRACKED, 0);
+  }
+
+  /**
+   * Decrements activeKeyCount. If the count is already at 0, this indicates drift
+   * (more deletes than creates), so we invalidate to {@link OffsetRecord#ACTIVE_KEY_COUNT_NOT_TRACKED}
+   * rather than continue tracking with a wrong baseline. If already not tracked, stays not tracked.
+   *
+   * @return true if the count was successfully decremented, false if invalidated or already invalid
+   */
+  public boolean decrementActiveKeyCount() {
+    long prev = activeKeyCount.getAndUpdate(v -> v > 0 ? v - 1 : OffsetRecord.ACTIVE_KEY_COUNT_NOT_TRACKED);
+    return prev > 0;
+  }
+
+  /**
+   * Increments activeKeyCount for a batch PUT, skipping speculative execution duplicates
+   * (key &lt;= last key). Only PUTs call this — DELETEs are tombstones and excluded.
+   * Requires prior {@link #initializeActiveKeyCount()} at SOP; skips if not initialized
+   * (mid-batch config enablement). Checkpoint-safe: partial counts are persisted.
+   */
+  public void incrementActiveKeyCountForBatchRecord(byte[] keyBytes) {
+    if (activeKeyCount.get() < 0) {
+      return; // Not initialized at SOP — mid-batch config enablement, skip
+    }
+    if (lastBatchKeyForDedup != null && ArrayUtils.compareUnsigned(keyBytes, lastBatchKeyForDedup) <= 0) {
+      return; // Speculative execution duplicate — key order went backwards
+    }
+    lastBatchKeyForDedup = keyBytes;
+    activeKeyCount.incrementAndGet();
+  }
+
+  /**
+   * Called at EOP. Releases dedup state. Empty partitions are already at 0 from
+   * {@link #initializeActiveKeyCount()} at SOP. If SOP was missed (mid-batch config enablement),
+   * the count stays at {@link OffsetRecord#ACTIVE_KEY_COUNT_NOT_TRACKED} — no partial baseline is created.
+   */
+  public void cleanupBatchKeyCountState() {
+    lastBatchKeyForDedup = null; // Release reference; dedup is only needed during batch
+  }
+
+  // --- HLL unique ingested key count methods ---
+
+  private void restoreUniqueKeyCountHllFromCheckpoint(int lgK, ByteBuffer hllBytes) {
+    byte[] bytes = new byte[hllBytes.remaining()];
+    hllBytes.duplicate().get(bytes);
+    this.uniqueIngestedKeyCountHll = HllSketch.heapify(Memory.wrap(bytes));
+    int restoredLgK = this.uniqueIngestedKeyCountHll.getLgConfigK();
+    if (restoredLgK != lgK) {
+      LOGGER.warn(
+          "Replica: {} HLL restored with lgK={}, configured lgK={}. Keeping restored sketch.",
+          getReplicaId(),
+          restoredLgK,
+          lgK);
+    }
+  }
+
+  private int clampLgK(int lgK) {
+    if (lgK < HLL_MIN_LOG_K || lgK > HLL_MAX_LOG_K) {
+      int clamped = Math.max(HLL_MIN_LOG_K, Math.min(HLL_MAX_LOG_K, lgK));
+      LOGGER.warn(
+          "Replica: {} HLL lgK={} is out of valid range [{}, {}]. Clamping to {}.",
+          getReplicaId(),
+          lgK,
+          HLL_MIN_LOG_K,
+          HLL_MAX_LOG_K,
+          clamped);
+      return clamped;
+    }
+    return lgK;
+  }
+
+  /**
+   * Add a key to the HLL sketch. Called on the ingestion hot path.
+   * Thread-safe: processKafkaDataMessage is single-threaded per partition.
+   */
+  public void trackKeyIngested(byte[] keyBytes) {
+    if (uniqueIngestedKeyCountHll != null) {
+      uniqueIngestedKeyCountHll.update(keyBytes);
+    }
+  }
+
+  /**
+   * Get the estimated count of unique keys ever put or deleted in this partition.
+   * Returns 0 if HLL tracking is not enabled.
+   *
+   * <p>Thread safety: HllSketch is not thread-safe. update() runs on the consumption thread
+   * while this method may be called from the OTel/Tehuti scraper thread. In steady state (HLL mode),
+   * a torn read only affects one register and produces a slightly wrong estimate.
+   */
+  public long getEstimatedUniqueIngestedKeyCount() {
+    return uniqueIngestedKeyCountHll != null ? (long) uniqueIngestedKeyCountHll.getEstimate() : 0;
+  }
+
+  /**
+   * Serialize the HLL sketch to a compact byte array for persistence.
+   * Returns null if HLL tracking is not enabled.
+   */
+  public byte[] serializeUniqueIngestedKeyCountHll() {
+    return uniqueIngestedKeyCountHll != null ? uniqueIngestedKeyCountHll.toCompactByteArray() : null;
+  }
+
+  /**
+   * Returns true if the HLL sketch has been initialized for this partition.
+   */
+  public boolean hasUniqueIngestedKeyCountHll() {
+    return uniqueIngestedKeyCountHll != null;
   }
 
   public int getPartition() {
-    return this.partition;
+    return getReplicaTopicPartition().getPartitionNumber();
   }
 
   public CompletableFuture<Void> getLastVTProduceCallFuture() {
@@ -260,8 +680,48 @@ public class PartitionConsumptionState {
     this.lastVTProduceCallFuture = lastVTProduceCallFuture;
   }
 
+  public void setCurrentVersionSupplier(BooleanSupplier isCurrentVersion) {
+    this.isCurrentVersion = isCurrentVersion;
+  }
+
+  public CompletableFuture<Void> getPendingBlobTransfer() {
+    return this.pendingBlobTransfer;
+  }
+
+  public void setPendingBlobTransfer(CompletableFuture<Void> pendingBlobTransfer) {
+    this.pendingBlobTransfer = pendingBlobTransfer;
+  }
+
+  public boolean isBlobTransferInProgress() {
+    return this.pendingBlobTransfer != null;
+  }
+
+  public CompletableFuture<Void> getPendingRecordTransformerRecovery() {
+    return this.pendingRecordTransformerRecovery;
+  }
+
+  public void setPendingRecordTransformerRecovery(CompletableFuture<Void> pendingRecordTransformerRecovery) {
+    this.pendingRecordTransformerRecovery = pendingRecordTransformerRecovery;
+  }
+
+  public boolean isRecordTransformerRecoveryInProgress() {
+    return this.pendingRecordTransformerRecovery != null;
+  }
+
+  public ConsumerAction getPostRecordTransformerConsumerAction() {
+    return this.postRecordTransformerConsumerAction;
+  }
+
+  public void setPostRecordTransformerConsumerAction(ConsumerAction postRecordTransformerConsumerAction) {
+    this.postRecordTransformerConsumerAction = postRecordTransformerConsumerAction;
+  }
+
   public OffsetRecord getOffsetRecord() {
     return this.offsetRecord;
+  }
+
+  public long getLatestMessageTimeInMs() {
+    return this.offsetRecord.calculateLatestMessageTimeInMs();
   }
 
   public void setDeferredWrite(boolean deferredWrite) {
@@ -273,7 +733,7 @@ public class PartitionConsumptionState {
   }
 
   public boolean isStarted() {
-    return getLatestProcessedLocalVersionTopicOffset() > 0;
+    return !PubSubSymbolicPosition.EARLIEST.equals(getLatestProcessedVtPosition());
   }
 
   public final boolean isEndOfPushReceived() {
@@ -289,6 +749,10 @@ public class PartitionConsumptionState {
       this.lagCaughtUp = true;
       this.lagCaughtUpTimeInMs = System.currentTimeMillis();
     }
+  }
+
+  public boolean isCurrentVersion() {
+    return isCurrentVersion.getAsBoolean();
   }
 
   public boolean hasLagCaughtUp() {
@@ -320,12 +784,20 @@ public class PartitionConsumptionState {
     this.isSubscribed = false;
   }
 
+  public boolean isLatchCreated() {
+    return latchStatus.get() != LatchStatus.NONE;
+  }
+
+  public void setLatchCreated() {
+    latchStatus.compareAndSet(LatchStatus.NONE, LatchStatus.LATCH_CREATED);
+  }
+
   public boolean isLatchReleased() {
-    return isLatchReleased;
+    return latchStatus.get() == LatchStatus.LATCH_RELEASED;
   }
 
   public void releaseLatch() {
-    this.isLatchReleased = true;
+    latchStatus.compareAndSet(LatchStatus.LATCH_CREATED, LatchStatus.LATCH_RELEASED);
   }
 
   public void errorReported() {
@@ -355,20 +827,16 @@ public class PartitionConsumptionState {
   @Override
   public String toString() {
     return new StringBuilder().append("PCS{")
-        .append("replicaId=")
-        .append(replicaId)
+        .append("replica=")
+        .append(getReplicaId())
         .append(", hybrid=")
         .append(hybrid)
-        .append(", latestProcessedLocalVersionTopicOffset=")
-        .append(latestProcessedLocalVersionTopicOffset)
-        .append(", latestProcessedUpstreamVersionTopicOffset=")
-        .append(latestProcessedUpstreamVersionTopicOffset)
-        .append(", latestProcessedUpstreamRTOffsetMap=")
-        .append(latestProcessedUpstreamRTOffsetMap)
-        .append(", latestIgnoredUpstreamRTOffsetMap=")
-        .append(latestIgnoredUpstreamRTOffsetMap)
-        .append(", latestRTOffsetTriedToProduceToVTMap")
-        .append(latestRTOffsetTriedToProduceToVTMap)
+        .append(", latestProcessedVtPosition=")
+        .append(latestProcessedVtPosition)
+        .append(", latestProcessedRemoteVtPosition=")
+        .append(latestProcessedRemoteVtPosition)
+        .append(", latestProcessedRtPositions=")
+        .append(latestProcessedRtPositions)
         .append(", offsetRecord=")
         .append(offsetRecord)
         .append(", errorReported=")
@@ -377,10 +845,26 @@ public class PartitionConsumptionState {
         .append(isStarted())
         .append(", lagCaughtUp=")
         .append(lagCaughtUp)
+        .append(", lagCaughtUpTimeInMs=")
+        .append(lagCaughtUpTimeInMs)
+        .append(", isDeferredWrite=")
+        .append(deferredWrite)
         .append(", processedRecordSizeSinceLastSync=")
         .append(processedRecordSizeSinceLastSync)
         .append(", leaderFollowerState=")
         .append(leaderFollowerState)
+        .append(", leaderCompleteState=")
+        .append(leaderCompleteState)
+        .append(", lastLeaderCompleteStateUpdateInMs=")
+        .append(lastLeaderCompleteStateUpdateInMs)
+        .append(", readyToServeViaDeadLeaderFallback=")
+        .append(readyToServeViaDeadLeaderFallback)
+        .append(", consumeRemotely=")
+        .append(consumeRemotely)
+        .append(", latestMessageConsumedTimestampInMs=")
+        .append(latestMessageConsumedTimestampInMs)
+        .append(", blobTransferPending=")
+        .append(pendingBlobTransfer != null)
         .append("}")
         .toString();
   }
@@ -397,12 +881,55 @@ public class PartitionConsumptionState {
     this.processedRecordSizeSinceLastSync = 0;
   }
 
+  public long getConsumedBytesSinceLastGlobalRtDivSync(String key) {
+    return consumedBytesSinceLastGlobalRtDivSync.getOrDefault(key, 0L);
+  }
+
+  public void addConsumedBytesSinceLastGlobalRtDivSync(String key, long bytes) {
+    if (bytes <= 0) {
+      return;
+    }
+    consumedBytesSinceLastGlobalRtDivSync.merge(key, bytes, Long::sum);
+  }
+
+  public void resetConsumedBytesSinceLastGlobalRtDivSync(String key) {
+    consumedBytesSinceLastGlobalRtDivSync.put(key, 0L);
+  }
+
   public void setLeaderFollowerState(LeaderFollowerStateType state) {
     this.leaderFollowerState = state;
   }
 
   public final LeaderFollowerStateType getLeaderFollowerState() {
     return this.leaderFollowerState;
+  }
+
+  public DolStamp getDolState() {
+    return this.dolStamp;
+  }
+
+  public void setDolState(DolStamp dolStamp) {
+    this.dolStamp = dolStamp;
+  }
+
+  public void clearDolState() {
+    this.dolStamp = null;
+  }
+
+  public PartitionIngestionMonitor getIngestionMonitor() {
+    return ingestionMonitor;
+  }
+
+  public void setIngestionMonitor(PartitionIngestionMonitor monitor) {
+    this.ingestionMonitor = monitor;
+  }
+
+  public long getHighestLeadershipTerm() {
+    return highestLeadershipTerm;
+  }
+
+  public void setHighestLeadershipTerm(long term) {
+    this.highestLeadershipTerm = term;
   }
 
   public void setLastLeaderPersistFuture(Future<Void> future) {
@@ -446,6 +973,14 @@ public class PartitionConsumptionState {
 
   public void finalizeExpectedChecksum() {
     this.expectedSSTFileChecksum = null;
+  }
+
+  public Lazy<VeniceWriter<byte[], byte[], byte[]>> getVeniceWriterLazyRef() {
+    return veniceWriterLazyRef;
+  }
+
+  public void setVeniceWriterLazyRef(Lazy<VeniceWriter<byte[], byte[], byte[]>> veniceWriterLazyRef) {
+    this.veniceWriterLazyRef = veniceWriterLazyRef;
   }
 
   /**
@@ -504,26 +1039,51 @@ public class PartitionConsumptionState {
     return consumptionStartTimeInMs;
   }
 
-  public void setTransientRecord(
-      int kafkaClusterId,
-      long kafkaConsumedOffset,
-      byte[] key,
-      int valueSchemaId,
-      GenericRecord replicationMetadataRecord) {
-    setTransientRecord(
-        kafkaClusterId,
-        kafkaConsumedOffset,
-        key,
-        null,
-        -1,
-        -1,
-        valueSchemaId,
-        replicationMetadataRecord);
+  /** Resets the bootstrap-timeout clock so paused time isn't counted against the window. */
+  public void resetConsumptionStartTimeInMs() {
+    this.consumptionStartTimeInMs = System.currentTimeMillis();
+  }
+
+  public boolean isStoreLevelPaused() {
+    return storeLevelPaused;
+  }
+
+  public void setStoreLevelPaused(boolean storeLevelPaused) {
+    this.storeLevelPaused = storeLevelPaused;
+  }
+
+  /**
+   * True while this partition is <em>physically held right now</em> by the future-slot pause — a
+   * reconciled cache maintained every tick by {@link StoreIngestionTask#reconcileFutureSlotPause},
+   * not the durable "region unpromoted" intent (that lives in
+   * {@link StoreIngestionTask#isPauseAfterStartOfPush()}).
+   * <p>
+   * Independent of {@link #storeLevelPaused} (which pauses via unsubscribe/resubscribe). The
+   * reconciler coordinates the two: while store-level pause owns the unsubscribed consumer this flag
+   * is cleared, and the physical pause is re-applied the tick after store-level EXIT_PAUSE resubscribes.
+   */
+  private volatile boolean futureSlotPaused = false;
+
+  public boolean isFutureSlotPaused() {
+    return futureSlotPaused;
+  }
+
+  public void setFutureSlotPaused(boolean futureSlotPaused) {
+    this.futureSlotPaused = futureSlotPaused;
   }
 
   public void setTransientRecord(
       int kafkaClusterId,
-      long kafkaConsumedOffset,
+      PubSubPosition consumedPosition,
+      byte[] key,
+      int valueSchemaId,
+      GenericRecord replicationMetadataRecord) {
+    setTransientRecord(kafkaClusterId, consumedPosition, key, null, -1, -1, valueSchemaId, replicationMetadataRecord);
+  }
+
+  public void setTransientRecord(
+      int kafkaClusterId,
+      PubSubPosition consumedPosition,
       byte[] key,
       byte[] value,
       int valueOffset,
@@ -531,7 +1091,7 @@ public class PartitionConsumptionState {
       int valueSchemaId,
       GenericRecord replicationMetadataRecord) {
     TransientRecord transientRecord =
-        new TransientRecord(value, valueOffset, valueLen, valueSchemaId, kafkaClusterId, kafkaConsumedOffset);
+        new TransientRecord(value, valueOffset, valueLen, valueSchemaId, kafkaClusterId, consumedPosition);
     if (replicationMetadataRecord != null) {
       transientRecord.setReplicationMetadataRecord(replicationMetadataRecord);
     }
@@ -547,13 +1107,13 @@ public class PartitionConsumptionState {
    * This operation is performed atomically to delete the record only when the provided sourceOffset matches.
    *
    * @param kafkaClusterId
-   * @param kafkaConsumedOffset
+   * @param recordPosition
    * @param key
    * @return
    */
-  public TransientRecord mayRemoveTransientRecord(int kafkaClusterId, long kafkaConsumedOffset, byte[] key) {
+  public TransientRecord mayRemoveTransientRecord(int kafkaClusterId, PubSubPosition recordPosition, byte[] key) {
     return transientRecordMap.computeIfPresent(ByteArrayKey.wrap(key), (k, v) -> {
-      if (v.kafkaClusterId == kafkaClusterId && v.kafkaConsumedOffset == kafkaConsumedOffset) {
+      if (v.kafkaClusterId == kafkaClusterId && v.consumedPosition == recordPosition) {
         return null;
       } else {
         return v;
@@ -562,6 +1122,9 @@ public class PartitionConsumptionState {
   }
 
   public PubSubTopicPartition getSourceTopicPartition(PubSubTopic topic) {
+    if (getReplicaTopicPartition().getPubSubTopic().equals(topic)) {
+      return getReplicaTopicPartition();
+    }
     /**
      * TODO: Consider whether the {@link PubSubTopicPartition} instance might be cacheable.
      * It might not be easily cacheable if we pass different topics as input param (which it seems we do).
@@ -582,6 +1145,27 @@ public class PartitionConsumptionState {
   }
 
   /**
+   * This persists to the offsetRecord associated to this partitionConsumptionState that the ready to serve check has
+   * passed.  This will be persisted to disk once the offsetRecord is checkpointed, and subsequent restarts will
+   * consult this information when determining if the node should come online or not to serve traffic
+   */
+  public void recordReadyToServeInOffsetRecord() {
+    offsetRecord.setPreviousStatusesEntry(PREVIOUSLY_READY_TO_SERVE, TRUE);
+  }
+
+  public boolean getReadyToServeInOffsetRecord() {
+    return TRUE.equals(offsetRecord.getPreviousStatusesEntry(PREVIOUSLY_READY_TO_SERVE));
+  }
+
+  /**
+   * Clears the previouslyReadyToServe flag from the offset record. This should be called after blob transfer
+   * completes to prevent the fast RTS check from triggering based on state inherited from a different host.
+   */
+  public void clearPreviouslyReadyToServeInOffsetRecord() {
+    offsetRecord.clearPreviousStatusesEntry(PREVIOUSLY_READY_TO_SERVE);
+  }
+
+  /**
    * This immutable class holds a association between a key and value and the source offset of the consumed message.
    * The value could be either as received in kafka ConsumerRecord or it could be a write computed value.
    */
@@ -591,7 +1175,7 @@ public class PartitionConsumptionState {
     private final int valueLen;
     private final int valueSchemaId;
     private final int kafkaClusterId;
-    private final long kafkaConsumedOffset;
+    private final PubSubPosition consumedPosition;
     private GenericRecord replicationMetadataRecord;
 
     private ChunkedValueManifest valueManifest;
@@ -603,13 +1187,13 @@ public class PartitionConsumptionState {
         int valueLen,
         int valueSchemaId,
         int kafkaClusterId,
-        long kafkaConsumedOffset) {
+        PubSubPosition consumedPosition) {
       this.value = value;
       this.valueOffset = valueOffset;
       this.valueLen = valueLen;
       this.valueSchemaId = valueSchemaId;
       this.kafkaClusterId = kafkaClusterId;
-      this.kafkaConsumedOffset = kafkaConsumedOffset;
+      this.consumedPosition = consumedPosition;
     }
 
     public ChunkedValueManifest getRmdManifest() {
@@ -653,101 +1237,223 @@ public class PartitionConsumptionState {
     }
   }
 
-  public void updateLeaderConsumedUpstreamRTOffset(String kafkaUrl, long offset) {
-    consumedUpstreamRTOffsetMap.put(kafkaUrl, offset);
-  }
-
-  public long getLeaderConsumedUpstreamRTOffset(String kafkaUrl) {
-    return consumedUpstreamRTOffsetMap.getOrDefault(kafkaUrl, 0L);
-  }
-
-  public void updateLatestProcessedUpstreamRTOffset(String kafkaUrl, long offset) {
-    latestProcessedUpstreamRTOffsetMap.put(kafkaUrl, offset);
-  }
-
-  public void updateLatestRTOffsetTriedToProduceToVTMap(String kafkaUrl, long offset) {
-    latestRTOffsetTriedToProduceToVTMap.put(kafkaUrl, offset);
-  }
-
-  public long getLatestRTOffsetTriedToProduceToVTMap(String kafkaUrl) {
-    return latestRTOffsetTriedToProduceToVTMap.getOrDefault(kafkaUrl, -1L);
-  }
-
-  public void updateLatestIgnoredUpstreamRTOffset(String kafkaUrl, long offset) {
-    latestIgnoredUpstreamRTOffsetMap.put(kafkaUrl, offset);
-  }
-
-  public long getLatestIgnoredUpstreamRTOffset(String kafkaUrl) {
-    return latestIgnoredUpstreamRTOffsetMap.getOrDefault(kafkaUrl, -1L);
-  }
-
-  public long getLatestProcessedUpstreamRTOffsetWithIgnoredMessages(String kafkaUrl) {
-    long lastOffsetFullyProcessed = getLatestProcessedUpstreamRTOffset(kafkaUrl);
-    long lastOffsetIgnored = getLatestIgnoredUpstreamRTOffset(kafkaUrl);
-    long offsetTriedToProduceToVT = getLatestRTOffsetTriedToProduceToVTMap(kafkaUrl);
-
-    // we've committed messages at a higher offset then the last thing we ignored. Return the processed offset
-    if (lastOffsetFullyProcessed >= lastOffsetIgnored) {
-      return lastOffsetFullyProcessed;
-    }
-
-    // We have messages which have been ignored at a higher offset then what we've processed but we still have committed
-    // all messages to local storage that we've produced to upstream VT. In this case, return the ignored offset as the
-    // highest offset. Technically speaking, processed should never be 'greater' then produced, it can at most be
-    // 'equal',
-    // but we'll include the broader comparison as it's still technically correct.
-    if (lastOffsetFullyProcessed >= offsetTriedToProduceToVT) {
-      return lastOffsetIgnored;
-    }
-
-    // We have messages that we're still waiting to commit, though the most recent messages we've ignored (probably
-    // after failing a comparison against record in the transient record cache). In this case we'll return the offset
-    // of what's been processed
-    return lastOffsetFullyProcessed;
-
-  }
-
-  public long getLatestProcessedUpstreamRTOffset(String kafkaUrl) {
-    long latestProcessedUpstreamRTOffset = latestProcessedUpstreamRTOffsetMap.getOrDefault(kafkaUrl, -1L);
-    if (latestProcessedUpstreamRTOffset < 0) {
-      /**
-       * When processing {@link TopicSwitch} control message, only the checkpoint upstream offset maps in {@link OffsetRecord}
-       * will be updated, since those offset are not processed yet; so when leader try to get the upstream offsets for the very
-       * first time, there are no records in {@link #latestProcessedUpstreamRTOffsetMap} yet.
-       */
-      return getOffsetRecord().getUpstreamOffset(kafkaUrl);
-    }
-    return latestProcessedUpstreamRTOffset;
-  }
-
-  public Long getLatestProcessedUpstreamRTOffsetWithNoDefault(String kafkaUrl) {
-    long latestProcessedUpstreamRTOffset = latestProcessedUpstreamRTOffsetMap.getOrDefault(kafkaUrl, -1L);
-    if (latestProcessedUpstreamRTOffset < 0) {
-      /**
-       * When processing {@link TopicSwitch} control message, only the checkpoint upstream offset maps in {@link OffsetRecord}
-       * will be updated, since those offset are not processed yet; so when leader try to get the upstream offsets for the very
-       * first time, there are no records in {@link #latestProcessedUpstreamRTOffsetMap} yet.
-       */
-      return getOffsetRecord().getUpstreamOffsetWithNoDefault(kafkaUrl);
-    }
-    return latestProcessedUpstreamRTOffset;
+  /**
+   * Updates the in-memory latest real-time topic position consumed from the given
+   * upstream PubSub broker.
+   *
+   * This position reflects the most recent message observed by the leader during
+   * real-time (RT) consumption and is used for tracking ingestion progress.
+   *
+   * @param pubSubBrokerAddress the source PubSub broker address
+   * @param lastConsumedRtPosition the latest consumed real-time topic position
+   */
+  public void setLatestConsumedRtPosition(String pubSubBrokerAddress, PubSubPosition lastConsumedRtPosition) {
+    latestConsumedRtPositions.put(pubSubBrokerAddress, lastConsumedRtPosition);
   }
 
   /**
-   * The caller of this API should be interested in which offset currently leader should consume from now.
-   * 1. If currently leader should consume from real-time topic, return upstream RT offset;
-   * 2. if currently leader should consume from version topic, return either remote VT offset or local VT offset, depending
-   *    on whether the remote consumption flag is on.
+   * Retrieves the latest real-time topic position consumed from the given
+   * upstream PubSub broker.
+   * If no position is recorded, returns {@link PubSubSymbolicPosition#EARLIEST}
+   * as the default.
+   *
+   * @param pubSubBrokerAddress the source PubSub broker address
+   * @return the latest consumed real-time topic position, or EARLIEST if not present
    */
-  public long getLeaderOffset(String kafkaURL, PubSubTopicRepository pubSubTopicRepository) {
-    PubSubTopic leaderTopic = offsetRecord.getLeaderTopic(pubSubTopicRepository);
-    if (leaderTopic != null && !leaderTopic.isVersionTopic()) {
-      return getLatestProcessedUpstreamRTOffset(kafkaURL);
-    } else {
-      return consumeRemotely()
-          ? getLatestProcessedUpstreamVersionTopicOffset()
-          : getLatestProcessedLocalVersionTopicOffset();
+  public PubSubPosition getLatestConsumedRtPosition(String pubSubBrokerAddress) {
+    // TODO(sushantmane): We changed default value from 0L to EARLIEST; remember this during troubleshooting in
+    // case of any issues. We don't have access (or construct) to Zeroth PubSubPosition.
+    return latestConsumedRtPositions.getOrDefault(pubSubBrokerAddress, PubSubSymbolicPosition.EARLIEST);
+  }
+
+  /**
+   * Sets the real-time topic position till which Data Integrity Validation (DIV)
+   * has been checkpointed for the given upstream broker.
+   *
+   * @param pubSubBrokerAddress the source PubSub broker address
+   * @param divRtCheckpointPosition the position till which DIV has been generated and persisted
+   */
+  public void setDivRtCheckpointPosition(String pubSubBrokerAddress, PubSubPosition divRtCheckpointPosition) {
+    divRtCheckpointPositions.put(pubSubBrokerAddress, divRtCheckpointPosition);
+  }
+
+  /**
+   * Returns the real-time topic position till which Data Integrity Validation (DIV)
+   * has been checkpointed for the given upstream broker.
+   *
+   * If no checkpoint exists for the broker, {@link PubSubSymbolicPosition#EARLIEST} is returned.
+   *
+   * @param pubSubBrokerAddress the source PubSub broker address
+   * @return the checkpointed position for DIV, or EARLIEST if not found
+   */
+  public PubSubPosition getDivRtCheckpointPosition(String pubSubBrokerAddress) {
+    return divRtCheckpointPositions.getOrDefault(pubSubBrokerAddress, PubSubSymbolicPosition.EARLIEST);
+  }
+
+  /**
+   * Sets the latest processed local version topic position.
+   *
+   * @param vtPosition the version topic position to set
+   */
+  public void setLatestProcessedVtPosition(PubSubPosition vtPosition) {
+    this.latestProcessedVtPosition = vtPosition;
+  }
+
+  /**
+   * Returns the latest processed local version topic position.
+   *
+   * @return the current version topic position
+   */
+  // TODO: revisit where LCVP needs to be replacing this
+  public PubSubPosition getLatestProcessedVtPosition() {
+    return this.latestProcessedVtPosition;
+  }
+
+  /**
+   * Sets the latest processed upstream version topic position.
+   *
+   * @param upstreamVtPosition the upstream version topic position to set
+   */
+  public void setLatestProcessedRemoteVtPosition(PubSubPosition upstreamVtPosition) {
+    this.latestProcessedRemoteVtPosition = upstreamVtPosition;
+  }
+
+  /**
+   * Returns the latest processed upstream version topic position.
+   *
+   * @return the current upstream version topic position
+   */
+  public PubSubPosition getLatestProcessedRemoteVtPosition() {
+    // TODO: Ideally, we should get this from offset record to ensure durability
+    // return this.offsetRecord.getCheckpointedRemoteVtPosition();
+    return this.latestProcessedRemoteVtPosition;
+  }
+
+  /**
+   * Updates the in-memory latest real-time topic position for the given upstream
+   * PubSub broker address.
+   *
+   * @param pubSubBrokerAddress the source PubSub broker address
+   * @param rtPosition the latest real-time topic position to set
+   */
+  public void setLatestProcessedRtPosition(String pubSubBrokerAddress, PubSubPosition rtPosition) {
+    latestProcessedRtPositions.put(pubSubBrokerAddress, rtPosition);
+  }
+
+  /**
+   * Retrieves the latest real-time topic position processed by the drainer for a given
+   * upstream PubSub broker address.
+   *
+   * <p>This method first checks the in-memory state stored in
+   * {@code latestProcessedUpstreamRtPositions}, which reflects positions already processed
+   * and tracked by the drainer. If no entry is found, or if the position is
+   * {@link PubSubSymbolicPosition#EARLIEST}, it falls back to the offset record, which is
+   * periodically flushed to disk and may contain checkpointed upstream offsets.
+   *
+   * <p>This fallback is necessary during initial processing of {@link TopicSwitch} control messages,
+   * where upstream offsets are written only to the {@link OffsetRecord} before actual records
+   * are processed. In such cases, the in-memory map may still be uninitialized.
+   *
+   * @param pubSubBrokerAddress the source PubSub broker address whose position is being queried
+   * @return the latest real-time topic position for the given broker address
+   */
+  public PubSubPosition getLatestProcessedRtPosition(String pubSubBrokerAddress) {
+    PubSubPosition rtPosition =
+        getLatestProcessedRtPositions().getOrDefault(pubSubBrokerAddress, PubSubSymbolicPosition.EARLIEST);
+    if (PubSubSymbolicPosition.EARLIEST.equals(rtPosition)) {
+      /**
+       * When processing {@link TopicSwitch} control message, only the checkpoint upstream offset maps in {@link OffsetRecord}
+       * will be updated, since those offset are not processed yet; so when leader try to get the upstream offsets for the very
+       * first time, there are no records in {@link #latestProcessedRtPositions} yet.
+       */
+      return getOffsetRecord().getCheckpointedRtPosition(pubSubBrokerAddress);
     }
+    return rtPosition;
+  }
+
+  /**
+   * Returns the in-memory map of latest real-time topic positions processed by the drainer
+   * for each upstream PubSub broker address.
+   *
+   * @return a map from PubSub broker address to the latest processed real-time topic position
+   */
+  public Map<String, PubSubPosition> getLatestProcessedRtPositions() {
+    return this.latestProcessedRtPositions;
+  }
+
+  /**
+   * Returns the position the leader should consume from, based on the current leader topic
+   * and whether real-time (RT) or version topic (VT) consumption is active.
+   *
+   * <p>If the leader topic is an RT topic:
+   * <ul>
+   *   <li>If {@code useCheckpointedDivRtPosition} is true, returns the last checkpointed
+   *       RT position from global DIV (LCRP).</li>
+   *   <li>Otherwise, returns the latest processed RT position from in-memory state (or OffsetRecord if required)</li>
+   * </ul>
+   *
+   * <p>If the leader topic is a version topic:
+   * <ul>
+   *   <li>If {@code useCheckpointedDivRtPosition} is true (the F-&gt;L transition path), returns the durable,
+   *       DIV-consistent checkpointed VT position via {@link #getCheckpointedVtLeaderPosition()} so the leader never
+   *       resumes ahead of the VT DIV producer state it persisted. See that method for why the in-memory processed
+   *       position is unsafe here.</li>
+   *   <li>Otherwise (steady state), returns the latest processed remote/local VT position from in-memory state.</li>
+   * </ul>
+   *
+   * @param pubSubBrokerAddress the upstream PubSub broker address
+   * @param useCheckpointedDivRtPosition whether this is the F-&gt;L transition path and the durable DIV checkpoint
+   *                                     should be used as the start position (LCRP for RT, checkpointed VT position
+   *                                     for VT)
+   * @return the position the leader should consume from
+   */
+  public PubSubPosition getLeaderPosition(String pubSubBrokerAddress, boolean useCheckpointedDivRtPosition) {
+    PubSubTopic leaderTopic = getOffsetRecord().getLeaderTopic(getPubSubContext().getPubSubTopicRepository());
+    if (leaderTopic != null && !leaderTopic.isVersionTopic()) {
+      // consumed corresponds to messages seen by consumer, processed corresponds to messages seen by drainer
+      return (useCheckpointedDivRtPosition)
+          ? getDivRtCheckpointPosition(pubSubBrokerAddress)
+          : getLatestProcessedRtPosition(pubSubBrokerAddress);
+    } else if (useCheckpointedDivRtPosition) {
+      return getCheckpointedVtLeaderPosition();
+    } else {
+      return consumeRemotely() ? getLatestProcessedRemoteVtPosition() : getLatestProcessedVtPosition();
+    }
+  }
+
+  /**
+   * Resolves the VT (version-topic) leader start position for the F-&gt;L transition path to the durable,
+   * DIV-consistent last-consumed VT position (LCVP), falling back to {@link PubSubSymbolicPosition#EARLIEST} when none
+   * was ever checkpointed.
+   *
+   * <p>Background: the in-memory processed VT positions ({@link #getLatestProcessedRemoteVtPosition()} /
+   * {@link #getLatestProcessedVtPosition()}) are advanced per-record by {@code updateLatestInMemoryProcessedOffset}
+   * as the leader drains records. After a server restart that wipes RocksDB, the leader can re-consume the local VT
+   * during the data-on-leader (DoL) phase and advance the in-memory processed-remote-VT position from the local-VT
+   * records' {@code leaderMetadataFooter.upstreamOffset} - without registering the source-VT producer's DIV segments.
+   * On F-&gt;L promotion, subscribing the source VT at that in-memory position can land many records past where the
+   * persisted VT DIV producer state is valid, producing {@code ImproperlyStartedSegmentException} /
+   * {@code MissingDataException}.
+   *
+   * <p>The LCVP, in contrast, is snapshotted into the {@link OffsetRecord} atomically with the {@code consumerDiv} VT
+   * producer-state segments (see {@code PartitionTracker#updateOffsetRecord}), so resuming from it is DIV-consistent by
+   * construction.
+   *
+   * <ul>
+   *   <li>Remote source-VT leader ({@link #consumeRemotely()} == true): uses the remote LCVP
+   *       {@link OffsetRecord#getLatestConsumedRemoteVtPosition()} (last position consumed from the remote/source VT).
+   *       The local LCVP is intentionally NOT used here: it tracks the local VT (re-)produce position, a different
+   *       position domain from the remote source VT this leader subscribes to.</li>
+   *   <li>Local-VT leader ({@link #consumeRemotely()} == false): uses the local LCVP
+   *       {@link OffsetRecord#getLatestConsumedVtPosition()}, matching
+   *       {@code LeaderFollowerStoreIngestionTask#getLocalVtSubscribePosition} under Global RT DIV.</li>
+   * </ul>
+   */
+  PubSubPosition getCheckpointedVtLeaderPosition() {
+    PubSubPosition checkpointedPosition = consumeRemotely()
+        ? getOffsetRecord().getLatestConsumedRemoteVtPosition()
+        : getOffsetRecord().getLatestConsumedVtPosition();
+    return checkpointedPosition == null ? PubSubSymbolicPosition.EARLIEST : checkpointedPosition;
   }
 
   public void setStartOfPushTimestamp(long startOfPushTimestamp) {
@@ -766,20 +1472,8 @@ public class PartitionConsumptionState {
     return endOfPushTimestamp;
   }
 
-  public void updateLatestProcessedLocalVersionTopicOffset(long offset) {
-    this.latestProcessedLocalVersionTopicOffset = offset;
-  }
-
-  public long getLatestProcessedLocalVersionTopicOffset() {
-    return this.latestProcessedLocalVersionTopicOffset;
-  }
-
-  public void updateLatestProcessedUpstreamVersionTopicOffset(long offset) {
-    this.latestProcessedUpstreamVersionTopicOffset = offset;
-  }
-
-  public long getLatestProcessedUpstreamVersionTopicOffset() {
-    return this.latestProcessedUpstreamVersionTopicOffset;
+  public PubSubPosition getLatestConsumedVtPosition() {
+    return offsetRecord.getLatestConsumedVtPosition();
   }
 
   public void setDataRecoveryCompleted(boolean dataRecoveryCompleted) {
@@ -788,10 +1482,6 @@ public class PartitionConsumptionState {
 
   public boolean isDataRecoveryCompleted() {
     return isDataRecoveryCompleted;
-  }
-
-  public Map<String, Long> getLatestProcessedUpstreamRTOffsetMap() {
-    return this.latestProcessedUpstreamRTOffsetMap;
   }
 
   public GUID getLeaderGUID() {
@@ -830,7 +1520,149 @@ public class PartitionConsumptionState {
     this.lastLeaderCompleteStateUpdateInMs = lastLeaderCompleteStateUpdateInMs;
   }
 
+  public boolean isReadyToServeViaDeadLeaderFallback() {
+    return readyToServeViaDeadLeaderFallback;
+  }
+
+  public void setReadyToServeViaDeadLeaderFallback(boolean readyToServeViaDeadLeaderFallback) {
+    this.readyToServeViaDeadLeaderFallback = readyToServeViaDeadLeaderFallback;
+  }
+
   public String getReplicaId() {
-    return replicaId;
+    return getReplicaTopicPartition().toString();
+  }
+
+  public PubSubTopicPartition getReplicaTopicPartition() {
+    return partitionReplica;
+  }
+
+  public void addIncPushVersionToPendingReportList(String incPushVersion) {
+    pendingReportIncPushVersionList.add(incPushVersion);
+    /**
+     * We will perform filtering on batch inc push to report, as by original design we will only keep latest 50 inc push
+     * entries.
+     */
+    int versionCount = pendingReportIncPushVersionList.size();
+    if (versionCount > MAX_INCREMENTAL_PUSH_ENTRY_NUM) {
+      pendingReportIncPushVersionList =
+          pendingReportIncPushVersionList.subList(versionCount - MAX_INCREMENTAL_PUSH_ENTRY_NUM, versionCount);
+    }
+    getOffsetRecord().setPendingReportIncPushVersionList(pendingReportIncPushVersionList);
+  }
+
+  public List<String> getPendingReportIncPushVersionList() {
+    return pendingReportIncPushVersionList;
+  }
+
+  public void clearPendingReportIncPushVersionList() {
+    pendingReportIncPushVersionList.clear();
+    offsetRecord.setPendingReportIncPushVersionList(pendingReportIncPushVersionList);
+  }
+
+  public PubSubContext getPubSubContext() {
+    return pubSubContext;
+  }
+
+  public long getReadyToServeTimeLagThresholdInMs() {
+    return readyToServeTimeLagThresholdInMs;
+  }
+
+  public void setReadyToServeTimeLagThresholdInMs(long readyToServeTimeLagThresholdInMs) {
+    this.readyToServeTimeLagThresholdInMs = readyToServeTimeLagThresholdInMs;
+  }
+
+  public Map<String, IncrementalPushReplicaStatus> getTrackingIncrementalPushStatus() {
+    return trackingIncrementalPushStatus;
+  }
+
+  /**
+   * Update the tracking incremental push status map for a specific push job ID.
+   * @param pushJobId the incremental push job ID
+   * @param status the push status (e.g., START or END)
+   * @param timestamp the timestamp when this status was recorded
+   */
+  public void setTrackingIncrementalPushStatus(String pushJobId, int status, long timestamp) {
+    purgeTrackingIncrementalPushStatus();
+
+    IncrementalPushReplicaStatus replicaStatus = new IncrementalPushReplicaStatus(status, timestamp);
+    this.trackingIncrementalPushStatus.put(pushJobId, replicaStatus);
+  }
+
+  /**
+   * Purge old entries from the tracking incremental push status map based on MAX_RETENTION_DAYS_IN_MS
+   */
+  private void purgeTrackingIncrementalPushStatus() {
+    if (this.trackingIncrementalPushStatus == null || this.trackingIncrementalPushStatus.isEmpty()) {
+      return;
+    }
+
+    // remove entries older than maxDurationDay
+    this.trackingIncrementalPushStatus.entrySet()
+        .removeIf(
+            entry -> LatencyUtils.getElapsedTimeFromMsToMs(entry.getValue().timestamp) > MAX_RETENTION_DAYS_IN_MS);
+  }
+
+  public boolean hasResubscribedAfterBootstrapAsCurrentVersion() {
+    return hasResubscribedAfterBootstrapAsCurrentVersion;
+  }
+
+  public void setHasResubscribedAfterBootstrapAsCurrentVersion(boolean hasResubscribedAfterBootstrapAsCurrentVersion) {
+    this.hasResubscribedAfterBootstrapAsCurrentVersion = hasResubscribedAfterBootstrapAsCurrentVersion;
+  }
+
+  /**
+   * Get or create a cached HeartbeatKey for the given region.
+   * Derives storeName/version from the partition replica topic name. SLO labels (write type,
+   * chunking, locality) come from constructor args and are baked into the cached key so per-record
+   * OTel emission can read them without re-derivation.
+   *
+   * <p>Locality is derived per region by comparing the cached key's region to the local region
+   * supplied at construction: equal → LOCAL, otherwise REMOTE. When the local region is null or
+   * empty (lookup-only paths in tests, or unconfigured server region), locality is left null on
+   * the cached key — defaulting it here would mislabel every region as REMOTE. The OTel emit
+   * path coerces null → REMOTE at emission time so the metric still ships a concrete label.
+   */
+  public HeartbeatKey getOrCreateCachedHeartbeatKey(String region) {
+    /*
+     * Normalize via RegionUtils so the per-record path produces the same region string as the
+     * HMS-side initializeEntry path. Both paths feed the same heartbeat-timestamps map and must
+     * agree on HeartbeatKey identity — otherwise computeIfPresent silently no-ops and the
+     * heartbeat-lag-driven ready-to-serve check never trips.
+     */
+    String normalizedRegion = RegionUtils.normalizeRegionName(region);
+    return cachedHeartbeatKeys.computeIfAbsent(normalizedRegion, r -> {
+      String topicName = partitionReplica.getTopicName();
+      String storeName = Version.parseStoreFromKafkaTopicName(topicName);
+      int version = Version.parseVersionFromKafkaTopicName(topicName);
+      VeniceRegionLocality locality = null;
+      if (localRegionName != null && !localRegionName.isEmpty()) {
+        locality = r.equals(localRegionName) ? VeniceRegionLocality.LOCAL : VeniceRegionLocality.REMOTE;
+      }
+      return new HeartbeatKey(
+          storeName,
+          version,
+          getPartition(),
+          r,
+          writeType,
+          chunkingStatus,
+          locality,
+          replicationMode);
+    });
+  }
+
+  /**
+   * Get or create the per-partition partial-update amplification detector. Lazily allocated using
+   * double-checked locking — only partitions that actually receive partial-update events will allocate.
+   * The {@code reportIntervalMs} is only used on first creation; subsequent calls return the existing detector.
+   */
+  public PartialUpdateAmplificationDetector getOrCreatePartialUpdateAmplificationDetector(long reportIntervalMs) {
+    if (partialUpdateAmplificationDetector == null) {
+      synchronized (this) {
+        if (partialUpdateAmplificationDetector == null) {
+          partialUpdateAmplificationDetector = new PartialUpdateAmplificationDetector(reportIntervalMs);
+        }
+      }
+    }
+    return partialUpdateAmplificationDetector;
   }
 }

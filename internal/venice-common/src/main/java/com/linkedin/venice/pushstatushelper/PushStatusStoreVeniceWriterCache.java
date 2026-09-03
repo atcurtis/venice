@@ -1,9 +1,9 @@
 package com.linkedin.venice.pushstatushelper;
 
 import com.linkedin.venice.common.VeniceSystemStoreUtils;
-import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.serialization.avro.AvroProtocolDefinition;
 import com.linkedin.venice.serialization.avro.VeniceAvroKafkaSerializer;
+import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import com.linkedin.venice.writer.VeniceWriter;
 import com.linkedin.venice.writer.VeniceWriterFactory;
@@ -35,13 +35,13 @@ public class PushStatusStoreVeniceWriterCache implements AutoCloseable {
 
   public VeniceWriter prepareVeniceWriter(String storeName) {
     return veniceWriters.computeIfAbsent(storeName, s -> {
-      String rtTopic = Version.composeRealTimeTopic(VeniceSystemStoreUtils.getDaVinciPushStatusStoreName(storeName));
+      String rtTopic = Utils.composeRealTimeTopic(VeniceSystemStoreUtils.getDaVinciPushStatusStoreName(storeName));
       VeniceWriterOptions options = new VeniceWriterOptions.Builder(rtTopic)
-          .setKeySerializer(
+          .setKeyPayloadSerializer(
               new VeniceAvroKafkaSerializer(
                   AvroProtocolDefinition.PUSH_STATUS_SYSTEM_SCHEMA_STORE_KEY.getCurrentProtocolVersionSchema()))
-          .setValueSerializer(new VeniceAvroKafkaSerializer(valueSchema))
-          .setWriteComputeSerializer(new VeniceAvroKafkaSerializer(updateSchema))
+          .setValuePayloadSerializer(new VeniceAvroKafkaSerializer(valueSchema))
+          .setWriteComputePayloadSerializer(new VeniceAvroKafkaSerializer(updateSchema))
           .setChunkingEnabled(false)
           .setPartitionCount(1)
           .build();

@@ -2,17 +2,8 @@ package com.linkedin.venice.utils;
 
 import static com.linkedin.venice.CommonConfigKeys.SSL_ENABLED;
 import static com.linkedin.venice.ConfigKeys.KAFKA_BOOTSTRAP_SERVERS;
+import static com.linkedin.venice.ConfigKeys.MULTI_REGION;
 import static com.linkedin.venice.VeniceConstants.DEFAULT_PER_ROUTER_READ_QUOTA;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.D2_ZK_HOSTS_PREFIX;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.DEFAULT_KEY_FIELD_PROP;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.DEFAULT_VALUE_FIELD_PROP;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.KEY_FIELD_PROP;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.MULTI_REGION;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.PARENT_CONTROLLER_REGION_NAME;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.SOURCE_GRID_FABRIC;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.VALUE_FIELD_PROP;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.VENICE_DISCOVER_URL_PROP;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.VENICE_STORE_NAME_PROP;
 import static com.linkedin.venice.integration.utils.VeniceControllerWrapper.D2_SERVICE_NAME;
 import static com.linkedin.venice.integration.utils.VeniceControllerWrapper.PARENT_D2_SERVICE_NAME;
 import static com.linkedin.venice.samza.VeniceSystemFactory.DEPLOYMENT_ID;
@@ -25,33 +16,82 @@ import static com.linkedin.venice.samza.VeniceSystemFactory.VENICE_PARENT_CONTRO
 import static com.linkedin.venice.samza.VeniceSystemFactory.VENICE_PARENT_D2_ZK_HOSTS;
 import static com.linkedin.venice.samza.VeniceSystemFactory.VENICE_PUSH_TYPE;
 import static com.linkedin.venice.samza.VeniceSystemFactory.VENICE_STORE;
+import static com.linkedin.venice.utils.TestUtils.assertCommand;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.D2_ZK_HOSTS_PREFIX;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.DEFAULT_KEY_FIELD_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.DEFAULT_VALUE_FIELD_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.JOB_STATUS_IN_UNKNOWN_STATE_TIMEOUT_MS;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.KEY_FIELD_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.PARENT_CONTROLLER_REGION_NAME;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.SOURCE_GRID_FABRIC;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VALUE_FIELD_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_DISCOVER_URL_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_STORE_NAME_PROP;
+import static org.testng.Assert.assertTrue;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.linkedin.d2.balancer.D2Client;
+import com.linkedin.davinci.kafka.consumer.ConsumerPoolType;
+import com.linkedin.davinci.kafka.consumer.KafkaStoreIngestionService;
+import com.linkedin.davinci.kafka.consumer.TopicPartitionIngestionInfo;
+import com.linkedin.davinci.listener.response.ReplicaIngestionResponse;
+import com.linkedin.venice.ConfigKeys;
+import com.linkedin.venice.common.VeniceSystemStoreType;
 import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.controllerapi.ControllerClient;
 import com.linkedin.venice.controllerapi.ControllerResponse;
 import com.linkedin.venice.controllerapi.D2ControllerClientFactory;
 import com.linkedin.venice.controllerapi.NewStoreResponse;
+import com.linkedin.venice.controllerapi.StoreResponse;
 import com.linkedin.venice.controllerapi.UpdateStoreQueryParams;
+import com.linkedin.venice.d2.D2ClientFactory;
 import com.linkedin.venice.endToEnd.DaVinciClientDiskFullTest;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.hadoop.VenicePushJob;
+import com.linkedin.venice.helix.VeniceJsonSerializer;
 import com.linkedin.venice.integration.utils.KafkaTestUtils;
 import com.linkedin.venice.integration.utils.PubSubBrokerWrapper;
 import com.linkedin.venice.integration.utils.VeniceClusterWrapper;
 import com.linkedin.venice.integration.utils.VeniceControllerWrapper;
 import com.linkedin.venice.integration.utils.VeniceMultiClusterWrapper;
+import com.linkedin.venice.integration.utils.VeniceServerWrapper;
 import com.linkedin.venice.integration.utils.VeniceTwoLayerMultiRegionMultiClusterWrapper;
+import com.linkedin.venice.jobs.StageMetricsSnapshot;
+import com.linkedin.venice.kafka.protocol.ControlMessage;
+import com.linkedin.venice.kafka.protocol.KafkaMessageEnvelope;
+import com.linkedin.venice.kafka.protocol.enums.ControlMessageType;
 import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.Version;
+import com.linkedin.venice.partitioner.DefaultVenicePartitioner;
+import com.linkedin.venice.pubsub.PubSubConsumerAdapterContext;
 import com.linkedin.venice.pubsub.PubSubProducerAdapterFactory;
+import com.linkedin.venice.pubsub.PubSubTopicPartitionImpl;
 import com.linkedin.venice.pubsub.PubSubTopicRepository;
+import com.linkedin.venice.pubsub.api.DefaultPubSubMessage;
+import com.linkedin.venice.pubsub.api.PubSubConsumerAdapter;
+import com.linkedin.venice.pubsub.api.PubSubMessageDeserializer;
+import com.linkedin.venice.pubsub.api.PubSubMessageHeader;
+import com.linkedin.venice.pubsub.api.PubSubMessageHeaders;
+import com.linkedin.venice.pubsub.api.PubSubSymbolicPosition;
+import com.linkedin.venice.pubsub.api.PubSubTopic;
+import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
 import com.linkedin.venice.pubsub.manager.TopicManagerContext;
 import com.linkedin.venice.pubsub.manager.TopicManagerRepository;
 import com.linkedin.venice.samza.VeniceObjectWithTimestamp;
 import com.linkedin.venice.samza.VeniceSystemFactory;
 import com.linkedin.venice.samza.VeniceSystemProducer;
+import com.linkedin.venice.serialization.avro.VeniceAvroKafkaSerializer;
+import com.linkedin.venice.stats.VeniceMetricsRepository;
 import com.linkedin.venice.writer.VeniceWriterFactory;
+import io.opentelemetry.api.common.AttributeKey;
+import io.opentelemetry.sdk.metrics.data.LongPointData;
+import io.opentelemetry.sdk.metrics.data.MetricData;
+import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
+import io.tehuti.metrics.MetricsRepository;
+import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -73,6 +113,12 @@ import org.testng.Assert;
 public class IntegrationTestPushUtils {
   private static final Logger LOGGER = LogManager.getLogger(IntegrationTestPushUtils.class);
 
+  private static final VeniceJsonSerializer<Map<String, Map<String, TopicPartitionIngestionInfo>>> VENICE_JSON_SERIALIZER =
+      new VeniceJsonSerializer<>(new TypeReference<Map<String, Map<String, TopicPartitionIngestionInfo>>>() {
+      });
+
+  private static final String INVALID_PARENT_D2_ZK_HOST = "invalid_parent_zk_address";
+
   public static Properties defaultVPJProps(VeniceClusterWrapper veniceCluster, String inputDirPath, String storeName) {
     Map<String, String> childRegionNamesToZkAddress =
         Collections.singletonMap(veniceCluster.getRegionName(), veniceCluster.getZk().getAddress());
@@ -83,14 +129,19 @@ public class IntegrationTestPushUtils {
         VeniceControllerWrapper.PARENT_D2_SERVICE_NAME,
         VeniceControllerWrapper.D2_SERVICE_NAME,
         inputDirPath,
-        storeName);
+        storeName,
+        veniceCluster.getPubSubClientProperties());
   }
 
   public static Properties defaultVPJPropsWithoutD2Routing(
       VeniceClusterWrapper veniceCluster,
       String inputDirPath,
       String storeName) {
-    return TestWriteUtils.defaultVPJProps(veniceCluster.getAllControllersURLs(), inputDirPath, storeName);
+    return TestWriteUtils.defaultVPJProps(
+        veniceCluster.getAllControllersURLs(),
+        inputDirPath,
+        storeName,
+        veniceCluster.getPubSubClientProperties());
   }
 
   public static Properties defaultVPJProps(
@@ -106,7 +157,8 @@ public class IntegrationTestPushUtils {
         VeniceControllerWrapper.PARENT_D2_SERVICE_NAME,
         VeniceControllerWrapper.D2_SERVICE_NAME,
         inputDirPath,
-        storeName);
+        storeName,
+        veniceMultiCluster.getPubSubClientProperties());
   }
 
   public static Properties defaultVPJProps(
@@ -129,7 +181,8 @@ public class IntegrationTestPushUtils {
         VeniceControllerWrapper.PARENT_D2_SERVICE_NAME,
         VeniceControllerWrapper.D2_SERVICE_NAME,
         inputDirPath,
-        storeName);
+        storeName,
+        multiRegionMultiClusterWrapper.getPubSubClientProperties());
   }
 
   public static Properties sslVPJProps(VeniceClusterWrapper veniceCluster, String inputDirPath, String storeName) {
@@ -139,7 +192,30 @@ public class IntegrationTestPushUtils {
   }
 
   /**
-   * Blocking, waits for new version to go online
+   * Run VPJ and blocking wait for complete.
+   */
+  public static void runVPJ(Properties props) {
+    runVPJAndGetMetrics(props);
+  }
+
+  /**
+   * Run VPJ and return the stage metrics snapshot (if available).
+   * Returns Optional.empty() for MR jobs or if metrics are not captured.
+   */
+  public static Optional<StageMetricsSnapshot> runVPJAndGetMetrics(Properties props) {
+    // Default unknown-state timeout is 30 minutes — far too long for integration tests.
+    // Override to 2 minutes so tests fail fast instead of hanging.
+    props.putIfAbsent(JOB_STATUS_IN_UNKNOWN_STATE_TIMEOUT_MS, 120_000L);
+    try (VenicePushJob job = new VenicePushJob(
+        "venice-push-job-" + props.get(VENICE_STORE_NAME_PROP) + "-" + System.currentTimeMillis(),
+        props)) {
+      job.run();
+      return job.getStageMetricsSnapshot();
+    }
+  }
+
+  /**
+   * Run VPJ and blocking wait for complete. Validate expected current version with provided controller client.
    */
   public static void runVPJ(Properties vpjProperties, int expectedVersionNumber, ControllerClient controllerClient) {
     runVPJ(vpjProperties, expectedVersionNumber, controllerClient, Optional.empty());
@@ -151,12 +227,12 @@ public class IntegrationTestPushUtils {
       ControllerClient controllerClient,
       Optional<DaVinciClientDiskFullTest.SentPushJobDetailsTrackerImpl> pushJobDetailsTracker) {
     long vpjStart = System.currentTimeMillis();
-    String jobName = Utils.getUniqueString("hybrid-job-" + expectedVersionNumber);
+    String jobName = Utils.getUniqueString("venice-push-job-" + expectedVersionNumber);
     try (VenicePushJob job = new VenicePushJob(jobName, vpjProperties)) {
       pushJobDetailsTracker.ifPresent(job::setSentPushJobDetailsTracker);
       job.run();
       TestUtils.waitForNonDeterministicCompletion(
-          5,
+          90,
           TimeUnit.SECONDS,
           () -> controllerClient.getStore((String) vpjProperties.get(VENICE_STORE_NAME_PROP))
               .getStore()
@@ -205,9 +281,9 @@ public class IntegrationTestPushUtils {
     samzaConfig.put(configPrefix + VENICE_PUSH_TYPE, type.toString());
     samzaConfig.put(configPrefix + VENICE_STORE, storeName);
     samzaConfig.put(VENICE_CHILD_D2_ZK_HOSTS, venice.getZk().getAddress());
-    samzaConfig.put(VENICE_CHILD_CONTROLLER_D2_SERVICE, VeniceControllerWrapper.D2_SERVICE_NAME);
-    samzaConfig.put(VENICE_PARENT_D2_ZK_HOSTS, "invalid_parent_zk_address");
-    samzaConfig.put(VENICE_PARENT_CONTROLLER_D2_SERVICE, "invalid_parent_d2_service");
+    samzaConfig.put(VENICE_CHILD_CONTROLLER_D2_SERVICE, D2_SERVICE_NAME);
+    samzaConfig.put(VENICE_PARENT_D2_ZK_HOSTS, INVALID_PARENT_D2_ZK_HOST);
+    samzaConfig.put(VENICE_PARENT_CONTROLLER_D2_SERVICE, PARENT_D2_SERVICE_NAME);
     samzaConfig.put(DEPLOYMENT_ID, Utils.getUniqueString("venice-push-id"));
     samzaConfig.put(SSL_ENABLED, "false");
     samzaConfig.putAll(
@@ -215,29 +291,47 @@ public class IntegrationTestPushUtils {
     return samzaConfig;
   }
 
-  /**
-   *  Create Samza Producer config for multi cluster setup.
-   */
-  public static Map<String, String> getSamzaProducerConfig(
-      List<VeniceMultiClusterWrapper> dataCenters,
+  private static Map<String, String> getSamzaProducerConfig(
+      VeniceTwoLayerMultiRegionMultiClusterWrapper clusterWrapper,
       int index,
       String storeName) {
     Map<String, String> samzaConfig = new HashMap<>();
     String configPrefix = SYSTEMS_PREFIX + "venice" + DOT;
     samzaConfig.put(configPrefix + VENICE_PUSH_TYPE, Version.PushType.STREAM.toString());
     samzaConfig.put(configPrefix + VENICE_STORE, storeName);
-    samzaConfig.put(configPrefix + VENICE_AGGREGATE, "false");
-    samzaConfig.put(VENICE_CHILD_D2_ZK_HOSTS, dataCenters.get(index).getZkServerWrapper().getAddress());
+    samzaConfig
+        .put(VENICE_CHILD_D2_ZK_HOSTS, clusterWrapper.getChildRegions().get(index).getZkServerWrapper().getAddress());
     samzaConfig.put(VENICE_CHILD_CONTROLLER_D2_SERVICE, D2_SERVICE_NAME);
-    samzaConfig.put(VENICE_PARENT_D2_ZK_HOSTS, "invalid_parent_d2_service");
+    samzaConfig.put(VENICE_PARENT_D2_ZK_HOSTS, INVALID_PARENT_D2_ZK_HOST);
     samzaConfig.put(VENICE_PARENT_CONTROLLER_D2_SERVICE, PARENT_D2_SERVICE_NAME);
     samzaConfig.put(DEPLOYMENT_ID, "DC_" + index + "_" + storeName);
     samzaConfig.put(SSL_ENABLED, "false");
     return samzaConfig;
   }
 
+  private static Map<String, String> getSamzaProducerConfigForBatch(
+      VeniceTwoLayerMultiRegionMultiClusterWrapper clusterWrapper,
+      String storeName) {
+    Map<String, String> samzaConfig = new HashMap<>();
+    String configPrefix = SYSTEMS_PREFIX + "venice" + DOT;
+    samzaConfig.put(configPrefix + VENICE_PUSH_TYPE, Version.PushType.BATCH.toString());
+    samzaConfig.put(configPrefix + VENICE_STORE, storeName);
+    samzaConfig
+        .put(VENICE_CHILD_D2_ZK_HOSTS, clusterWrapper.getChildRegions().get(0).getZkServerWrapper().getAddress());
+    samzaConfig.put(VENICE_CHILD_CONTROLLER_D2_SERVICE, D2_SERVICE_NAME);
+    samzaConfig.put(VENICE_PARENT_D2_ZK_HOSTS, clusterWrapper.getZkServerWrapper().getAddress());
+    samzaConfig.put(VENICE_PARENT_CONTROLLER_D2_SERVICE, PARENT_D2_SERVICE_NAME);
+    samzaConfig.put(DEPLOYMENT_ID, Utils.getUniqueString("venice-push-id"));
+    samzaConfig.put(SSL_ENABLED, "false");
+    samzaConfig.put(configPrefix + VENICE_AGGREGATE, "true");
+    return samzaConfig;
+  }
+
+  /**
+   * Create Samza Producer in Single-Region setup with optional configs.
+   */
   @SafeVarargs
-  public static SystemProducer getSamzaProducer(
+  public static VeniceSystemProducer getSamzaProducer(
       VeniceClusterWrapper venice,
       String storeName,
       Version.PushType type,
@@ -247,16 +341,64 @@ public class IntegrationTestPushUtils {
       samzaConfig.put(config.getFirst(), config.getSecond());
     }
     VeniceSystemFactory factory = new VeniceSystemFactory();
-    SystemProducer veniceProducer = factory.getProducer("venice", new MapConfig(samzaConfig), null);
+    VeniceSystemProducer veniceProducer = factory.getClosableProducer("venice", new MapConfig(samzaConfig), null);
     veniceProducer.start();
     return veniceProducer;
   }
 
+  /**
+   *  Create Samza Producer for multi-region setup BATCH write.
+   */
+  public static VeniceSystemProducer getSamzaProducerForBatch(
+      VeniceTwoLayerMultiRegionMultiClusterWrapper venice,
+      String storeName) {
+    Map<String, String> samzaConfig = getSamzaProducerConfigForBatch(venice, storeName);
+    VeniceSystemFactory factory = new VeniceSystemFactory();
+    VeniceSystemProducer veniceProducer = factory.getClosableProducer("venice", new MapConfig(samzaConfig), null);
+    veniceProducer.start();
+    return veniceProducer;
+  }
+
+  /**
+   *  Create Samza Producer for multi-region setup STREAM write.
+   */
+  @SafeVarargs
+  public static VeniceSystemProducer getSamzaProducerForStream(
+      VeniceTwoLayerMultiRegionMultiClusterWrapper venice,
+      int regionId,
+      String storeName,
+      Pair<String, String>... optionalConfigs) {
+    Map<String, String> samzaConfig = getSamzaProducerConfig(venice, regionId, storeName);
+    for (Pair<String, String> config: optionalConfigs) {
+      samzaConfig.put(config.getFirst(), config.getSecond());
+    }
+    VeniceSystemFactory factory = new VeniceSystemFactory();
+    VeniceSystemProducer veniceProducer = factory.getClosableProducer("venice", new MapConfig(samzaConfig), null);
+    veniceProducer.start();
+    return veniceProducer;
+  }
+
+  public static String getKeySchemaString(Schema recordSchema, Properties props) {
+    return getSchemaString(recordSchema, props, KEY_FIELD_PROP, DEFAULT_KEY_FIELD_PROP);
+  }
+
+  public static String getValueSchemaString(Schema recordSchema, Properties props) {
+    return getSchemaString(recordSchema, props, VALUE_FIELD_PROP, DEFAULT_VALUE_FIELD_PROP);
+  }
+
+  private static String getSchemaString(Schema recordSchema, Properties props, String field, String fallbackField) {
+    return recordSchema.getField(props.getProperty(field, fallbackField)).schema().toString();
+  }
+
+  /**
+   * Consider using {@link VeniceClusterWrapper#createStoreForJob(Schema, Properties)} if you do not need the controller
+   * client returned by this function.
+   */
   public static ControllerClient createStoreForJob(String veniceClusterName, Schema recordSchema, Properties props) {
     return createStoreForJob(
         veniceClusterName,
-        recordSchema.getField(props.getProperty(KEY_FIELD_PROP, DEFAULT_KEY_FIELD_PROP)).schema().toString(),
-        recordSchema.getField(props.getProperty(VALUE_FIELD_PROP, DEFAULT_VALUE_FIELD_PROP)).schema().toString(),
+        getKeySchemaString(recordSchema, props),
+        getValueSchemaString(recordSchema, props),
         props,
         CompressionStrategy.NO_OP,
         false,
@@ -326,15 +468,15 @@ public class IntegrationTestPushUtils {
         String childControllerRegionName = pushJobProps.getProperty(SOURCE_GRID_FABRIC);
         d2ZkHosts = pushJobProps.getProperty(D2_ZK_HOSTS_PREFIX + childControllerRegionName);
       }
-      return D2ControllerClientFactory
-          .getControllerClient(d2ServiceName, veniceClusterName, d2ZkHosts, Optional.empty());
+      D2Client d2Client = D2ClientFactory.getD2Client(d2ZkHosts, Optional.empty());
+      return D2ControllerClientFactory.getControllerClient(d2ServiceName, veniceClusterName, d2Client);
     } else {
       return ControllerClient.constructClusterControllerClient(veniceClusterName, veniceUrl);
     }
   }
 
   public static void sendStreamingRecordWithLogicalTimestamp(
-      VeniceSystemProducer veniceProducer,
+      SystemProducer veniceProducer,
       String storeName,
       int index,
       long logicalTimestamp,
@@ -370,7 +512,7 @@ public class IntegrationTestPushUtils {
   public static void sendStreamingDeleteRecord(
       SystemProducer producer,
       String storeName,
-      String key,
+      Object key,
       Long logicalTimeStamp) {
     sendStreamingRecord(producer, storeName, key, null, logicalTimeStamp);
   }
@@ -380,6 +522,16 @@ public class IntegrationTestPushUtils {
   }
 
   public static void sendStreamingRecord(
+      SystemProducer producer,
+      String storeName,
+      Object key,
+      Object message,
+      Long logicalTimeStamp) {
+    sendStreamingRecordWithoutFlush(producer, storeName, key, message, logicalTimeStamp);
+    producer.flush(storeName);
+  }
+
+  public static void sendStreamingRecordWithoutFlush(
       SystemProducer producer,
       String storeName,
       Object key,
@@ -395,7 +547,14 @@ public class IntegrationTestPushUtils {
           new VeniceObjectWithTimestamp(message, logicalTimeStamp));
     }
     producer.send(storeName, envelope);
-    producer.flush(storeName);
+  }
+
+  public static void sendStreamingRecordWithoutFlush(
+      SystemProducer producer,
+      String storeName,
+      Object key,
+      Object message) {
+    sendStreamingRecordWithoutFlush(producer, storeName, key, message, null);
   }
 
   /**
@@ -428,6 +587,7 @@ public class IntegrationTestPushUtils {
     TopicManagerContext topicManagerContext =
         new TopicManagerContext.Builder().setPubSubPropertiesSupplier(k -> new VeniceProperties(properties))
             .setPubSubTopicRepository(pubSubTopicRepository)
+            .setPubSubPositionTypeRegistry(pubSubBrokerWrapper.getPubSubPositionTypeRegistry())
             .setPubSubConsumerAdapterFactory(pubSubBrokerWrapper.getPubSubClientsFactory().getConsumerAdapterFactory())
             .setPubSubAdminAdapterFactory(pubSubBrokerWrapper.getPubSubClientsFactory().getAdminAdapterFactory())
             .setPubSubOperationTimeoutMs(kafkaOperationTimeoutMs)
@@ -445,6 +605,256 @@ public class IntegrationTestPushUtils {
     veniceWriterProperties.put(KAFKA_BOOTSTRAP_SERVERS, pubSubBrokerWrapper.getAddress());
     veniceWriterProperties
         .putAll(PubSubBrokerWrapper.getBrokerDetailsForClients(Collections.singletonList(pubSubBrokerWrapper)));
-    return TestUtils.getVeniceWriterFactory(veniceWriterProperties, pubSubProducerAdapterFactory);
+    return TestUtils.getVeniceWriterFactory(
+        veniceWriterProperties,
+        pubSubProducerAdapterFactory,
+        pubSubBrokerWrapper.getPubSubPositionTypeRegistry());
+  }
+
+  public static void verifyConsumerThreadPoolFor(
+      VeniceTwoLayerMultiRegionMultiClusterWrapper multiRegionMultiClusterWrapper,
+      String clusterName,
+      PubSubTopic versionTopic,
+      PubSubTopicPartition pubSubTopicPartition,
+      ConsumerPoolType consumerPoolType,
+      int expectedSourceRegionNumOnServer,
+      int expectedReplicaNumPerRegion) {
+    for (VeniceMultiClusterWrapper veniceMultiClusterWrapper: multiRegionMultiClusterWrapper.getChildRegions()) {
+      int replicaPerRegionCount = 0;
+      for (VeniceServerWrapper serverWrapper: veniceMultiClusterWrapper.getClusters()
+          .get(clusterName)
+          .getVeniceServers()) {
+        KafkaStoreIngestionService kafkaStoreIngestionService =
+            serverWrapper.getVeniceServer().getKafkaStoreIngestionService();
+        ReplicaIngestionResponse replicaIngestionResponse =
+            kafkaStoreIngestionService.getTopicPartitionIngestionContext(
+                versionTopic.getName(),
+                pubSubTopicPartition.getTopicName(),
+                pubSubTopicPartition.getPartitionNumber());
+        try {
+          Map<String, Map<String, TopicPartitionIngestionInfo>> topicPartitionIngestionContexts =
+              VENICE_JSON_SERIALIZER.deserialize(replicaIngestionResponse.getPayload(), "");
+          if (!topicPartitionIngestionContexts.isEmpty()) {
+            int regionCount = 0;
+            for (Map.Entry<String, Map<String, TopicPartitionIngestionInfo>> entry: topicPartitionIngestionContexts
+                .entrySet()) {
+              Map<String, TopicPartitionIngestionInfo> topicPartitionIngestionInfoMap = entry.getValue();
+              for (Map.Entry<String, TopicPartitionIngestionInfo> topicPartitionIngestionInfoEntry: topicPartitionIngestionInfoMap
+                  .entrySet()) {
+                String topicPartitionStr = topicPartitionIngestionInfoEntry.getKey();
+                if (pubSubTopicPartition.toString().equals(topicPartitionStr)) {
+                  TopicPartitionIngestionInfo topicPartitionIngestionInfo = topicPartitionIngestionInfoEntry.getValue();
+                  assertTrue(topicPartitionIngestionInfo.getConsumerIdStr().contains(consumerPoolType.getStatSuffix()));
+                  regionCount += 1;
+                }
+              }
+            }
+            // To ensure exactly one consumer from specific pool is allocated for each region.
+            Assert.assertEquals(regionCount, expectedSourceRegionNumOnServer);
+            replicaPerRegionCount += 1;
+          }
+        } catch (IOException e) {
+          throw new VeniceException("Got IO Exception during consumer pool check.", e);
+        }
+      }
+      Assert.assertEquals(replicaPerRegionCount, expectedReplicaNumPerRegion);
+    }
+  }
+
+  static public D2Client getD2Client(String d2ZkHosts) {
+    return D2ClientFactory.getD2Client(d2ZkHosts, Optional.empty());
+  }
+
+  public static void makeSureUserSystemStoreIsOnline(
+      VeniceTwoLayerMultiRegionMultiClusterWrapper clusterWrapper,
+      String clusterName,
+      String storeName) {
+    List<VeniceMultiClusterWrapper> childDatacenters = clusterWrapper.getChildRegions();
+    TestUtils.waitForNonDeterministicAssertion(1, TimeUnit.MINUTES, true, () -> {
+      for (VeniceMultiClusterWrapper childDataCenter: childDatacenters) {
+        childDataCenter.getClusters().get(clusterName).useControllerClient(cc -> {
+          assertStoreHealth(
+              cc,
+              VeniceSystemStoreType.META_STORE.getSystemStoreName(storeName),
+              childDataCenter.getRegionName());
+          assertStoreHealth(
+              cc,
+              VeniceSystemStoreType.DAVINCI_PUSH_STATUS_STORE.getSystemStoreName(storeName),
+              childDataCenter.getRegionName());
+        });
+      }
+    });
+  }
+
+  /**
+   * Reads EOP messages from all partitions of a store's version topic and returns the per-partition
+   * record counts from the "prc" headers. Asserts that every partition has a prc header.
+   *
+   * @return Map of partition ID to record count extracted from prc headers.
+   */
+  public static Map<Integer, Long> getEopPartitionRecordCounts(
+      PubSubBrokerWrapper pubSubBrokerWrapper,
+      String storeName,
+      int version,
+      int partitionCount) {
+    String versionTopic = Version.composeKafkaTopic(storeName, version);
+    Properties consumerProps = new Properties();
+    consumerProps.setProperty(ConfigKeys.KAFKA_BOOTSTRAP_SERVERS, pubSubBrokerWrapper.getAddress());
+
+    Map<Integer, Long> foundCounts = new HashMap<>();
+    for (int p = 0; p < partitionCount; p++) {
+      final int partition = p;
+      try (PubSubConsumerAdapter consumer = pubSubBrokerWrapper.getPubSubClientsFactory()
+          .getConsumerAdapterFactory()
+          .create(
+              new PubSubConsumerAdapterContext.Builder().setVeniceProperties(new VeniceProperties(consumerProps))
+                  .setPubSubMessageDeserializer(PubSubMessageDeserializer.createDefaultDeserializer())
+                  .setPubSubPositionTypeRegistry(pubSubBrokerWrapper.getPubSubPositionTypeRegistry())
+                  .setConsumerName("eopVerifier-" + partition)
+                  .build())) {
+        consumer.subscribe(
+            new PubSubTopicPartitionImpl(new PubSubTopicRepository().getTopic(versionTopic), partition),
+            PubSubSymbolicPosition.EARLIEST,
+            false);
+
+        TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, () -> {
+          Map<PubSubTopicPartition, List<DefaultPubSubMessage>> messages = consumer.poll(5000);
+          messages.forEach((tp, msgList) -> msgList.forEach(msg -> {
+            if (msg.getKey().isControlMessage()) {
+              KafkaMessageEnvelope kme = msg.getValue();
+              ControlMessage cm = (ControlMessage) kme.payloadUnion;
+              if (cm.getControlMessageType() == ControlMessageType.END_OF_PUSH.getValue()) {
+                PubSubMessageHeader prcHeader =
+                    msg.getPubSubMessageHeaders().get(PubSubMessageHeaders.VENICE_PARTITION_RECORD_COUNT_HEADER);
+                Assert.assertNotNull(prcHeader, "EOP on partition " + partition + " missing prc header");
+                foundCounts.put(partition, ByteBuffer.wrap(prcHeader.value()).getLong());
+              }
+            }
+          }));
+          Assert.assertTrue(foundCounts.containsKey(partition), "No EOP with prc header on partition " + partition);
+        });
+      }
+    }
+
+    Assert.assertEquals(foundCounts.size(), partitionCount, "All partitions should have prc headers");
+    return foundCounts;
+  }
+
+  /**
+   * Verifies that EOP prc headers match the expected per-partition record distribution
+   * computed by running the Venice partitioner against the given keys.
+   *
+   * @param actualCounts per-partition record counts from EOP headers (from {@link #getEopPartitionRecordCounts})
+   * @param keys the keys that were pushed (will be serialized using the string schema)
+   * @param keySchemaStr the Avro schema string for serializing keys (e.g., "\"string\"")
+   * @param partitionCount number of partitions
+   */
+  public static void verifyPerPartitionCounts(
+      Map<Integer, Long> actualCounts,
+      Collection<String> keys,
+      String keySchemaStr,
+      int partitionCount) {
+    DefaultVenicePartitioner partitioner = new DefaultVenicePartitioner();
+    VeniceAvroKafkaSerializer keySerializer = new VeniceAvroKafkaSerializer(keySchemaStr);
+
+    Map<Integer, Long> expectedCounts = new HashMap<>();
+    for (String key: keys) {
+      byte[] keyBytes = keySerializer.serialize(null, key);
+      int partition = partitioner.getPartitionId(keyBytes, partitionCount);
+      expectedCounts.merge(partition, 1L, Long::sum);
+    }
+
+    long actualTotal = actualCounts.values().stream().mapToLong(Long::longValue).sum();
+    long expectedTotal = keys.size();
+    Assert.assertEquals(actualTotal, expectedTotal, "Total record count mismatch");
+
+    for (Map.Entry<Integer, Long> entry: expectedCounts.entrySet()) {
+      int partition = entry.getKey();
+      long expected = entry.getValue();
+      Long actual = actualCounts.get(partition);
+      Assert.assertNotNull(actual, "Missing prc count for partition " + partition);
+      Assert.assertEquals(actual.longValue(), expected, "Record count mismatch on partition " + partition);
+    }
+  }
+
+  /**
+   * Shared assertion helper for the per-store batch-push record-count match/mismatch OTel counters.
+   * Reads from each server's {@link InMemoryMetricReader} (attached by
+   * {@code VeniceServerWrapper}), filters counter points by the
+   * {@code venice.store.name} attribute, and sums across the supplied servers.
+   *
+   * <p>OTel metric names match {@code IngestionOtelMetricEntity}:
+   * {@code ingestion.batch_push_record_count_match.count} and
+   * {@code ingestion.batch_push_record_count_mismatch.count}.</p>
+   *
+   * <p>{@code expectMatch=true} requires at least one match increment somewhere in the supplied
+   * set (every partition's EOP triggers one increment); {@code expectMismatch=false} requires the
+   * mismatch counter to remain at 0 across the supplied set.</p>
+   *
+   * <p>Wrapped in {@link TestUtils#waitForNonDeterministicAssertion} because the OTel SDK can lag
+   * the test thread's collection sample by a small margin after the SIT consumer thread records.</p>
+   */
+  public static void assertBatchPushRecordCountSensors(
+      Collection<VeniceServerWrapper> servers,
+      String storeName,
+      boolean expectMatch,
+      boolean expectMismatch) {
+    String matchMetricName = "ingestion.batch_push_record_count_match.count";
+    String mismatchMetricName = "ingestion.batch_push_record_count_mismatch.count";
+    AttributeKey<String> storeKey = AttributeKey.stringKey("venice.store.name");
+    TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, true, () -> {
+      long matchSum = 0L;
+      long mismatchSum = 0L;
+      for (VeniceServerWrapper server: servers) {
+        MetricsRepository repo = server.getMetricsRepository();
+        if (!(repo instanceof VeniceMetricsRepository)) {
+          continue;
+        }
+        InMemoryMetricReader reader = (InMemoryMetricReader) ((VeniceMetricsRepository) repo).getVeniceMetricsConfig()
+            .getOtelAdditionalMetricsReader();
+        if (reader == null) {
+          continue;
+        }
+        for (MetricData md: reader.collectAllMetrics()) {
+          boolean isMatch = md.getName().endsWith(matchMetricName);
+          boolean isMismatch = md.getName().endsWith(mismatchMetricName);
+          if (!isMatch && !isMismatch) {
+            continue;
+          }
+          long sum = md.getLongSumData()
+              .getPoints()
+              .stream()
+              .filter(p -> storeName.equals(p.getAttributes().get(storeKey)))
+              .mapToLong(LongPointData::getValue)
+              .sum();
+          if (isMatch) {
+            matchSum += sum;
+          } else {
+            mismatchSum += sum;
+          }
+        }
+      }
+      if (expectMatch) {
+        Assert.assertTrue(
+            matchSum > 0,
+            "Expected " + matchMetricName + " > 0 for store " + storeName + " but got " + matchSum);
+      } else {
+        Assert.assertEquals(matchSum, 0L, matchMetricName + " should be 0 for store " + storeName);
+      }
+      if (expectMismatch) {
+        Assert.assertTrue(
+            mismatchSum > 0,
+            "Expected " + mismatchMetricName + " > 0 for store " + storeName + " but got " + mismatchSum);
+      } else {
+        Assert.assertEquals(mismatchSum, 0L, mismatchMetricName + " should be 0 for store " + storeName);
+      }
+    });
+  }
+
+  private static void assertStoreHealth(ControllerClient controllerClient, String systemStoreName, String regionName) {
+    StoreResponse storeResponse = assertCommand(controllerClient.getStore(systemStoreName));
+    Assert.assertTrue(
+        storeResponse.getStore().getCurrentVersion() > 0,
+        systemStoreName + " is not ready for " + regionName);
   }
 }

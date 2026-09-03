@@ -1,6 +1,11 @@
 package com.linkedin.venice.restart;
 
-import static com.linkedin.venice.ConfigKeys.SERVER_PROMOTION_TO_LEADER_REPLICA_DELAY_SECONDS;
+import static com.linkedin.davinci.stats.ingestion.IngestionOtelMetricEntity.DISK_QUOTA_USED;
+import static com.linkedin.davinci.stats.ingestion.IngestionOtelMetricEntity.INGESTION_BYTES_CONSUMED;
+import static com.linkedin.davinci.stats.ingestion.IngestionOtelMetricEntity.INGESTION_RECORDS_CONSUMED;
+import static com.linkedin.venice.integration.utils.VeniceServerWrapper.SERVICE_METRIC_PREFIX;
+import static com.linkedin.venice.utils.OpenTelemetryDataTestUtils.validateAnyDoubleGaugeDataPointAtLeast;
+import static com.linkedin.venice.utils.OpenTelemetryDataTestUtils.validateAnySumDataPointAtLeast;
 
 import com.linkedin.venice.controllerapi.UpdateStoreQueryParams;
 import com.linkedin.venice.integration.utils.ServiceFactory;
@@ -11,11 +16,14 @@ import com.linkedin.venice.integration.utils.VeniceServerWrapper;
 import com.linkedin.venice.meta.RoutingDataRepository;
 import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.Version;
+import com.linkedin.venice.stats.VeniceMetricsRepository;
 import com.linkedin.venice.utils.TestUtils;
 import com.linkedin.venice.utils.Time;
 import com.linkedin.venice.utils.Utils;
+import io.opentelemetry.sdk.metrics.data.MetricData;
+import io.opentelemetry.sdk.testing.exporter.InMemoryMetricReader;
 import io.tehuti.Metric;
-import java.util.Properties;
+import java.util.Collection;
 import java.util.concurrent.TimeUnit;
 import org.testng.Assert;
 import org.testng.annotations.AfterClass;
@@ -30,11 +38,8 @@ public class TestRestartServer {
   @BeforeClass
   public void setUp() {
     Utils.thisIsLocalhost();
-    Properties clusterConfig = new Properties();
-    clusterConfig.put(SERVER_PROMOTION_TO_LEADER_REPLICA_DELAY_SECONDS, 1L);
     VeniceClusterCreateOptions options = new VeniceClusterCreateOptions.Builder().numberOfServers(REPLICATION_FACTOR)
         .replicationFactor(REPLICATION_FACTOR)
-        .extraProperties(clusterConfig)
         .build();
     cluster = ServiceFactory.getVeniceCluster(options);
   }
@@ -56,6 +61,9 @@ public class TestRestartServer {
     int partitionCount = routingDataRepository.getNumberOfPartitions(kafkaTopic);
     Assert.assertTrue(partitionCount > 1);
 
+    // Validate OTel ingestion metrics are reported after push
+    validateOtelIngestionMetricsAfterPush();
+
     cluster.updateStore(storeName, new UpdateStoreQueryParams().setStorageQuotaInByte(Store.UNLIMITED_STORAGE_QUOTA));
     TestUtils.waitForNonDeterministicAssertion(10, TimeUnit.SECONDS, () -> {
       for (VeniceServerWrapper server: cluster.getVeniceServers()) {
@@ -72,6 +80,10 @@ public class TestRestartServer {
         Assert.assertTrue(quotaUsedMetric.value() > keyCount);
       }
     });
+
+    // Validate OTel DISK_QUOTA_USED metric — reports raw ratio (e.g., 0.75) instead of 0-100 scale.
+    // After a push, disk usage should be non-trivial (> 1%).
+    validateOtelDiskQuotaUsed(0.01);
 
     for (VeniceServerWrapper server: cluster.getVeniceServers()) {
       cluster.stopVeniceServer(server.getPort());
@@ -101,5 +113,41 @@ public class TestRestartServer {
         Assert.assertTrue(quotaUsedMetric.value() > keyCount);
       }
     });
+  }
+
+  private static InMemoryMetricReader getOtelReader(VeniceServerWrapper server) {
+    VeniceMetricsRepository metricsRepo = (VeniceMetricsRepository) server.getMetricsRepository();
+    return (InMemoryMetricReader) metricsRepo.getVeniceMetricsConfig().getOtelAdditionalMetricsReader();
+  }
+
+  private void validateOtelIngestionMetricsAfterPush() {
+    for (VeniceServerWrapper server: cluster.getVeniceServers()) {
+      InMemoryMetricReader reader = getOtelReader(server);
+      Assert.assertNotNull(reader, "InMemoryMetricReader should be registered for server");
+      // Collect once to avoid draining async counter adders between validations
+      Collection<MetricData> metrics = reader.collectAllMetrics();
+      validateAnySumDataPointAtLeast(
+          metrics,
+          1,
+          INGESTION_RECORDS_CONSUMED.getMetricEntity().getMetricName(),
+          SERVICE_METRIC_PREFIX);
+      validateAnySumDataPointAtLeast(
+          metrics,
+          1,
+          INGESTION_BYTES_CONSUMED.getMetricEntity().getMetricName(),
+          SERVICE_METRIC_PREFIX);
+    }
+  }
+
+  private void validateOtelDiskQuotaUsed(double expectedMinValue) {
+    for (VeniceServerWrapper server: cluster.getVeniceServers()) {
+      InMemoryMetricReader reader = getOtelReader(server);
+      // DISK_QUOTA_USED is now ASYNC_DOUBLE_GAUGE — reports raw ratio as double
+      validateAnyDoubleGaugeDataPointAtLeast(
+          reader,
+          expectedMinValue,
+          DISK_QUOTA_USED.getMetricEntity().getMetricName(),
+          SERVICE_METRIC_PREFIX);
+    }
   }
 }

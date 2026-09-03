@@ -20,7 +20,6 @@ import com.linkedin.venice.service.ICProvider;
 import com.linkedin.venice.utils.AvroSchemaUtils;
 import com.linkedin.venice.utils.DaemonThreadFactory;
 import com.linkedin.venice.utils.ObjectMapperFactory;
-import com.linkedin.venice.utils.RetryUtils;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import java.io.IOException;
 import java.time.Duration;
@@ -31,7 +30,6 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -187,7 +185,9 @@ public class RouterBackedSchemaReader implements SchemaReader {
 
   @Override
   public Schema getValueSchema(int id) {
-    SchemaEntry valueSchemaEntry = maybeFetchValueSchemaEntryById(id, false);
+    // Should call with refresh as any router transient error can lead to null schema stored in the map
+    // `valueSchemaEntryMap`
+    SchemaEntry valueSchemaEntry = maybeFetchValueSchemaEntryById(id, true);
     if (!isValidSchemaEntry(valueSchemaEntry)) {
       LOGGER.warn("Got null value schema from Venice for store: {} and id: {}", storeName, id);
       return null;
@@ -197,18 +197,23 @@ public class RouterBackedSchemaReader implements SchemaReader {
 
   @Override
   public Schema getLatestValueSchema() throws VeniceClientException {
-    SchemaEntry latest = maybeFetchLatestValueSchemaEntry();
+    SchemaEntry latest = maybeFetchLatestValueSchemaEntry(false);
     // Defensive coding, in theory, there will be at least one schema, so latest value schema won't be null after
     // refresh.
     return latest == null ? null : SCHEMA_EXTRACTOR.apply(latest);
   }
 
   @Override
-  public Integer getLatestValueSchemaId() throws VeniceClientException {
-    SchemaEntry latest = maybeFetchLatestValueSchemaEntry();
+  public Integer getLatestValueSchemaId(boolean forceRefresh) throws VeniceClientException {
+    SchemaEntry latest = maybeFetchLatestValueSchemaEntry(forceRefresh);
     // Defensive coding, in theory, there will be at least one schema, so latest value schema won't be null after
     // refresh.
     return latest == null ? null : SCHEMA_ID_EXTRACTOR.apply(latest);
+  }
+
+  @Override
+  public Integer getLatestValueSchemaId() {
+    return getLatestValueSchemaId(false);
   }
 
   @Override
@@ -236,7 +241,7 @@ public class RouterBackedSchemaReader implements SchemaReader {
 
   @Override
   public Schema getUpdateSchema(int valueSchemaId) {
-    DerivedSchemaEntry updateSchemaEntry = maybeUpdateAndFetchUpdateSchemaEntryById(valueSchemaId, false);
+    DerivedSchemaEntry updateSchemaEntry = maybeUpdateAndFetchUpdateSchemaEntryById(valueSchemaId, true);
     if (isValidSchemaEntry(updateSchemaEntry)) {
       return updateSchemaEntry.getSchema();
     }
@@ -246,7 +251,7 @@ public class RouterBackedSchemaReader implements SchemaReader {
 
   @Override
   public DerivedSchemaEntry getLatestUpdateSchema() {
-    SchemaEntry latestValueSchema = maybeFetchLatestValueSchemaEntry();
+    SchemaEntry latestValueSchema = maybeFetchLatestValueSchemaEntry(false);
     if (latestValueSchema == null) {
       LOGGER.warn("Got null latest value schema from Venice for store: {}.", storeName);
       return null;
@@ -272,7 +277,8 @@ public class RouterBackedSchemaReader implements SchemaReader {
       try {
         refreshSchemaExecutor.awaitTermination(60, TimeUnit.SECONDS);
       } catch (InterruptedException e) {
-        LOGGER.warn("Caught InterruptedException while closing the Venice producer ExecutorService", e);
+        Thread.currentThread().interrupt();
+        LOGGER.warn("Caught InterruptedException while closing the schema refresh ExecutorService", e);
       }
     }
     if (!externalClient) {
@@ -322,9 +328,13 @@ public class RouterBackedSchemaReader implements SchemaReader {
         valueSchemaIdSet = fetchAllValueSchemaIdsFromRouter();
       } catch (Exception e) {
         LOGGER.warn(
-            "Caught exception when trying to fetch all value schema IDs from router, will fetch all value schema entries instead.");
+            "Caught exception when trying to fetch all value schema IDs from router, will fetch all value schema entries instead.",
+            e);
         // Fall back to fetch all value schema.
         for (SchemaEntry valueSchemaEntry: fetchAllValueSchemaEntriesFromRouter()) {
+          if (!isValidSchemaEntry(valueSchemaEntry)) {
+            continue;
+          }
           valueSchemaEntryMap.put(valueSchemaEntry.getId(), valueSchemaEntry);
           cacheValueAndCanonicalSchemas(valueSchemaEntry.getSchema(), valueSchemaEntry.getId());
         }
@@ -429,9 +439,10 @@ public class RouterBackedSchemaReader implements SchemaReader {
     }
   }
 
-  private SchemaEntry maybeFetchLatestValueSchemaEntry() {
+  private SchemaEntry maybeFetchLatestValueSchemaEntry(boolean refresh) {
     SchemaEntry latest = latestValueSchemaEntry.get();
-    if (latest == null || shouldRefreshLatestValueSchemaEntry.get()) {
+
+    if (refresh || latest == null || shouldRefreshLatestValueSchemaEntry.get()) {
       /**
        * Every time it sees latestValueSchemaEntry is null or the flag to update latest schema entry is set to true,
        * it will try to update it once.
@@ -439,7 +450,11 @@ public class RouterBackedSchemaReader implements SchemaReader {
        * one active value schema.
        */
       synchronized (this) {
-        if (latest != null && !shouldRefreshLatestValueSchemaEntry.get()) {
+        if (refresh) {
+          shouldRefreshLatestValueSchemaEntry.set(true);
+        }
+        if (latest != null && (!shouldRefreshLatestValueSchemaEntry.get() && isValidSchemaEntry(latest)
+            || !latest.equals(latestValueSchemaEntry.get()))) {
           return latest;
         }
         updateAllValueSchemaEntriesAndLatestValueSchemaEntry(false);
@@ -447,6 +462,9 @@ public class RouterBackedSchemaReader implements SchemaReader {
         latestValueSchemaEntry.set(latestValueSchemaEntry.get());
         latest = latestValueSchemaEntry.get();
       }
+    }
+    if (latest == null || !isValidSchemaEntry(latest)) {
+      throw new VeniceClientException("Failed to get latest value schema for store: " + storeName);
     }
     return latest;
   }
@@ -475,6 +493,7 @@ public class RouterBackedSchemaReader implements SchemaReader {
         return NOT_EXIST_VALUE_SCHEMA_ENTRY;
       } else {
         valueSchemaEntryMap.put(valueSchemaId, entry);
+        shouldRefreshLatestValueSchemaEntry.compareAndSet(false, true);
         cacheValueAndCanonicalSchemas(entry.getSchema(), valueSchemaId);
         return entry;
       }
@@ -661,11 +680,7 @@ public class RouterBackedSchemaReader implements SchemaReader {
         responseFuture = (CompletableFuture<byte[]>) storeClient.getRaw(requestPath);
       }
 
-      response = RetryUtils.executeWithMaxAttempt(
-          () -> (responseFuture.get()),
-          3,
-          Duration.ofNanos(1),
-          Collections.singletonList(ExecutionException.class));
+      response = responseFuture.get(1, TimeUnit.SECONDS);
     } catch (Exception e) {
       throw new VeniceClientException(
           "Failed to execute request from path " + requestPath + ", storeClient: " + storeClient,
@@ -738,10 +753,12 @@ public class RouterBackedSchemaReader implements SchemaReader {
   }
 
   private void cacheValueAndCanonicalSchemas(Schema valueSchema, int valueSchemaId) {
-    String canonicalSchemaStr = AvroCompatibilityHelper.toParsingForm(valueSchema);
-    Schema canonicalSchema = AvroSchemaParseUtils.parseSchemaFromJSONLooseValidation(canonicalSchemaStr);
-
-    cacheValueAndCanonicalSchemas(valueSchema, canonicalSchema, valueSchemaId);
+    Integer previousValueSchemaId = valueSchemaToCanonicalSchemaId.getIfPresent(valueSchema);
+    if (previousValueSchemaId == null || previousValueSchemaId < valueSchemaId) {
+      String canonicalSchemaStr = AvroCompatibilityHelper.toParsingForm(valueSchema);
+      Schema canonicalSchema = AvroSchemaParseUtils.parseSchemaFromJSONLooseValidation(canonicalSchemaStr);
+      cacheValueAndCanonicalSchemas(valueSchema, canonicalSchema, valueSchemaId);
+    }
   }
 
   private void cacheValueAndCanonicalSchemas(Schema valueSchema, Schema canonicalSchema, int valueSchemaId) {

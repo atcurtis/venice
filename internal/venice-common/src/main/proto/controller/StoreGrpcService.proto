@@ -1,0 +1,128 @@
+syntax = 'proto3';
+package com.linkedin.venice.protocols.controller;
+
+
+import "controller/ControllerGrpcRequestContext.proto";
+
+option java_multiple_files = true;
+
+service StoreGrpcService {
+  rpc createStore(CreateStoreGrpcRequest) returns (CreateStoreGrpcResponse);
+  rpc updateAclForStore(UpdateAclForStoreGrpcRequest) returns (UpdateAclForStoreGrpcResponse);
+  rpc getAclForStore(GetAclForStoreGrpcRequest) returns (GetAclForStoreGrpcResponse);
+  rpc deleteAclForStore(DeleteAclForStoreGrpcRequest) returns (DeleteAclForStoreGrpcResponse);
+  rpc checkResourceCleanupForStoreCreation(ClusterStoreGrpcInfo) returns (ResourceCleanupCheckGrpcResponse) {}
+  rpc validateStoreDeleted(ValidateStoreDeletedGrpcRequest) returns (ValidateStoreDeletedGrpcResponse);
+  rpc listStores(ListStoresGrpcRequest) returns (ListStoresGrpcResponse);
+  rpc getStoreStatuses(GetStoreStatusRequest) returns (GetStoreStatusResponse);
+  rpc getRepushInfo(GetRepushInfoGrpcRequest) returns (GetRepushInfoGrpcResponse);
+  rpc getStore(GetStoreGrpcRequest) returns (GetStoreGrpcResponse);
+}
+
+message CreateStoreGrpcRequest {
+  ClusterStoreGrpcInfo storeInfo = 1;
+  string keySchema = 2;
+  string valueSchema = 3;
+  optional string owner = 4;
+  optional bool isSystemStore = 5;
+  optional string accessPermission = 6;
+}
+
+message CreateStoreGrpcResponse {
+  ClusterStoreGrpcInfo storeInfo = 1;
+  string owner = 2;
+}
+
+message UpdateAclForStoreGrpcRequest {
+  ClusterStoreGrpcInfo storeInfo = 1;
+  string accessPermissions = 3;
+}
+
+message UpdateAclForStoreGrpcResponse {
+  ClusterStoreGrpcInfo storeInfo = 1;
+}
+
+message GetAclForStoreGrpcRequest {
+  ClusterStoreGrpcInfo storeInfo = 1;
+}
+
+message GetAclForStoreGrpcResponse {
+  ClusterStoreGrpcInfo storeInfo = 1;
+  string accessPermissions = 2;
+}
+
+message DeleteAclForStoreGrpcRequest {
+  ClusterStoreGrpcInfo storeInfo = 1;
+}
+
+message DeleteAclForStoreGrpcResponse {
+  ClusterStoreGrpcInfo storeInfo = 1;
+}
+
+message ResourceCleanupCheckGrpcResponse {
+  ClusterStoreGrpcInfo storeInfo = 1;
+  bool hasLingeringResources = 2;
+  optional string description = 3;
+}
+
+message ValidateStoreDeletedGrpcRequest {
+  ClusterStoreGrpcInfo storeInfo = 1;
+}
+
+message ValidateStoreDeletedGrpcResponse {
+  ClusterStoreGrpcInfo storeInfo = 1;
+  bool storeDeleted = 2;
+  optional string reason = 3;
+}
+
+message ListStoresGrpcRequest {
+  string clusterName = 1;
+  optional bool includeSystemStores = 2;
+  optional string storeConfigNameFilter = 3;
+  optional string storeConfigValueFilter = 4;
+}
+
+message ListStoresGrpcResponse {
+  string clusterName = 1;
+  repeated string storeNames = 2;
+}
+
+message GetStoreStatusRequest {
+  string clusterName = 1;
+}
+
+message StoreStatus {
+  string storeName = 1;
+  string status = 2;
+}
+
+message GetStoreStatusResponse {
+  string clusterName = 1;
+  repeated StoreStatus storeStatuses = 2;
+}
+
+message GetRepushInfoGrpcRequest {
+  ClusterStoreGrpcInfo storeInfo = 1;
+  optional string fabric = 2;
+}
+
+message GetRepushInfoGrpcResponse {
+  ClusterStoreGrpcInfo storeInfo = 1;
+  RepushInfoGrpc repushInfo = 2;
+}
+
+message RepushInfoGrpc {
+  string pubSubUrl = 1;
+  optional VersionGrpc version = 2;
+  optional string systemSchemaClusterD2ServiceName = 3;
+  optional string systemSchemaClusterD2ZkHost = 4;
+}
+
+message GetStoreGrpcRequest {
+  ClusterStoreGrpcInfo storeInfo = 1;
+}
+
+message GetStoreGrpcResponse {
+  ClusterStoreGrpcInfo storeInfo = 1;
+  string storeInfoJson = 2;
+}

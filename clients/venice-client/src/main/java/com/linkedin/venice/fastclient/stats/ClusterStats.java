@@ -1,20 +1,33 @@
 package com.linkedin.venice.fastclient.stats;
 
+import static com.linkedin.venice.fastclient.stats.ClusterMetricEntity.INSTANCE_ERROR_COUNT;
+import static com.linkedin.venice.fastclient.stats.ClusterMetricEntity.STORE_VERSION_CURRENT;
+import static com.linkedin.venice.fastclient.stats.ClusterMetricEntity.STORE_VERSION_UPDATE_FAILURE_COUNT;
+import static com.linkedin.venice.stats.dimensions.InstanceErrorType.BLOCKED;
+import static com.linkedin.venice.stats.dimensions.InstanceErrorType.OVERLOADED;
+import static com.linkedin.venice.stats.dimensions.InstanceErrorType.UNHEALTHY;
+
 import com.linkedin.venice.stats.AbstractVeniceStats;
-import com.linkedin.venice.stats.StatsUtils;
-import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
+import com.linkedin.venice.stats.OpenTelemetryMetricsSetup;
+import com.linkedin.venice.stats.VeniceOpenTelemetryMetricsRepository;
+import com.linkedin.venice.stats.dimensions.InstanceErrorType;
+import com.linkedin.venice.stats.dimensions.VeniceMetricsDimensions;
+import com.linkedin.venice.stats.metrics.AsyncMetricEntityStateBase;
+import com.linkedin.venice.stats.metrics.MetricEntityStateBase;
+import com.linkedin.venice.stats.metrics.MetricEntityStateOneEnum;
+import com.linkedin.venice.stats.metrics.TehutiMetricNameEnum;
+import io.opentelemetry.api.common.Attributes;
 import io.tehuti.Metric;
 import io.tehuti.metrics.MetricsRepository;
-import io.tehuti.metrics.Sensor;
 import io.tehuti.metrics.stats.AsyncGauge;
 import io.tehuti.metrics.stats.Avg;
 import io.tehuti.metrics.stats.Max;
 import io.tehuti.metrics.stats.OccurrenceRate;
-import java.net.MalformedURLException;
-import java.net.URL;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.stream.Collectors;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -28,43 +41,104 @@ public class ClusterStats extends AbstractVeniceStats {
   private static final Logger LOGGER = LogManager.getLogger(ClusterStats.class);
 
   private final String storeName;
-  private final Map<String, RouteStats> perRouteStats = new VeniceConcurrentHashMap<>();
-  private final Sensor blockedInstanceCount;
-  private final Sensor unhealthyInstanceCount;
-  private final Sensor versionUpdateFailureSensor;
-  /* This sensor tracks the version number that the client is at. This will help in case some clients are not able
-  to switch to the latest version*/
-  private final Sensor currentVersionNumberSensor;
-  private int currentVersion = -1;
+  private final MetricEntityStateBase versionUpdateFailureCount;
+  private final AsyncMetricEntityStateBase currentVersionNumber;
+
+  // OTel metrics for instance error counts
+  private final MetricEntityStateOneEnum<InstanceErrorType> blockedInstanceErrorCount;
+  private final MetricEntityStateOneEnum<InstanceErrorType> unhealthyInstanceErrorCount;
+  private final MetricEntityStateOneEnum<InstanceErrorType> overloadedInstanceErrorCount;
+  private final AtomicLong currentVersion = new AtomicLong(-1);
+
+  // OTel support
+  private final VeniceOpenTelemetryMetricsRepository otelRepository;
+  private final Map<VeniceMetricsDimensions, String> baseDimensionsMap;
+  private final Attributes baseAttributes;
 
   public ClusterStats(MetricsRepository metricsRepository, String storeName) {
     super(metricsRepository, storeName);
     this.storeName = storeName;
-    this.blockedInstanceCount = registerSensor("blocked_instance_count", new Avg(), new Max());
-    this.unhealthyInstanceCount = registerSensor("unhealthy_instance_count", new Avg(), new Max());
-    this.versionUpdateFailureSensor = registerSensor("version_update_failure", new OccurrenceRate());
-    this.currentVersionNumberSensor =
-        registerSensor(new AsyncGauge((ignored, ignored2) -> this.currentVersion, "current_version"));
+
+    OpenTelemetryMetricsSetup.OpenTelemetryMetricsSetupInfo otelData =
+        OpenTelemetryMetricsSetup.builder(metricsRepository)
+            // set all base dimensions for this stats class and build
+            .setStoreName(storeName)
+            .build();
+
+    this.otelRepository = otelData.getOtelRepository();
+    this.baseDimensionsMap = otelData.getBaseDimensionsMap();
+    this.baseAttributes = otelData.getBaseAttributes();
+
+    // Initialize OTel metrics
+    this.versionUpdateFailureCount = MetricEntityStateBase.create(
+        STORE_VERSION_UPDATE_FAILURE_COUNT.getMetricEntity(),
+        otelRepository,
+        this::registerSensor,
+        ClusterTehutiMetricName.VERSION_UPDATE_FAILURE,
+        Collections.singletonList(new OccurrenceRate()),
+        baseDimensionsMap,
+        baseAttributes);
+
+    this.currentVersionNumber = AsyncMetricEntityStateBase.create(
+        STORE_VERSION_CURRENT.getMetricEntity(),
+        otelRepository,
+        this::registerSensor,
+        ClusterTehutiMetricName.CURRENT_VERSION,
+        Collections.singletonList(
+            new AsyncGauge(
+                (ignored, ignored2) -> this.currentVersion.get(),
+                ClusterTehutiMetricName.CURRENT_VERSION.getMetricName())),
+        baseDimensionsMap,
+        baseAttributes,
+        this.currentVersion::get);
+
+    // Initialize OTel metrics for instance error counts
+    this.blockedInstanceErrorCount = MetricEntityStateOneEnum.create(
+        INSTANCE_ERROR_COUNT.getMetricEntity(),
+        otelRepository,
+        this::registerSensor,
+        ClusterTehutiMetricName.BLOCKED_INSTANCE_COUNT,
+        Arrays.asList(new Avg(), new Max()),
+        baseDimensionsMap,
+        InstanceErrorType.class);
+
+    this.unhealthyInstanceErrorCount = MetricEntityStateOneEnum.create(
+        INSTANCE_ERROR_COUNT.getMetricEntity(),
+        otelRepository,
+        this::registerSensor,
+        ClusterTehutiMetricName.UNHEALTHY_INSTANCE_COUNT,
+        Arrays.asList(new Avg(), new Max()),
+        baseDimensionsMap,
+        InstanceErrorType.class);
+
+    this.overloadedInstanceErrorCount = MetricEntityStateOneEnum.create(
+        INSTANCE_ERROR_COUNT.getMetricEntity(),
+        otelRepository,
+        this::registerSensor,
+        ClusterTehutiMetricName.OVERLOADED_INSTANCE_COUNT,
+        Arrays.asList(new Avg(), new Max()),
+        baseDimensionsMap,
+        InstanceErrorType.class);
   }
 
   public void recordBlockedInstanceCount(int count) {
-    this.blockedInstanceCount.record(count);
+    blockedInstanceErrorCount.record(count, BLOCKED);
   }
 
   public void recordUnhealthyInstanceCount(int count) {
-    this.unhealthyInstanceCount.record(count);
+    unhealthyInstanceErrorCount.record(count, UNHEALTHY);
   }
 
-  public void recordPendingRequestCount(String instance, int count) {
-    getRouteStats(instance).recordPendingRequestCount(count);
+  public void recordOverloadedInstanceCount(int count) {
+    overloadedInstanceErrorCount.record(count, OVERLOADED);
   }
 
   public void updateCurrentVersion(int currentVersion) {
-    this.currentVersion = currentVersion;
+    this.currentVersion.set(currentVersion);
   }
 
   public void recordVersionUpdateFailure() {
-    versionUpdateFailureSensor.record();
+    versionUpdateFailureCount.record(1);
   }
 
   public List<Double> getMetricValues(String sensorName, String... stats) {
@@ -76,30 +150,10 @@ public class ClusterStats extends AbstractVeniceStats {
     return collect;
   }
 
-  private RouteStats getRouteStats(String instanceUrl) {
-    return perRouteStats.computeIfAbsent(instanceUrl, k -> {
-      String instanceName = instanceUrl;
-      try {
-        URL url = new URL(instanceUrl);
-        instanceName = url.getHost() + "_" + url.getPort();
-      } catch (MalformedURLException e) {
-        LOGGER.error("Invalid instance url: {}", instanceUrl);
-      }
-      return new RouteStats(getMetricsRepository(), storeName, instanceName);
-    });
-  }
-
-  private static class RouteStats extends AbstractVeniceStats {
-    private final Sensor pendingRequestCounterSensor;
-
-    public RouteStats(MetricsRepository metricsRepository, String storeName, String instanceName) {
-      super(metricsRepository, storeName + "." + StatsUtils.convertHostnameToMetricName(instanceName));
-
-      this.pendingRequestCounterSensor = registerSensor("pending_request_count", new Avg(), new Max());
-    }
-
-    public void recordPendingRequestCount(int count) {
-      pendingRequestCounterSensor.record(count);
-    }
+  /**
+   * Metric names for tehuti metrics used in this class.
+   */
+  public enum ClusterTehutiMetricName implements TehutiMetricNameEnum {
+    VERSION_UPDATE_FAILURE, CURRENT_VERSION, BLOCKED_INSTANCE_COUNT, UNHEALTHY_INSTANCE_COUNT, OVERLOADED_INSTANCE_COUNT
   }
 }

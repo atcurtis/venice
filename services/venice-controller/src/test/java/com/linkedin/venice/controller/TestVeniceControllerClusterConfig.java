@@ -1,0 +1,877 @@
+package com.linkedin.venice.controller;
+
+import static com.linkedin.venice.ConfigConstants.CONTROLLER_DEFAULT_HELIX_RESOURCE_CAPACITY_KEY;
+import static com.linkedin.venice.ConfigKeys.ACTIVE_ACTIVE_REAL_TIME_SOURCE_FABRIC_LIST;
+import static com.linkedin.venice.ConfigKeys.ADMIN_HELIX_MESSAGING_CHANNEL_ENABLED;
+import static com.linkedin.venice.ConfigKeys.CHILD_CLUSTER_ALLOWLIST;
+import static com.linkedin.venice.ConfigKeys.CHILD_CLUSTER_URL_PREFIX;
+import static com.linkedin.venice.ConfigKeys.CHILD_DATA_CENTER_KAFKA_URL_PREFIX;
+import static com.linkedin.venice.ConfigKeys.CLUSTER_NAME;
+import static com.linkedin.venice.ConfigKeys.CLUSTER_TO_D2;
+import static com.linkedin.venice.ConfigKeys.CLUSTER_TO_SERVER_D2;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_ADD_VERSION_VIA_ADMIN_PROTOCOL;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_DISABLED_ROUTES;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_HELIX_CLOUD_ID;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_HELIX_CLOUD_INFO_PROCESSOR_NAME;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_HELIX_CLOUD_INFO_SOURCES;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_HELIX_CLOUD_PROVIDER;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_HELIX_PARTICIPANT_DEREGISTRATION_TIMEOUT_MS;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_HELIX_REST_CUSTOMIZED_HEALTH_URL;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_HELIX_SERVER_CLUSTER_FAULT_ZONE_TYPE;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_HELIX_SERVER_CLUSTER_TOPOLOGY;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_HELIX_SERVER_CLUSTER_TOPOLOGY_AWARE;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PARENT_MODE;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_ALL;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_BATCH_JOB_HEARTBEAT_STORE_RT;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_BATCH_JOB_HEARTBEAT_STORE_VT;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_BATCH_USER_STORE_VT;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_EXCLUSION_LIST;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_HYBRID_USER_STORE_RT;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_HYBRID_USER_STORE_VT;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_INCLUSION_LIST;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_META_SYSTEM_STORE_RT;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_META_SYSTEM_STORE_VT;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_PUSH_STATUS_SYSTEM_STORE_RT;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_PUSH_STATUS_SYSTEM_STORE_VT;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_PUSH_RETRY_COOLDOWN_MS;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_SSL_ENABLED;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_STORAGE_CLUSTER_HELIX_CLOUD_ENABLED;
+import static com.linkedin.venice.ConfigKeys.CONTROLLER_SYSTEM_SCHEMA_CLUSTER_NAME;
+import static com.linkedin.venice.ConfigKeys.DEFAULT_MAX_NUMBER_OF_PARTITIONS;
+import static com.linkedin.venice.ConfigKeys.DEFAULT_PARTITION_SIZE;
+import static com.linkedin.venice.ConfigKeys.KAFKA_BOOTSTRAP_SERVERS;
+import static com.linkedin.venice.ConfigKeys.KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE_RT_TOPICS;
+import static com.linkedin.venice.ConfigKeys.LOCAL_REGION_NAME;
+import static com.linkedin.venice.ConfigKeys.MULTI_REGION;
+import static com.linkedin.venice.ConfigKeys.NATIVE_REPLICATION_FABRIC_ALLOWLIST;
+import static com.linkedin.venice.ConfigKeys.PARTICIPANT_MESSAGE_STORE_ENABLED;
+import static com.linkedin.venice.ConfigKeys.PUSH_JOB_FAILURE_CHECKPOINTS_TO_DEFINE_USER_ERROR;
+import static com.linkedin.venice.ConfigKeys.ZOOKEEPER_ADDRESS;
+import static com.linkedin.venice.PushJobCheckpoints.DVC_INGESTION_ERROR_OTHER;
+import static com.linkedin.venice.PushJobCheckpoints.QUOTA_EXCEEDED;
+import static com.linkedin.venice.controller.VeniceControllerClusterConfig.parsePushJobUserErrorCheckpoints;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+import static org.testng.Assert.assertEquals;
+import static org.testng.Assert.assertFalse;
+import static org.testng.Assert.assertNotNull;
+import static org.testng.Assert.assertThrows;
+import static org.testng.Assert.assertTrue;
+import static org.testng.Assert.expectThrows;
+
+import com.linkedin.venice.ConfigKeys;
+import com.linkedin.venice.PushJobCheckpoints;
+import com.linkedin.venice.common.VeniceSystemStoreType;
+import com.linkedin.venice.controller.helix.HelixCapacityConfig;
+import com.linkedin.venice.controllerapi.ControllerRoute;
+import com.linkedin.venice.exceptions.ConfigurationException;
+import com.linkedin.venice.exceptions.UndefinedPropertyException;
+import com.linkedin.venice.exceptions.VeniceException;
+import com.linkedin.venice.status.protocol.PushJobDetails;
+import com.linkedin.venice.utils.DataProviderUtils;
+import com.linkedin.venice.utils.PropertyBuilder;
+import com.linkedin.venice.utils.TestUtils;
+import com.linkedin.venice.utils.Utils;
+import com.linkedin.venice.utils.VeniceProperties;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import org.apache.commons.lang.StringUtils;
+import org.apache.helix.cloud.constants.CloudProvider;
+import org.apache.helix.model.CloudConfig;
+import org.apache.helix.model.ClusterConfig;
+import org.testng.Assert;
+import org.testng.annotations.DataProvider;
+import org.testng.annotations.Test;
+
+
+public class TestVeniceControllerClusterConfig {
+  private static final String DELIMITER = ",\\s*";
+  private static final Set<String> REGION_ALLOW_LIST = Utils.setOf("dc1", "dc2");
+
+  @Test
+  public void canParseClusterMap() {
+    PropertyBuilder builder = new PropertyBuilder();
+    builder.put("child.cluster.url.dc1", "http://host:1234, http://host:5678")
+        .put("child.cluster.url.dc2", "http://host:1234, http://host:5678");
+
+    Map<String, String> map = VeniceControllerClusterConfig.parseClusterMap(builder.build(), REGION_ALLOW_LIST);
+
+    assertEquals(map.size(), 2);
+    Assert.assertTrue(map.containsKey("dc1"));
+    Assert.assertTrue(map.containsKey("dc2"));
+
+    String[] uris = map.get("dc1").split(DELIMITER);
+    assertEquals(uris[0], "http://host:1234");
+    assertEquals(uris[1], "http://host:5678");
+  }
+
+  @Test
+  public void canParseD2ClusterMap() {
+    PropertyBuilder builder = new PropertyBuilder();
+    builder.put("child.cluster.d2.zkHost.dc1", "zkAddress1").put("child.cluster.d2.zkHost.dc2", "zkAddress2");
+
+    Map<String, String> map = VeniceControllerClusterConfig.parseClusterMap(builder.build(), REGION_ALLOW_LIST, true);
+    assertEquals(map.get("dc1").split(DELIMITER).length, 1);
+    assertEquals(map.get("dc2").split(DELIMITER)[0], "zkAddress2");
+  }
+
+  @Test
+  public void canParseBannedPaths() {
+    PropertyBuilder builder = new PropertyBuilder();
+    // Add some stuff. why not
+    builder.put("child.cluster.d2.zkHost.dc1", "zkAddress1").put("child.cluster.d2.zkHost.dc2", "zkAddress2");
+
+    // Add the list of disabled endpoints, '/' are optional, and will be ignored. Invalid values will be filtered
+    builder.put(CONTROLLER_DISABLED_ROUTES, "request_topic, /discover_cluster, foo,bar");
+    List<ControllerRoute> parsedRoutes = VeniceControllerClusterConfig
+        .parseControllerRoutes(builder.build(), CONTROLLER_DISABLED_ROUTES, Collections.emptyList());
+
+    // Make sure it looks right.
+    assertEquals(parsedRoutes.size(), 2);
+    Assert.assertTrue(parsedRoutes.contains(ControllerRoute.REQUEST_TOPIC));
+    Assert.assertTrue(parsedRoutes.contains(ControllerRoute.CLUSTER_DISCOVERY));
+  }
+
+  @Test(expectedExceptions = VeniceException.class)
+  public void emptyAllowlist() {
+    PropertyBuilder build = new PropertyBuilder().put("child.cluster.url.dc1", "http://host:1234, http://host:5678")
+        .put("child.cluster.url.dc2", "http://host:1234, http://host:5678");
+    VeniceControllerClusterConfig.parseClusterMap(build.build(), Collections.emptySet());
+  }
+
+  @Test(expectedExceptions = VeniceException.class)
+  public void nullAllowlist() {
+    PropertyBuilder build = new PropertyBuilder().put("child.cluster.url.dc1", "http://host:1234, http://host:5678")
+        .put("child.cluster.url.dc2", "http://host:1234, http://host:5678");
+    VeniceControllerClusterConfig.parseClusterMap(build.build(), null);
+  }
+
+  @Test(expectedExceptions = VeniceException.class)
+  public void errOnMissingScheme() {
+    PropertyBuilder builder = new PropertyBuilder();
+    builder.put("child.cluster.url.dc1", "host:1234");
+    VeniceControllerClusterConfig.parseClusterMap(builder.build(), REGION_ALLOW_LIST);
+  }
+
+  @Test(expectedExceptions = VeniceException.class)
+  public void errOnMissingNodes() {
+    PropertyBuilder builder = new PropertyBuilder();
+    builder.put("child.cluster.url.dc1", "");
+    VeniceControllerClusterConfig.parseClusterMap(builder.build(), REGION_ALLOW_LIST);
+  }
+
+  protected static Properties getBaseSingleRegionProperties(boolean includeMultiRegionConfig) {
+    Properties props = TestUtils.getPropertiesForControllerConfig();
+    String clusterName = props.getProperty(CLUSTER_NAME);
+    props.put(LOCAL_REGION_NAME, "dc-0");
+    props.put(ZOOKEEPER_ADDRESS, "zkAddress");
+    props.put(KAFKA_BOOTSTRAP_SERVERS, "kafkaBootstrapServers");
+    props.put(DEFAULT_PARTITION_SIZE, 10);
+    props.put(DEFAULT_MAX_NUMBER_OF_PARTITIONS, 16);
+    props.put(CLUSTER_TO_D2, TestUtils.getClusterToD2String(Collections.singletonMap(clusterName, "dummy_d2")));
+    props.put(
+        CLUSTER_TO_SERVER_D2,
+        TestUtils.getClusterToD2String(Collections.singletonMap(clusterName, "dummy_server_d2")));
+    props.put(CONTROLLER_ADD_VERSION_VIA_ADMIN_PROTOCOL, true);
+    props.put(ADMIN_HELIX_MESSAGING_CHANNEL_ENABLED, false);
+    props.put(PARTICIPANT_MESSAGE_STORE_ENABLED, true);
+    props.put(CONTROLLER_SYSTEM_SCHEMA_CLUSTER_NAME, clusterName);
+    props.put(CONTROLLER_SSL_ENABLED, false);
+    if (includeMultiRegionConfig) {
+      props.put(MULTI_REGION, "false");
+    }
+    return props;
+  }
+
+  private Properties getBaseMultiRegionProperties(boolean includeMultiRegionConfig) {
+    Properties props = getBaseSingleRegionProperties(false);
+    props.put(NATIVE_REPLICATION_FABRIC_ALLOWLIST, "dc-0, dc-1, dc-parent");
+    props.put(CHILD_DATA_CENTER_KAFKA_URL_PREFIX + ".dc-0", "kafkaUrlDc0");
+    props.put(CHILD_DATA_CENTER_KAFKA_URL_PREFIX + ".dc-1", "kafkaUrlDc1");
+    props.put(CHILD_DATA_CENTER_KAFKA_URL_PREFIX + ".dc-parent", "kafkaUrlDcParent");
+
+    if (includeMultiRegionConfig) {
+      props.put(MULTI_REGION, "true");
+    }
+    return props;
+  }
+
+  private Properties getBaseParentControllerProperties(boolean includeMultiRegionConfig) {
+    Properties props = getBaseMultiRegionProperties(includeMultiRegionConfig);
+    props.put(CONTROLLER_PARENT_MODE, "true");
+    props.put(CHILD_CLUSTER_ALLOWLIST, "dc-0, dc-1");
+    props.put(CHILD_CLUSTER_URL_PREFIX + "dc-0", "http://childControllerUrlDc0");
+    props.put(CHILD_CLUSTER_URL_PREFIX + "dc-1", "http://childControllerUrlDc1");
+    return props;
+  }
+
+  @Test(dataProvider = "True-and-False", dataProviderClass = DataProviderUtils.class)
+  public void testMultiRegionConfig(boolean explicitMultiRegionConfig) {
+    Properties singleRegionProps = getBaseSingleRegionProperties(explicitMultiRegionConfig);
+    VeniceControllerClusterConfig singleRegionConfig =
+        new VeniceControllerClusterConfig(new VeniceProperties(singleRegionProps));
+    Assert.assertFalse(singleRegionConfig.isMultiRegion());
+
+    Properties multiRegionProps = getBaseMultiRegionProperties(explicitMultiRegionConfig);
+    VeniceControllerClusterConfig multiRegionConfig =
+        new VeniceControllerClusterConfig(new VeniceProperties(multiRegionProps));
+    Assert.assertTrue(multiRegionConfig.isMultiRegion());
+
+    Properties multiRegionPropsWithAaSourceRegion = getBaseMultiRegionProperties(explicitMultiRegionConfig);
+    multiRegionPropsWithAaSourceRegion.put(ACTIVE_ACTIVE_REAL_TIME_SOURCE_FABRIC_LIST, "dc-0, dc-1");
+    VeniceControllerClusterConfig multiRegionConfigWithAaSourceRegion =
+        new VeniceControllerClusterConfig(new VeniceProperties(multiRegionPropsWithAaSourceRegion));
+    Assert.assertTrue(multiRegionConfigWithAaSourceRegion.isMultiRegion());
+
+    Properties parentControllerProps = getBaseParentControllerProperties(explicitMultiRegionConfig);
+    VeniceControllerClusterConfig parentControllerConfig =
+        new VeniceControllerClusterConfig(new VeniceProperties(parentControllerProps));
+    Assert.assertTrue(parentControllerConfig.isMultiRegion());
+  }
+
+  @Test
+  public void testParsePushJobUserErrorCheckpoints() {
+    PushJobDetails pushJobDetails = mock(PushJobDetails.class);
+    Map<CharSequence, CharSequence> pushJobConfigs = new HashMap<>();
+    when(pushJobDetails.getPushJobConfigs()).thenReturn(pushJobConfigs);
+    when(pushJobDetails.getPushJobLatestCheckpoint()).thenReturn(DVC_INGESTION_ERROR_OTHER.getValue());
+
+    // valid
+    Properties properties = new Properties();
+    properties.put(PUSH_JOB_FAILURE_CHECKPOINTS_TO_DEFINE_USER_ERROR, "QUOTA_EXCEEDED,DVC_INGESTION_ERROR_OTHER");
+    VeniceProperties controllerProps = new VeniceProperties(properties);
+    Set<PushJobCheckpoints> expectedCustomUserErrorCheckpoints =
+        new HashSet<>(Arrays.asList(QUOTA_EXCEEDED, DVC_INGESTION_ERROR_OTHER));
+    assertEquals(expectedCustomUserErrorCheckpoints, parsePushJobUserErrorCheckpoints(controllerProps));
+
+    // invalid cases: Should throw IllegalArgumentException
+    Set<String> invalidCheckpointConfigs = new HashSet<>(
+        Arrays.asList(
+            "INVALID_CHECKPOINT",
+            "[DVC_INGESTION_ERROR_OTHER",
+            "DVC_INGESTION_ERROR_OTHER, RECORD_TOO_LARGE_FAILED]",
+            "DVC_INGESTION_ERROR_OTHER, TEST",
+            "-14"));
+    for (String invalidCheckpointConfig: invalidCheckpointConfigs) {
+      properties.put(PUSH_JOB_FAILURE_CHECKPOINTS_TO_DEFINE_USER_ERROR, invalidCheckpointConfig);
+      VeniceProperties controllerPropsInvalid = new VeniceProperties(properties);
+      assertThrows(IllegalArgumentException.class, () -> parsePushJobUserErrorCheckpoints(controllerPropsInvalid));
+    }
+  }
+
+  @Test
+  public void testPushRetryCooldownConfig() {
+    Properties props = getBaseSingleRegionProperties(true);
+    VeniceControllerClusterConfig clusterConfig = new VeniceControllerClusterConfig(new VeniceProperties(props));
+    assertEquals(clusterConfig.getPushRetryCooldownMs(), TimeUnit.MINUTES.toMillis(10));
+
+    props.put(CONTROLLER_PUSH_RETRY_COOLDOWN_MS, 0);
+    clusterConfig = new VeniceControllerClusterConfig(new VeniceProperties(props));
+    assertEquals(clusterConfig.getPushRetryCooldownMs(), 0);
+
+    props.put(CONTROLLER_PUSH_RETRY_COOLDOWN_MS, -1);
+    assertThrows(ConfigurationException.class, () -> new VeniceControllerClusterConfig(new VeniceProperties(props)));
+  }
+
+  @Test
+  public void testHelixCloudConfig() {
+    Properties baseProps = getBaseSingleRegionProperties(false);
+    baseProps.setProperty(CONTROLLER_STORAGE_CLUSTER_HELIX_CLOUD_ENABLED, "true");
+
+    UndefinedPropertyException e1 = expectThrows(
+        UndefinedPropertyException.class,
+        () -> new VeniceControllerClusterConfig(new VeniceProperties(baseProps)));
+    assertTrue(e1.getMessage().contains("Missing required property '" + CONTROLLER_HELIX_CLOUD_PROVIDER + "'"));
+
+    baseProps.setProperty(CONTROLLER_HELIX_CLOUD_PROVIDER, "invalidProvider");
+    VeniceException e2 =
+        expectThrows(VeniceException.class, () -> new VeniceControllerClusterConfig(new VeniceProperties(baseProps)));
+    assertTrue(e2.getMessage().contains("Invalid Helix cloud provider"));
+
+    baseProps.setProperty(CONTROLLER_HELIX_CLOUD_PROVIDER, CloudProvider.AZURE.name());
+    VeniceControllerClusterConfig clusterConfig1 = new VeniceControllerClusterConfig(new VeniceProperties(baseProps));
+    validateCloudConfig(clusterConfig1, CloudProvider.AZURE, null, null, null);
+
+    CloudProvider cloudProvider = CloudProvider.CUSTOMIZED;
+    String cloudId = "ABC";
+    String processorName = "testProcessor";
+    List<String> cloudInfoSources = Arrays.asList("source1", "source2");
+
+    baseProps.setProperty(CONTROLLER_HELIX_CLOUD_PROVIDER, cloudProvider.name());
+    baseProps.setProperty(CONTROLLER_HELIX_CLOUD_ID, cloudId);
+    baseProps.setProperty(CONTROLLER_HELIX_CLOUD_INFO_PROCESSOR_NAME, processorName);
+    baseProps.setProperty(CONTROLLER_HELIX_CLOUD_INFO_SOURCES, StringUtils.join(cloudInfoSources, ","));
+
+    VeniceControllerClusterConfig clusterConfig2 = new VeniceControllerClusterConfig(new VeniceProperties(baseProps));
+    validateCloudConfig(clusterConfig2, CloudProvider.CUSTOMIZED, cloudId, processorName, cloudInfoSources);
+  }
+
+  private void validateCloudConfig(
+      VeniceControllerClusterConfig clusterConfig,
+      CloudProvider cloudProvider,
+      String cloudId,
+      String processorName,
+      List<String> cloudInfoSources) {
+    CloudConfig cloudConfig = clusterConfig.getHelixCloudConfig();
+    assertTrue(cloudConfig.isCloudEnabled());
+    assertEquals(cloudConfig.getCloudProvider(), cloudProvider.name());
+    assertEquals(cloudConfig.getCloudID(), cloudId);
+    assertEquals(cloudConfig.getCloudInfoProcessorName(), processorName);
+    assertEquals(cloudConfig.getCloudInfoSources(), cloudInfoSources);
+  }
+
+  @Test
+  public void testHelixRestCustomizedHealthUrl() {
+    Properties baseProps = getBaseSingleRegionProperties(false);
+
+    String healthUrl = "http://localhost:8080/health";
+    baseProps.setProperty(CONTROLLER_HELIX_REST_CUSTOMIZED_HEALTH_URL, healthUrl);
+
+    VeniceControllerClusterConfig clusterConfig = new VeniceControllerClusterConfig(new VeniceProperties(baseProps));
+    assertEquals(clusterConfig.getHelixRestCustomizedHealthUrl(), healthUrl);
+  }
+
+  @Test
+  public void testServerHelixTopologyAwareConfigs() {
+    Properties baseProps = getBaseSingleRegionProperties(false);
+
+    boolean topologyAware = true;
+    String topology = "/zone/rack/host/instance";
+    String faultZoneType = "zone";
+
+    baseProps.setProperty(CONTROLLER_HELIX_SERVER_CLUSTER_TOPOLOGY_AWARE, String.valueOf(topologyAware));
+    baseProps.setProperty(CONTROLLER_HELIX_SERVER_CLUSTER_TOPOLOGY, topology);
+    baseProps.setProperty(CONTROLLER_HELIX_SERVER_CLUSTER_FAULT_ZONE_TYPE, faultZoneType);
+
+    VeniceControllerClusterConfig clusterConfig = new VeniceControllerClusterConfig(new VeniceProperties(baseProps));
+    assertEquals(clusterConfig.isServerHelixClusterTopologyAware(), topologyAware);
+    assertEquals(clusterConfig.getServerHelixClusterTopology(), topology);
+    assertEquals(clusterConfig.getServerHelixClusterFaultZoneType(), faultZoneType);
+  }
+
+  @Test
+  public void testPartialServerHelixTopologyAwareConfigs() {
+    Properties baseProps = getBaseSingleRegionProperties(false);
+
+    boolean topologyAware = true;
+    String topology = "/zone/rack/host/instance";
+    String faultZoneType = "zone";
+
+    Properties propsWithoutTopology = new Properties();
+    propsWithoutTopology.putAll(baseProps);
+    propsWithoutTopology.setProperty(CONTROLLER_HELIX_SERVER_CLUSTER_TOPOLOGY_AWARE, String.valueOf(topologyAware));
+    propsWithoutTopology.setProperty(CONTROLLER_HELIX_SERVER_CLUSTER_FAULT_ZONE_TYPE, faultZoneType);
+    Exception exceptionWithoutTopology = Assert.expectThrows(
+        VeniceException.class,
+        () -> new VeniceControllerClusterConfig(new VeniceProperties(propsWithoutTopology)));
+    assertTrue(
+        exceptionWithoutTopology.getMessage()
+            .contains("Server cluster is configured for topology-aware placement, but no topology is provided"));
+
+    Properties propsWithoutFaultZoneType = new Properties();
+    propsWithoutFaultZoneType.putAll(baseProps);
+    propsWithoutFaultZoneType
+        .setProperty(CONTROLLER_HELIX_SERVER_CLUSTER_TOPOLOGY_AWARE, String.valueOf(topologyAware));
+    propsWithoutFaultZoneType.setProperty(CONTROLLER_HELIX_SERVER_CLUSTER_TOPOLOGY, topology);
+    Exception exceptionWithoutFaultZoneType = Assert.expectThrows(
+        VeniceException.class,
+        () -> new VeniceControllerClusterConfig(new VeniceProperties(propsWithoutFaultZoneType)));
+    assertTrue(
+        exceptionWithoutFaultZoneType.getMessage()
+            .contains("Server cluster is configured for topology-aware placement, but no fault zone type is provided"));
+  }
+
+  @Test
+  public void testRebalancePreferenceAndCapacityKeys() {
+    Properties clusterProperties = getBaseSingleRegionProperties(false);
+
+    int helixRebalancePreferenceEvenness = 10;
+    int helixRebalancePreferenceLessMovement = 1;
+    int helixRebalancePreferenceForceBaselineConverge = 1;
+    int helixInstanceCapacity = 10000;
+    int helixResourceCapacityWeight = 100;
+
+    clusterProperties.put(ConfigKeys.CONTROLLER_HELIX_REBALANCE_PREFERENCE_EVENNESS, helixRebalancePreferenceEvenness);
+    clusterProperties
+        .put(ConfigKeys.CONTROLLER_HELIX_REBALANCE_PREFERENCE_LESS_MOVEMENT, helixRebalancePreferenceLessMovement);
+    clusterProperties.put(
+        ConfigKeys.CONTROLLER_HELIX_REBALANCE_PREFERENCE_FORCE_BASELINE_CONVERGE,
+        helixRebalancePreferenceForceBaselineConverge);
+    clusterProperties.put(ConfigKeys.CONTROLLER_HELIX_INSTANCE_CAPACITY, helixInstanceCapacity);
+    clusterProperties.put(ConfigKeys.CONTROLLER_HELIX_RESOURCE_CAPACITY_WEIGHT, helixResourceCapacityWeight);
+
+    VeniceControllerClusterConfig clusterConfig =
+        new VeniceControllerClusterConfig(new VeniceProperties(clusterProperties));
+
+    Map<ClusterConfig.GlobalRebalancePreferenceKey, Integer> helixGlobalRebalancePreference =
+        clusterConfig.getHelixGlobalRebalancePreference();
+    assertNotNull(helixGlobalRebalancePreference);
+
+    assertEquals(
+        (int) helixGlobalRebalancePreference.get(ClusterConfig.GlobalRebalancePreferenceKey.EVENNESS),
+        helixRebalancePreferenceEvenness);
+    assertEquals(
+        (int) helixGlobalRebalancePreference.get(ClusterConfig.GlobalRebalancePreferenceKey.LESS_MOVEMENT),
+        helixRebalancePreferenceLessMovement);
+    assertEquals(
+        (int) helixGlobalRebalancePreference.get(ClusterConfig.GlobalRebalancePreferenceKey.FORCE_BASELINE_CONVERGE),
+        helixRebalancePreferenceForceBaselineConverge);
+
+    HelixCapacityConfig helixCapacityConfig = clusterConfig.getHelixCapacityConfig();
+    List<String> helixInstanceCapacityKeys = helixCapacityConfig.getHelixInstanceCapacityKeys();
+    assertEquals(helixInstanceCapacityKeys.size(), 1);
+    assertEquals(helixInstanceCapacityKeys.get(0), CONTROLLER_DEFAULT_HELIX_RESOURCE_CAPACITY_KEY);
+
+    Map<String, Integer> helixDefaultInstanceCapacityMap = helixCapacityConfig.getHelixDefaultInstanceCapacityMap();
+    assertEquals(
+        (int) helixDefaultInstanceCapacityMap.get(CONTROLLER_DEFAULT_HELIX_RESOURCE_CAPACITY_KEY),
+        helixInstanceCapacity);
+
+    Map<String, Integer> helixDefaultPartitionWeightMap = helixCapacityConfig.getHelixDefaultPartitionWeightMap();
+    assertEquals(
+        (int) helixDefaultPartitionWeightMap.get(CONTROLLER_DEFAULT_HELIX_RESOURCE_CAPACITY_KEY),
+        helixResourceCapacityWeight);
+  }
+
+  @Test
+  public void testUndefinedRebalancePreferenceAndCapacityKeys() {
+    Properties clusterProperties = getBaseSingleRegionProperties(false);
+    VeniceControllerClusterConfig clusterConfig =
+        new VeniceControllerClusterConfig(new VeniceProperties(clusterProperties));
+
+    Map<ClusterConfig.GlobalRebalancePreferenceKey, Integer> helixGlobalRebalancePreference =
+        clusterConfig.getHelixGlobalRebalancePreference();
+    assertNotNull(helixGlobalRebalancePreference);
+    assertEquals((int) helixGlobalRebalancePreference.get(ClusterConfig.GlobalRebalancePreferenceKey.EVENNESS), 10);
+    assertEquals((int) helixGlobalRebalancePreference.get(ClusterConfig.GlobalRebalancePreferenceKey.LESS_MOVEMENT), 1);
+    assertEquals(
+        (int) helixGlobalRebalancePreference.get(ClusterConfig.GlobalRebalancePreferenceKey.FORCE_BASELINE_CONVERGE),
+        0);
+
+    HelixCapacityConfig helixCapacityConfig = clusterConfig.getHelixCapacityConfig();
+    assertNotNull(helixCapacityConfig);
+    assertEquals(helixCapacityConfig.getHelixInstanceCapacityKeys().size(), 1);
+    assertEquals(
+        helixCapacityConfig.getHelixInstanceCapacityKeys().get(0),
+        CONTROLLER_DEFAULT_HELIX_RESOURCE_CAPACITY_KEY);
+    assertEquals(
+        (int) helixCapacityConfig.getHelixDefaultInstanceCapacityMap()
+            .get(CONTROLLER_DEFAULT_HELIX_RESOURCE_CAPACITY_KEY),
+        10000);
+    assertEquals(
+        (int) helixCapacityConfig.getHelixDefaultPartitionWeightMap()
+            .get(CONTROLLER_DEFAULT_HELIX_RESOURCE_CAPACITY_KEY),
+        100);
+    assertFalse(clusterConfig.isLogCompactionSchedulingEnabled());
+  }
+
+  @Test
+  public void testCompactionConfigs() {
+    Properties clusterProperties = getBaseSingleRegionProperties(false);
+    VeniceControllerClusterConfig clusterConfig =
+        new VeniceControllerClusterConfig(new VeniceProperties(clusterProperties));
+
+    assertFalse(clusterConfig.isLogCompactionSchedulingEnabled());
+
+    clusterProperties.put(ConfigKeys.LOG_COMPACTION_SCHEDULING_ENABLED, true);
+    clusterProperties.put(ConfigKeys.LOG_COMPACTION_ENABLED, true);
+    clusterProperties.put(ConfigKeys.REPUSH_ORCHESTRATOR_CLASS_NAME, "com.linkedin.venice.RepushOrchestrator");
+    clusterConfig = new VeniceControllerClusterConfig(new VeniceProperties(clusterProperties));
+    assertTrue(clusterConfig.isLogCompactionSchedulingEnabled());
+  }
+
+  @Test
+  public void testPartiallyDefinedRebalancePreferenceAndCapacityKeys() {
+
+    int helixRebalancePreferenceEvenness = 10;
+    int helixRebalancePreferenceLessMovement = 2;
+    int helixRebalancePreferenceForceBaselineConverge = 1;
+    int helixInstanceCapacity = 10000;
+    int helixResourceCapacityWeight = 100;
+
+    // LESS_MOVEMENT defaults to production value when only EVENNESS is defined.
+    Properties clusterProperties1 = getBaseSingleRegionProperties(false);
+    clusterProperties1.put(ConfigKeys.CONTROLLER_HELIX_REBALANCE_PREFERENCE_EVENNESS, helixRebalancePreferenceEvenness);
+    VeniceControllerClusterConfig clusterConfig =
+        new VeniceControllerClusterConfig(new VeniceProperties(clusterProperties1));
+    Map<ClusterConfig.GlobalRebalancePreferenceKey, Integer> helixGlobalRebalancePreference =
+        clusterConfig.getHelixGlobalRebalancePreference();
+    assertEquals(
+        (int) helixGlobalRebalancePreference.get(ClusterConfig.GlobalRebalancePreferenceKey.EVENNESS),
+        helixRebalancePreferenceEvenness);
+    assertEquals((int) helixGlobalRebalancePreference.get(ClusterConfig.GlobalRebalancePreferenceKey.LESS_MOVEMENT), 1);
+
+    // EVENNESS defaults to production value when only LESS_MOVEMENT is defined.
+    Properties clusterProperties2 = getBaseSingleRegionProperties(false);
+    clusterProperties2
+        .put(ConfigKeys.CONTROLLER_HELIX_REBALANCE_PREFERENCE_LESS_MOVEMENT, helixRebalancePreferenceLessMovement);
+    clusterConfig = new VeniceControllerClusterConfig(new VeniceProperties(clusterProperties2));
+    helixGlobalRebalancePreference = clusterConfig.getHelixGlobalRebalancePreference();
+    assertEquals((int) helixGlobalRebalancePreference.get(ClusterConfig.GlobalRebalancePreferenceKey.EVENNESS), 10);
+    assertEquals(
+        (int) helixGlobalRebalancePreference.get(ClusterConfig.GlobalRebalancePreferenceKey.LESS_MOVEMENT),
+        helixRebalancePreferenceLessMovement);
+
+    // You can set FORCE_BASELINE_CONVERGE without EVENNESS and LESS_MOVEMENT
+    Properties clusterProperties3 = getBaseSingleRegionProperties(false);
+    clusterProperties3.put(
+        ConfigKeys.CONTROLLER_HELIX_REBALANCE_PREFERENCE_FORCE_BASELINE_CONVERGE,
+        helixRebalancePreferenceForceBaselineConverge);
+    clusterConfig = new VeniceControllerClusterConfig(new VeniceProperties(clusterProperties3));
+    helixGlobalRebalancePreference = clusterConfig.getHelixGlobalRebalancePreference();
+    assertEquals(helixGlobalRebalancePreference.size(), 3);
+    assertEquals((int) helixGlobalRebalancePreference.get(ClusterConfig.GlobalRebalancePreferenceKey.EVENNESS), 10);
+    assertEquals((int) helixGlobalRebalancePreference.get(ClusterConfig.GlobalRebalancePreferenceKey.LESS_MOVEMENT), 1);
+    assertEquals(
+        (int) helixGlobalRebalancePreference.get(ClusterConfig.GlobalRebalancePreferenceKey.FORCE_BASELINE_CONVERGE),
+        helixRebalancePreferenceForceBaselineConverge);
+
+    // You can set capacities without rebalance preference
+    Properties clusterProperties4 = getBaseSingleRegionProperties(false);
+    clusterProperties4.put(ConfigKeys.CONTROLLER_HELIX_INSTANCE_CAPACITY, helixInstanceCapacity);
+    clusterProperties4.put(ConfigKeys.CONTROLLER_HELIX_RESOURCE_CAPACITY_WEIGHT, helixResourceCapacityWeight);
+    clusterConfig = new VeniceControllerClusterConfig(new VeniceProperties(clusterProperties4));
+
+    HelixCapacityConfig capacityConfig = clusterConfig.getHelixCapacityConfig();
+    Map<String, Integer> helixDefaultInstanceCapacityMap = capacityConfig.getHelixDefaultInstanceCapacityMap();
+    assertEquals(
+        (int) helixDefaultInstanceCapacityMap.get(CONTROLLER_DEFAULT_HELIX_RESOURCE_CAPACITY_KEY),
+        helixInstanceCapacity);
+
+    Map<String, Integer> helixDefaultPartitionWeightMap = capacityConfig.getHelixDefaultPartitionWeightMap();
+    assertEquals(
+        (int) helixDefaultPartitionWeightMap.get(CONTROLLER_DEFAULT_HELIX_RESOURCE_CAPACITY_KEY),
+        helixResourceCapacityWeight);
+  }
+
+  @Test
+  public void testInvalidRebalancePreferenceAndCapacityKeys() {
+    int helixRebalancePreferenceEvenness = 10;
+    int helixRebalancePreferenceLessMovement = -1;
+    int helixRebalancePreferenceForceBaselineConverge = -1;
+    int helixInstanceCapacity = 1;
+    int helixResourceCapacityWeight = 10;
+
+    // Rebalance preference cannot be negative
+    Properties clusterProperties1 = getBaseSingleRegionProperties(false);
+    clusterProperties1.put(ConfigKeys.CONTROLLER_HELIX_REBALANCE_PREFERENCE_EVENNESS, helixRebalancePreferenceEvenness);
+    clusterProperties1
+        .put(ConfigKeys.CONTROLLER_HELIX_REBALANCE_PREFERENCE_LESS_MOVEMENT, helixRebalancePreferenceLessMovement);
+    assertThrows(
+        ConfigurationException.class,
+        () -> new VeniceControllerClusterConfig(new VeniceProperties(clusterProperties1)));
+
+    // Rebalance preference must be < 1000
+    Properties clusterProperties2 = getBaseSingleRegionProperties(false);
+    clusterProperties2.put(ConfigKeys.CONTROLLER_HELIX_REBALANCE_PREFERENCE_EVENNESS, helixRebalancePreferenceEvenness);
+    clusterProperties2.put(ConfigKeys.CONTROLLER_HELIX_REBALANCE_PREFERENCE_LESS_MOVEMENT, 1001);
+    assertThrows(
+        ConfigurationException.class,
+        () -> new VeniceControllerClusterConfig(new VeniceProperties(clusterProperties2)));
+
+    // Rebalance preference cannot be negative
+    Properties clusterProperties3 = getBaseSingleRegionProperties(false);
+    clusterProperties3
+        .put(ConfigKeys.CONTROLLER_HELIX_REBALANCE_PREFERENCE_LESS_MOVEMENT, helixRebalancePreferenceLessMovement);
+    clusterProperties3.put(
+        ConfigKeys.CONTROLLER_HELIX_REBALANCE_PREFERENCE_FORCE_BASELINE_CONVERGE,
+        helixRebalancePreferenceForceBaselineConverge);
+    assertThrows(
+        ConfigurationException.class,
+        () -> new VeniceControllerClusterConfig(new VeniceProperties(clusterProperties3)));
+
+    // CONTROLLER_HELIX_INSTANCE_CAPACITY cannot be less than CONTROLLER_HELIX_RESOURCE_CAPACITY_WEIGHT
+    Properties clusterProperties4 = getBaseSingleRegionProperties(false);
+    clusterProperties4.put(ConfigKeys.CONTROLLER_HELIX_INSTANCE_CAPACITY, helixInstanceCapacity);
+    clusterProperties4.put(ConfigKeys.CONTROLLER_HELIX_RESOURCE_CAPACITY_WEIGHT, helixResourceCapacityWeight);
+    assertThrows(
+        ConfigurationException.class,
+        () -> new VeniceControllerClusterConfig(new VeniceProperties(clusterProperties4)));
+
+    // CONTROLLER_HELIX_INSTANCE_CAPACITY must be greater than 0
+    Properties clusterProperties5 = getBaseSingleRegionProperties(false);
+    clusterProperties5.put(ConfigKeys.CONTROLLER_HELIX_INSTANCE_CAPACITY, 0);
+    assertThrows(
+        ConfigurationException.class,
+        () -> new VeniceControllerClusterConfig(new VeniceProperties(clusterProperties5)));
+
+    // CONTROLLER_HELIX_RESOURCE_CAPACITY_WEIGHT must be greater than 0
+    Properties clusterProperties6 = getBaseSingleRegionProperties(false);
+    clusterProperties6.put(ConfigKeys.CONTROLLER_HELIX_RESOURCE_CAPACITY_WEIGHT, 0);
+    assertThrows(
+        ConfigurationException.class,
+        () -> new VeniceControllerClusterConfig(new VeniceProperties(clusterProperties6)));
+
+    // CONTROLLER_HELIX_INSTANCE_CAPACITY defaults when only CONTROLLER_HELIX_RESOURCE_CAPACITY_WEIGHT is defined.
+    Properties clusterProperties7 = getBaseSingleRegionProperties(false);
+    clusterProperties7.put(ConfigKeys.CONTROLLER_HELIX_RESOURCE_CAPACITY_WEIGHT, helixResourceCapacityWeight);
+    VeniceControllerClusterConfig clusterConfig =
+        new VeniceControllerClusterConfig(new VeniceProperties(clusterProperties7));
+    HelixCapacityConfig capacityConfig = clusterConfig.getHelixCapacityConfig();
+    assertEquals(
+        (int) capacityConfig.getHelixDefaultInstanceCapacityMap().get(CONTROLLER_DEFAULT_HELIX_RESOURCE_CAPACITY_KEY),
+        10000);
+    assertEquals(
+        (int) capacityConfig.getHelixDefaultPartitionWeightMap().get(CONTROLLER_DEFAULT_HELIX_RESOURCE_CAPACITY_KEY),
+        helixResourceCapacityWeight);
+  }
+
+  @Test
+  public void testControllerHelixParticipantDeregistrationTimeoutMs() {
+    Properties baseProps = getBaseSingleRegionProperties(false);
+
+    baseProps.setProperty(CONTROLLER_HELIX_PARTICIPANT_DEREGISTRATION_TIMEOUT_MS, "60000");
+
+    VeniceControllerClusterConfig clusterConfig = new VeniceControllerClusterConfig(new VeniceProperties(baseProps));
+    assertEquals(clusterConfig.getControllerHelixParticipantDeregistrationTimeoutMs(), 60000L);
+  }
+
+  @Test
+  public void testShouldUseAlternativePubSubBackend_AllDisabledByDefault() {
+    Properties baseProps = getBaseSingleRegionProperties(false);
+    VeniceControllerClusterConfig config = new VeniceControllerClusterConfig(new VeniceProperties(baseProps));
+
+    String metaStoreName = VeniceSystemStoreType.META_STORE.getSystemStoreName("MY_STORE");
+    String pushStatusStoreName = VeniceSystemStoreType.DAVINCI_PUSH_STATUS_STORE.getSystemStoreName("MY_STORE");
+
+    // All topic types should default to false
+    assertFalse(config.shouldUseAlternativePubSubBackend(metaStoreName, false, false));
+    assertFalse(config.shouldUseAlternativePubSubBackend(metaStoreName, true, false));
+    assertFalse(config.shouldUseAlternativePubSubBackend(pushStatusStoreName, false, false));
+    assertFalse(config.shouldUseAlternativePubSubBackend(pushStatusStoreName, true, false));
+    assertFalse(config.shouldUseAlternativePubSubBackend("userStore", false, false));
+    assertFalse(config.shouldUseAlternativePubSubBackend("userStore", true, false));
+  }
+
+  /**
+   * Each row: { configKey, storeName, isRealTime, isHybridStore }.
+   * Setting only that one flag to {@code true} must enable exactly the matching topic type
+   * and leave the orthogonal topic type (RT vs VT flip) disabled.
+   */
+  @DataProvider(name = "alternativeBackendFlagCases")
+  public Object[][] alternativeBackendFlagCases() {
+    String metaStore = VeniceSystemStoreType.META_STORE.getSystemStoreName("MY_STORE");
+    String pushStatusStore = VeniceSystemStoreType.DAVINCI_PUSH_STATUS_STORE.getSystemStoreName("MY_STORE");
+    return new Object[][] { { CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_META_SYSTEM_STORE_VT, metaStore, false, false },
+        { CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_META_SYSTEM_STORE_RT, metaStore, true, false },
+        { CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_PUSH_STATUS_SYSTEM_STORE_VT, pushStatusStore, false, false },
+        { CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_PUSH_STATUS_SYSTEM_STORE_RT, pushStatusStore, true, false },
+        { CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_BATCH_USER_STORE_VT, "userStore", false, false },
+        { CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_HYBRID_USER_STORE_VT, "userStore", false, true },
+        { CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_HYBRID_USER_STORE_RT, "userStore", true, true }, };
+  }
+
+  @Test(dataProvider = "alternativeBackendFlagCases")
+  public void testShouldUseAlternativePubSubBackend_SingleFlagEnabled(
+      String configKey,
+      String storeName,
+      boolean isRealTime,
+      boolean isHybridStore) {
+    Properties baseProps = getBaseSingleRegionProperties(false);
+    baseProps.put(configKey, "true");
+    VeniceControllerClusterConfig config = new VeniceControllerClusterConfig(new VeniceProperties(baseProps));
+
+    // The matching topic type must be enabled
+    assertTrue(config.shouldUseAlternativePubSubBackend(storeName, isRealTime, isHybridStore));
+    // Flipping RT vs VT must not be enabled (flag isolation)
+    assertFalse(config.shouldUseAlternativePubSubBackend(storeName, !isRealTime, isHybridStore));
+    // For user store VTs, flipping batch vs hybrid must not be enabled (isHybridStore is ignored for system stores)
+    if (!isRealTime && VeniceSystemStoreType.getSystemStoreType(storeName) == null) {
+      assertFalse(config.shouldUseAlternativePubSubBackend(storeName, false, !isHybridStore));
+    }
+  }
+
+  @Test
+  public void testShouldUseAlternativePubSubBackend_AllFlag() {
+    // all=true enables every topic type; specific flags can still selectively disable
+    Properties baseProps = getBaseSingleRegionProperties(false);
+    baseProps.put(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_ALL, "true");
+    VeniceControllerClusterConfig config = new VeniceControllerClusterConfig(new VeniceProperties(baseProps));
+
+    String metaStoreName = VeniceSystemStoreType.META_STORE.getSystemStoreName("MY_STORE");
+    String pushStatusStoreName = VeniceSystemStoreType.DAVINCI_PUSH_STATUS_STORE.getSystemStoreName("MY_STORE");
+    assertTrue(config.shouldUseAlternativePubSubBackend(metaStoreName, false, false));
+    assertTrue(config.shouldUseAlternativePubSubBackend(metaStoreName, true, false));
+    assertTrue(config.shouldUseAlternativePubSubBackend(pushStatusStoreName, false, false));
+    assertTrue(config.shouldUseAlternativePubSubBackend(pushStatusStoreName, true, false));
+    assertTrue(config.shouldUseAlternativePubSubBackend("userStore", false, false));
+    assertTrue(config.shouldUseAlternativePubSubBackend("userStore", false, true));
+    assertTrue(config.shouldUseAlternativePubSubBackend("userStore", true, true));
+
+    // Specific flag can override all=true back to false
+    baseProps.put(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_HYBRID_USER_STORE_VT, "false");
+    VeniceControllerClusterConfig config2 = new VeniceControllerClusterConfig(new VeniceProperties(baseProps));
+    assertTrue(config2.shouldUseAlternativePubSubBackend("userStore", false, false));
+    assertFalse(config2.shouldUseAlternativePubSubBackend("userStore", false, true));
+    assertTrue(config2.shouldUseAlternativePubSubBackend("userStore", true, true));
+  }
+
+  @Test
+  public void testShouldUseAlternativePubSubBackend_ExclusionList() {
+    Properties baseProps = getBaseSingleRegionProperties(false);
+    baseProps.put(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_HYBRID_USER_STORE_RT, "true");
+    baseProps.put(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_EXCLUSION_LIST, "excludedStore,anotherExcluded");
+    VeniceControllerClusterConfig config = new VeniceControllerClusterConfig(new VeniceProperties(baseProps));
+
+    // Excluded store should return false even though user store RT is enabled
+    assertFalse(config.shouldUseAlternativePubSubBackend("excludedStore", true, false));
+    // Non-excluded store should still work
+    assertTrue(config.shouldUseAlternativePubSubBackend("notExcluded", true, false));
+
+    // Excluding a user store should NOT affect its system stores
+    Properties baseProps2 = getBaseSingleRegionProperties(false);
+    baseProps2.put(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_META_SYSTEM_STORE_VT, "true");
+    baseProps2.put(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_EXCLUSION_LIST, "excludedStore");
+    VeniceControllerClusterConfig config2 = new VeniceControllerClusterConfig(new VeniceProperties(baseProps2));
+
+    String metaStoreOfExcluded = VeniceSystemStoreType.META_STORE.getSystemStoreName("excludedStore");
+    String metaStoreOfAllowed = VeniceSystemStoreType.META_STORE.getSystemStoreName("allowedStore");
+    // System store is not in the exclusion list, so it should still use alternative backend
+    assertTrue(config2.shouldUseAlternativePubSubBackend(metaStoreOfExcluded, false, false));
+    assertTrue(config2.shouldUseAlternativePubSubBackend(metaStoreOfAllowed, false, false));
+    // The user store itself should be excluded
+    assertFalse(config2.shouldUseAlternativePubSubBackend("excludedStore", false, false));
+  }
+
+  @Test
+  public void testShouldUseAlternativePubSubBackend_InclusionList() {
+    // Inclusion list forces the alternative backend on for matched stores even when the per-topic-type flag is off.
+    Properties baseProps = getBaseSingleRegionProperties(false);
+    baseProps.put(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_INCLUSION_LIST, "includedStore, anotherIncluded");
+    VeniceControllerClusterConfig config = new VeniceControllerClusterConfig(new VeniceProperties(baseProps));
+
+    // Batch and hybrid user-store VTs are disabled by default, but the included store is forced on for both.
+    assertTrue(config.shouldUseAlternativePubSubBackend("includedStore", false, false));
+    assertTrue(config.shouldUseAlternativePubSubBackend("includedStore", false, true));
+    assertTrue(config.shouldUseAlternativePubSubBackend("anotherIncluded", true, true));
+    // A store not in the inclusion list still follows the (disabled) per-topic-type flags.
+    assertFalse(config.shouldUseAlternativePubSubBackend("notIncluded", false, false));
+  }
+
+  @Test
+  public void testShouldUseAlternativePubSubBackend_ExclusionOverridesInclusion() {
+    // Exclusion (deny) takes precedence over inclusion (force on) for the same store.
+    Properties baseProps = getBaseSingleRegionProperties(false);
+    baseProps.put(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_INCLUSION_LIST, "bothLists");
+    baseProps.put(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_EXCLUSION_LIST, "bothLists");
+    VeniceControllerClusterConfig config = new VeniceControllerClusterConfig(new VeniceProperties(baseProps));
+    assertFalse(config.shouldUseAlternativePubSubBackend("bothLists", false, false));
+    assertFalse(config.shouldUseAlternativePubSubBackend("bothLists", false, true));
+  }
+
+  @Test
+  public void testShouldUseAlternativePubSubBackend_BatchJobHeartbeatStore() {
+    // The batch-job-heartbeat system store must route through its own topic type, not the user-store batch/hybrid
+    // config. Enabling the user-store batch VT flag alone must NOT enable the heartbeat store's VT.
+    // The batch-job-heartbeat system store is a non-per-user shared store whose full name is its prefix.
+    String heartbeatStore = VeniceSystemStoreType.BATCH_JOB_HEARTBEAT_STORE.getPrefix();
+    Properties userBatchOnly = getBaseSingleRegionProperties(false);
+    userBatchOnly.put(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_BATCH_USER_STORE_VT, "true");
+    VeniceControllerClusterConfig config = new VeniceControllerClusterConfig(new VeniceProperties(userBatchOnly));
+    assertFalse(config.shouldUseAlternativePubSubBackend(heartbeatStore, false, false));
+    assertFalse(config.shouldUseAlternativePubSubBackend(heartbeatStore, true, false));
+
+    // Enabling the dedicated heartbeat flags routes only that store.
+    Properties heartbeatOn = getBaseSingleRegionProperties(false);
+    heartbeatOn.put(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_BATCH_JOB_HEARTBEAT_STORE_VT, "true");
+    VeniceControllerClusterConfig config2 = new VeniceControllerClusterConfig(new VeniceProperties(heartbeatOn));
+    assertTrue(config2.shouldUseAlternativePubSubBackend(heartbeatStore, false, false));
+    assertFalse(config2.shouldUseAlternativePubSubBackend(heartbeatStore, true, false));
+    // A user store must not be affected by the heartbeat flag.
+    assertFalse(config2.shouldUseAlternativePubSubBackend("userStore", false, false));
+
+    // Symmetric case: enabling only the heartbeat RT flag routes the heartbeat RT while its VT stays disabled.
+    Properties heartbeatRtOn = getBaseSingleRegionProperties(false);
+    heartbeatRtOn.put(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_BATCH_JOB_HEARTBEAT_STORE_RT, "true");
+    VeniceControllerClusterConfig config3 = new VeniceControllerClusterConfig(new VeniceProperties(heartbeatRtOn));
+    assertTrue(config3.shouldUseAlternativePubSubBackend(heartbeatStore, true, false));
+    assertFalse(config3.shouldUseAlternativePubSubBackend(heartbeatStore, false, false));
+    // A user store must not be affected by the heartbeat RT flag.
+    assertFalse(config3.shouldUseAlternativePubSubBackend("userStore", true, false));
+  }
+
+  @Test
+  public void testShouldUseAlternativePubSubBackend_ListEntriesAreTrimmedAndEmptiesDropped() {
+    // Leading/trailing whitespace around entries (and stray empty entries) must not cause silent match failures.
+    Properties baseProps = getBaseSingleRegionProperties(false);
+    baseProps.put(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_INCLUSION_LIST, "  includedStore ,, ,  anotherIncluded  ");
+    baseProps.put(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_EXCLUSION_LIST, " excludedStore ,");
+    VeniceControllerClusterConfig config = new VeniceControllerClusterConfig(new VeniceProperties(baseProps));
+
+    // Both inclusion entries match despite surrounding whitespace and the empty tokens between commas.
+    assertTrue(config.shouldUseAlternativePubSubBackend("includedStore", false, false));
+    assertTrue(config.shouldUseAlternativePubSubBackend("anotherIncluded", true, true));
+    // The trailing-comma exclusion entry still matches after trimming.
+    assertFalse(config.shouldUseAlternativePubSubBackend("excludedStore", true, false));
+    // The empty token must not have been added as a matchable (blank) store name.
+    assertFalse(config.shouldUseAlternativePubSubBackend("", false, false));
+  }
+
+  @Test
+  public void testResolveAlternativePubSubBackendTopic_HybridUserStoreVtRoutesToHybridType() {
+    // Regression: a hybrid user store's VT must resolve to HYBRID_USER_STORE_VT (not BATCH_USER_STORE_VT), so that
+    // enabling only batch.user.store.vt does NOT drag hybrid stores' VTs onto the alternative backend.
+    Properties batchVtOn = getBaseSingleRegionProperties(false);
+    batchVtOn.put(CONTROLLER_PUBSUB_ALTERNATIVE_BACKEND_BATCH_USER_STORE_VT, "true");
+    VeniceControllerClusterConfig config = new VeniceControllerClusterConfig(new VeniceProperties(batchVtOn));
+
+    // Batch user store VT (isHybridStore=false) -> alternative backend on.
+    assertEquals(
+        config.resolveAlternativePubSubBackendTopic("userStore", false, false),
+        VeniceControllerClusterConfig.AlternativePubSubBackendTopic.BATCH_USER_STORE_VT);
+    assertTrue(config.shouldUseAlternativePubSubBackend("userStore", false, false));
+
+    // Hybrid user store VT (isHybridStore=true) -> resolves to the hybrid type, which is disabled -> stays off.
+    assertEquals(
+        config.resolveAlternativePubSubBackendTopic("userStore", false, true),
+        VeniceControllerClusterConfig.AlternativePubSubBackendTopic.HYBRID_USER_STORE_VT);
+    assertFalse(config.shouldUseAlternativePubSubBackend("userStore", false, true));
+  }
+
+  @Test
+  public void testUncleanLeaderElectionEnableRTTopicsDefaultIsEmpty() {
+    Properties baseProps = getBaseSingleRegionProperties(false);
+    VeniceControllerClusterConfig config = new VeniceControllerClusterConfig(new VeniceProperties(baseProps));
+    assertFalse(config.getUncleanLeaderElectionEnableRealTimeTopics().isPresent());
+  }
+
+  @Test
+  public void testUncleanLeaderElectionEnableRTTopicsSetToFalse() {
+    Properties baseProps = getBaseSingleRegionProperties(false);
+    baseProps.put(KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE_RT_TOPICS, "false");
+    VeniceControllerClusterConfig config = new VeniceControllerClusterConfig(new VeniceProperties(baseProps));
+    assertTrue(config.getUncleanLeaderElectionEnableRealTimeTopics().isPresent());
+    assertFalse(config.getUncleanLeaderElectionEnableRealTimeTopics().get());
+  }
+
+  @Test
+  public void testUncleanLeaderElectionEnableRTTopicsSetToTrue() {
+    Properties baseProps = getBaseSingleRegionProperties(false);
+    baseProps.put(KAFKA_UNCLEAN_LEADER_ELECTION_ENABLE_RT_TOPICS, "true");
+    VeniceControllerClusterConfig config = new VeniceControllerClusterConfig(new VeniceProperties(baseProps));
+    assertTrue(config.getUncleanLeaderElectionEnableRealTimeTopics().isPresent());
+    assertTrue(config.getUncleanLeaderElectionEnableRealTimeTopics().get());
+  }
+
+  @Test
+  public void testStateProtocolSchemaStartupRegistrationDefaultsToFalse() {
+    Properties baseProps = getBaseSingleRegionProperties(false);
+    VeniceControllerClusterConfig config = new VeniceControllerClusterConfig(new VeniceProperties(baseProps));
+    assertFalse(config.isStateProtocolSchemaStartupRegistrationEnabled());
+  }
+
+  @Test
+  public void testStateProtocolSchemaStartupRegistrationEnabled() {
+    Properties baseProps = getBaseSingleRegionProperties(false);
+    baseProps.put(ConfigKeys.CONTROLLER_STATE_PROTOCOL_SCHEMA_STARTUP_REGISTRATION_ENABLED, "true");
+    VeniceControllerClusterConfig config = new VeniceControllerClusterConfig(new VeniceProperties(baseProps));
+    assertTrue(config.isStateProtocolSchemaStartupRegistrationEnabled());
+  }
+}

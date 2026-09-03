@@ -3,18 +3,22 @@ package com.linkedin.davinci.store.rocksdb;
 import static com.linkedin.davinci.store.AbstractStorageEngine.METADATA_PARTITION_ID;
 
 import com.linkedin.davinci.callback.BytesStreamingCallback;
-import com.linkedin.davinci.config.VeniceStoreVersionConfig;
 import com.linkedin.davinci.stats.RocksDBMemoryStats;
+import com.linkedin.davinci.store.AbstractStorageIterator;
 import com.linkedin.davinci.store.AbstractStoragePartition;
 import com.linkedin.davinci.store.StoragePartitionConfig;
-import com.linkedin.venice.exceptions.MemoryLimitExhaustedException;
+import com.linkedin.venice.annotation.VisibleForTesting;
+import com.linkedin.venice.exceptions.DiskLimitExhaustedException;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.store.rocksdb.RocksDBUtils;
+import com.linkedin.venice.utils.ConfigCommonUtils.ActivationState;
 import com.linkedin.venice.utils.LatencyUtils;
 import com.linkedin.venice.utils.Utils;
 import java.io.File;
+import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -27,11 +31,13 @@ import java.util.Set;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Supplier;
 import javax.annotation.concurrent.NotThreadSafe;
+import org.apache.commons.io.FileUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.rocksdb.BlockBasedTableConfig;
 import org.rocksdb.ByteBufferGetStatus;
 import org.rocksdb.Cache;
+import org.rocksdb.Checkpoint;
 import org.rocksdb.ColumnFamilyDescriptor;
 import org.rocksdb.ColumnFamilyHandle;
 import org.rocksdb.ColumnFamilyOptions;
@@ -46,7 +52,6 @@ import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
 import org.rocksdb.RocksIterator;
 import org.rocksdb.Slice;
-import org.rocksdb.SstFileManager;
 import org.rocksdb.SstFileWriter;
 import org.rocksdb.Statistics;
 import org.rocksdb.Status;
@@ -65,13 +70,8 @@ import org.rocksdb.WriteOptions;
 @NotThreadSafe
 public class RocksDBStoragePartition extends AbstractStoragePartition {
   private static final Logger LOGGER = LogManager.getLogger(RocksDBStoragePartition.class);
-  private static final String ROCKSDB_ERROR_MESSAGE_FOR_RUNNING_OUT_OF_SPACE_QUOTA = "Max allowed space was reached";
+  protected static final String ROCKSDB_ERROR_MESSAGE_FOR_RUNNING_OUT_OF_DISK_QUOTA = "No space left on device";
   protected static final ReadOptions READ_OPTIONS_DEFAULT = new ReadOptions();
-  /**
-   * Async IO will speed up the lookup for multi-get with posix file system.
-   * https://rocksdb.org/blog/2022/10/07/asynchronous-io-in-rocksdb.html
-   */
-  protected static final ReadOptions READ_OPTIONS_WITH_ASYNC_IO = new ReadOptions().setAsyncIo(true);
   static final byte[] REPLICATION_METADATA_COLUMN_FAMILY = "timestamp_metadata".getBytes();
 
   private static final FlushOptions WAIT_FOR_FLUSH_OPTIONS = new FlushOptions().setWaitForFlush(true);
@@ -81,15 +81,16 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
    * to avoid data loss during recovery.
    */
   protected final WriteOptions writeOptions;
+  protected final ReadOptions iteratorReadOptions;
   private final String fullPathForTempSSTFileDir;
-  private final String fullPathForTempSnapshotFileDir;
+  private final String fullPathForPartitionDBSnapshot;
 
   private final EnvOptions envOptions;
 
   protected final String replicaId;
   protected final String storeName;
   protected final String storeNameAndVersion;
-  protected final boolean blobTransferEnabled;
+  protected final int storeVersion;
   protected final int partitionId;
   private final String fullPathForPartitionDB;
 
@@ -119,7 +120,24 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
    *
    */
   private final Options options;
-  protected RocksDB rocksDB;
+
+  /**
+   * The RocksDB JNI handle. Private to enforce lifecycle safety and prevent use-after-free crashes.
+   *
+   * <p><b>DO NOT make this field protected or public.</b> Direct access to this handle without proper
+   * lifecycle guards causes JVM crashes (SIGSEGV) when the native handle is freed by {@link #close()}
+   * or {@link #reopen()} while another thread is using it.
+   *
+   * <p>For read operations: use {@link #withOpenDatabase(RocksDBOperation)} which acquires
+   * {@link #readCloseRWLock} and verifies the DB is still open before executing.
+   *
+   * <p>For synchronized write operations: use {@link #withSynchronizedDatabase(RocksDBOperation)}
+   * which acquires the partition monitor and checks the DB is still open.
+   *
+   * <p>Direct access is only permitted within this class, and only in tightly controlled lifecycle code
+   * paths such as construction/initialization, {@link #close()}, and {@link #reopen()}.
+   */
+  private RocksDB rocksDB;
   private final RocksDBServerConfig rocksDBServerConfig;
   private final RocksDBStorageEngineFactory factory;
   private final RocksDBThrottler rocksDBThrottler;
@@ -136,8 +154,10 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
    */
   protected final boolean readOnly;
   protected final boolean writeOnly;
+  protected final boolean blobTransferInProgress;
   protected final boolean readWriteLeaderForDefaultCF;
   protected final boolean readWriteLeaderForRMDCF;
+  protected final ActivationState blobDbEnabled;
 
   private final Optional<Statistics> aggStatistics;
   private final RocksDBMemoryStats rocksDBMemoryStats;
@@ -163,17 +183,18 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
       RocksDBMemoryStats rocksDBMemoryStats,
       RocksDBThrottler rocksDbThrottler,
       RocksDBServerConfig rocksDBServerConfig,
-      List<byte[]> columnFamilyNameList,
-      VeniceStoreVersionConfig storeConfig) {
+      List<byte[]> columnFamilyNameList) {
     super(storagePartitionConfig.getPartitionId());
     this.factory = factory;
     this.rocksDBServerConfig = rocksDBServerConfig;
     this.storeNameAndVersion = storagePartitionConfig.getStoreName();
     this.storeName = Version.parseStoreFromVersionTopic(storeNameAndVersion);
+    this.storeVersion = Version.parseVersionFromVersionTopicPartition(storeNameAndVersion);
     this.partitionId = storagePartitionConfig.getPartitionId();
     this.replicaId = Utils.getReplicaId(storagePartitionConfig.getStoreName(), partitionId);
+    this.fullPathForPartitionDB = RocksDBUtils.composePartitionDbDir(dbDir, storeNameAndVersion, partitionId);
+    List<byte[]> columnFamilyNamesToOpen = getColumnFamilyNamesToOpen(columnFamilyNameList);
     this.aggStatistics = factory.getAggStatistics();
-    this.blobTransferEnabled = storeConfig.isBlobTransferEnabled();
 
     // If writing to offset metadata partition METADATA_PARTITION_ID enable WAL write to sync up offset on server
     // restart,
@@ -184,10 +205,22 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
     // if WAL is disabled then all ingestion progress made would be lost in case of non-graceful shutdown of server.
     this.writeOptions = new WriteOptions().setDisableWAL(this.partitionId != METADATA_PARTITION_ID);
 
-    // For multiple column family enable atomic flush
-    if (columnFamilyNameList.size() > 1 && rocksDBServerConfig.isAtomicFlushEnabled()) {
-      options.setAtomicFlush(true);
-    }
+    this.iteratorReadOptions = new ReadOptions().setReadaheadSize(rocksDBServerConfig.getIteratorReadAheadSizeInBytes())
+        /*
+         * Setting this to false prevents data blocks accessed during iteration from being pinned in memory,
+         * allowing them to be evicted from the block cache and saving memory.
+         */
+        .setPinData(false)
+        /*
+         * Setting this to false disables caching of blocks loaded by the iterator in the block cache,
+         * reducing memory usage and eliminating the eviction costs in the LRU block cache.
+         */
+        .setFillCache(false)
+        /*
+         * Setting this to true, allows for iterator cleanup operations to be performed asynchronously leading to
+         * faster iterator closing times.
+         */
+        .setBackgroundPurgeOnIteratorCleanup(true);
 
     if (options.tableFormatConfig() instanceof PlainTableConfig) {
       this.deferredWrite = false;
@@ -196,9 +229,10 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
     }
     this.readOnly = storagePartitionConfig.isReadOnly();
     this.writeOnly = storagePartitionConfig.isWriteOnlyConfig();
+    this.blobTransferInProgress = storagePartitionConfig.isBlobTransferInProgress();
     this.readWriteLeaderForDefaultCF = storagePartitionConfig.isReadWriteLeaderForDefaultCF();
     this.readWriteLeaderForRMDCF = storagePartitionConfig.isReadWriteLeaderForRMDCF();
-    this.fullPathForPartitionDB = RocksDBUtils.composePartitionDbDir(dbDir, storeNameAndVersion, partitionId);
+    this.blobDbEnabled = storagePartitionConfig.getBlobDbEnabled();
     this.options = options;
     /**
      * TODO: check whether we should tune any config with {@link EnvOptions}.
@@ -210,8 +244,12 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
     this.expectedChecksumSupplier = Optional.empty();
     this.rocksDBThrottler = rocksDbThrottler;
     this.fullPathForTempSSTFileDir = RocksDBUtils.composeTempSSTFileDir(dbDir, storeNameAndVersion, partitionId);
-    this.fullPathForTempSnapshotFileDir =
-        blobTransferEnabled ? RocksDBUtils.composeSnapshotDir(dbDir, storeNameAndVersion, partitionId) : null;
+    this.fullPathForPartitionDBSnapshot = RocksDBUtils.composeSnapshotDir(dbDir, storeNameAndVersion, partitionId);
+
+    // For multiple column family enable atomic flush
+    if (columnFamilyNamesToOpen.size() > 1 && rocksDBServerConfig.isAtomicFlushEnabled()) {
+      options.setAtomicFlush(true);
+    }
 
     if (deferredWrite) {
       this.rocksDBSstFileWriter = new RocksDBSstFileWriter(
@@ -222,8 +260,7 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
           options,
           fullPathForTempSSTFileDir,
           false,
-          rocksDBServerConfig,
-          blobTransferEnabled);
+          rocksDBServerConfig);
     }
 
     /**
@@ -231,44 +268,36 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
      * may be applied if we are sure replicationMetadata column family is smaller in size.
      */
     ColumnFamilyOptions columnFamilyOptions;
-    for (byte[] name: columnFamilyNameList) {
-      if (name == REPLICATION_METADATA_COLUMN_FAMILY && !rocksDBServerConfig.isRocksDBPlainTableFormatEnabled()) {
+    for (byte[] name: columnFamilyNamesToOpen) {
+      if (Arrays.equals(name, REPLICATION_METADATA_COLUMN_FAMILY)
+          && !rocksDBServerConfig.isRocksDBPlainTableFormatEnabled()) {
         columnFamilyOptions = new ColumnFamilyOptions(getStoreOptions(storagePartitionConfig, true));
       } else {
         columnFamilyOptions = new ColumnFamilyOptions(options);
       }
       columnFamilyDescriptors.add(new ColumnFamilyDescriptor(name, columnFamilyOptions));
     }
+
+    if (blobTransferInProgress) {
+      this.rocksDB = null;
+      LOGGER.info("Blob transfer in progress for replica: {}. Skip initializing and opening RocksDB.", replicaId);
+      return;
+    }
+
     /**
      * This new open(ReadOnly)WithColumnFamily API replace original open(ReadOnly) API to reduce code duplication.
      * In the default case, we will only open DEFAULT_COLUMN_FAMILY, which is what old API does internally.
      */
-    Runnable dbOpenRunnable = () -> {
-      try {
-        if (this.readOnly) {
-          this.rocksDB = rocksDbThrottler
-              .openReadOnly(options, fullPathForPartitionDB, columnFamilyDescriptors, columnFamilyHandleList);
-        } else {
-          this.rocksDB =
-              rocksDbThrottler.open(options, fullPathForPartitionDB, columnFamilyDescriptors, columnFamilyHandleList);
-        }
-      } catch (RocksDBException | InterruptedException e) {
-        throw new VeniceException("Failed to open RocksDB for replica: " + replicaId, e);
+    try {
+      if (this.readOnly) {
+        this.rocksDB = rocksDbThrottler
+            .openReadOnly(options, fullPathForPartitionDB, columnFamilyDescriptors, columnFamilyHandleList);
+      } else {
+        this.rocksDB =
+            rocksDbThrottler.open(options, fullPathForPartitionDB, columnFamilyDescriptors, columnFamilyHandleList);
       }
-    };
-    if (factory.enforceMemoryLimit(storeName)) {
-      /**
-       * We need to put a lock when calculating the memory usage since multiple threads can open different databases concurrently.
-       *
-       * {@link SstFileManager} doesn't check the size limit when opening up an existing database,
-       * so this function will do the check manually when opening up any new database.
-       */
-      synchronized (factory) {
-        checkMemoryLimit(factory.getMemoryLimit(), factory.getSstFileManagerForMemoryLimiter(), fullPathForPartitionDB);
-        dbOpenRunnable.run();
-      }
-    } else {
-      dbOpenRunnable.run();
+    } catch (RocksDBException | InterruptedException e) {
+      throw new VeniceException("Failed to open RocksDB for replica: " + replicaId, e);
     }
     registerDBStats();
     LOGGER.info(
@@ -279,14 +308,55 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
         this.deferredWrite ? "deferred write" : "non-deferred write");
   }
 
+  private List<byte[]> getColumnFamilyNamesToOpen(List<byte[]> configuredColumnFamilyNames) {
+    if (!new File(fullPathForPartitionDB, "CURRENT").exists()) {
+      return configuredColumnFamilyNames;
+    }
+
+    List<byte[]> existingColumnFamilyNames;
+    try (Options columnFamilyListingOptions = new Options().setEnv(factory.getEnv())) {
+      existingColumnFamilyNames = RocksDB.listColumnFamilies(columnFamilyListingOptions, fullPathForPartitionDB);
+    } catch (RocksDBException e) {
+      throw new VeniceException("Failed to list RocksDB column families for replica: " + replicaId, e);
+    }
+
+    boolean hasReplicationMetadataColumnFamily = false;
+    for (byte[] columnFamilyName: existingColumnFamilyNames) {
+      if (Arrays.equals(columnFamilyName, REPLICATION_METADATA_COLUMN_FAMILY)) {
+        hasReplicationMetadataColumnFamily = true;
+      } else if (!Arrays.equals(columnFamilyName, RocksDB.DEFAULT_COLUMN_FAMILY)) {
+        throw new VeniceException(
+            "Unsupported RocksDB column family for replica " + replicaId + ": "
+                + new String(columnFamilyName, StandardCharsets.UTF_8));
+      }
+    }
+
+    if (!hasReplicationMetadataColumnFamily
+        || containsColumnFamily(configuredColumnFamilyNames, REPLICATION_METADATA_COLUMN_FAMILY)) {
+      return configuredColumnFamilyNames;
+    }
+
+    List<byte[]> columnFamilyNamesToOpen = new ArrayList<>(configuredColumnFamilyNames);
+    columnFamilyNamesToOpen.add(REPLICATION_METADATA_COLUMN_FAMILY);
+    return columnFamilyNamesToOpen;
+  }
+
+  private boolean containsColumnFamily(List<byte[]> columnFamilyNames, byte[] expectedColumnFamilyName) {
+    for (byte[] columnFamilyName: columnFamilyNames) {
+      if (Arrays.equals(columnFamilyName, expectedColumnFamilyName)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   public RocksDBStoragePartition(
       StoragePartitionConfig storagePartitionConfig,
       RocksDBStorageEngineFactory factory,
       String dbDir,
       RocksDBMemoryStats rocksDBMemoryStats,
       RocksDBThrottler rocksDbThrottler,
-      RocksDBServerConfig rocksDBServerConfig,
-      VeniceStoreVersionConfig storeConfig) {
+      RocksDBServerConfig rocksDBServerConfig) {
     // If not specified, RocksDB inserts values into DEFAULT_COLUMN_FAMILY.
     this(
         storagePartitionConfig,
@@ -295,64 +365,92 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
         rocksDBMemoryStats,
         rocksDbThrottler,
         rocksDBServerConfig,
-        Collections.singletonList(RocksDB.DEFAULT_COLUMN_FAMILY),
-        storeConfig);
-  }
-
-  private void checkMemoryLimit(long memoryLimit, SstFileManager sstFileManager, String dbPath) {
-    if (memoryLimit < 0) {
-      return;
-    }
-
-    /**
-     * Check whether current {@link sstFileManager} is already tracking the sst files in the db path.
-     * Here are the reasons:
-     * 1. Database close won't remove the tracking info from SSTFileManager.
-     * 2. During ingestion, Venice could reopen the database (close and open).
-     */
-    File storeDbDir = new File(dbPath);
-    if (storeDbDir.exists()) {
-      Map<String, Long> trackedSSTFiles = sstFileManager.getTrackedFiles();
-      File[] sstFiles = storeDbDir.listFiles((dir, name) -> name.endsWith(".sst"));
-      if (sstFiles == null) {
-        return;
-      }
-      boolean alreadyTracked = false;
-      long storeSize = 0;
-      for (File sstFile: sstFiles) {
-        if (trackedSSTFiles.containsKey(sstFile.getAbsolutePath())) {
-          alreadyTracked = true;
-        } else if (alreadyTracked) {
-          throw new VeniceException("SSTFileManager tracking files is missing sst file: " + sstFile.getAbsolutePath());
-        }
-        storeSize += sstFile.length();
-      }
-      if (alreadyTracked) {
-        return;
-      }
-      long currentSSTFileUsage = sstFileManager.getTotalSize();
-      if (currentSSTFileUsage + storeSize >= memoryLimit) {
-        throw new MemoryLimitExhaustedException(
-            "Failed to open up RocksDB for replica: " + replicaId + ", memory limit: " + memoryLimit
-                + " and the current memory usage: " + currentSSTFileUsage + ", new store size: " + storeSize);
-      }
-    }
+        Collections.singletonList(RocksDB.DEFAULT_COLUMN_FAMILY));
   }
 
   protected void makeSureRocksDBIsStillOpen() {
-    if (isClosed) {
+    if (rocksDB == null || isClosed) {
       throw new VeniceException(
           "RocksDB has been closed for replica: " + replicaId + ", partition id: " + partitionId
               + ", any further operation is disallowed");
     }
   }
 
-  protected EnvOptions getEnvOptions() {
-    return envOptions;
+  /**
+   * A function that operates on a RocksDB handle and returns a result.
+   * May throw {@link RocksDBException} which is caught and wrapped by the caller.
+   */
+  @FunctionalInterface
+  protected interface RocksDBOperation<T> {
+    T execute(RocksDB db) throws RocksDBException;
   }
 
-  protected Boolean getBlobTransferEnabled() {
-    return blobTransferEnabled;
+  /**
+   * A function that operates on a RocksDB handle without returning a result.
+   */
+  @FunctionalInterface
+  protected interface RocksDBVoidOperation {
+    void execute(RocksDB db) throws RocksDBException;
+  }
+
+  /**
+   * Executes a read operation against the RocksDB handle with full lifecycle guards.
+   * Acquires {@link #readCloseRWLock}, verifies DB is open, executes, releases lock.
+   *
+   * <p>This is the primary way to access rocksDB for read/stats operations.
+   * Subclasses should use this for all RocksDB reads.
+   *
+   * @throws VeniceException if the DB is closed or the operation fails
+   */
+  protected <T> T withOpenDatabase(RocksDBOperation<T> operation) {
+    readCloseRWLock.readLock().lock();
+    try {
+      makeSureRocksDBIsStillOpen();
+      return operation.execute(rocksDB);
+    } catch (RocksDBException e) {
+      throw new VeniceException("Failed to perform RocksDB operation for replica: " + replicaId, e);
+    } finally {
+      readCloseRWLock.readLock().unlock();
+    }
+  }
+
+  /** Void variant of {@link #withOpenDatabase(RocksDBOperation)}. */
+  protected void withOpenDatabaseVoid(RocksDBVoidOperation operation) {
+    withOpenDatabase(db -> {
+      operation.execute(db);
+      return null;
+    });
+  }
+
+  /**
+   * Executes a write operation against the RocksDB handle with monitor synchronization.
+   * Acquires this object's monitor, verifies DB is open, then executes.
+   *
+   * <p>Callers are typically already {@code synchronized} — the reentrant monitor
+   * re-entry costs ~1ns (counter increment), which is negligible vs the JNI call.
+   *
+   * @throws VeniceException if the DB is closed or the operation fails
+   */
+  protected synchronized <T> T withSynchronizedDatabase(RocksDBOperation<T> operation) {
+    makeSureRocksDBIsStillOpen();
+    try {
+      return operation.execute(rocksDB);
+    } catch (RocksDBException e) {
+      checkAndThrowDiskLimitException(e);
+      throw new VeniceException("Failed to perform RocksDB operation for replica: " + replicaId, e);
+    }
+  }
+
+  /** Void variant of {@link #withSynchronizedDatabase(RocksDBOperation)}. */
+  protected void withSynchronizedDatabaseVoid(RocksDBVoidOperation operation) {
+    withSynchronizedDatabase(db -> {
+      operation.execute(db);
+      return null;
+    });
+  }
+
+  protected EnvOptions getEnvOptions() {
+    return envOptions;
   }
 
   protected Options getStoreOptions(StoragePartitionConfig storagePartitionConfig, boolean isRMD) {
@@ -360,11 +458,7 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
 
     options.setEnv(factory.getEnv());
     options.setRateLimiter(factory.getRateLimiter());
-    if (factory.enforceMemoryLimit(storeName)) {
-      options.setSstFileManager(factory.getSstFileManagerForMemoryLimiter());
-    } else {
-      options.setSstFileManager(factory.getSstFileManager());
-    }
+    options.setSstFileManager(factory.getSstFileManager());
     options.setWriteBufferManager(factory.getWriteBufferManager());
 
     options.setCreateIfMissing(true);
@@ -375,6 +469,7 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
     options.setMaxOpenFiles(rocksDBServerConfig.getMaxOpenFiles());
     options.setTargetFileSizeBase(rocksDBServerConfig.getTargetFileSizeInBytes());
     options.setMaxFileOpeningThreads(rocksDBServerConfig.getMaxFileOpeningThreads());
+    options.setMinWriteBufferNumberToMerge(rocksDBServerConfig.getRocksDBMinWriteBufferNumberToMerge());
 
     /**
      * Disable the stat dump threads, which will create excessive threads, which will eventually crash
@@ -405,6 +500,32 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
       tableConfig.setCacheIndexAndFilterBlocks(rocksDBServerConfig.isRocksDBSetCacheIndexAndFilterBlocks());
       tableConfig.setFormatVersion(rocksDBServerConfig.getBlockBaseFormatVersion());
       options.setTableFormatConfig(tableConfig);
+
+      /**
+       * Only enable blob files for block-based format.
+       * Store-level config takes precedence; if not specified, fallback to cluster-level config.
+       */
+      boolean enableBlobFiles;
+      switch (storagePartitionConfig.getBlobDbEnabled()) {
+        case ENABLED:
+          enableBlobFiles = true;
+          break;
+        case DISABLED:
+          enableBlobFiles = false;
+          break;
+        default:
+          // NOT_SPECIFIED - use cluster-level config
+          enableBlobFiles = rocksDBServerConfig.isBlobFilesEnabled();
+      }
+      if (enableBlobFiles) {
+        options.setEnableBlobFiles(true);
+        options.setEnableBlobGarbageCollection(true);
+        options.setMinBlobSize(rocksDBServerConfig.getMinBlobSizeInBytes());
+        options.setBlobFileSize(rocksDBServerConfig.getBlobFileSizeInBytes());
+        options.setBlobGarbageCollectionAgeCutoff(rocksDBServerConfig.getBlobGarbageCollectionAgeCutOff());
+        options.setBlobGarbageCollectionForceThreshold(rocksDBServerConfig.getBlobGarbageCollectionForceThreshold());
+        options.setBlobFileStartingLevel(rocksDBServerConfig.getBlobFileStartingLevel());
+      }
     }
 
     if (storagePartitionConfig.isWriteOnlyConfig()) {
@@ -453,7 +574,7 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
   public boolean checkDatabaseIntegrity(Map<String, String> checkpointedInfo) {
     makeSureRocksDBIsStillOpen();
     if (!deferredWrite) {
-      LOGGER.info("checkDatabaseIntegrity will do nothing since 'deferredWrite' is disabled");
+      LOGGER.debug("checkDatabaseIntegrity is a no-op since 'deferredWrite' is disabled for replica: {}", replicaId);
       return true;
     }
     return rocksDBSstFileWriter.checkDatabaseIntegrity(checkpointedInfo);
@@ -465,7 +586,7 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
       Optional<Supplier<byte[]>> expectedChecksumSupplier) {
     makeSureRocksDBIsStillOpen();
     if (!deferredWrite) {
-      LOGGER.info("'beginBatchWrite' will do nothing since 'deferredWrite' is disabled");
+      LOGGER.debug("beginBatchWrite is a no-op since 'deferredWrite' is disabled for replica: {}", replicaId);
       return;
     }
     rocksDBSstFileWriter.open(checkpointedInfo, expectedChecksumSupplier);
@@ -475,39 +596,32 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
   public synchronized void endBatchWrite() {
     makeSureRocksDBIsStillOpen();
     if (!deferredWrite) {
-      LOGGER.info("'endBatchWrite' will do nothing since 'deferredWrite' is disabled");
+      LOGGER.debug("endBatchWrite is a no-op since 'deferredWrite' is disabled for replica: {}", replicaId);
       return;
     }
-    /**
-     * Sync all the SST files before ingestion.
-     */
+    // Sync all SST files before ingestion to ensure the last SST file is finished.
     sync();
-    /**
-     * Ingest all the generated sst files into RocksDB database.
-     *
-     * Note: this function should be invoked after {@link #sync()} to make sure
-     * the last SST file written is finished.
-     */
-    rocksDBSstFileWriter.ingestSSTFiles(rocksDB, columnFamilyHandleList);
-
-    if (blobTransferEnabled) {
-      createSnapshot();
-    }
+    withSynchronizedDatabaseVoid(db -> rocksDBSstFileWriter.ingestSSTFiles(db, columnFamilyHandleList));
   }
 
   @Override
   public synchronized void createSnapshot() {
-    if (blobTransferEnabled) {
-      rocksDBSstFileWriter.createSnapshot(rocksDB);
-    }
+    makeSureRocksDBIsStillOpen();
+    withSynchronizedDatabaseVoid(db -> createSnapshot(db, fullPathForPartitionDBSnapshot, replicaId));
   }
 
-  private void checkAndThrowMemoryLimitException(RocksDBException e) {
-    if (e.getMessage().contains(ROCKSDB_ERROR_MESSAGE_FOR_RUNNING_OUT_OF_SPACE_QUOTA)) {
-      throw new MemoryLimitExhaustedException(
-          storeNameAndVersion,
-          partitionId,
-          factory.getSstFileManagerForMemoryLimiter().getTotalSize());
+  public boolean isRocksDBPartitionBlobTransferInProgress() {
+    return blobTransferInProgress;
+  }
+
+  @Override
+  public synchronized void cleanupSnapshot() {
+    cleanupSnapshot(fullPathForPartitionDBSnapshot, replicaId);
+  }
+
+  public void checkAndThrowDiskLimitException(RocksDBException e) {
+    if (e.getMessage().contains(ROCKSDB_ERROR_MESSAGE_FOR_RUNNING_OUT_OF_DISK_QUOTA)) {
+      throw new DiskLimitExhaustedException(storeName, storeVersion, e.getMessage());
     }
   }
 
@@ -516,6 +630,13 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
     put(key, ByteBuffer.wrap(value));
   }
 
+  /**
+   * Stores a key-value pair. Deferred-write mode appends to SST files; otherwise writes directly
+   * to RocksDB via {@link #withSynchronizedDatabaseVoid}.
+   *
+   * @throws DiskLimitExhaustedException if the write fails due to disk quota exhaustion
+   * @throws VeniceException if the database is closed, read-only, or the write fails
+   */
   @Override
   public synchronized void put(byte[] key, ByteBuffer valueBuffer) {
     makeSureRocksDBIsStillOpen();
@@ -523,21 +644,24 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
       throw new VeniceException(
           "Cannot make writes while database is opened in read-only mode for replica: " + replicaId);
     }
+
+    if (!deferredWrite) {
+      withSynchronizedDatabaseVoid(
+          db -> db.put(
+              writeOptions,
+              key,
+              0,
+              key.length,
+              valueBuffer.array(),
+              valueBuffer.position(),
+              valueBuffer.remaining()));
+      return;
+    }
+
     try {
-      if (deferredWrite) {
-        rocksDBSstFileWriter.put(key, valueBuffer);
-      } else {
-        rocksDB.put(
-            writeOptions,
-            key,
-            0,
-            key.length,
-            valueBuffer.array(),
-            valueBuffer.position(),
-            valueBuffer.remaining());
-      }
+      rocksDBSstFileWriter.put(key, valueBuffer);
     } catch (RocksDBException e) {
-      checkAndThrowMemoryLimitException(e);
+      checkAndThrowDiskLimitException(e);
       throw new VeniceException("Failed to store the key/value pair in the RocksDB: " + replicaId, e);
     }
   }
@@ -547,43 +671,63 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
     throw new UnsupportedOperationException("Method not implemented!!");
   }
 
+  /**
+   * @throws VeniceException if the database is closed or the read fails
+   */
   @Override
   public byte[] get(byte[] key) {
-    readCloseRWLock.readLock().lock();
-    try {
-      makeSureRocksDBIsStillOpen();
-      return rocksDB.get(key);
-    } catch (RocksDBException e) {
-      throw new VeniceException("Failed to get value from RocksDB: " + replicaId, e);
-    } finally {
-      readCloseRWLock.readLock().unlock();
-    }
+    return withOpenDatabase(db -> db.get(key));
+  }
+
+  /**
+   * Checks key existence using RocksDB's native {@code keyExists} JNI API.
+   *
+   * <p><b>Current limitations (RocksDB 9.11.2, as of April 2026):</b>
+   * <ul>
+   *   <li>No bloom filter configured for BlockBasedTable in Venice, so {@code KeyMayExist}
+   *       always returns "maybe" — no fast rejection of absent keys.</li>
+   *   <li>For BlobDB stores, the JNI {@code keyExists} internally calls {@code Get()} which
+   *       resolves blob indexes and reads the full blob value, then discards it. No savings
+   *       over {@link #get(byte[])} for BlobDB.</li>
+   *   <li>For non-BlobDB stores, avoids copying value bytes across JNI (uses PinnableSlice
+   *       destroyed C++-side), but the SST data block read still occurs.</li>
+   * </ul>
+   *
+   * <p><b>Upstream RocksDB improvement:</b> PR facebook/rocksdb#14644 adds a {@code DB::KeyExists()}
+   * C++ API that uses {@code GetImpl} with a non-null {@code is_blob_index} pointer to skip blob
+   * file reads entirely. Once merged and Venice upgrades RocksDB, this method will automatically
+   * benefit from blob-skip — making it significantly cheaper for BlobDB stores.
+   */
+  @Override
+  public boolean keyExists(byte[] key) {
+    return withOpenDatabase(db -> db.keyExists(key));
   }
 
   @Override
   public ByteBuffer get(byte[] key, ByteBuffer valueToBePopulated) {
-    readCloseRWLock.readLock().lock();
-    try {
-      makeSureRocksDBIsStillOpen();
-      int size = rocksDB.get(key, valueToBePopulated.array());
+    return withOpenDatabase(db -> {
+      int size = db.get(key, valueToBePopulated.array());
       if (size == RocksDB.NOT_FOUND) {
         return null;
       } else if (size > valueToBePopulated.capacity()) {
         LOGGER.warn(
-            "Reallocating a new ByteBuffer of size {}, previous size was {}",
+            "Reallocating a new ByteBuffer of size {}, previous size was {} for replica: {}",
             size,
-            valueToBePopulated.capacity());
-        valueToBePopulated = ByteBuffer.allocate(size);
-        size = rocksDB.get(key, valueToBePopulated.array());
+            valueToBePopulated.capacity(),
+            replicaId);
+        ByteBuffer reallocated = ByteBuffer.allocate(size);
+        size = db.get(key, reallocated.array());
+        if (size == RocksDB.NOT_FOUND) {
+          return null;
+        }
+        reallocated.position(0);
+        reallocated.limit(size);
+        return reallocated;
       }
       valueToBePopulated.position(0);
       valueToBePopulated.limit(size);
       return valueToBePopulated;
-    } catch (RocksDBException e) {
-      throw new VeniceException("Failed to get value from RocksDB: " + replicaId, e);
-    } finally {
-      readCloseRWLock.readLock().unlock();
-    }
+    });
   }
 
   @Override
@@ -593,44 +737,16 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
 
   @Override
   public byte[] get(ByteBuffer keyBuffer) {
-    readCloseRWLock.readLock().lock();
-    try {
-      makeSureRocksDBIsStillOpen();
-      return rocksDB.get(keyBuffer.array(), keyBuffer.position(), keyBuffer.remaining());
-    } catch (RocksDBException e) {
-      throw new VeniceException("Failed to get value from RocksDB: " + replicaId, e);
-    } finally {
-      readCloseRWLock.readLock().unlock();
-    }
+    return withOpenDatabase(db -> db.get(keyBuffer.array(), keyBuffer.position(), keyBuffer.remaining()));
   }
 
-  protected ReadOptions getReadOptionsForMultiGet() {
-    if (rocksDBServerConfig.isRocksDBPlainTableFormatEnabled() || !rocksDBServerConfig.isReadAsyncIOEanbled()) {
-      return READ_OPTIONS_DEFAULT;
-    }
-    return READ_OPTIONS_WITH_ASYNC_IO;
-  }
-
-  @Override
   public List<byte[]> multiGet(List<byte[]> keys) {
-    readCloseRWLock.readLock().lock();
-    try {
-      makeSureRocksDBIsStillOpen();
-      return rocksDB.multiGetAsList(getReadOptionsForMultiGet(), keys);
-    } catch (RocksDBException e) {
-      throw new VeniceException("Failed to get value from RocksDB: " + replicaId, e);
-    } finally {
-      readCloseRWLock.readLock().unlock();
-    }
+    return withOpenDatabase(db -> db.multiGetAsList(keys));
   }
 
   public List<ByteBuffer> multiGet(List<ByteBuffer> keys, List<ByteBuffer> values) {
-    readCloseRWLock.readLock().lock();
-
-    try {
-      makeSureRocksDBIsStillOpen();
-      List<ByteBufferGetStatus> statusList = rocksDB.multiGetByteBuffers(getReadOptionsForMultiGet(), keys, values);
-
+    return withOpenDatabase(db -> {
+      List<ByteBufferGetStatus> statusList = db.multiGetByteBuffers(keys, values);
       int keyCnt = keys.size();
       int statusCnt = statusList.size();
       int valueCnt = values.size();
@@ -685,11 +801,7 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
       }
 
       return resultList;
-    } catch (RocksDBException e) {
-      throw new VeniceException("Failed to get value from RocksDB: " + replicaId, e);
-    } finally {
-      readCloseRWLock.readLock().unlock();
-    }
+    });
   }
 
   @Override
@@ -698,24 +810,22 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
       throw new VeniceException("Get by key prefix is not supported with RocksDB PlainTable Format.");
     }
 
-    readCloseRWLock.readLock().lock();
     try {
-      makeSureRocksDBIsStillOpen();
-
-      try (ReadOptions readOptions = getReadOptionsForIteration(keyPrefix);
-          RocksIterator iterator = rocksDB.newIterator(readOptions)) {
-        if (keyPrefix == null) {
-          iterator.seekToFirst();
-        } else {
-          iterator.seek(keyPrefix);
+      withOpenDatabaseVoid(db -> {
+        try (ReadOptions readOptions = getReadOptionsForPrefixIteration(keyPrefix);
+            RocksIterator iterator = db.newIterator(readOptions)) {
+          if (keyPrefix == null) {
+            iterator.seekToFirst();
+          } else {
+            iterator.seek(keyPrefix);
+          }
+          while (iterator.isValid()) {
+            callback.onRecordReceived(iterator.key(), iterator.value());
+            iterator.next();
+          }
         }
-        while (iterator.isValid()) {
-          callback.onRecordReceived(iterator.key(), iterator.value());
-          iterator.next();
-        }
-      }
+      });
     } finally {
-      readCloseRWLock.readLock().unlock();
       callback.onCompletion();
     }
   }
@@ -727,7 +837,7 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
     return rocksDBSstFileWriter.validateBatchIngestion();
   }
 
-  private ReadOptions getReadOptionsForIteration(byte[] keyPrefix) {
+  private ReadOptions getReadOptionsForPrefixIteration(byte[] keyPrefix) {
     if (keyPrefix == null) {
       return new ReadOptions();
     } else {
@@ -753,6 +863,12 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
     }
   }
 
+  /**
+   * Deletes a key from RocksDB. Not supported in deferred-write mode.
+   *
+   * @throws DiskLimitExhaustedException if the delete fails due to disk quota exhaustion
+   * @throws VeniceException if the database is closed, read-only, in deferred-write mode, or the delete fails
+   */
   @Override
   public synchronized void delete(byte[] key) {
     makeSureRocksDBIsStillOpen();
@@ -760,47 +876,35 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
       throw new VeniceException(
           "Cannot make deletion while database is opened in read-only mode for replica: " + replicaId);
     }
-    try {
-      if (deferredWrite) {
-        throw new VeniceException("Deletion is unexpected in 'deferredWrite' mode");
-      } else {
-        rocksDB.delete(key);
-      }
-    } catch (RocksDBException e) {
-      checkAndThrowMemoryLimitException(e);
-      throw new VeniceException("Failed to delete entry from RocksDB: " + replicaId, e);
+    if (deferredWrite) {
+      throw new VeniceException("Deletion is unexpected in 'deferredWrite' mode");
     }
+    withSynchronizedDatabaseVoid(db -> db.delete(key));
   }
 
+  /**
+   * Flushes the memtable to disk. In deferred-write mode, syncs the SST file writer instead.
+   *
+   * @throws DiskLimitExhaustedException if the flush fails due to disk quota exhaustion
+   * @throws VeniceException if the database is closed or the flush fails
+   */
   @Override
   public synchronized Map<String, String> sync() {
     makeSureRocksDBIsStillOpen();
     if (!deferredWrite) {
       LOGGER.debug("Flush memtable to disk for RocksDB: {}", replicaId);
-
       if (this.readOnly) {
-        /**
-         * Update the log level to be debug since in some cases (a sync could be triggered after adjusting the storage
-         * engine to be ready-only even there is no write in between), this log is causing confusion.
-         *
-         * And this log is not so important because of the following reasons:
-         * 1. If there is data being writen before 'sync', the write will be rejected with proper exceptional message.
-         * 2. If there is no data being writen before sync, the 'sync' will do nothing.
-         */
-        LOGGER.debug("Unexpected sync in RocksDB read-only mode");
+        LOGGER.debug("Unexpected sync in RocksDB read-only mode for replica: {}", replicaId);
       } else {
-        try {
-          // Since Venice RocksDB database disables WAL, flush will be triggered for every 'sync' to
-          // avoid data loss during crash recovery
-          rocksDB.flush(WAIT_FOR_FLUSH_OPTIONS, columnFamilyHandleList);
-        } catch (RocksDBException e) {
-          checkAndThrowMemoryLimitException(e);
-          throw new VeniceException("Failed to flush memtable to disk for RocksDB: " + replicaId, e);
-        }
+        withSynchronizedDatabaseVoid(db -> db.flush(WAIT_FOR_FLUSH_OPTIONS, columnFamilyHandleList));
       }
       return Collections.emptyMap();
     }
     return rocksDBSstFileWriter.sync();
+  }
+
+  public long getKeyCountEstimate() {
+    return getRocksDBStatValue("rocksdb.estimate-num-keys");
   }
 
   public void deleteFilesInDirectory(String fullPath) {
@@ -810,10 +914,13 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
 
     File dir = new File(fullPath);
     if (dir.exists()) {
-      // Remove the files inside
-      Arrays.stream(dir.list()).forEach(file -> {
+      String[] files = dir.list();
+      if (files == null) {
+        return;
+      }
+      Arrays.stream(files).forEach(file -> {
         if (!(new File(fullPath, file).delete())) {
-          LOGGER.warn("Failed to remove file: {} in dir: {}", file, fullPath);
+          LOGGER.warn("Failed to remove file: {} in dir: {} for replica: {}", file, fullPath, replicaId);
         }
       });
     }
@@ -826,7 +933,7 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
     File dir = new File(fullPath);
     if (dir.exists()) {
       if (!dir.delete()) {
-        LOGGER.warn("Failed to remove dir: {}", fullPath);
+        LOGGER.warn("Failed to remove dir: {} for replica: {}", fullPath, replicaId);
       }
     }
   }
@@ -834,6 +941,13 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
   @Override
   public synchronized void drop() {
     close();
+    /**
+     * To avoid resource leaking, we will clean up all the database files anyway.
+     */
+    // Remove extra SST files first
+    deleteFilesInDirectory(fullPathForTempSSTFileDir);
+    // remove snapshots files
+    deleteFilesInDirectory(fullPathForPartitionDBSnapshot);
     try {
       Options storeOptions = getStoreOptions(new StoragePartitionConfig(storeNameAndVersion, partitionId), false);
       RocksDB.destroyDB(fullPathForPartitionDB, storeOptions);
@@ -841,13 +955,6 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
     } catch (RocksDBException e) {
       LOGGER.error("Failed to destroy DB for replica: {}", replicaId);
     }
-    /**
-     * To avoid resource leaking, we will clean up all the database files anyway.
-     */
-    // Remove extra SST files first
-    deleteFilesInDirectory(fullPathForTempSSTFileDir);
-    // remove snapshots files
-    deleteFilesInDirectory(fullPathForTempSnapshotFileDir);
     // Remove partition directory
     deleteDirectory(fullPathForPartitionDB);
     LOGGER.info("RocksDB for replica:{} was dropped.", replicaId);
@@ -865,7 +972,9 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
     deRegisterDBStats();
     readCloseRWLock.writeLock().lock();
     try {
-      rocksDB.close();
+      if (rocksDB != null) {
+        rocksDB.close();
+      }
     } finally {
       isClosed = true;
       readCloseRWLock.writeLock().unlock();
@@ -908,7 +1017,7 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
       }
       LOGGER.info("Reopened RocksDB for replica: {}", replicaId);
     } catch (Exception e) {
-      throw new VeniceException("Failed to reopen RocksDB for replica: " + replicaId);
+      throw new VeniceException("Failed to reopen RocksDB for replica: " + replicaId, e);
     } finally {
       readCloseRWLock.writeLock().unlock();
     }
@@ -927,27 +1036,11 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
   }
 
   public long getRocksDBStatValue(String statName) {
-    readCloseRWLock.readLock().lock();
-    try {
-      makeSureRocksDBIsStillOpen();
-      return rocksDB.getLongProperty(statName);
-    } catch (RocksDBException e) {
-      throw new VeniceException(
-          "Failed to get property value from RocksDB: " + replicaId + " for property: " + statName,
-          e);
-    } finally {
-      readCloseRWLock.readLock().unlock();
-    }
+    return withOpenDatabase(db -> db.getLongProperty(statName));
   }
 
   public Map<MemoryUsageType, Long> getApproximateMemoryUsageByType(final Set<Cache> caches) {
-    readCloseRWLock.readLock().lock();
-    try {
-      makeSureRocksDBIsStillOpen();
-      return MemoryUtil.getApproximateMemoryUsageByType(Arrays.asList(rocksDB), caches);
-    } finally {
-      readCloseRWLock.readLock().unlock();
-    }
+    return withOpenDatabase(db -> MemoryUtil.getApproximateMemoryUsageByType(Arrays.asList(db), caches));
   }
 
   /**
@@ -973,6 +1066,14 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
       }
     }
 
+    if (blobTransferInProgress != partitionConfig.isBlobTransferInProgress()) {
+      return false;
+    }
+
+    if (blobDbEnabled != partitionConfig.getBlobDbEnabled()) {
+      return false;
+    }
+
     if (options.tableFormatConfig() instanceof BlockBasedTableConfig
         && deferredWrite != partitionConfig.isDeferredWrite()) {
       return false;
@@ -983,17 +1084,18 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
 
   @Override
   public long getPartitionSizeInBytes() {
-    readCloseRWLock.readLock().lock();
-    try {
-      makeSureRocksDBIsStillOpen();
-      return getRocksDBStatValue("rocksdb.live-sst-files-size");
-    } finally {
-      readCloseRWLock.readLock().unlock();
-    }
+    // Each getRocksDBStatValue() call acquires its own read lock independently.
+    // Not atomic across both calls, but acceptable for approximate size stats.
+    return getRocksDBStatValue("rocksdb.live-sst-files-size") + getRocksDBStatValue("rocksdb.live-blob-file-size");
   }
 
   protected Options getOptions() {
     return options;
+  }
+
+  @VisibleForTesting
+  void compactRange() {
+    withOpenDatabaseVoid(RocksDB::compactRange);
   }
 
   // Visible for testing
@@ -1004,5 +1106,71 @@ public class RocksDBStoragePartition extends AbstractStoragePartition {
   // Visible for testing
   public RocksDBSstFileWriter getRocksDBSstFileWriter() {
     return rocksDBSstFileWriter;
+  }
+
+  /**
+   * Returns an iterator over the partition's data. The lifecycle guard only covers iterator
+   * <b>creation</b> — the returned iterator is NOT protected against a concurrent
+   * {@link #close()} or {@link #reopen()}. Callers must ensure the partition remains open
+   * for the iterator's lifetime (e.g., use try-with-resources in a context where close
+   * cannot race). If this method is ever used on a hot path or a long-lived context,
+   * consider wrapping the iterator to validate the DB is still open on each operation.
+   */
+  @Override
+  public AbstractStorageIterator getIterator() {
+    return withOpenDatabase(db -> new RocksDBStorageIterator(db.newIterator(iteratorReadOptions)));
+  }
+
+  /**
+   * Creates a RocksDB checkpoint snapshot, removing any existing snapshot directory first.
+   */
+  public static void createSnapshot(RocksDB rocksDB, String fullPathForPartitionDBSnapshot, String replicaId) {
+    File partitionSnapshotDir = new File(fullPathForPartitionDBSnapshot);
+    if (partitionSnapshotDir.exists()) {
+      LOGGER.info("Deleting existing snapshot at {} for replica: {}", fullPathForPartitionDBSnapshot, replicaId);
+      try {
+        FileUtils.deleteDirectory(partitionSnapshotDir);
+      } catch (IOException e) {
+        throw new VeniceException(
+            "Failed to delete the existing snapshot directory: " + fullPathForPartitionDBSnapshot,
+            e);
+      }
+    }
+
+    try {
+      LOGGER.info("Creating snapshot in directory: {} for replica: {}", fullPathForPartitionDBSnapshot, replicaId);
+      Checkpoint checkpoint = Checkpoint.create(rocksDB);
+      checkpoint.createCheckpoint(fullPathForPartitionDBSnapshot);
+      LOGGER.info(
+          "Finished creating snapshot in directory: {} for replica: {}",
+          fullPathForPartitionDBSnapshot,
+          replicaId);
+    } catch (RocksDBException e) {
+      throw new VeniceException(
+          "Received exception during RocksDB's snapshot creation in directory " + fullPathForPartitionDBSnapshot,
+          e);
+    }
+  }
+
+  public static void cleanupSnapshot(String fullPathForPartitionDBSnapshot, String replicaId) {
+    File partitionSnapshotDir = new File(fullPathForPartitionDBSnapshot);
+    if (partitionSnapshotDir.exists()) {
+      LOGGER.info(
+          "Snapshot directory already exists, deleting old snapshots at {} for replica: {}",
+          fullPathForPartitionDBSnapshot,
+          replicaId);
+      try {
+        FileUtils.deleteDirectory(partitionSnapshotDir);
+      } catch (IOException e) {
+        throw new VeniceException(
+            "Failed to delete the existing snapshot directory: " + fullPathForPartitionDBSnapshot,
+            e);
+      }
+    } else {
+      LOGGER.info(
+          "Snapshot directory does not exist, no need to delete old snapshots at {} for replica: {}",
+          fullPathForPartitionDBSnapshot,
+          replicaId);
+    }
   }
 }

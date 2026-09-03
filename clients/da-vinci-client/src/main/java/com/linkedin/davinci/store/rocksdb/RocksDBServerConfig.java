@@ -3,11 +3,14 @@ package com.linkedin.davinci.store.rocksdb;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.utils.VeniceProperties;
 import java.util.Arrays;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.rocksdb.CompactionStyle;
 import org.rocksdb.CompressionType;
 
 
 public class RocksDBServerConfig {
+  private static final Logger LOGGER = LogManager.getLogger(RocksDBServerConfig.class);
   /**
    * Ability to use direct IO for disk reads, might yield better performance on Azure disks.
    * Also makes caching behavior more consistent, by limiting the caching to only RocksDB.
@@ -95,6 +98,9 @@ public class RocksDBServerConfig {
    * Max memtable count per database;
    */
   public static final String ROCKSDB_MAX_MEMTABLE_COUNT = "rocksdb.max.memtable.count";
+
+  public static final String ROCKSDB_MIN_WRITE_BUFFER_NUMBER_TO_MERGE = "rocksdb.min.write.buffer.number.to.merge";
+
   /**
    * Max total WAL log size per database;
    */
@@ -211,18 +217,59 @@ public class RocksDBServerConfig {
    */
   public static final String ROCKSDB_WRITE_QUOTA_BYTES_PER_SECOND = "rocksdb.write.quota.bytes.per.second";
   public static final String ROCKSDB_AUTO_TUNED_RATE_LIMITER_ENABLED = "rocksdb.auto.tuned.rate.limited.enabled";
+
+  /**
+   * SstFileManager deletion rate limiting configuration.
+   * Check the following links for more details:
+   * https://github.com/facebook/rocksdb/wiki/Managing-Disk-Space-Utilization
+   * This is used to throttle file deletion operations during store cleanup to prevent I/O saturation
+   * Set to 0 to disable throttling.
+   */
+  public static final String ROCKSDB_SST_FILE_MANAGER_DELETE_RATE_BYTES_PER_SECOND =
+      "rocksdb.sst.file.manager.delete.rate.bytes.per.second";
+
+  /**
+   * Maximum trash-to-DB ratio for SstFileManager.
+   * When deletion rate limiting is enabled, this ratio determines when to start deleting files without rate limiting
+   */
+  public static final String ROCKSDB_SST_FILE_MANAGER_MAX_TRASH_DB_RATIO =
+      "rocksdb.sst.file.manager.max.trash.db.ratio";
+
   public static final String ROCKSDB_ATOMIC_FLUSH_ENABLED = "rocksdb.atomic.flush.enabled";
   public static final String ROCKSDB_SEPARATE_RMD_CACHE_ENABLED = "rocksdb.separate.rmd.cache.enabled";
   public static final String ROCKSDB_BLOCK_BASE_FORMAT_VERSION = "rocksdb.block.base.format.version";
-  /**
-   * Whether to enable async io in the read path or not.
-   * https://rocksdb.org/blog/2022/10/07/asynchronous-io-in-rocksdb.html
-   */
-  public static final String ROCKSDB_READ_ASYNC_IO_ENABLED = "rocksdb.read.async.io.enabled";
 
   public static final String ROCKSDB_MAX_LOG_FILE_NUM = "rocksdb.max.log.file.num";
   public static final String ROCKSDB_MAX_LOG_FILE_SIZE = "rocksdb.max.log.file.size";
   public static final String RECORD_TRANSFORMER_VALUE_SCHEMA = "record.transformer.value.schema";
+
+  /**
+   * Check this page to find more details:
+   * https://github.com/facebook/rocksdb/wiki/BlobDB
+   */
+  public static final String ROCKSDB_BLOB_FILES_ENABLED = "rocksdb.blob.files.enabled";
+  public static final String ROCKSDB_MIN_BLOB_SIZE_IN_BYTES = "rocksdb.min.blob.size.in.bytes";
+  public static final String ROCKSDB_BLOB_FILE_SIZE_IN_BYTES = "rocksdb.blob.file.size.in.bytes";
+  public static final String ROCKSDB_BLOB_GARBAGE_COLLECTION_AGE_CUTOFF = "rocksdb.blob.garbage.collection.age.cutoff";
+  public static final String ROCKSDB_BLOB_GARBAGE_COLLECTION_FORCE_THRESHOLD =
+      "rocksdb.blob.garbage.collection.force.threshold";
+  public static final String ROCKSDB_BLOB_FILE_STARTING_LEVEL = "rocksdb.blob.file.starting.level";
+
+  public static final String ROCKSDB_BLOCK_CACHE_MEMORY_LIMIT = "rocksdb.block.cache.memory.limit";
+
+  /**
+   * Check these pages to find more details:
+   * https://github.com/facebook/rocksdb/wiki/Iterator
+   * https://javadoc.io/static/org.rocksdb/rocksdbjni/6.20.3/org/rocksdb/ReadOptions.html
+   */
+
+  /**
+   * When this config is set to a value > 0, the RocksDB iterator will pre-fetch data asynchronously leading to better
+   * iteration performance.
+   * From testing, setting this to a value larger than 2MB doesn't result in any performance gain. Hypothetically, if
+   * the records are large, setting this to a higher number may see noticeable gains.
+   */
+  public static final String ROCKSDB_ITERATOR_READ_AHEAD_SIZE_IN_BYTES = "rocksdb.iterator.read.ahead.size.in.bytes";
 
   private final boolean rocksDBUseDirectReads;
 
@@ -243,6 +290,8 @@ public class RocksDBServerConfig {
 
   private final long rocksDBMemtableSizeInBytes;
   private final int rocksDBMaxMemtableCount;
+
+  private final int rocksDBMinWriteBufferNumberToMerge;
   private final long rocksDBMaxTotalWalSizeInBytes;
 
   private final long rocksDBMaxBytesForLevelBase;
@@ -270,6 +319,9 @@ public class RocksDBServerConfig {
   private final long writeQuotaBytesPerSecond;
   private final boolean autoTunedRateLimiterEnabled;
 
+  private final long sstFileManagerDeleteRateBytesPerSecond;
+  private final double sstFileManagerMaxTrashDBRatio;
+
   private final int level0FileNumCompactionTrigger;
   private final int level0SlowdownWritesTrigger;
   private final int level0StopWritesTrigger;
@@ -289,8 +341,17 @@ public class RocksDBServerConfig {
   private int blockBaseFormatVersion;
   private final int maxLogFileNum;
   private final long maxLogFileSize;
-  private final boolean readAsyncIOEanbled;
   private final String transformerValueSchema;
+
+  private final boolean blobFilesEnabled;
+  private final long minBlobSizeInBytes;
+  private final long blobFileSizeInBytes;
+  private final double blobGarbageCollectionAgeCutOff;
+  private final double blobGarbageCollectionForceThreshold;
+  private final int blobFileStartingLevel;
+  private final double rocksdbBlockCacheMemoryLimit;
+
+  private final long iteratorReadAheadSizeInBytes;
 
   public RocksDBServerConfig(VeniceProperties props) {
     // Do not use Direct IO for reads by default
@@ -335,6 +396,7 @@ public class RocksDBServerConfig {
 
     this.rocksDBMemtableSizeInBytes = props.getSizeInBytes(ROCKSDB_MEMTABLE_SIZE_IN_BYTES, 32 * 1024 * 1024L); // 32MB
     this.rocksDBMaxMemtableCount = props.getInt(ROCKSDB_MAX_MEMTABLE_COUNT, 2);
+    this.rocksDBMinWriteBufferNumberToMerge = props.getInt(ROCKSDB_MIN_WRITE_BUFFER_NUMBER_TO_MERGE, 1);
     /**
      * Default: 0 means letting RocksDB to decide the proper WAL size.
      * Here is the related docs in RocksDB C++ lib:
@@ -381,6 +443,13 @@ public class RocksDBServerConfig {
                                                                                                                     // by
                                                                                                                     // default
     this.autoTunedRateLimiterEnabled = props.getBoolean(ROCKSDB_AUTO_TUNED_RATE_LIMITER_ENABLED, false);
+
+    // 0 means disable the rate limiting for file deletion.
+    this.sstFileManagerDeleteRateBytesPerSecond =
+        props.getSizeInBytes(ROCKSDB_SST_FILE_MANAGER_DELETE_RATE_BYTES_PER_SECOND, 0L);
+    // By default, the ratio is set to 0.25 in the SSTFileManager of RocksDB.
+    this.sstFileManagerMaxTrashDBRatio = props.getDouble(ROCKSDB_SST_FILE_MANAGER_MAX_TRASH_DB_RATIO, 0.25); // 25%
+                                                                                                             // default
     this.level0FileNumCompactionTrigger = props.getInt(ROCKSDB_LEVEL0_FILE_NUM_COMPACTION_TRIGGER, 40);
     this.level0SlowdownWritesTrigger = props.getInt(ROCKSDB_LEVEL0_SLOWDOWN_WRITES_TRIGGER, 60);
     this.level0StopWritesTrigger = props.getInt(ROCKSDB_LEVEL0_STOPS_WRITES_TRIGGER, 80);
@@ -412,9 +481,23 @@ public class RocksDBServerConfig {
      */
     this.maxLogFileNum = props.getInt(ROCKSDB_MAX_LOG_FILE_NUM, 3);
     this.maxLogFileSize = props.getSizeInBytes(ROCKSDB_MAX_LOG_FILE_SIZE, 10 * 1024 * 1024); // 10MB;
-    this.readAsyncIOEanbled = props.getBoolean(ROCKSDB_READ_ASYNC_IO_ENABLED, true);
-    this.transformerValueSchema =
-        props.containsKey(RECORD_TRANSFORMER_VALUE_SCHEMA) ? props.getString(RECORD_TRANSFORMER_VALUE_SCHEMA) : "null";
+    this.transformerValueSchema = props.getString(RECORD_TRANSFORMER_VALUE_SCHEMA, "null");
+
+    /**
+     *  Check this page to find more details:
+     *  https://github.com/facebook/rocksdb/wiki/BlobDB
+     */
+    this.blobFilesEnabled = props.getBoolean(ROCKSDB_BLOB_FILES_ENABLED, false);
+    this.minBlobSizeInBytes = props.getSizeInBytes(ROCKSDB_MIN_BLOB_SIZE_IN_BYTES, 4 * 1024); // default: 4KB
+    this.blobFileSizeInBytes = props.getSizeInBytes(ROCKSDB_BLOB_FILE_SIZE_IN_BYTES, 256 * 1024 * 1024); // default:
+                                                                                                         // 256MB
+    this.blobGarbageCollectionAgeCutOff = props.getDouble(ROCKSDB_BLOB_GARBAGE_COLLECTION_AGE_CUTOFF, 0.25);
+    this.blobGarbageCollectionForceThreshold = props.getDouble(ROCKSDB_BLOB_GARBAGE_COLLECTION_FORCE_THRESHOLD, 0.8);
+    this.blobFileStartingLevel = props.getInt(ROCKSDB_BLOB_FILE_STARTING_LEVEL, 0);
+    this.rocksdbBlockCacheMemoryLimit = props.getDouble(ROCKSDB_BLOCK_CACHE_MEMORY_LIMIT, 0.8);
+
+    this.iteratorReadAheadSizeInBytes =
+        props.getSizeInBytes(ROCKSDB_ITERATOR_READ_AHEAD_SIZE_IN_BYTES, 2 * 1024 * 1024); // default: 2MB
   }
 
   public int getLevel0FileNumCompactionTriggerWriteOnlyVersion() {
@@ -513,6 +596,10 @@ public class RocksDBServerConfig {
     return rocksDBMaxMemtableCount;
   }
 
+  public int getRocksDBMinWriteBufferNumberToMerge() {
+    return rocksDBMinWriteBufferNumberToMerge;
+  }
+
   public long getRocksDBMaxTotalWalSizeInBytes() {
     return rocksDBMaxTotalWalSizeInBytes;
   }
@@ -587,6 +674,14 @@ public class RocksDBServerConfig {
     return autoTunedRateLimiterEnabled;
   }
 
+  public long getSstFileManagerDeleteRateBytesPerSecond() {
+    return sstFileManagerDeleteRateBytesPerSecond;
+  }
+
+  public double getSstFileManagerMaxTrashDBRatio() {
+    return sstFileManagerMaxTrashDBRatio;
+  }
+
   public boolean isPutReuseByteBufferEnabled() {
     return putReuseByteBufferEnabled;
   }
@@ -620,12 +715,39 @@ public class RocksDBServerConfig {
     return maxLogFileSize;
   }
 
-  public boolean isReadAsyncIOEanbled() {
-    return readAsyncIOEanbled;
-  }
-
   public String getTransformerValueSchema() {
     return transformerValueSchema;
   }
 
+  public boolean isBlobFilesEnabled() {
+    return blobFilesEnabled;
+  }
+
+  public long getMinBlobSizeInBytes() {
+    return minBlobSizeInBytes;
+  }
+
+  public long getBlobFileSizeInBytes() {
+    return blobFileSizeInBytes;
+  }
+
+  public double getBlobGarbageCollectionAgeCutOff() {
+    return blobGarbageCollectionAgeCutOff;
+  }
+
+  public double getBlobGarbageCollectionForceThreshold() {
+    return blobGarbageCollectionForceThreshold;
+  }
+
+  public int getBlobFileStartingLevel() {
+    return blobFileStartingLevel;
+  }
+
+  public double getRocksdbBlockCacheMemoryLimit() {
+    return rocksdbBlockCacheMemoryLimit;
+  }
+
+  public long getIteratorReadAheadSizeInBytes() {
+    return iteratorReadAheadSizeInBytes;
+  }
 }

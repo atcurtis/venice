@@ -1,19 +1,26 @@
 package com.linkedin.davinci.storage;
 
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.linkedin.davinci.config.VeniceClusterConfig;
 import com.linkedin.davinci.config.VeniceConfigLoader;
 import com.linkedin.davinci.config.VeniceServerConfig;
 import com.linkedin.davinci.config.VeniceStoreVersionConfig;
 import com.linkedin.davinci.stats.AggVersionedStorageEngineStats;
 import com.linkedin.davinci.stats.RocksDBMemoryStats;
-import com.linkedin.davinci.store.AbstractStorageEngine;
+import com.linkedin.davinci.store.StorageEngine;
 import com.linkedin.davinci.store.StorageEngineFactory;
 import com.linkedin.venice.exceptions.VeniceNoStoreException;
+import com.linkedin.venice.helix.SafeHelixDataAccessor;
+import com.linkedin.venice.helix.SafeHelixManager;
 import com.linkedin.venice.kafka.protocol.state.PartitionState;
 import com.linkedin.venice.kafka.protocol.state.StoreVersionState;
 import com.linkedin.venice.meta.PartitionerConfig;
@@ -23,13 +30,22 @@ import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.serialization.avro.InternalAvroSpecificSerializer;
 import com.linkedin.venice.utils.Utils;
+import java.lang.reflect.Field;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import org.apache.helix.PropertyKey;
+import org.apache.helix.model.IdealState;
+import org.apache.helix.zookeeper.datamodel.ZNRecord;
+import org.mockito.ArgumentCaptor;
 import org.mockito.internal.util.collections.Sets;
+import org.mockito.invocation.InvocationOnMock;
+import org.mockito.stubbing.Answer;
 import org.testng.Assert;
 import org.testng.annotations.Test;
 
@@ -95,7 +111,7 @@ public class StorageServiceTest {
 
     when(configLoader.getStoreConfig(eq(resourceName), eq(PersistenceType.BLACK_HOLE))).thenReturn(storeVersionConfig);
 
-    AbstractStorageEngine mockStorageEngine = mock(AbstractStorageEngine.class);
+    StorageEngine mockStorageEngine = mock(StorageEngine.class);
     when(mockStorageEngineFactory.getStorageEngine(storeVersionConfig, false)).thenReturn(mockStorageEngine);
     Set<Integer> partitionSet = new HashSet<>(Arrays.asList(1, 2, 3));
     when(mockStorageEngine.getPersistedPartitionIds()).thenReturn(partitionSet);
@@ -120,5 +136,256 @@ public class StorageServiceTest {
     Map<String, Set<Integer>> expectedMapping = new HashMap<>();
     expectedMapping.put(resourceName, partitionSet);
     Assert.assertEquals(storageService.getStoreAndUserPartitionsMapping(), expectedMapping);
+  }
+
+  @Test
+  public void testCheckWhetherStoragePartitionsShouldBeKeptOrNot() throws NoSuchFieldException, IllegalAccessException {
+    // TODO: Make this into a real StorageService, rather than a mock, and tear down all the reflection stuff below...
+    StorageService mockStorageService = mock(StorageService.class);
+    SafeHelixManager manager = mock(SafeHelixManager.class);
+    StorageEngine storageEngine = mock(StorageEngine.class);
+
+    String resourceName = "test_store_v1";
+
+    when(storageEngine.getStoreVersionName()).thenReturn(resourceName);
+
+    String clusterName = "test_cluster";
+    VeniceConfigLoader mockVeniceConfigLoader = mock(VeniceConfigLoader.class);
+    VeniceClusterConfig mockClusterConfig = mock(VeniceClusterConfig.class);
+    when(mockVeniceConfigLoader.getVeniceClusterConfig()).thenReturn(mockClusterConfig);
+    when(mockVeniceConfigLoader.getVeniceClusterConfig().getClusterName()).thenReturn(clusterName);
+
+    List<StorageEngine> localStorageEngines = new ArrayList<>();
+    localStorageEngines.add(storageEngine);
+
+    SafeHelixDataAccessor helixDataAccessor = mock(SafeHelixDataAccessor.class);
+    when(manager.getHelixDataAccessor()).thenReturn(helixDataAccessor);
+    IdealState idealState = mock(IdealState.class);
+    when(helixDataAccessor.getProperty((PropertyKey) any())).thenReturn(idealState);
+    ZNRecord record = new ZNRecord("testId");
+    Map<String, Map<String, String>> mapFields = new HashMap<>();
+    Map<String, String> testPartitionZero = new HashMap<>();
+    Map<String, String> testPartitionOne = new HashMap<>();
+    testPartitionZero.put("host_1430", "LEADER");
+    testPartitionZero.put("host_1435", "STANDBY");
+    testPartitionZero.put("host_1440", "STANDBY");
+    testPartitionOne.put("host_1520", "LEADER");
+    testPartitionOne.put("host_1525", "STANDBY");
+    testPartitionOne.put("host_1530", "STANDBY");
+    mapFields.put("test_store_v1_0", testPartitionZero);
+    mapFields.put("test_store_v1_1", testPartitionOne);
+    record.setMapFields(mapFields);
+
+    Map<String, List<String>> listFields = new HashMap<>();
+    List<String> testPartitionZeroHostList = new ArrayList<>();
+    testPartitionZeroHostList.add("host_1430");
+    testPartitionZeroHostList.add("host_1435");
+    testPartitionZeroHostList.add("host_1440");
+    List<String> testPartitionOneHostList = new ArrayList<>();
+    testPartitionOneHostList.add("host_1520");
+    testPartitionOneHostList.add("host_1525");
+    testPartitionOneHostList.add("host_1530");
+    listFields.put("test_store_v1_0", testPartitionZeroHostList);
+    listFields.put("test_store_v1_1", testPartitionOneHostList);
+    record.setListFields(listFields);
+
+    when(idealState.getRecord()).thenReturn(record);
+    when(manager.getInstanceName()).thenReturn("host_1520");
+
+    Set<Integer> partitionSet = new HashSet<>(Arrays.asList(0, 1));
+    when(storageEngine.getPartitionIds()).thenReturn(partitionSet);
+    doAnswer(new Answer() {
+      @Override
+      public Object answer(InvocationOnMock invocation) throws Throwable {
+        int partitionId = invocation.getArgument(0);
+        storageEngine.getPartitionIds().remove(partitionId);
+        return null;
+      }
+    }).when(storageEngine).dropPartition(anyInt());
+
+    when(mockStorageService.getStorageEngineRepository()).thenReturn(mock(StorageEngineRepository.class));
+    when(mockStorageService.getStorageEngineRepository().getAllLocalStorageEngines()).thenReturn(localStorageEngines);
+    Field configLoaderField = StorageService.class.getDeclaredField("configLoader");
+    configLoaderField.setAccessible(true);
+    configLoaderField.set(mockStorageService, mockVeniceConfigLoader);
+
+    VeniceServerConfig mockServerConfig = mock(VeniceServerConfig.class);
+    when(mockServerConfig.isDeleteUnassignedPartitionsOnStartupEnabled()).thenReturn(true);
+    Field serverConfigField = StorageService.class.getDeclaredField("serverConfig");
+    serverConfigField.setAccessible(true);
+    serverConfigField.set(mockStorageService, mockServerConfig);
+
+    doCallRealMethod().when(mockStorageService).checkWhetherStoragePartitionsShouldBeKeptOrNot(manager);
+    mockStorageService.checkWhetherStoragePartitionsShouldBeKeptOrNot(manager);
+    verify(storageEngine).dropPartition(0);
+    Assert.assertFalse(storageEngine.getPartitionIds().contains(0));
+  }
+
+  /**
+   * Helper to build a StorageService with a controllable mock factory for RocksDB persistence type,
+   * used by the isReplicationMetadataEnabled tests.
+   */
+  private StorageService createStorageServiceForRmdTest(
+      ReadOnlyStoreRepository mockStoreRepo,
+      VeniceServerConfig mockServerConfig,
+      StorageEngineFactory mockFactory,
+      VeniceStoreVersionConfig mockStoreVersionConfig) {
+    VeniceConfigLoader configLoader = mock(VeniceConfigLoader.class);
+    when(configLoader.getVeniceServerConfig()).thenReturn(mockServerConfig);
+    when(mockServerConfig.getDataBasePath()).thenReturn("/tmp");
+
+    AggVersionedStorageEngineStats storageEngineStats = mock(AggVersionedStorageEngineStats.class);
+    RocksDBMemoryStats rocksDBMemoryStats = mock(RocksDBMemoryStats.class);
+    InternalAvroSpecificSerializer<StoreVersionState> storeVersionStateSerializer =
+        mock(InternalAvroSpecificSerializer.class);
+    InternalAvroSpecificSerializer<PartitionState> partitionStateSerializer =
+        mock(InternalAvroSpecificSerializer.class);
+
+    when(mockFactory.getPersistenceType()).thenReturn(PersistenceType.ROCKS_DB);
+    when(mockFactory.getPersistedStoreNames()).thenReturn(new HashSet<>());
+
+    Map<PersistenceType, StorageEngineFactory> factoryMap = new HashMap<>();
+    factoryMap.put(PersistenceType.ROCKS_DB, mockFactory);
+
+    return new StorageService(
+        configLoader,
+        storageEngineStats,
+        rocksDBMemoryStats,
+        storeVersionStateSerializer,
+        partitionStateSerializer,
+        mockStoreRepo,
+        false,
+        false,
+        (s) -> true,
+        Optional.of(factoryMap));
+  }
+
+  /**
+   * Tests the happy path: version metadata is available immediately, and the version-level
+   * AA config is used to determine whether RMD is enabled.
+   */
+  @Test
+  public void testIsReplicationMetadataEnabledHappyPath() {
+    String testStore = "test_rmd_store";
+    int versionNum = 1;
+    String topicName = Version.composeKafkaTopic(testStore, versionNum);
+
+    Version mockVersion = mock(Version.class);
+    when(mockVersion.isActiveActiveReplicationEnabled()).thenReturn(true);
+
+    Store mockStore = mock(Store.class);
+    when(mockStore.getVersion(versionNum)).thenReturn(mockVersion);
+
+    ReadOnlyStoreRepository mockStoreRepo = mock(ReadOnlyStoreRepository.class);
+    when(mockStoreRepo.getStoreOrThrow(testStore)).thenReturn(mockStore);
+
+    VeniceServerConfig mockServerConfig = mock(VeniceServerConfig.class);
+    when(mockServerConfig.isDaVinciClient()).thenReturn(false);
+
+    StorageEngine mockEngine = mock(StorageEngine.class);
+    StorageEngineFactory mockFactory = mock(StorageEngineFactory.class);
+
+    VeniceStoreVersionConfig mockStoreVersionConfig = mock(VeniceStoreVersionConfig.class);
+    when(mockStoreVersionConfig.getStoreVersionName()).thenReturn(topicName);
+    when(mockStoreVersionConfig.isStorePersistenceTypeKnown()).thenReturn(true);
+    when(mockStoreVersionConfig.getStorePersistenceType()).thenReturn(PersistenceType.ROCKS_DB);
+
+    when(mockEngine.getStoreVersionName()).thenReturn(topicName);
+
+    // Capture the boolean argument to verify RMD is enabled
+    ArgumentCaptor<Boolean> rmdCaptor = ArgumentCaptor.forClass(Boolean.class);
+    when(mockFactory.getStorageEngine(eq(mockStoreVersionConfig), rmdCaptor.capture())).thenReturn(mockEngine);
+
+    StorageService storageService =
+        createStorageServiceForRmdTest(mockStoreRepo, mockServerConfig, mockFactory, mockStoreVersionConfig);
+    storageService.openStore(mockStoreVersionConfig, () -> null);
+
+    Assert.assertTrue(rmdCaptor.getValue(), "RMD should be enabled when version-level AA is true");
+  }
+
+  /**
+   * Tests the fallback path: version is null, so the code falls back to the store-level
+   * Active-Active config immediately (no retry in StorageService).
+   */
+  @Test
+  public void testIsReplicationMetadataEnabledFallbackToStoreLevel() {
+    String testStore = "test_rmd_fallback_store";
+    int versionNum = 1;
+    String topicName = Version.composeKafkaTopic(testStore, versionNum);
+
+    Store mockStore = mock(Store.class);
+    // Version is not available
+    when(mockStore.getVersion(versionNum)).thenReturn(null);
+    // Store-level AA config is the fallback
+    when(mockStore.isActiveActiveReplicationEnabled()).thenReturn(true);
+
+    ReadOnlyStoreRepository mockStoreRepo = mock(ReadOnlyStoreRepository.class);
+    when(mockStoreRepo.getStoreOrThrow(testStore)).thenReturn(mockStore);
+
+    VeniceServerConfig mockServerConfig = mock(VeniceServerConfig.class);
+    when(mockServerConfig.isDaVinciClient()).thenReturn(false);
+
+    StorageEngine mockEngine = mock(StorageEngine.class);
+    StorageEngineFactory mockFactory = mock(StorageEngineFactory.class);
+
+    VeniceStoreVersionConfig mockStoreVersionConfig = mock(VeniceStoreVersionConfig.class);
+    when(mockStoreVersionConfig.getStoreVersionName()).thenReturn(topicName);
+    when(mockStoreVersionConfig.isStorePersistenceTypeKnown()).thenReturn(true);
+    when(mockStoreVersionConfig.getStorePersistenceType()).thenReturn(PersistenceType.ROCKS_DB);
+
+    when(mockEngine.getStoreVersionName()).thenReturn(topicName);
+
+    ArgumentCaptor<Boolean> rmdCaptor = ArgumentCaptor.forClass(Boolean.class);
+    when(mockFactory.getStorageEngine(eq(mockStoreVersionConfig), rmdCaptor.capture())).thenReturn(mockEngine);
+
+    StorageService storageService =
+        createStorageServiceForRmdTest(mockStoreRepo, mockServerConfig, mockFactory, mockStoreVersionConfig);
+    storageService.openStore(mockStoreVersionConfig, () -> null);
+
+    Assert.assertTrue(
+        rmdCaptor.getValue(),
+        "RMD should be enabled via store-level AA fallback when version is not available");
+  }
+
+  /**
+   * Tests that when store-level AA is false and version is not available, the fallback correctly returns false.
+   */
+  @Test
+  public void testIsReplicationMetadataEnabledFallbackReturnsFalse() {
+    String testStore = "test_rmd_fallback_false_store";
+    int versionNum = 1;
+    String topicName = Version.composeKafkaTopic(testStore, versionNum);
+
+    Store mockStore = mock(Store.class);
+    when(mockStore.getVersion(versionNum)).thenReturn(null);
+    // Store-level AA is disabled
+    when(mockStore.isActiveActiveReplicationEnabled()).thenReturn(false);
+
+    ReadOnlyStoreRepository mockStoreRepo = mock(ReadOnlyStoreRepository.class);
+    when(mockStoreRepo.getStoreOrThrow(testStore)).thenReturn(mockStore);
+
+    VeniceServerConfig mockServerConfig = mock(VeniceServerConfig.class);
+    when(mockServerConfig.isDaVinciClient()).thenReturn(false);
+
+    StorageEngine mockEngine = mock(StorageEngine.class);
+    StorageEngineFactory mockFactory = mock(StorageEngineFactory.class);
+
+    VeniceStoreVersionConfig mockStoreVersionConfig = mock(VeniceStoreVersionConfig.class);
+    when(mockStoreVersionConfig.getStoreVersionName()).thenReturn(topicName);
+    when(mockStoreVersionConfig.isStorePersistenceTypeKnown()).thenReturn(true);
+    when(mockStoreVersionConfig.getStorePersistenceType()).thenReturn(PersistenceType.ROCKS_DB);
+
+    when(mockEngine.getStoreVersionName()).thenReturn(topicName);
+
+    ArgumentCaptor<Boolean> rmdCaptor = ArgumentCaptor.forClass(Boolean.class);
+    when(mockFactory.getStorageEngine(eq(mockStoreVersionConfig), rmdCaptor.capture())).thenReturn(mockEngine);
+
+    StorageService storageService =
+        createStorageServiceForRmdTest(mockStoreRepo, mockServerConfig, mockFactory, mockStoreVersionConfig);
+    storageService.openStore(mockStoreVersionConfig, () -> null);
+
+    Assert.assertFalse(
+        rmdCaptor.getValue(),
+        "RMD should be disabled when store-level AA is false and version is not available");
   }
 }

@@ -6,6 +6,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -13,34 +14,33 @@ import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertNotNull;
 import static org.testng.Assert.assertThrows;
 
-import com.linkedin.alpini.io.IOUtils;
 import com.linkedin.avroutil1.compatibility.AvroCompatibilityHelper;
 import com.linkedin.venice.exceptions.InvalidVeniceSchemaException;
 import com.linkedin.venice.exceptions.VeniceNoStoreException;
 import com.linkedin.venice.meta.ReadOnlyStoreRepository;
 import com.linkedin.venice.meta.Store;
+import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.schema.GeneratedSchemaID;
 import com.linkedin.venice.schema.SchemaData;
 import com.linkedin.venice.schema.SchemaEntry;
 import com.linkedin.venice.schema.rmd.RmdSchemaEntry;
 import com.linkedin.venice.schema.writecompute.DerivedSchemaEntry;
 import com.linkedin.venice.schema.writecompute.WriteComputeSchemaConverter;
+import com.linkedin.venice.utils.DataProviderUtils;
+import com.linkedin.venice.utils.TestUtils;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
-import com.linkedin.venice.writer.update.UpdateBuilderImplTest;
-import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.apache.avro.Schema;
 import org.apache.helix.zookeeper.impl.client.ZkClient;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
 import org.testng.Assert;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
@@ -48,10 +48,7 @@ import org.testng.annotations.Test;
 
 
 public class HelixReadOnlySchemaRepositoryTest {
-  private static final Logger LOGGER = LogManager.getLogger(UpdateBuilderImplTest.class);
-
-  private static final Schema VALUE_SCHEMA =
-      AvroCompatibilityHelper.parse(loadFileAsString("TestWriteComputeBuilder.avsc"));
+  private static final Schema VALUE_SCHEMA = AvroCompatibilityHelper.parse(TestUtils.loadFileAsString("PersonV1.avsc"));
   private static final Schema UPDATE_SCHEMA =
       WriteComputeSchemaConverter.getInstance().convertFromValueRecordSchema(VALUE_SCHEMA);
 
@@ -92,6 +89,149 @@ public class HelixReadOnlySchemaRepositoryTest {
     schemaRepository.maybeRegisterAndPopulateRmdSchema(store, schemaData);
     verify(schemaAccessor, times(1)).subscribeReplicationMetadataSchemaCreationChange(anyString(), any());
     Assert.assertEquals(schemaData.getReplicationMetadataSchema(1, 1).getSchema(), UPDATE_SCHEMA);
+  }
+
+  /**
+   * Builds a {@link Store} mock whose store-level A/A flag is {@code storeAAEnabled}, and which retains two
+   * {@link Version}s (mimicking a current serving version plus one retained backup version) with the given A/A
+   * flags. This models the incident scenario where a store's A/A flag was flipped to false, but a retained
+   * (e.g. backup) version was created while A/A was still enabled and is thus still A/A itself.
+   */
+  private Store mockStoreWithRetainedVersions(
+      String storeName,
+      boolean storeAAEnabled,
+      boolean currentVersionAAEnabled,
+      boolean retainedBackupVersionAAEnabled) {
+    Store store = mock(Store.class);
+    when(store.getName()).thenReturn(storeName);
+    when(store.isActiveActiveReplicationEnabled()).thenReturn(storeAAEnabled);
+
+    Version currentVersion = mock(Version.class);
+    when(currentVersion.isActiveActiveReplicationEnabled()).thenReturn(currentVersionAAEnabled);
+    Version retainedBackupVersion = mock(Version.class);
+    when(retainedBackupVersion.isActiveActiveReplicationEnabled()).thenReturn(retainedBackupVersionAAEnabled);
+    when(store.getVersions()).thenReturn(Arrays.asList(currentVersion, retainedBackupVersion));
+    return store;
+  }
+
+  /**
+   * Regression test for the incident where a store had A/A replication disabled at the store level (and its
+   * current version was also non-A/A), yet a retained backup {@link Version} still had A/A replication enabled.
+   * {@link HelixReadOnlySchemaRepository#isActiveActiveReplicationEnabled(Store)} must consider retained versions,
+   * not just the store-level flag, so that {@link HelixReadOnlySchemaRepository#maybeRegisterAndPopulateRmdSchema}
+   * still subscribes to and populates RMD schemas; otherwise a cold server bootstrap would skip RMD schemas
+   * entirely and ingestion (SITs) of the retained A/A version would fail.
+   */
+  @Test
+  public void testMaybeRegisterAndPopulateRmdSchemaForRetainedActiveActiveVersion() {
+    HelixReadOnlySchemaRepository schemaRepository = mock(HelixReadOnlySchemaRepository.class);
+    doCallRealMethod().when(schemaRepository).maybeRegisterAndPopulateRmdSchema(any(), any());
+    String storeName = "testStore";
+    // Store-level AA disabled, current version AA disabled, but a retained backup version is still AA enabled.
+    Store store = mockStoreWithRetainedVersions(storeName, false, false, true);
+
+    RmdSchemaEntry rmdSchemaEntry = new RmdSchemaEntry(1, 1, UPDATE_SCHEMA.toString());
+    HelixSchemaAccessor schemaAccessor = mock(HelixSchemaAccessor.class);
+    when(schemaRepository.getAccessor()).thenReturn(schemaAccessor);
+    when(schemaAccessor.getAllReplicationMetadataSchemas(storeName))
+        .thenReturn(Collections.singletonList(rmdSchemaEntry));
+    SchemaData schemaData = new SchemaData(storeName, null);
+
+    boolean subscribed = schemaRepository.maybeRegisterAndPopulateRmdSchema(store, schemaData);
+    Assert.assertTrue(subscribed, "RMD schema subscription must be established for retained A/A version");
+    verify(schemaAccessor, times(1)).subscribeReplicationMetadataSchemaCreationChange(anyString(), any());
+    Assert.assertEquals(schemaData.getReplicationMetadataSchema(1, 1).getSchema(), UPDATE_SCHEMA);
+  }
+
+  /**
+   * Companion regression test for {@link #testMaybeRegisterAndPopulateRmdSchemaForRetainedActiveActiveVersion()}:
+   * confirms {@link HelixReadOnlySchemaRepository#isSupersetSchemaReadyToServe} also honors retained A/A versions
+   * when deciding whether the RMD schema for the superset value schema must be present.
+   */
+  @Test
+  public void testIsSupersetSchemaReadyToServeForRetainedActiveActiveVersion() {
+    HelixReadOnlySchemaRepository schemaRepository = mock(HelixReadOnlySchemaRepository.class);
+    doCallRealMethod().when(schemaRepository).isSupersetSchemaReadyToServe(any(), any(), anyInt());
+    String storeName = "testStore";
+    Store store = mockStoreWithRetainedVersions(storeName, false, false, true);
+    when(store.isWriteComputationEnabled()).thenReturn(false);
+    int supersetSchemaId = 1;
+
+    SchemaData schemaData = new SchemaData(storeName, null);
+    schemaData.addValueSchema(new SchemaEntry(supersetSchemaId, VALUE_SCHEMA.toString()));
+
+    // RMD schema not yet populated: not ready to serve, since a retained version is still A/A.
+    Assert.assertFalse(schemaRepository.isSupersetSchemaReadyToServe(store, schemaData, supersetSchemaId));
+
+    // Once the RMD schema is populated, it should be considered ready.
+    schemaData.addReplicationMetadataSchema(new RmdSchemaEntry(supersetSchemaId, 1, UPDATE_SCHEMA.toString()));
+    Assert.assertTrue(schemaRepository.isSupersetSchemaReadyToServe(store, schemaData, supersetSchemaId));
+  }
+
+  /**
+   * Companion regression test for {@link #testMaybeRegisterAndPopulateRmdSchemaForRetainedActiveActiveVersion()}:
+   * confirms {@link HelixReadOnlySchemaRepository#forceRefreshSchemaData} also fetches RMD schemas for stores with
+   * a retained A/A version, even though neither the store nor its current version is A/A enabled.
+   */
+  @Test
+  public void testForceRefreshSchemaDataForRetainedActiveActiveVersion() {
+    HelixReadOnlySchemaRepository schemaRepository = mock(HelixReadOnlySchemaRepository.class);
+    doCallRealMethod().when(schemaRepository).forceRefreshSchemaData(any(), any());
+    String storeName = "testStore";
+    Store store = mockStoreWithRetainedVersions(storeName, false, false, true);
+    when(store.isWriteComputationEnabled()).thenReturn(false);
+
+    RmdSchemaEntry rmdSchemaEntry = new RmdSchemaEntry(1, 1, UPDATE_SCHEMA.toString());
+    HelixSchemaAccessor schemaAccessor = mock(HelixSchemaAccessor.class);
+    when(schemaRepository.getAccessor()).thenReturn(schemaAccessor);
+    when(schemaAccessor.getAllValueSchemas(storeName)).thenReturn(Collections.emptyList());
+    when(schemaAccessor.getAllReplicationMetadataSchemas(storeName))
+        .thenReturn(Collections.singletonList(rmdSchemaEntry));
+    SchemaData schemaData = new SchemaData(storeName, null);
+
+    schemaRepository.forceRefreshSchemaData(store, schemaData);
+    verify(schemaAccessor, times(1)).getAllReplicationMetadataSchemas(storeName);
+    Assert.assertEquals(schemaData.getReplicationMetadataSchema(1, 1).getSchema(), UPDATE_SCHEMA);
+  }
+
+  /**
+   * End-to-end regression test modeling a cold Venice server bootstrap for the incident scenario: a store whose
+   * store-level A/A flag is false (and whose current version is also non-A/A) but which retains a backup
+   * {@link Version} with A/A replication enabled. Prior to the fix, {@link HelixReadOnlySchemaRepository} only
+   * consulted the store-level flag when warming up its local schema cache
+   * ({@link HelixReadOnlySchemaRepository#populateSchemaMap}), so RMD schemas were never subscribed to or fetched
+   * on bootstrap, which subsequently caused SITs for the retained A/A version to fail. This test uses a real
+   * {@link HelixReadOnlySchemaRepository} (mirroring the existing {@code getDerivedSchemaIdTest}/
+   * {@code getSupersetOrLatestValueSchemaTest} integration-style tests in this file) with a mocked store repository
+   * and schema accessor, and triggers the very first (cold) schema lookup for the store to verify that RMD schema
+   * subscription and population still occur.
+   */
+  @Test
+  public void testColdBootstrapPopulatesRmdSchemaForRetainedActiveActiveVersion() {
+    ReadOnlyStoreRepository storeRepository = mock(ReadOnlyStoreRepository.class);
+    ZkClient zkClient = mock(ZkClient.class);
+    HelixSchemaAccessor accessor = mock(HelixSchemaAccessor.class);
+    HelixReadOnlySchemaRepository schemaRepository =
+        new HelixReadOnlySchemaRepository(storeRepository, zkClient, accessor, 10, 100);
+
+    String storeName = "store";
+    Store store = mockStoreWithRetainedVersions(storeName, false, false, true);
+    when(store.isWriteComputationEnabled()).thenReturn(false);
+    when(storeRepository.getStoreOrThrow(storeName)).thenReturn(store);
+
+    RmdSchemaEntry rmdSchemaEntry = new RmdSchemaEntry(1, 1, UPDATE_SCHEMA.toString());
+    when(accessor.getAllValueSchemas(storeName)).thenReturn(Collections.emptyList());
+    when(accessor.getAllReplicationMetadataSchemas(storeName)).thenReturn(Collections.singletonList(rmdSchemaEntry));
+
+    verify(accessor, never()).subscribeReplicationMetadataSchemaCreationChange(anyString(), any());
+
+    // The local schema cache is empty (cold bootstrap), so this first lookup for the store must populate it,
+    // including subscribing to and fetching the RMD schema for the retained A/A backup version.
+    Collection<RmdSchemaEntry> rmdSchemas = schemaRepository.getReplicationMetadataSchemas(storeName);
+
+    verify(accessor, times(1)).subscribeReplicationMetadataSchemaCreationChange(anyString(), any());
+    assertEquals(rmdSchemas.size(), 1);
+    assertEquals(rmdSchemas.iterator().next(), rmdSchemaEntry);
   }
 
   /**
@@ -157,8 +297,8 @@ public class HelixReadOnlySchemaRepositoryTest {
     Assert.assertNull(schemaRepository.getSupersetSchema(storeName));
   }
 
-  @Test
-  public void getDerivedSchemaIdTest() {
+  @Test(dataProviderClass = DataProviderUtils.class, dataProvider = "Two-True-and-False")
+  public void getDerivedSchemaIdTest(boolean wcEnabled, boolean aaEnabled) {
     ReadOnlyStoreRepository storeRepository = mock(ReadOnlyStoreRepository.class);
     ZkClient zkClient = mock(ZkClient.class);
     HelixSchemaAccessor accessor = mock(HelixSchemaAccessor.class);
@@ -167,10 +307,16 @@ public class HelixReadOnlySchemaRepositoryTest {
     String storeName = "store";
     String schemaStr = "int";
     Store store = mock(Store.class);
-    when(store.isWriteComputationEnabled()).thenReturn(false);
-    when(store.isActiveActiveReplicationEnabled()).thenReturn(false);
+    when(store.getName()).thenReturn(storeName);
+    when(store.isWriteComputationEnabled()).thenReturn(wcEnabled);
+    when(store.isActiveActiveReplicationEnabled()).thenReturn(aaEnabled);
     when(storeRepository.getStoreOrThrow(storeName)).thenReturn(store);
+    verify(accessor, never()).subscribeDerivedSchemaCreationChange(anyString(), any());
+    verify(accessor, never()).subscribeReplicationMetadataSchemaCreationChange(anyString(), any());
     GeneratedSchemaID generatedSchemaID = schemaRepository.getDerivedSchemaId(storeName, schemaStr);
+    verify(accessor, wcEnabled ? times(1) : never()).subscribeDerivedSchemaCreationChange(anyString(), any());
+    verify(accessor, aaEnabled ? times(1) : never())
+        .subscribeReplicationMetadataSchemaCreationChange(anyString(), any());
     assertNotNull(generatedSchemaID);
     assertEquals(generatedSchemaID, GeneratedSchemaID.INVALID);
 
@@ -178,8 +324,8 @@ public class HelixReadOnlySchemaRepositoryTest {
     assertThrows(VeniceNoStoreException.class, () -> schemaRepository.getDerivedSchemaId(storeName, schemaStr));
   }
 
-  @Test
-  public void getSupersetOrLatestValueSchemaTest() {
+  @Test(dataProviderClass = DataProviderUtils.class, dataProvider = "Two-True-and-False")
+  public void getSupersetOrLatestValueSchemaTest(boolean wcEnabled, boolean aaEnabled) {
     ReadOnlyStoreRepository storeRepository = mock(ReadOnlyStoreRepository.class);
     ZkClient zkClient = mock(ZkClient.class);
     HelixSchemaAccessor accessor = mock(HelixSchemaAccessor.class);
@@ -187,8 +333,9 @@ public class HelixReadOnlySchemaRepositoryTest {
         new HelixReadOnlySchemaRepository(storeRepository, zkClient, accessor, 10, 100);
     String storeName = "store";
     Store store = mock(Store.class);
-    when(store.isWriteComputationEnabled()).thenReturn(false);
-    when(store.isActiveActiveReplicationEnabled()).thenReturn(false);
+    when(store.getName()).thenReturn(storeName);
+    when(store.isWriteComputationEnabled()).thenReturn(wcEnabled);
+    when(store.isActiveActiveReplicationEnabled()).thenReturn(aaEnabled);
     when(store.getLatestSuperSetValueSchemaId()).thenReturn(SchemaData.INVALID_VALUE_SCHEMA_ID);
     when(storeRepository.getStoreOrThrow(storeName)).thenReturn(store);
 
@@ -196,7 +343,12 @@ public class HelixReadOnlySchemaRepositoryTest {
     List<SchemaEntry> listOfSchemaEntriesToReturn = new ArrayList<>();
     listOfSchemaEntriesToReturn.add(schemaEntryToReturn);
     when(accessor.getAllValueSchemas(storeName)).thenReturn(listOfSchemaEntriesToReturn);
+    verify(accessor, never()).subscribeDerivedSchemaCreationChange(anyString(), any());
+    verify(accessor, never()).subscribeReplicationMetadataSchemaCreationChange(anyString(), any());
     SchemaEntry schemaEntry = schemaRepository.getSupersetOrLatestValueSchema(storeName);
+    verify(accessor, wcEnabled ? times(1) : never()).subscribeDerivedSchemaCreationChange(anyString(), any());
+    verify(accessor, aaEnabled ? times(1) : never())
+        .subscribeReplicationMetadataSchemaCreationChange(anyString(), any());
     assertNotNull(schemaEntry);
     assertEquals(schemaEntry, schemaEntryToReturn);
   }
@@ -219,16 +371,5 @@ public class HelixReadOnlySchemaRepositoryTest {
     doCallRealMethod().when(listener).handleSchemaChanges(storeName, list);
     listener.handleSchemaChanges(storeName, list);
     verify(accessor, times(1)).getValueSchema(anyString(), anyString());
-  }
-
-  private static String loadFileAsString(String fileName) {
-    try {
-      return IOUtils.toString(
-          Objects.requireNonNull(Thread.currentThread().getContextClassLoader().getResourceAsStream(fileName)),
-          StandardCharsets.UTF_8);
-    } catch (Exception e) {
-      LOGGER.error(e);
-      return null;
-    }
   }
 }

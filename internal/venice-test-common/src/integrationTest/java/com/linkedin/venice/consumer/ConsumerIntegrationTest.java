@@ -9,14 +9,18 @@ import com.linkedin.venice.controllerapi.StoreResponse;
 import com.linkedin.venice.controllerapi.UpdateStoreQueryParams;
 import com.linkedin.venice.exceptions.VeniceMessageException;
 import com.linkedin.venice.integration.utils.ServiceFactory;
+import com.linkedin.venice.integration.utils.VeniceClusterCreateOptions;
 import com.linkedin.venice.integration.utils.VeniceClusterWrapper;
 import com.linkedin.venice.kafka.protocol.KafkaMessageEnvelope;
-import com.linkedin.venice.meta.Version;
+import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.partitioner.DefaultVenicePartitioner;
 import com.linkedin.venice.partitioner.VenicePartitioner;
+import com.linkedin.venice.pubsub.PubSubProducerAdapterContext;
 import com.linkedin.venice.pubsub.adapter.kafka.producer.ApacheKafkaProducerAdapter;
 import com.linkedin.venice.pubsub.adapter.kafka.producer.ApacheKafkaProducerConfig;
+import com.linkedin.venice.pubsub.api.PubSubMessageSerializer;
 import com.linkedin.venice.serialization.DefaultSerializer;
+import com.linkedin.venice.serialization.KafkaKeySerializer;
 import com.linkedin.venice.serialization.VeniceKafkaSerializer;
 import com.linkedin.venice.serialization.avro.AvroProtocolDefinition;
 import com.linkedin.venice.serialization.avro.InternalAvroSpecificSerializer;
@@ -104,7 +108,9 @@ public abstract class ConsumerIntegrationTest {
 
   @BeforeClass
   public void sharedSetUp() {
-    cluster = ServiceFactory.getVeniceCluster();
+    VeniceClusterCreateOptions options =
+        new VeniceClusterCreateOptions.Builder().numberOfControllers(1).numberOfServers(1).numberOfRouters(1).build();
+    cluster = ServiceFactory.getVeniceCluster(options);
     controllerClient =
         ControllerClient.constructClusterControllerClient(cluster.getClusterName(), cluster.getAllControllersURLs());
 
@@ -118,7 +124,6 @@ public abstract class ConsumerIntegrationTest {
   public void testSetUp() {
     store = Utils.getUniqueString("consumer_integ_test");
     version = 1;
-    topicName = Version.composeRealTimeTopic(store);
     cluster.getNewStore(store);
     long streamingRewindSeconds = 25L;
     long streamingMessageLag = 2L;
@@ -126,14 +131,19 @@ public abstract class ConsumerIntegrationTest {
         store,
         new UpdateStoreQueryParams().setHybridRewindSeconds(streamingRewindSeconds)
             .setHybridOffsetLagThreshold(streamingMessageLag));
-    controllerClient.emptyPush(store, "test_push", 1);
+    topicName = Utils.getRealTimeTopicName(
+        cluster.getLeaderVeniceController().getVeniceAdmin().getStore(cluster.getClusterName(), store));
+    TestUtils.assertCommand(controllerClient.emptyPush(this.store, "test_push", 1), "empty push failed");
+
     TestUtils.waitForNonDeterministicAssertion(15, TimeUnit.SECONDS, () -> {
-      StoreResponse freshStoreResponse = controllerClient.getStore(store);
+      StoreResponse freshStoreResponse = controllerClient.getStore(this.store);
       Assert.assertFalse(freshStoreResponse.isError());
       Assert.assertEquals(
           freshStoreResponse.getStore().getCurrentVersion(),
           version,
           "The empty push has not activated the store.");
+      Store routerStore = cluster.getVeniceRouters().get(0).getMetaDataRepository().getStore(store);
+      Assert.assertEquals(routerStore.getCurrentVersion(), version, "The empty push has not activated the store.");
     });
     client = ClientFactory.getAndStartGenericAvroClient(
         ClientConfig.defaultGenericClientConfig(store).setVeniceURL(cluster.getRandomRouterURL()));
@@ -164,27 +174,34 @@ public abstract class ConsumerIntegrationTest {
   }
 
   VeniceWriterWithNewerProtocol getVeniceWriterWithNewerProtocol(Schema overrideProtocolSchema, String topicName) {
-    Properties javaProps = new Properties();
-    javaProps
-        .put(ApacheKafkaProducerConfig.KAFKA_VALUE_SERIALIZER, KafkaValueSerializerWithNewerProtocol.class.getName());
-    javaProps.put(ApacheKafkaProducerConfig.KAFKA_BOOTSTRAP_SERVERS, cluster.getPubSubBrokerWrapper().getAddress());
-    VeniceProperties props = new VeniceProperties(javaProps);
+    VeniceProperties props = new VeniceProperties(new Properties());
     String stringSchema = "\"string\"";
     VeniceKafkaSerializer keySerializer = new VeniceAvroKafkaSerializer(stringSchema);
     VeniceKafkaSerializer valueSerializer = new VeniceAvroKafkaSerializer(stringSchema);
     VenicePartitioner partitioner = new DefaultVenicePartitioner(props);
     Time time = new SystemTime();
-
-    VeniceWriterOptions veniceWriterOptions = new VeniceWriterOptions.Builder(topicName).setKeySerializer(keySerializer)
-        .setValueSerializer(valueSerializer)
-        .setWriteComputeSerializer(new DefaultSerializer())
-        .setTime(time)
-        .setPartitioner(partitioner)
-        .build();
+    PubSubMessageSerializer pubSubMessageSerializer =
+        new PubSubMessageSerializer(new KafkaKeySerializer(), new KafkaValueSerializerWithNewerProtocol());
+    VeniceWriterOptions veniceWriterOptions =
+        new VeniceWriterOptions.Builder(topicName).setKeyPayloadSerializer(keySerializer)
+            .setBrokerAddress(cluster.getPubSubBrokerWrapper().getAddress())
+            .setValuePayloadSerializer(valueSerializer)
+            .setWriteComputePayloadSerializer(new DefaultSerializer())
+            .setPubSubMessageSerializer(pubSubMessageSerializer)
+            .setTime(time)
+            .setPartitioner(partitioner)
+            .build();
+    PubSubProducerAdapterContext context =
+        new PubSubProducerAdapterContext.Builder().setShouldValidateProducerConfigStrictly(false)
+            .setVeniceProperties(props)
+            .setPubSubMessageSerializer(pubSubMessageSerializer)
+            .setBrokerAddress(cluster.getPubSubBrokerWrapper().getAddress())
+            .setPubSubPositionTypeRegistry(cluster.getPubSubBrokerWrapper().getPubSubPositionTypeRegistry())
+            .build();
     return new VeniceWriterWithNewerProtocol(
         veniceWriterOptions,
         props,
-        new ApacheKafkaProducerWithNewerProtocolAdapter(props),
+        new ApacheKafkaProducerAdapter(new ApacheKafkaProducerConfig(context)),
         overrideProtocolSchema);
   }
 
@@ -271,12 +288,6 @@ public abstract class ConsumerIntegrationTest {
         }
       }
       throw new IllegalStateException("Missing a field called '" + NEW_FIELD_NAME + "' in the schema!");
-    }
-  }
-
-  private static class ApacheKafkaProducerWithNewerProtocolAdapter extends ApacheKafkaProducerAdapter {
-    public ApacheKafkaProducerWithNewerProtocolAdapter(VeniceProperties props) {
-      super(new ApacheKafkaProducerConfig(props, null, null, false));
     }
   }
 

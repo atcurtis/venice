@@ -18,16 +18,23 @@ dependencies {
     exclude group: 'com.oracle', module: 'ojdbc14' // unused transitive dependencies, doesn't exist in repo
     exclude group: 'org.mockito', module: 'mockito-all' // this will introduce another different mockito-all version
   }
-
-  implementation (libraries.helix) { // TODO: Get rid of Helix dependency in venice-common
-    // Helix pulls in an ancient version of the zkclient, which lacks some APIs and clashes with Kafka's dependency
-    exclude group: 'com.github.sgroschupf'
-    // Helix use zk 3.6.9, which introduce netty 3.10 and will fail our test.
-    exclude module: 'zookeeper'
+  implementation('org.apache.helix:helix-core:1.4.1:jdk8') {
+    exclude group: 'org.apache.helix'
   }
+  implementation('org.apache.helix:helix-common:1.4.1:jdk8')  {
+    exclude group: 'org.apache.helix'
+  }
+  implementation('org.apache.helix:zookeeper-api:1.4.1:jdk8') {
+    exclude group: 'org.apache.helix'
+  }
+  implementation('org.apache.helix:metadata-store-directory-common:1.4.1:jdk8') {
+    exclude group: 'org.apache.helix'
+  }
+  implementation('org.apache.helix:metrics-common:1.4.1:jdk8')
 
   implementation project(':internal:venice-common')
   implementation project(':clients:venice-thin-client')
+  implementation project(':internal:venice-client-common')
 
   implementation libraries.commonsIo
   implementation libraries.fastUtil
@@ -37,11 +44,13 @@ dependencies {
   implementation libraries.spark
   // It's necessary to pull in the most recent version of zkclient explicitly, otherwise Helix won't have it...
   implementation libraries.zkclient
+  implementation libraries.opentelemetryApi
 
   testImplementation project(':services:venice-router')
   testImplementation libraries.avroUtilFastserde
   testImplementation libraries.kafkaClientsTest // TODO: Get rid of Kafka dependency in venice-common (used by TopicCreator)
   testImplementation project(':internal:venice-test-common')
+  testImplementation libraries.openTelemetryTestSdk
 }
 
 jar {
@@ -56,4 +65,11 @@ jar {
 
 ext {
   jacocoCoverageThreshold = 0.21
+}
+
+checkerFramework {
+  extraJavacArgs = ['-Xmaxerrs', '256']
+  checkers = ['org.checkerframework.checker.nullness.NullnessChecker']
+  skipCheckerFramework = true
+  excludeTests = true
 }

@@ -2,6 +2,7 @@ package com.linkedin.venice.controller;
 
 import com.linkedin.venice.exceptions.ResourceStillExistsException;
 import com.linkedin.venice.service.AbstractVeniceService;
+import com.linkedin.venice.utils.LogContext;
 import com.linkedin.venice.utils.SystemTime;
 import com.linkedin.venice.utils.Time;
 import java.util.List;
@@ -59,13 +60,14 @@ public class StoreGraveyardCleanupService extends AbstractVeniceService {
   private class StoreGraveyardCleanupTask implements Runnable {
     @Override
     public void run() {
+      LogContext.setLogContext(multiClusterConfig.getLogContext());
       LOGGER.info("Started running {}", getClass().getSimpleName());
       while (!stop.get()) {
         try {
           time.sleep((long) sleepIntervalBetweenListFetchMinutes * Time.MS_PER_MINUTE);
           // loop all clusters
           for (String clusterName: multiClusterConfig.getClusters()) {
-            VeniceControllerConfig clusterConfig = multiClusterConfig.getControllerConfig(clusterName);
+            VeniceControllerClusterConfig clusterConfig = multiClusterConfig.getControllerConfig(clusterName);
             boolean cleanupEnabled = clusterConfig.isStoreGraveyardCleanupEnabled();
             int delayInMinutes = clusterConfig.getStoreGraveyardCleanupDelayMinutes();
             if (!cleanupEnabled || !admin.isLeaderControllerFor(clusterName)) {

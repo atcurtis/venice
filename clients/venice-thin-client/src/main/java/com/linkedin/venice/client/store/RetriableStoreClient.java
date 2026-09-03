@@ -3,11 +3,15 @@ package com.linkedin.venice.client.store;
 import com.linkedin.venice.client.exceptions.VeniceClientException;
 import com.linkedin.venice.client.exceptions.VeniceClientHttpException;
 import com.linkedin.venice.read.RequestType;
+import com.linkedin.venice.utils.DaemonThreadFactory;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Executor;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import org.apache.commons.httpclient.HttpStatus;
 
@@ -16,17 +20,47 @@ import org.apache.commons.httpclient.HttpStatus;
  * TODO: make retry work for compute request.
  */
 public class RetriableStoreClient<K, V> extends DelegatingStoreClient<K, V> {
-  private final StatTrackingStoreClient statStoreclient;
+  /**
+   * We need to execute the retry in a different thread pool than the one being used by the response callback.
+   * If we don't use another thread pool, the de-serialization thread pool will be used to initiate
+   * the retry request, which needs to submit the deserialization request for the retry response to the same thread
+   * pool, which can cause a deadlock issue.
+   * This issue is similar to the one around {@link AbstractAvroStoreClient#DESERIALIZATION_EXECUTOR}.
+   */
+  private static Executor RETRY_EXECUTOR;
+
+  private final InternalAvroStoreClient innerStoreClient;
   private final boolean retryOnAllErrors;
   private final long retryBackOffInMs;
   private final int retryCount;
+  private final boolean enableStatTracking;
+  private final Executor retryExecutor;
 
-  public RetriableStoreClient(StatTrackingStoreClient<K, V> innerStoreClient, ClientConfig clientConfig) {
+  public static synchronized Executor getDefaultRetryExecutor() {
+    if (RETRY_EXECUTOR == null) {
+      // Half of process number of threads should be good enough, minimum 2
+      int threadNum = Math.max(Runtime.getRuntime().availableProcessors() / 2, 2);
+
+      RETRY_EXECUTOR = Executors.newFixedThreadPool(threadNum, new DaemonThreadFactory("Venice-Request-Retry"));
+    }
+
+    return RETRY_EXECUTOR;
+  }
+
+  public RetriableStoreClient(InternalAvroStoreClient<K, V> innerStoreClient, ClientConfig clientConfig) {
     super(innerStoreClient);
-    this.statStoreclient = innerStoreClient;
-    retryOnAllErrors = clientConfig.isRetryOnAllErrorsEnabled();
-    retryBackOffInMs = clientConfig.getRetryBackOffInMs();
-    retryCount = clientConfig.getRetryCount();
+    this.innerStoreClient = innerStoreClient;
+    this.retryOnAllErrors = clientConfig.isRetryOnAllErrorsEnabled();
+    this.retryBackOffInMs = clientConfig.getRetryBackOffInMs();
+    this.retryCount = clientConfig.getRetryCount();
+    this.enableStatTracking = clientConfig.isStatTrackingEnabled();
+    Executor configuredRetryExecutor = clientConfig.getRetryExecutor();
+    if (clientConfig.getDeserializationExecutor() != null && configuredRetryExecutor != null
+        && clientConfig.getDeserializationExecutor() == configuredRetryExecutor) {
+      throw new VeniceClientException(
+          "RetryExecutor needs to be different from DeserializationExecutor to avoid deadlock issues");
+    }
+    this.retryExecutor = configuredRetryExecutor != null ? configuredRetryExecutor : getDefaultRetryExecutor();
   }
 
   /**
@@ -39,17 +73,6 @@ public class RetriableStoreClient<K, V> extends DelegatingStoreClient<K, V> {
   }
 
   /**
-   * Skip retrying getRaw for now as it ues R2 thread pool, doing retry might cause deadlock.
-  
-  *@Override
-  *public CompletableFuture<byte[]> getRaw(String requestPath, Optional<ClientStats> stats, long preRequestTimeInNS) {
-   * return super.getRaw(requestPath, stats, preRequestTimeInNS);
-   * Supplier<CompletableFuture<byte[]>> supplier = () -> super.getRaw(requestPath, stats, preRequestTimeInNS);
-   * return innerFuture.handle((BiFunction<? super byte[], Throwable, ? extends byte[]>)retryOnRouterError(supplier));
-  }
-   */
-
-  /**
    *  Adding retry logic on router error as this method returning the completion stage value.
    */
   @Override
@@ -60,13 +83,16 @@ public class RetriableStoreClient<K, V> extends DelegatingStoreClient<K, V> {
 
   private <T> CompletableFuture<T> executeWithRetry(Supplier<CompletableFuture<T>> supplier, RequestType requestType) {
     CompletableFuture<T> retryFuture = new CompletableFuture<>();
-    supplier.get().whenComplete((T val, Throwable throwable) -> {
+
+    supplier.get().whenCompleteAsync((T val, Throwable throwable) -> {
       if (throwable != null) {
         int attempt = 0;
         Throwable retryThrowable = throwable;
         while (!retryFuture.isDone() && attempt < retryCount && isRetriableException(retryThrowable)) {
           attempt++;
-          statStoreclient.recordRetryCount(requestType);
+          if (enableStatTracking) {
+            ((StatTrackingStoreClient) innerStoreClient).recordRetryCount(requestType);
+          }
           if (retryBackOffInMs > 0) {
             try {
               Thread.sleep(retryBackOffInMs);
@@ -76,7 +102,7 @@ public class RetriableStoreClient<K, V> extends DelegatingStoreClient<K, V> {
             }
           }
           try {
-            T retryVal = supplier.get().get();
+            T retryVal = supplier.get().get(10, TimeUnit.SECONDS);
             retryFuture.complete(retryVal);
             retryThrowable = null;
             break;
@@ -90,7 +116,7 @@ public class RetriableStoreClient<K, V> extends DelegatingStoreClient<K, V> {
       } else {
         retryFuture.complete(val);
       }
-    });
+    }, this.retryExecutor);
     return retryFuture;
   }
 

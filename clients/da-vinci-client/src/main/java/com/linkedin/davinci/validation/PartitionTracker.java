@@ -1,8 +1,10 @@
 package com.linkedin.davinci.validation;
 
-import static com.linkedin.davinci.validation.KafkaDataIntegrityValidator.DISABLED;
+import static com.linkedin.davinci.validation.DataIntegrityValidator.DISABLED;
+import static com.linkedin.venice.pubsub.PubSubUtil.deserializePositionWithOffsetFallback;
 
 import com.linkedin.venice.annotation.Threadsafe;
+import com.linkedin.venice.annotation.VisibleForTesting;
 import com.linkedin.venice.exceptions.validation.CorruptDataException;
 import com.linkedin.venice.exceptions.validation.DataValidationException;
 import com.linkedin.venice.exceptions.validation.DuplicateDataException;
@@ -21,23 +23,30 @@ import com.linkedin.venice.kafka.protocol.enums.MessageType;
 import com.linkedin.venice.kafka.protocol.state.ProducerPartitionState;
 import com.linkedin.venice.kafka.validation.Segment;
 import com.linkedin.venice.kafka.validation.checksum.CheckSumType;
-import com.linkedin.venice.message.KafkaKey;
 import com.linkedin.venice.offsets.OffsetRecord;
-import com.linkedin.venice.pubsub.api.PubSubMessage;
+import com.linkedin.venice.pubsub.PubSubPositionDeserializer;
+import com.linkedin.venice.pubsub.api.DefaultPubSubMessage;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
+import com.linkedin.venice.pubsub.api.PubSubSymbolicPosition;
+import com.linkedin.venice.utils.ByteUtils;
 import com.linkedin.venice.utils.CollectionUtils;
 import com.linkedin.venice.utils.LatencyUtils;
 import com.linkedin.venice.utils.RedundantExceptionFilter;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import com.linkedin.venice.utils.lazy.Lazy;
 import java.nio.ByteBuffer;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Iterator;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import java.util.stream.Collectors;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -53,8 +62,8 @@ import org.apache.logging.log4j.Logger;
  * This class also encapsulates the capability to clear expired state, in the functions
  * which take in the maxAgeInMs parameter:
  * <p>
- * - {@link #clearExpiredStateAndUpdateOffsetRecord(OffsetRecord, long)}
- * - {@link #setPartitionState(OffsetRecord, long)}
+ * - {@link #clearExpiredStateAndUpdateOffsetRecord(TopicType, OffsetRecord, long)}
+ * - {@link #setPartitionState(TopicType, OffsetRecord, long)}
  */
 @Threadsafe
 public class PartitionTracker {
@@ -66,19 +75,68 @@ public class PartitionTracker {
   private static final RedundantExceptionFilter REDUNDANT_LOGGING_FILTER =
       RedundantExceptionFilter.getRedundantExceptionFilter();
 
+  public static final TopicType VERSION_TOPIC = TopicType.of(TopicType.VERSION_TOPIC_TYPE);
+
   private final Logger logger;
   private final String topicName;
   private final int partition;
-  private final Map<GUID, Segment> segments = new VeniceConcurrentHashMap<>();
+  // TODO: clear vtSegments
+  /**
+   * There should only be one {@code ConsumptionTask} for VT, so there shouldn't need to be any locking.
+   */
+  private final VeniceConcurrentHashMap<GUID, Segment> vtSegments = new VeniceConcurrentHashMap<>();
+  /**
+   * The equivalent for RT is not stored. It's the instantaneous offset when a DIV sync is triggered.
+   */
+  private final AtomicReference<PubSubPosition> latestConsumedVtPosition =
+      new AtomicReference(PubSubSymbolicPosition.EARLIEST);
 
-  public PartitionTracker(String topicName, int partition) {
+  /**
+   * The remote/upstream counterpart of {@link #latestConsumedVtPosition}: the last position consumed from the remote
+   * version topic by a remote-consume leader. Tracked separately because {@link #latestConsumedVtPosition} follows the
+   * local VT (produce/consume), which is a different position domain from the remote source VT this leader subscribes
+   * to.
+   */
+  private final AtomicReference<PubSubPosition> latestConsumedRemoteVtPosition =
+      new AtomicReference(PubSubSymbolicPosition.EARLIEST);
+
+  /**
+   * rtSegments is a map of source broker URL to a map of GUID to Segment.
+   * There should only be one {@code ConsumptionTask} for each broker URL, so there shouldn't need to be any locking.
+   *
+   * TODO: Refactor this so the {@link #rtSegments} map is keyed by region ID (numeric), rather than URL. URLs could
+   *       change over time but the ID should remain fixed. It is also more compact (and the outer collection could even
+   *       become just an array).
+   */
+  private final VeniceConcurrentHashMap<String, VeniceConcurrentHashMap<GUID, Segment>> rtSegments =
+      new VeniceConcurrentHashMap<>();
+  PubSubPositionDeserializer pubSubPositionDeserializer;
+
+  public PartitionTracker(String topicName, int partition, PubSubPositionDeserializer pubSubPositionDeserializer) {
     this.topicName = topicName;
     this.partition = partition;
     this.logger = LogManager.getLogger(this.toString());
+    this.pubSubPositionDeserializer = pubSubPositionDeserializer;
   }
 
   public int getPartition() {
     return partition;
+  }
+
+  public PubSubPosition getLatestConsumedVtPosition() {
+    return latestConsumedVtPosition.get();
+  }
+
+  public void updateLatestConsumedVtPosition(PubSubPosition vtPosition) {
+    latestConsumedVtPosition.updateAndGet(current -> vtPosition);
+  }
+
+  public PubSubPosition getLatestConsumedRemoteVtPosition() {
+    return latestConsumedRemoteVtPosition.get();
+  }
+
+  public void updateLatestConsumedRemoteVtPosition(PubSubPosition vtPosition) {
+    latestConsumedRemoteVtPosition.updateAndGet(current -> vtPosition);
   }
 
   public final String toString() {
@@ -86,23 +144,55 @@ public class PartitionTracker {
   }
 
   /** N.B. Intended for tests */
-  Set<GUID> getTrackedGUIDs() {
-    return Collections.unmodifiableSet(this.segments.keySet());
+  Set<GUID> getTrackedGUIDs(TopicType type) {
+    return Collections.unmodifiableSet(getSegments(type).keySet());
+  }
+
+  private VeniceConcurrentHashMap<GUID, Segment> getSegments(TopicType type) {
+    if (TopicType.isVersionTopic(type)) {
+      return vtSegments;
+    }
+    return rtSegments.computeIfAbsent(type.getKafkaUrl(), k -> new VeniceConcurrentHashMap<>());
+  }
+
+  public void clearSegments(TopicType type) {
+    if (TopicType.isVersionTopic(type)) {
+      vtSegments.clear();
+    } else {
+      rtSegments.clear();
+    }
   }
 
   /**
    * @param guid for which to retrieve the lock and segment
    * @return a {@link Segment} or null if it's absent
    */
-  Segment getSegment(GUID guid) {
-    return this.segments.get(guid);
+  Segment getSegment(TopicType type, GUID guid) {
+    return getSegments(type).get(guid);
   }
 
-  public void setPartitionState(OffsetRecord offsetRecord, long maxAgeInMs) {
-    long minimumRequiredRecordProducerTimestamp =
-        maxAgeInMs == DISABLED ? DISABLED : offsetRecord.getMaxMessageTimeInMs() - maxAgeInMs;
+  private static long computeEarliestAllowableTimestamp(long maxAgeInMs, long latestMessageTimeInMs) {
+    return maxAgeInMs == DISABLED ? DISABLED : latestMessageTimeInMs - maxAgeInMs;
+  }
+
+  public void setPartitionState(TopicType type, OffsetRecord offsetRecord, long maxAgeInMs) {
+    long earliestAllowableTimestamp =
+        computeEarliestAllowableTimestamp(maxAgeInMs, offsetRecord.calculateLatestMessageTimeInMs());
+    setPartitionState(type, offsetRecord.getProducerPartitionStateMap(), earliestAllowableTimestamp);
+    if (TopicType.isVersionTopic(type)) {
+      // Rehydrate the durable remote LCVP so a follower's VT-DIV checkpoint writes back the persisted value instead of
+      // EARLIEST across a restart. Unlike the local LCVP (re-advanced live on the consume path), the remote LCVP is
+      // only advanced by a remote-consume leader, so without this it would collapse to EARLIEST before an F->L resume.
+      updateLatestConsumedRemoteVtPosition(offsetRecord.getLatestConsumedRemoteVtPosition());
+    }
+  }
+
+  public void setPartitionState(
+      TopicType type,
+      Map<CharSequence, ProducerPartitionState> producerPartitionStateMap,
+      long earliestAllowableTimestamp) {
     Iterator<Map.Entry<CharSequence, ProducerPartitionState>> iterator =
-        offsetRecord.getProducerPartitionStateMap().entrySet().iterator();
+        producerPartitionStateMap.entrySet().iterator();
     Map.Entry<CharSequence, ProducerPartitionState> entry;
     GUID producerGuid;
     ProducerPartitionState producerPartitionState;
@@ -110,22 +200,31 @@ public class PartitionTracker {
       entry = iterator.next();
       producerGuid = GuidUtils.getGuidFromCharSequence(entry.getKey());
       producerPartitionState = entry.getValue();
-      if (producerPartitionState.messageTimestamp >= minimumRequiredRecordProducerTimestamp) {
+      if (producerPartitionState.messageTimestamp >= earliestAllowableTimestamp) {
         /**
          * This {@link producerPartitionState} is eligible to be retained, so we'll set the state in the
          * {@link PartitionTracker}.
          */
-        setSegment(producerGuid, new Segment(partition, producerPartitionState));
+        setSegment(type, producerGuid, new Segment(partition, producerPartitionState));
       } else {
         // The state is eligible to be cleared.
-        segments.remove(producerGuid);
+        getSegments(type).remove(producerGuid);
         iterator.remove();
       }
     }
   }
 
-  private void setSegment(GUID guid, Segment segment) {
-    Segment previousSegment = this.segments.put(guid, segment);
+  public Map<CharSequence, ProducerPartitionState> getPartitionStates(TopicType type) {
+    return getSegments(type).entrySet()
+        .stream()
+        .collect(
+            Collectors.toMap(
+                entry -> GuidUtils.guidToUtf8(entry.getKey()),
+                entry -> entry.getValue().toProducerPartitionState()));
+  }
+
+  private void setSegment(TopicType type, GUID guid, Segment segment) {
+    Segment previousSegment = getSegments(type).put(guid, segment);
     if (previousSegment == null) {
       logger.debug(" set state for partition: {}, New state: {}", partition, segment);
     } else {
@@ -137,55 +236,142 @@ public class PartitionTracker {
     }
   }
 
-  public void cloneProducerStates(PartitionTracker destProducerTracker) {
-    for (Map.Entry<GUID, Segment> entry: this.segments.entrySet()) {
-      destProducerTracker.setSegment(entry.getKey(), new Segment(entry.getValue()));
+  /**
+   * Clone the vtSegments and LCVP to the destination PartitionTracker. May be called concurrently.
+   *
+   * @param latestMessageTimeInMs the latest producer message timestamp observed so far, used as the data-relative
+   *                              anchor for age-based pruning (mirrors {@link #clearExpiredStateAndUpdateOffsetRecord}).
+   *                              When {@link DataIntegrityValidator#DISABLED} is passed (e.g. from a fresh
+   *                              OffsetRecord before any messages have been observed), the computed threshold
+   *                              {@code DISABLED - maxAgeInMs} is a very large negative value, so no segment is
+   *                              pruned. To disable pruning entirely regardless of timestamps, pass
+   *                              {@link DataIntegrityValidator#DISABLED} as {@code maxAgeInMs} instead.
+   */
+  public void cloneVtProducerStates(
+      PartitionTracker destProducerTracker,
+      long maxAgeInMs,
+      long latestMessageTimeInMs,
+      boolean emitLog) {
+    long earliestAllowableTimestamp = computeEarliestAllowableTimestamp(maxAgeInMs, latestMessageTimeInMs);
+    List<GUID> staleGuids = new ArrayList<>();
+    for (Map.Entry<GUID, Segment> entry: vtSegments.entrySet()) {
+      if (entry.getValue().getLastRecordProducerTimestamp() >= earliestAllowableTimestamp) {
+        destProducerTracker.setSegment(PartitionTracker.VERSION_TOPIC, entry.getKey(), new Segment(entry.getValue()));
+      } else {
+        staleGuids.add(entry.getKey()); // Collect stale GUIDs for removal
+      }
+    }
+    // Remove stale entries using map API
+    int removedCount = 0;
+    for (GUID guid: staleGuids) {
+      if (vtSegments.remove(guid) != null) {
+        removedCount++;
+      }
+    }
+    if (emitLog && removedCount > 0 && !REDUNDANT_LOGGING_FILTER.isRedundantException(topicName + "-cloneVtStates")) {
+      logger.info("event=globalRtDiv Removed {} stale VT producer state(s) for store {}", removedCount, topicName);
+    }
+    destProducerTracker.updateLatestConsumedVtPosition(latestConsumedVtPosition.get());
+    destProducerTracker.updateLatestConsumedRemoteVtPosition(latestConsumedRemoteVtPosition.get());
+  }
+
+  /**
+   * Clone the rtSegments to the destination PartitionTracker. Filter by brokerUrl. May be called concurrently.
+   *
+   * @param latestMessageTimeInMs the latest producer message timestamp observed so far, used as the data-relative
+   *                              anchor for age-based pruning (mirrors {@link #clearExpiredStateAndUpdateOffsetRecord}).
+   *                              When {@link DataIntegrityValidator#DISABLED} is passed (e.g. from a fresh
+   *                              OffsetRecord before any messages have been observed), the computed threshold
+   *                              {@code DISABLED - maxAgeInMs} is a very large negative value, so no segment is
+   *                              pruned. To disable pruning entirely regardless of timestamps, pass
+   *                              {@link DataIntegrityValidator#DISABLED} as {@code maxAgeInMs} instead.
+   */
+  public void cloneRtProducerStates(
+      PartitionTracker destProducerTracker,
+      String brokerUrl,
+      long maxAgeInMs,
+      long latestMessageTimeInMs) {
+    long earliestAllowableTimestamp = computeEarliestAllowableTimestamp(maxAgeInMs, latestMessageTimeInMs);
+    int removedCount = 0;
+    List<String> brokersToRemove = new ArrayList<>();
+    Iterator<Map.Entry<String, VeniceConcurrentHashMap<GUID, Segment>>> brokerIterator =
+        rtSegments.entrySet().iterator();
+    while (brokerIterator.hasNext()) {
+      Map.Entry<String, VeniceConcurrentHashMap<GUID, Segment>> broker2Segment = brokerIterator.next();
+      if (!brokerUrl.equals(broker2Segment.getKey())) {
+        continue; // filter by the specified brokerUrl
+      }
+
+      final VeniceConcurrentHashMap<GUID, Segment> rtEntries = broker2Segment.getValue();
+      List<GUID> guidsToRemove = new ArrayList<>();
+      for (Map.Entry<GUID, Segment> rtEntry: rtEntries.entrySet()) {
+        if (rtEntry.getValue().getLastRecordProducerTimestamp() >= earliestAllowableTimestamp) {
+          TopicType realTimeTopicType = TopicType.of(TopicType.REALTIME_TOPIC_TYPE, broker2Segment.getKey());
+          destProducerTracker.setSegment(realTimeTopicType, rtEntry.getKey(), new Segment(rtEntry.getValue()));
+        } else {
+          guidsToRemove.add(rtEntry.getKey()); // Collect stale GUIDs for removal
+        }
+      }
+      // Remove stale entries using map API
+      for (GUID guid: guidsToRemove) {
+        if (rtEntries.remove(guid) != null) {
+          removedCount++;
+        }
+      }
+      if (broker2Segment.getValue().isEmpty()) {
+        brokersToRemove.add(broker2Segment.getKey());
+      }
+    }
+    // Remove empty broker entries using map API
+    for (String broker: brokersToRemove) {
+      rtSegments.remove(broker);
+    }
+    if (removedCount > 0 && !REDUNDANT_LOGGING_FILTER.isRedundantException(topicName + "-cloneRtStates")) {
+      logger.info("event=globalRtDiv Removed {} stale RT producer state(s) for store {}", removedCount, topicName);
     }
   }
 
-  private void updateOffsetRecord(GUID guid, Segment segment, OffsetRecord offsetRecord) {
+  private void updateOffsetRecord(TopicType type, GUID guid, Segment segment, OffsetRecord offsetRecord) {
     if (segment == null) {
       // This producer didn't write anything to this GUID
       return;
     }
-    ProducerPartitionState state = offsetRecord.getProducerPartitionState(guid);
-    if (state == null) {
-      state = new ProducerPartitionState();
-
-      /**
-       * The aggregates and debugInfo being stored in the {@link ProducerPartitionState} will add a bit
-       * of overhead when we checkpoint this metadata to disk, so we should be careful not to add a very
-       * large number of elements to these arbitrary collections.
-       * <p>
-       * In the case of the debugInfo, it is expected (at the time of writing this comment) that all
-       * partitions produced by the same producer GUID would have the same debug values (though nothing
-       * precludes us from having per-partition debug values in the future if there is a use case for
-       * that). It is redundant that we store the same debug values once per partition. In the future,
-       * if we want to eliminate this redundancy, we could move the per-producer debug info to another
-       * data structure, though that would increase bookkeeping complexity. This is expected to be a
-       * minor overhead, and therefore it appears to be premature to optimize this now.
-       */
-      state.aggregates = CollectionUtils.substituteEmptyMap(segment.getAggregates());
-      state.debugInfo = CollectionUtils.substituteEmptyMap(segment.getDebugInfo());
+    ProducerPartitionState state;
+    if (TopicType.isVersionTopic(type)) {
+      state = offsetRecord.getProducerPartitionState(guid);
+    } else {
+      state = offsetRecord.getRealTimeProducerState(type.getKafkaUrl(), guid);
     }
-    state.checksumType = segment.getCheckSumType().getValue();
-    /**
-     * {@link MD5Digest#getEncodedState()} is allocating a byte array to contain the intermediate state,
-     * which is expensive. We should only invoke this closure when necessary.
-     */
-    state.checksumState = ByteBuffer.wrap(segment.getCheckSumState());
-    state.segmentNumber = segment.getSegmentNumber();
-    state.messageSequenceNumber = segment.getSequenceNumber();
-    state.messageTimestamp = segment.getLastRecordProducerTimestamp();
-    state.segmentStatus = segment.getStatus().getValue();
-    state.isRegistered = segment.isRegistered();
 
-    offsetRecord.setProducerPartitionState(guid, state);
+    if (state == null) {
+      state = segment.toProducerPartitionState();
+    } else {
+      segment.populateProducerPartitionState(state);
+    }
+
+    setProducerState(offsetRecord, type, guid, state);
   }
 
-  public void updateOffsetRecord(OffsetRecord offsetRecord) {
-    for (Map.Entry<GUID, Segment> entry: this.segments.entrySet()) {
-      updateOffsetRecord(entry.getKey(), entry.getValue(), offsetRecord);
+  public void setProducerState(OffsetRecord offsetRecord, TopicType type, GUID guid, ProducerPartitionState state) {
+    if (TopicType.isVersionTopic(type)) {
+      offsetRecord.setProducerPartitionState(guid, state);
+      return;
+    }
+    if (TopicType.isRealtimeTopic(type)) {
+      offsetRecord.setRealtimeTopicProducerState(type.getKafkaUrl(), guid, state);
+      return;
+    }
+    throw new IllegalArgumentException("Unsupported TopicType: " + type);
+  }
+
+  public void updateOffsetRecord(TopicType type, OffsetRecord offsetRecord) {
+    if (TopicType.isVersionTopic(type)) {
+      // Without this, the OffsetRecord keeps latestConsumedVtPosition=EARLIEST
+      offsetRecord.setLatestConsumedVtPosition(getLatestConsumedVtPosition());
+      offsetRecord.setLatestConsumedRemoteVtPosition(getLatestConsumedRemoteVtPosition());
+    }
+    for (Map.Entry<GUID, Segment> entry: getSegments(type).entrySet()) {
+      updateOffsetRecord(type, entry.getKey(), entry.getValue(), offsetRecord);
     }
   }
 
@@ -201,16 +387,17 @@ public class PartitionTracker {
    * @throws DataValidationException if the DIV check failed.
    */
   public void validateMessage(
-      PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> consumerRecord,
+      TopicType type,
+      DefaultPubSubMessage consumerRecord,
       boolean endOfPushReceived,
       Lazy<Boolean> tolerateMissingMsgs) throws DataValidationException {
-    Segment segment = getSegment(consumerRecord.getValue().getProducerMetadata().getProducerGUID());
+    Segment segment = getSegment(type, consumerRecord.getValue().getProducerMetadata().getProducerGUID());
     boolean hasPreviousSegment = segment != null;
-    segment = trackSegment(segment, consumerRecord, endOfPushReceived, tolerateMissingMsgs);
+    segment = trackSegment(type, segment, consumerRecord, endOfPushReceived, tolerateMissingMsgs);
     trackSequenceNumber(segment, consumerRecord, endOfPushReceived, tolerateMissingMsgs, hasPreviousSegment);
     // This is the last step, because we want failures in the previous steps to short-circuit execution.
     trackCheckSum(segment, consumerRecord, endOfPushReceived, tolerateMissingMsgs);
-    segment.setLastSuccessfulOffset(consumerRecord.getOffset());
+    segment.setLastSuccessfulPosition(consumerRecord.getPosition());
     segment.setNewSegment(false);
   }
 
@@ -222,27 +409,24 @@ public class PartitionTracker {
    * 1. The previous segment does not exist, or
    * 2. The incoming segment is exactly one greater than the previous one, and the previous segment is ended.
    *
-   * @see #initializeNewSegment(PubSubMessage, boolean, boolean)
+   * @see #initializeNewSegment(TopicType, DefaultPubSubMessage, boolean, boolean)
    *
    * @param consumerRecord the incoming Kafka message.
    * @throws DuplicateDataException if the incoming segment is lower than the previously seen segment.
    */
   private Segment trackSegment(
+      TopicType type,
       Segment previousSegment,
-      PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> consumerRecord,
+      DefaultPubSubMessage consumerRecord,
       boolean endOfPushReceived,
       Lazy<Boolean> tolerateMissingMsgs) throws DuplicateDataException {
     int incomingSegmentNumber = consumerRecord.getValue().producerMetadata.segmentNumber;
     if (previousSegment == null) {
       if (incomingSegmentNumber != 0) {
-        handleUnregisteredProducer(
-            "track new segment with non-zero incomingSegment=" + incomingSegmentNumber,
-            consumerRecord,
-            null,
-            endOfPushReceived,
-            true);
+        final String scenario = "track new segment with non-zero incomingSegment=" + incomingSegmentNumber;
+        handleUnregisteredProducer(scenario, consumerRecord, endOfPushReceived, true);
       }
-      return initializeNewSegment(consumerRecord, endOfPushReceived, true);
+      return initializeNewSegment(type, consumerRecord, endOfPushReceived, true);
     }
     int previousSegmentNumber = previousSegment.getSegmentNumber();
     if (incomingSegmentNumber == previousSegmentNumber) {
@@ -250,16 +434,16 @@ public class PartitionTracker {
     }
     if (incomingSegmentNumber == previousSegmentNumber + 1 && previousSegment.isEnded()) {
       /** tolerateAnyMessageType should always be false in this scenario, regardless of {@param endOfPushReceived} */
-      return initializeNewSegment(consumerRecord, endOfPushReceived, false);
+      return initializeNewSegment(type, consumerRecord, endOfPushReceived, false);
     }
     if (incomingSegmentNumber > previousSegmentNumber) {
       if (tolerateMissingMsgs.get()) {
-        return initializeNewSegment(consumerRecord, endOfPushReceived, true);
+        return initializeNewSegment(type, consumerRecord, endOfPushReceived, true);
       }
-      throw DataFaultType.MISSING.getNewException(previousSegment, consumerRecord);
+      throw DataFaultType.MISSING.getNewException(previousSegment, consumerRecord, pubSubPositionDeserializer);
     }
     // incomingSegmentNumber < previousSegmentNumber
-    throw DataFaultType.DUPLICATE.getNewException(previousSegment, consumerRecord);
+    throw DataFaultType.DUPLICATE.getNewException(previousSegment, consumerRecord, pubSubPositionDeserializer);
   }
 
   /**
@@ -275,7 +459,8 @@ public class PartitionTracker {
    * @throws IllegalStateException if called for a message other than a {@link ControlMessageType#START_OF_SEGMENT}
    */
   private Segment initializeNewSegment(
-      PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> consumerRecord,
+      TopicType type,
+      DefaultPubSubMessage consumerRecord,
       boolean endOfPushReceived,
       boolean tolerateAnyMessageType) {
     CheckSumType checkSumType = CheckSumType.NONE;
@@ -307,15 +492,10 @@ public class PartitionTracker {
         debugInfo,
         aggregates);
     newSegment.setLastRecordProducerTimestamp(consumerRecord.getValue().getProducerMetadata().getMessageTimestamp());
-    this.segments.put(consumerRecord.getValue().getProducerMetadata().getProducerGUID(), newSegment);
+    getSegments(type).put(consumerRecord.getValue().getProducerMetadata().getProducerGUID(), newSegment);
 
     if (unregisteredProducer) {
-      handleUnregisteredProducer(
-          "initialize new segment with a non-" + ControlMessageType.START_OF_SEGMENT.name() + " message",
-          consumerRecord,
-          null,
-          endOfPushReceived,
-          tolerateAnyMessageType);
+      handleUnregisteredProducer(NON_SOS_SCENARIO, consumerRecord, endOfPushReceived, tolerateAnyMessageType);
     } else {
       newSegment.registeredSegment();
     }
@@ -325,27 +505,19 @@ public class PartitionTracker {
 
   /**
    * Found an unregistered producer when creating a segment.
-   * @param endOfPushReceived Whether end of push is received for this partition.
+   * @param endOfPushReceived      Whether end of push is received for this partition.
    * @param tolerateAnyMessageType If true, then a segment can be initialized without "START_OF_SEGMENT".
    */
   private void handleUnregisteredProducer(
       String scenario,
-      PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> consumerRecord,
-      Segment segment,
+      DefaultPubSubMessage consumerRecord,
       boolean endOfPushReceived,
       boolean tolerateAnyMessageType) {
-    if (endOfPushReceived && tolerateAnyMessageType) {
-      String errorMsgIdentifier = consumerRecord.getTopicPartition().getPubSubTopic().getName() + "-"
-          + consumerRecord.getTopicPartition().getPartitionNumber() + "-" + DataFaultType.UNREGISTERED_PRODUCER;
-      if (!REDUNDANT_LOGGING_FILTER.isRedundantException(errorMsgIdentifier)) {
-        logger.warn("Will {}, endOfPushReceived=true, tolerateAnyMessageType=true", scenario);
-      }
-    } else {
-      throw DataFaultType.UNREGISTERED_PRODUCER.getNewException(
-          segment,
-          consumerRecord,
-          "Cannot " + scenario + ", endOfPushReceived=" + endOfPushReceived + ", tolerateAnyMessageType="
-              + tolerateAnyMessageType);
+    if (!endOfPushReceived || !tolerateAnyMessageType) {
+      String extraInfo = "Cannot " + scenario + ", endOfPushReceived=" + endOfPushReceived + ", tolerateAnyMessageType="
+          + tolerateAnyMessageType;
+      throw DataFaultType.UNREGISTERED_PRODUCER
+          .getNewException(null, consumerRecord, extraInfo, pubSubPositionDeserializer);
     }
   }
 
@@ -365,7 +537,7 @@ public class PartitionTracker {
    */
   private void trackSequenceNumber(
       Segment segment,
-      PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> consumerRecord,
+      DefaultPubSubMessage consumerRecord,
       boolean endOfPushReceived,
       Lazy<Boolean> tolerateMissingMsgs,
       boolean hasPreviousSegment) throws MissingDataException, DuplicateDataException {
@@ -382,7 +554,7 @@ public class PartitionTracker {
 
     if (incomingSequenceNumber == previousSequenceNumber) {
       if (!segment.isNewSegment()) {
-        throw DataFaultType.DUPLICATE.getNewException(segment, consumerRecord);
+        throw DataFaultType.DUPLICATE.getNewException(segment, consumerRecord, pubSubPositionDeserializer);
       }
       segment.setLastRecordProducerTimestamp(recordMetadata.getMessageTimestamp());
       /**
@@ -415,13 +587,12 @@ public class PartitionTracker {
       // 1. We want to short-circuit data validation, because the running checksum depends on exactly-once guarantees.
       // 2. The upstream caller can choose to avoid writing duplicate data, as an optimization.
       // 3. We don't want to re-calculate checksum for duplicated msgs. It's an incorrect behavior.
-      throw DataFaultType.DUPLICATE.getNewException(segment, consumerRecord);
+      throw DataFaultType.DUPLICATE.getNewException(segment, consumerRecord, pubSubPositionDeserializer);
     }
 
     if (incomingSequenceNumber > previousSequenceNumber + 1) {
       // There is a gap in the sequence, so we are missing some data!
 
-      DataValidationException dataMissingException = DataFaultType.MISSING.getNewException(segment, consumerRecord);
       /**
        * We will swallow {@link DataFaultType.MISSING} in either of the two scenarios:
        * 1. The segment was sent by unregistered producers after EOP
@@ -438,7 +609,7 @@ public class PartitionTracker {
         return;
       }
 
-      throw dataMissingException;
+      throw DataFaultType.MISSING.getNewException(segment, consumerRecord, pubSubPositionDeserializer);
     }
 
     // Defensive coding, to prevent regressions in the above code from causing silent failures
@@ -459,14 +630,25 @@ public class PartitionTracker {
    */
   private void trackCheckSum(
       Segment segment,
-      PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> consumerRecord,
+      DefaultPubSubMessage consumerRecord,
       boolean endOfPushReceived,
       Lazy<Boolean> tolerateMissingMsgs) throws CorruptDataException {
-    /**
-     * {@link Segment#addToCheckSum(KafkaKey, KafkaMessageEnvelope)} is an expensive operation because of the internal
-     * memory allocation.
-     * TODO: we could disable checksum validation if we think it is not necessary any more later on.
-     */
+    if (!segment.isRegistered()) {
+      /**
+       * Checksums only work for full segments. The unregistered segments are those which we first saw after the
+       * {@link StartOfSegment}, so there is no point in expending effort computing the checksum in those cases.
+       */
+      KafkaMessageEnvelope messageEnvelope = consumerRecord.getValue();
+      if (MessageType.valueOf(messageEnvelope) == MessageType.CONTROL_MESSAGE) {
+        ControlMessage controlMessage = (ControlMessage) messageEnvelope.getPayloadUnion();
+        if (ControlMessageType.valueOf(controlMessage) == ControlMessageType.END_OF_SEGMENT) {
+          EndOfSegment incomingEndOfSegment = (EndOfSegment) controlMessage.controlMessageUnion;
+          segment.end(incomingEndOfSegment.finalSegment);
+        }
+      }
+      return;
+    }
+
     boolean update = true;
     try {
       /**
@@ -490,13 +672,12 @@ public class PartitionTracker {
         // We're good, the expected checksum matches the one we computed on the receiving end (:
         segment.end(incomingEndOfSegment.finalSegment);
       } else {
-        DataValidationException dataCorruptException = DataFaultType.CORRUPT.getNewException(segment, consumerRecord);
         /**
          * We will swallow {@link DataFaultType.CORRUPT} in either of the two scenarios:
-         * 1. The segment was sent by unregistered producers after EOP
-         * 2. The topic might have been compacted for the record so that tolerateMissingMsgs is true
+         * 1. The segment was sent by unregistered producers (handled at the top of the function)
+         * 2. The tolerateMissingMsgs param is true (e.g., due to log compaction thresholds or other criteria)
          */
-        if ((endOfPushReceived && !segment.isRegistered()) || tolerateMissingMsgs.get()) {
+        if (tolerateMissingMsgs.get()) {
           segment.end(incomingEndOfSegment.finalSegment);
         } else {
           if (endOfPushReceived) {
@@ -507,7 +688,7 @@ public class PartitionTracker {
              */
             segment.end(incomingEndOfSegment.finalSegment);
           }
-          throw dataCorruptException;
+          throw DataFaultType.CORRUPT.getNewException(segment, consumerRecord, pubSubPositionDeserializer);
         }
       }
     }
@@ -528,7 +709,7 @@ public class PartitionTracker {
    */
   private void validateSequenceNumber(
       Segment segment,
-      PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> consumerRecord,
+      DefaultPubSubMessage consumerRecord,
       long logCompactionDelayInMs,
       Optional<DIVErrorMetricCallback> errorMetricCallback) throws MissingDataException {
     int previousSequenceNumber = segment.getSequenceNumber();
@@ -563,7 +744,8 @@ public class PartitionTracker {
       long lastRecordTimestamp = segment.getLastRecordTimestamp();
       if (logCompactionDelayInMs > 0
           && LatencyUtils.getElapsedTimeFromMsToMs(lastRecordTimestamp) < logCompactionDelayInMs) {
-        DataValidationException dataMissingException = DataFaultType.MISSING.getNewException(segment, consumerRecord);
+        DataValidationException dataMissingException =
+            DataFaultType.MISSING.getNewException(segment, consumerRecord, pubSubPositionDeserializer);
         logger.error(
             "Encountered missing data message within the log compaction time window. Error msg: {}",
             dataMissingException.getMessage());
@@ -581,16 +763,17 @@ public class PartitionTracker {
   }
 
   public void checkMissingMessage(
-      PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> consumerRecord,
+      TopicType type,
+      DefaultPubSubMessage consumerRecord,
       Optional<PartitionTracker.DIVErrorMetricCallback> errorMetricCallback,
       long kafkaLogCompactionDelayInMs) throws DataValidationException {
-    Segment segment = getSegment(consumerRecord.getValue().getProducerMetadata().getProducerGUID());
+    Segment segment = getSegment(type, consumerRecord.getValue().getProducerMetadata().getProducerGUID());
 
     try {
       /**
        * Explicitly suppress UNREGISTERED_PRODUCER DIV error.
        */
-      segment = trackSegment(segment, consumerRecord, true, Lazy.FALSE);
+      segment = trackSegment(type, segment, consumerRecord, true, Lazy.FALSE);
     } catch (DuplicateDataException duplicate) {
       /**
        * Tolerate a segment rewind and not necessary to validate a previous segment;
@@ -628,10 +811,10 @@ public class PartitionTracker {
     }
   }
 
-  void clearExpiredStateAndUpdateOffsetRecord(OffsetRecord offsetRecord, long maxAgeInMs) {
-    long minimumRequiredRecordProducerTimestamp = offsetRecord.getMaxMessageTimeInMs() - maxAgeInMs;
+  void clearExpiredStateAndUpdateOffsetRecord(TopicType type, OffsetRecord offsetRecord, long maxAgeInMs) {
+    long minimumRequiredRecordProducerTimestamp = offsetRecord.calculateLatestMessageTimeInMs() - maxAgeInMs;
     int numberOfClearedGUIDs = 0;
-    Iterator<Map.Entry<GUID, Segment>> iterator = this.segments.entrySet().iterator();
+    Iterator<Map.Entry<GUID, Segment>> iterator = getSegments(type).entrySet().iterator();
     Map.Entry<GUID, Segment> entry;
     Segment segment;
     while (iterator.hasNext()) {
@@ -639,10 +822,10 @@ public class PartitionTracker {
       segment = entry.getValue();
       if (segment.getLastRecordProducerTimestamp() < minimumRequiredRecordProducerTimestamp) {
         iterator.remove();
-        offsetRecord.removeProducerPartitionState(entry.getKey());
+        removeProducerState(type, entry.getKey(), offsetRecord);
         numberOfClearedGUIDs++;
       } else {
-        updateOffsetRecord(entry.getKey(), segment, offsetRecord);
+        updateOffsetRecord(type, entry.getKey(), segment, offsetRecord);
       }
     }
     if (numberOfClearedGUIDs > 0) {
@@ -650,12 +833,46 @@ public class PartitionTracker {
     }
   }
 
+  public void removeProducerState(TopicType type, GUID guid, OffsetRecord offsetRecord) {
+    if (TopicType.isVersionTopic(type)) {
+      offsetRecord.removeProducerPartitionState(guid);
+      return;
+    }
+
+    if (TopicType.isRealtimeTopic(type)) {
+      offsetRecord.removeRealTimeTopicProducerState(type.getKafkaUrl(), guid);
+      return;
+    }
+
+    throw new IllegalArgumentException("Unsupported TopicType: " + type);
+  }
+
+  @VisibleForTesting
+  VeniceConcurrentHashMap<String, VeniceConcurrentHashMap<GUID, Segment>> getRtSegmentsForTesting() {
+    return rtSegments;
+  }
+
+  @VisibleForTesting
+  VeniceConcurrentHashMap<GUID, Segment> getVtSegmentsForTesting() {
+    return vtSegments;
+  }
+
+  private static final String NON_SOS_SCENARIO =
+      "initialize new segment with a non-" + ControlMessageType.START_OF_SEGMENT.name() + " message";
+
+  /**
+   * Pre-allocated, as this is a hot path exception. In order to avoid confusion with where the exception comes from,
+   * the fillInStacktrace behavior is explicitly disabled.
+   */
+  private static final DuplicateDataException SINGLETON_DUPLICATE_DATA_EXCEPTION =
+      new DuplicateDataException("Duplicate message will be skipped!", false);
+
   enum DataFaultType {
     /**
      * A given producer sent a message with a sequence number smaller or equal to the previously received
      * sequence number, rather than being exactly one greater than the previous.
      */
-    DUPLICATE(DuplicateDataException::new),
+    DUPLICATE(ignored -> SINGLETON_DUPLICATE_DATA_EXCEPTION),
 
     /**
      * A given producer sent a message with a sequence number more than one greater than the previously
@@ -685,22 +902,40 @@ public class PartitionTracker {
      */
     UNREGISTERED_PRODUCER(ImproperlyStartedSegmentException::new);
 
-    final Function<String, DataValidationException> exceptionSupplier;
+    final Function<Lazy<String>, DataValidationException> exceptionSupplier;
 
-    DataFaultType(Function<String, DataValidationException> exceptionSupplier) {
+    DataFaultType(Function<Lazy<String>, DataValidationException> exceptionSupplier) {
       this.exceptionSupplier = exceptionSupplier;
     }
 
     DataValidationException getNewException(
         Segment segment,
-        PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> consumerRecord) {
-      return getNewException(segment, consumerRecord, null);
+        DefaultPubSubMessage consumerRecord,
+        PubSubPositionDeserializer pubSubPositionDeserializer) {
+      return getNewException(segment, consumerRecord, null, pubSubPositionDeserializer);
     }
 
     DataValidationException getNewException(
         Segment segment,
-        PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> consumerRecord,
-        String extraInfo) {
+        DefaultPubSubMessage consumerRecord,
+        String extraInfo,
+        PubSubPositionDeserializer pubSubPositionDeserializer) {
+      if (this == DUPLICATE) {
+        // We don't care about getting details for duplicate data, and we don't even want to allocate a stacktrace.
+        return SINGLETON_DUPLICATE_DATA_EXCEPTION;
+      }
+
+      return exceptionSupplier
+          .apply(Lazy.of(() -> generateMessage(segment, consumerRecord, extraInfo, pubSubPositionDeserializer)));
+    }
+
+    /** N.B.: This is an expensive function, so we only want to invoke it lazily */
+    private String generateMessage(
+        Segment segment,
+        DefaultPubSubMessage consumerRecord,
+        String extraInfo,
+        PubSubPositionDeserializer pubSubPositionDeserializer) {
+      boolean isCorruptException = this == CORRUPT;
       ProducerMetadata producerMetadata = consumerRecord.getValue().producerMetadata;
       MessageType messageType = MessageType.valueOf(consumerRecord.getValue());
       String previousSegment, previousSequenceNumber;
@@ -709,7 +944,19 @@ public class PartitionTracker {
         previousSegment = previousSequenceNumber = "N/A (null segment)";
       } else {
         previousSegment = String.valueOf(segment.getSegmentNumber());
-        previousSequenceNumber = String.valueOf(segment.getSequenceNumber());
+        if (isCorruptException) {
+          /**
+           * The {@link #trackSequenceNumber(Segment, DefaultPubSubMessage, boolean, Lazy, boolean)} function is called
+           * prior to the {@link #trackCheckSum(Segment, DefaultPubSubMessage, boolean, Lazy)} function, so the previous
+           * sequence number is no longer available when we get to the checksum validation step, which is the one that
+           * would throw a {@link CorruptDataException}. If we printed the sequence number contained in the
+           * {@link Segment} state anyway, then we could be confused as to why this shows up as corrupt data, rather
+           * than duplicate data.
+           */
+          previousSequenceNumber = "N/A (already incremented by previous step)";
+        } else {
+          previousSequenceNumber = String.valueOf(segment.getSequenceNumber());
+        }
       }
       StringBuilder sb = new StringBuilder();
       // during parsing the logs, you can pipe these lines to
@@ -719,17 +966,20 @@ public class PartitionTracker {
           .append(GuidUtils.getHexFromGuid(producerMetadata.producerGUID))
           .append("; message type: ")
           .append(messageType.name());
-      if (MessageType.CONTROL_MESSAGE.equals(messageType)) {
-        ControlMessage controlMessage = (ControlMessage) consumerRecord.getValue().payloadUnion;
-        sb.append(" (").append(ControlMessageType.valueOf(controlMessage).name()).append(")");
+      ControlMessage controlMessage = null;
+      ControlMessageType controlMessageType = null;
+      if (messageType == MessageType.CONTROL_MESSAGE) {
+        controlMessage = (ControlMessage) consumerRecord.getValue().payloadUnion;
+        controlMessageType = ControlMessageType.valueOf(controlMessage);
+        sb.append(" (").append(controlMessageType.name()).append(")");
       }
 
       sb.append("; partition: ").append(consumerRecord.getTopicPartition().getPartitionNumber());
       if (segment != null) {
-        sb.append("; previous successful offset (in same segment): ").append(segment.getLastSuccessfulOffset());
+        sb.append("; previous successful position (in same segment): ").append(segment.getLastSuccessfulPosition());
       }
       sb.append("; incoming offset: ")
-          .append(consumerRecord.getOffset())
+          .append(consumerRecord.getPosition())
           .append("; previous segment: ")
           .append(previousSegment)
           .append("; incoming segment: ")
@@ -748,22 +998,66 @@ public class PartitionTracker {
           .append(new Date(producerMetadata.messageTimestamp))
           .append(")");
       if (consumerRecord.getValue().leaderMetadataFooter != null) {
-        sb.append("; leader metadata's upstream offset: ")
-            .append(consumerRecord.getValue().leaderMetadataFooter.upstreamOffset)
-            .append("; leader metadata's host name: ")
-            .append(consumerRecord.getValue().leaderMetadataFooter.hostName);
+        sb.append("; LeaderMetadata { upstream position: ")
+            .append(
+                deserializePositionWithOffsetFallback(
+                    consumerRecord.getValue().leaderMetadataFooter.upstreamPubSubPosition,
+                    consumerRecord.getValue().leaderMetadataFooter.upstreamOffset,
+                    pubSubPositionDeserializer))
+            .append("; upstream pub sub cluster ID: ")
+            .append(consumerRecord.getValue().leaderMetadataFooter.upstreamKafkaClusterId)
+            .append("; producer host name: ")
+            .append(consumerRecord.getValue().leaderMetadataFooter.hostName)
+            .append(" }");
       }
       if (segment != null) {
-        sb.append("; aggregates: ");
-        printMap(segment.getAggregates(), sb);
-        sb.append("; debugInfo: ");
-        printMap(segment.getDebugInfo(), sb);
+        sb.append("; unregisteredProducer: ").append(!segment.isRegistered());
+        if (!CollectionUtils.isEmpty(segment.getAggregates())) {
+          sb.append("; aggregates: ");
+          printMap(segment.getAggregates(), sb);
+        }
+        if (!CollectionUtils.isEmpty(segment.getDebugInfo())) {
+          sb.append("; debugInfo: ");
+          printMap(segment.getDebugInfo(), sb);
+        }
+      }
+      if (isCorruptException) {
+        /** Since corrupt data exceptions are pretty rare and tricky, we print as much info as possible. */
+        sb.append("; Segment { isRegistered: ")
+            .append(segment.isRegistered())
+            .append("; isNewSegment: ")
+            .append(segment.isNewSegment())
+            .append("; isEnded: ")
+            .append(segment.isEnded())
+            .append("; isStarted: ")
+            .append(segment.isStarted())
+            .append("; checksum type: ")
+            .append(segment.getCheckSumType())
+            .append("; checksum value: ")
+            .append(ByteUtils.toHexString(segment.getFinalCheckSum()))
+            .append(" }");
+        if (controlMessageType == ControlMessageType.END_OF_SEGMENT) {
+          /**
+           * It should always be the case that we are dealing with an EOS CM in the corrupt data case, so these checks
+           * are just defensive code to avoid class cast exceptions... No need to append any other info in the else case
+           * since we are already printing the message type and CM type at the beginning, which is all we can really do.
+           */
+          EndOfSegment endOfSegment = (EndOfSegment) controlMessage.controlMessageUnion;
+          sb.append("; EOS { checksum value: ");
+          ByteBuffer eosChecksum = endOfSegment.getChecksumValue();
+          if (eosChecksum == null || eosChecksum.remaining() == 0) {
+            sb.append("(empty)");
+          } else {
+            sb.append(ByteUtils.toHexString(ByteUtils.extractByteArray(eosChecksum)));
+          }
+          sb.append("; isFinalSegment: ").append(endOfSegment.getFinalSegment()).append(" }");
+        }
       }
       if (extraInfo != null) {
         sb.append("; extra info: ").append(extraInfo);
       }
 
-      return exceptionSupplier.apply(sb.toString());
+      return sb.toString();
     }
 
     private <K, V> void printMap(Map<K, V> map, StringBuilder sb) {
@@ -785,5 +1079,64 @@ public class PartitionTracker {
 
   public interface DIVErrorMetricCallback {
     void execute(DataValidationException exception);
+  }
+
+  public static class TopicType {
+    /**
+     * The topic is a version topic.
+     */
+    public static final int VERSION_TOPIC_TYPE = 0;
+
+    /**
+     * The topic is a realtime topic.
+     */
+    public static final int REALTIME_TOPIC_TYPE = 1;
+
+    private final int val;
+    private final String kafkaUrl;
+
+    private TopicType(int val, String kakfkaUrl) {
+      this.val = val;
+      this.kafkaUrl = kakfkaUrl;
+    }
+
+    public static TopicType of(int val, String kafkaUrl) {
+      return new TopicType(val, kafkaUrl);
+    }
+
+    public static TopicType of(int val) {
+      return of(val, null);
+    }
+
+    public int getValue() {
+      return val;
+    }
+
+    public String getKafkaUrl() {
+      return kafkaUrl;
+    }
+
+    public static boolean isRealtimeTopic(TopicType type) {
+      return type.getValue() == REALTIME_TOPIC_TYPE;
+    }
+
+    public static boolean isVersionTopic(TopicType type) {
+      return type.getValue() == VERSION_TOPIC_TYPE;
+    }
+
+    public String toString() {
+      switch (this.val) {
+        case VERSION_TOPIC_TYPE:
+          return toString("VERSION_TOPIC");
+        case REALTIME_TOPIC_TYPE:
+          return toString("REALTIME_TOPIC");
+        default:
+          return toString("INVALID_TOPIC");
+      }
+    }
+
+    private String toString(String type) {
+      return type + (this.kafkaUrl == null ? "" : "(" + this.kafkaUrl + ")");
+    }
   }
 }

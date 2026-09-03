@@ -1,5 +1,6 @@
 package com.linkedin.davinci.store;
 
+import com.linkedin.venice.utils.ConfigCommonUtils.ActivationState;
 import com.linkedin.venice.utils.Utils;
 import java.util.Objects;
 
@@ -19,8 +20,17 @@ public class StoragePartitionConfig {
   private boolean writeOnlyConfig;
   private boolean readWriteLeaderForDefaultCF;
   private boolean readWriteLeaderForRMDCF;
+  private final boolean blobTransferInProgress;
+  /**
+   * Store-level BlobDB config. NOT_SPECIFIED means use cluster-level config.
+   */
+  private ActivationState blobDbEnabled = ActivationState.NOT_SPECIFIED;
 
   public StoragePartitionConfig(String storeName, int partitionId) {
+    this(storeName, partitionId, false);
+  }
+
+  public StoragePartitionConfig(String storeName, int partitionId, boolean isBlobTransferInProgress) {
     this.storeName = storeName;
     this.partitionId = partitionId;
     this.deferredWrite = false;
@@ -28,6 +38,7 @@ public class StoragePartitionConfig {
     this.writeOnlyConfig = true;
     this.readWriteLeaderForDefaultCF = false;
     this.readWriteLeaderForRMDCF = false;
+    this.blobTransferInProgress = isBlobTransferInProgress;
   }
 
   public String getStoreName() {
@@ -36,6 +47,10 @@ public class StoragePartitionConfig {
 
   public int getPartitionId() {
     return this.partitionId;
+  }
+
+  public boolean isBlobTransferInProgress() {
+    return blobTransferInProgress;
   }
 
   public void setDeferredWrite(boolean deferredWrite) {
@@ -84,6 +99,14 @@ public class StoragePartitionConfig {
     this.readWriteLeaderForRMDCF = readWriteLeaderForRMDCF;
   }
 
+  public ActivationState getBlobDbEnabled() {
+    return blobDbEnabled;
+  }
+
+  public void setBlobDbEnabled(ActivationState blobDbEnabled) {
+    this.blobDbEnabled = blobDbEnabled != null ? blobDbEnabled : ActivationState.NOT_SPECIFIED;
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) {
@@ -96,7 +119,7 @@ public class StoragePartitionConfig {
     return partitionId == that.partitionId && deferredWrite == that.deferredWrite && readOnly == that.readOnly
         && writeOnlyConfig == that.writeOnlyConfig && storeName.equals(that.storeName)
         && readWriteLeaderForDefaultCF == that.readWriteLeaderForDefaultCF
-        && readWriteLeaderForRMDCF == that.readWriteLeaderForRMDCF;
+        && readWriteLeaderForRMDCF == that.readWriteLeaderForRMDCF && blobDbEnabled == that.blobDbEnabled;
   }
 
   @Override
@@ -108,13 +131,21 @@ public class StoragePartitionConfig {
         readOnly,
         writeOnlyConfig,
         readWriteLeaderForDefaultCF,
-        readWriteLeaderForRMDCF);
+        readWriteLeaderForRMDCF,
+        blobDbEnabled);
   }
 
   @Override
   public String toString() {
-    return "Replica: " + Utils.getReplicaId(storeName, partitionId) + ", deferred-write: " + deferredWrite
-        + ", read-only: " + readOnly + ", write-only: " + writeOnlyConfig + ", read-write leader for default CF: "
-        + readWriteLeaderForDefaultCF + ", read-write leader for RMD CF: " + readWriteLeaderForRMDCF;
+    String toStringResult = "Replica: " + Utils.getReplicaId(storeName, partitionId) + ", deferred-write: "
+        + deferredWrite + ", read-only: " + readOnly + ", write-only: " + writeOnlyConfig
+        + ", read-write leader for default CF: " + readWriteLeaderForDefaultCF + ", read-write leader for RMD CF: "
+        + readWriteLeaderForRMDCF + ", blob-db-enabled: " + blobDbEnabled;
+
+    if (blobTransferInProgress) {
+      toStringResult += ", blob transfer in progress: true.";
+    }
+
+    return toStringResult;
   }
 }

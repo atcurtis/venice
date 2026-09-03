@@ -1,13 +1,14 @@
 package com.linkedin.venice.hadoop.input.kafka;
 
-import static com.linkedin.venice.ConfigKeys.KAFKA_BOOTSTRAP_SERVERS;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.COMPRESSION_STRATEGY;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.KAFKA_INPUT_BROKER_URL;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.KAFKA_INPUT_SOURCE_COMPRESSION_STRATEGY;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.KAFKA_INPUT_TOPIC;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.REPUSH_TTL_ENABLE;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.TOPIC_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.COMPRESSION_STRATEGY;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.KAFKA_INPUT_SOURCE_COMPRESSION_STRATEGY;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.KAFKA_INPUT_TOPIC;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.REPUSH_TTL_ENABLE;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.TOPIC_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_PUSH_DESTINATION_PUBSUB_BROKER;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_REPUSH_SOURCE_PUBSUB_BROKER;
 
+import com.linkedin.venice.common.ChunkAssembler;
 import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.compression.CompressorFactory;
 import com.linkedin.venice.compression.VeniceCompressor;
@@ -16,7 +17,6 @@ import com.linkedin.venice.hadoop.FilterChain;
 import com.linkedin.venice.hadoop.input.kafka.avro.KafkaInputMapperKey;
 import com.linkedin.venice.hadoop.input.kafka.avro.KafkaInputMapperValue;
 import com.linkedin.venice.hadoop.input.kafka.avro.MapperValueType;
-import com.linkedin.venice.hadoop.input.kafka.chunk.ChunkAssembler;
 import com.linkedin.venice.hadoop.input.kafka.ttl.VeniceChunkedPayloadTTLFilter;
 import com.linkedin.venice.hadoop.mapreduce.datawriter.reduce.VeniceReducer;
 import com.linkedin.venice.hadoop.task.datawriter.AbstractPartitionWriter;
@@ -24,6 +24,7 @@ import com.linkedin.venice.hadoop.task.datawriter.DataWriterTaskTracker;
 import com.linkedin.venice.serializer.FastSerializerDeserializerFactory;
 import com.linkedin.venice.serializer.RecordDeserializer;
 import com.linkedin.venice.utils.ByteUtils;
+import com.linkedin.venice.utils.IteratorUtils;
 import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.VeniceProperties;
 import java.io.IOException;
@@ -68,13 +69,13 @@ public class VeniceKafkaInputReducer extends VeniceReducer {
     sourceVersionCompressor = KafkaInputUtils.getCompressor(
         compressorFactory,
         CompressionStrategy.valueOf(props.getString(KAFKA_INPUT_SOURCE_COMPRESSION_STRATEGY)),
-        props.getString(KAFKA_INPUT_BROKER_URL),
+        props.getString(VENICE_REPUSH_SOURCE_PUBSUB_BROKER),
         props.getString(KAFKA_INPUT_TOPIC),
         props);
     destVersionCompressor = KafkaInputUtils.getCompressor(
         compressorFactory,
         CompressionStrategy.valueOf(props.getString(COMPRESSION_STRATEGY)),
-        props.getString(KAFKA_BOOTSTRAP_SERVERS),
+        props.getString(VENICE_PUSH_DESTINATION_PUBSUB_BROKER),
         props.getString(TOPIC_PROP),
         props);
     passThrough = sourceVersionCompressor.equals(destVersionCompressor);
@@ -125,15 +126,16 @@ public class VeniceKafkaInputReducer extends VeniceReducer {
   @Override
   protected AbstractPartitionWriter.VeniceWriterMessage extract(
       byte[] key,
-      Iterator<byte[]> valueIterator,
+      Iterator<VeniceRecordWithMetadata> values,
       DataWriterTaskTracker dataWriterTaskTracker) {
     KafkaInputMapperKey mapperKey = KAFKA_INPUT_MAPPER_KEY_AVRO_SPECIFIC_DESERIALIZER.deserialize(key);
     byte[] keyBytes = ByteUtils.extractByteArray(mapperKey.key);
-    if (!valueIterator.hasNext()) {
+    if (!values.hasNext()) {
       throw new VeniceException("There is no value corresponding to key bytes: " + ByteUtils.toHexString(keyBytes));
     }
 
-    return extractor.extract(keyBytes, valueIterator, dataWriterTaskTracker);
+    // We don't support a field override in KIF today, so we don't need to pass the rmdIterator
+    return extractor.extract(keyBytes, getValueOnlyIterator(values), dataWriterTaskTracker);
   }
 
   @Override
@@ -192,6 +194,10 @@ public class VeniceKafkaInputReducer extends VeniceReducer {
           isEnableWriteCompute(),
           getDerivedValueSchemaId());
     }
+  }
+
+  private Iterator<byte[]> getValueOnlyIterator(Iterator<VeniceRecordWithMetadata> valueRecordIterator) {
+    return IteratorUtils.mapIterator(valueRecordIterator, VeniceRecordWithMetadata::getValue);
   }
 
   private AbstractPartitionWriter.VeniceWriterMessage extractNonChunkedMessage(

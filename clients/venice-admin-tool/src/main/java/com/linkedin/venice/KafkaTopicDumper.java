@@ -1,14 +1,12 @@
 package com.linkedin.venice;
 
 import static com.linkedin.venice.chunking.ChunkKeyValueTransformer.KeyType.WITH_VALUE_CHUNK;
-import static com.linkedin.venice.pubsub.PubSubConstants.getPubsubOffsetApiTimeoutDurationDefaultValue;
 
 import com.github.luben.zstd.Zstd;
 import com.linkedin.avroutil1.compatibility.AvroCompatibilityHelper;
 import com.linkedin.venice.chunking.ChunkKeyValueTransformer;
 import com.linkedin.venice.chunking.ChunkKeyValueTransformerImpl;
 import com.linkedin.venice.chunking.RawKeyBytesAndChunkedKeySuffix;
-import com.linkedin.venice.client.change.capture.protocol.RecordChangeEvent;
 import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.compression.CompressorFactory;
 import com.linkedin.venice.compression.VeniceCompressor;
@@ -24,17 +22,21 @@ import com.linkedin.venice.kafka.protocol.KafkaMessageEnvelope;
 import com.linkedin.venice.kafka.protocol.LeaderMetadata;
 import com.linkedin.venice.kafka.protocol.ProducerMetadata;
 import com.linkedin.venice.kafka.protocol.Put;
+import com.linkedin.venice.kafka.protocol.TopicSwitch;
 import com.linkedin.venice.kafka.protocol.Update;
 import com.linkedin.venice.kafka.protocol.enums.ControlMessageType;
 import com.linkedin.venice.kafka.protocol.enums.MessageType;
 import com.linkedin.venice.message.KafkaKey;
 import com.linkedin.venice.meta.StoreInfo;
 import com.linkedin.venice.meta.Version;
-import com.linkedin.venice.pubsub.PubSubTopicPartitionImpl;
+import com.linkedin.venice.pubsub.PubSubPositionDeserializer;
 import com.linkedin.venice.pubsub.PubSubTopicRepository;
+import com.linkedin.venice.pubsub.PubSubUtil;
+import com.linkedin.venice.pubsub.api.DefaultPubSubMessage;
 import com.linkedin.venice.pubsub.api.PubSubConsumerAdapter;
-import com.linkedin.venice.pubsub.api.PubSubMessage;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
 import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
+import com.linkedin.venice.pubsub.api.exceptions.PubSubClientException;
 import com.linkedin.venice.schema.AvroSchemaParseUtils;
 import com.linkedin.venice.serialization.avro.ChunkedValueManifestSerializer;
 import com.linkedin.venice.serializer.AvroSpecificDeserializer;
@@ -44,7 +46,6 @@ import com.linkedin.venice.utils.ByteUtils;
 import com.linkedin.venice.utils.DictionaryUtils;
 import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
-import com.linkedin.venice.views.ChangeCaptureView;
 import java.io.File;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -79,9 +80,10 @@ import org.apache.logging.log4j.Logger;
  */
 public class KafkaTopicDumper implements AutoCloseable {
   private static final Logger LOGGER = LogManager.getLogger(KafkaTopicDumper.class);
+  private static final PubSubTopicRepository TOPIC_REPOSITORY = new PubSubTopicRepository();
   private static final String VENICE_ETL_KEY_FIELD = "key";
   private static final String VENICE_ETL_VALUE_FIELD = "value";
-  private static final String VENICE_ETL_OFFSET_FIELD = "offset";
+  private static final String VENICE_ETL_POSITION_FIELD = "position";
   private static final String VENICE_ETL_DELETED_TS_FIELD = "DELETED_TS";
   private static final String VENICE_ETL_METADATA_FIELD = "metadata";
 
@@ -91,8 +93,6 @@ public class KafkaTopicDumper implements AutoCloseable {
   private static final String REGULAR_REC = "REG";
   private static final String CONTROL_REC = "CTRL";
 
-  private final String topicName;
-  private final int partition;
   private final String keySchemaStr;
   private final Schema keySchema;
   private final String latestValueSchemaStr;
@@ -103,12 +103,11 @@ public class KafkaTopicDumper implements AutoCloseable {
   private final VeniceCompressor compressor;
   private final String parentDirectory;
   private final PubSubConsumerAdapter consumer;
-  private final long messageCount;
-  private final long endOffset;
   private final int maxConsumeAttempts;
   private final boolean logMetadata;
   private final boolean logDataRecord;
   private final boolean logRmdRecord;
+  private final boolean logTsRecord;
 
   private final ChunkKeyValueTransformer chunkKeyValueTransformer;
   private final AvroSpecificDeserializer<ChunkedKeySuffix> chunkedKeySuffixDeserializer;
@@ -120,25 +119,26 @@ public class KafkaTopicDumper implements AutoCloseable {
   private GenericDatumReader<Object>[] valueReaders;
   private DecoderFactory decoderFactory = new DecoderFactory();
   private Schema outputSchema;
+  private PubSubTopicPartition topicPartition;
+  private PubSubPositionDeserializer pubSubPositionDeserializer;
 
   public KafkaTopicDumper(
       ControllerClient controllerClient,
       PubSubConsumerAdapter consumer,
-      String topic,
-      int partitionNumber,
-      long startingOffset,
-      int messageCount,
+      PubSubTopicPartition topicPartition,
       String parentDir,
       int maxConsumeAttempts,
       boolean logMetadata,
       boolean logDataRecord,
-      boolean logRmdRecord) {
+      boolean logRmdRecord,
+      boolean logTsRecord,
+      PubSubPositionDeserializer pubSubPositionDeserializer) {
+    this.topicPartition = topicPartition;
     this.consumer = consumer;
     this.maxConsumeAttempts = maxConsumeAttempts;
+    this.pubSubPositionDeserializer = pubSubPositionDeserializer;
 
-    PubSubTopicRepository pubSubTopicRepository = new PubSubTopicRepository();
-
-    String storeName = Version.parseStoreFromKafkaTopicName(topic);
+    String storeName = Version.parseStoreFromKafkaTopicName(topicPartition.getTopicName());
     StoreResponse storeResponse = controllerClient.getStore(storeName);
     if (storeResponse.isError()) {
       throw new VeniceException(
@@ -147,8 +147,8 @@ public class KafkaTopicDumper implements AutoCloseable {
 
     StoreInfo storeInfo = storeResponse.getStore();
     this.compressorFactory = new CompressorFactory();
-    if (Version.isATopicThatIsVersioned(topic)) {
-      int version = Version.parseVersionFromKafkaTopicName(topic);
+    if (Version.isATopicThatIsVersioned(topicPartition.getTopicName())) {
+      int version = Version.parseVersionFromKafkaTopicName(topicPartition.getTopicName());
       Optional<Version> optionalVersion = storeInfo.getVersion(version);
       if (!optionalVersion.isPresent()) {
         throw new VeniceException("Version: " + version + " does not exist for store: " + storeName);
@@ -156,7 +156,8 @@ public class KafkaTopicDumper implements AutoCloseable {
       this.isChunkingEnabled = optionalVersion.get().isChunkingEnabled();
       CompressionStrategy compressionStrategy = optionalVersion.get().getCompressionStrategy();
       if (compressionStrategy == CompressionStrategy.ZSTD_WITH_DICT) {
-        ByteBuffer dictionary = DictionaryUtils.readDictionaryFromKafka(topic, consumer, pubSubTopicRepository);
+        ByteBuffer dictionary =
+            DictionaryUtils.readDictionaryFromKafka(topicPartition.getTopicName(), consumer, TOPIC_REPOSITORY);
         compressor = compressorFactory
             .createCompressorWithDictionary(ByteUtils.extractByteArray(dictionary), Zstd.maxCompressionLevel());
       } else {
@@ -179,22 +180,15 @@ public class KafkaTopicDumper implements AutoCloseable {
       chunkedKeySuffixDeserializer = null;
       manifestSerializer = null;
     }
-
-    this.topicName = topic;
-    this.partition = partitionNumber;
     this.parentDirectory = parentDir;
     this.logMetadata = logMetadata;
     this.logDataRecord = logDataRecord;
     this.logRmdRecord = logRmdRecord;
+    this.logTsRecord = logTsRecord;
 
     if (logMetadata && !logDataRecord) {
       this.latestValueSchemaStr = null;
       this.allValueSchemas = null;
-    } else if (topicName.contains(ChangeCaptureView.CHANGE_CAPTURE_TOPIC_SUFFIX)) {
-      // For now dump data record to console mode does not support change capture topic.
-      this.latestValueSchemaStr = RecordChangeEvent.getClassSchema().toString();
-      this.allValueSchemas = new Schema[1];
-      this.allValueSchemas[0] = RecordChangeEvent.getClassSchema();
     } else {
       MultiSchemaResponse.Schema[] schemas = controllerClient.getAllValueSchema(storeName).getSchemas();
       LOGGER.info("Found {} value schemas for store {}", schemas.length, storeName);
@@ -230,66 +224,213 @@ public class KafkaTopicDumper implements AutoCloseable {
         }
       }
     }
-
-    PubSubTopicPartition partition =
-        new PubSubTopicPartitionImpl(pubSubTopicRepository.getTopic(topicName), partitionNumber);
-
-    Long partitionBeginningOffset =
-        consumer.beginningOffset(partition, getPubsubOffsetApiTimeoutDurationDefaultValue());
-    long computedStartingOffset = Math.max(partitionBeginningOffset, startingOffset);
-    LOGGER.info("Starting from offset: {}", computedStartingOffset);
-    consumer.subscribe(partition, computedStartingOffset - 1);
-    this.endOffset = consumer.endOffset(partition);
-    LOGGER.info("End offset for partition {} is {}", partition, this.endOffset);
-    if (messageCount < 0) {
-      this.messageCount = this.endOffset;
-    } else {
-      this.messageCount = messageCount;
-    }
-
     if (!(logMetadata || logDataRecord)) {
       setupDumpFile();
     }
   }
 
+  // Constructor for testing purpose only
+  KafkaTopicDumper(PubSubConsumerAdapter consumer, PubSubTopicPartition topicPartition, int maxConsumeAttempts) {
+    this.topicPartition = topicPartition;
+    this.consumer = consumer;
+    this.maxConsumeAttempts = maxConsumeAttempts;
+    this.keySchemaStr = null;
+    this.keySchema = null;
+    this.keyReader = null;
+    this.latestValueSchemaStr = null;
+    this.allValueSchemas = null;
+    this.parentDirectory = null;
+    this.logMetadata = false;
+    this.logDataRecord = false;
+    this.logRmdRecord = false;
+    this.logTsRecord = false;
+    this.isChunkingEnabled = false;
+    this.compressorFactory = new CompressorFactory();
+    this.compressor = compressorFactory.getCompressor(CompressionStrategy.NO_OP);
+    this.chunkKeyValueTransformer = null;
+    this.chunkedKeySuffixDeserializer = null;
+    this.manifestSerializer = null;
+  }
+
   /**
-   * 1. Fetch up to {@link KafkaTopicDumper#messageCount} messages in this partition.
-   * 2. Discard non-control messages.
+   * Calculates the starting offset for consuming messages from a PubSub topic partition.
+   *
+   * <p>This method determines the appropriate starting offset based on the provided starting
+   * offset or timestamp. If a specific {@code startingTimestamp} is provided, it attempts to find
+   * the offset corresponding to that timestamp. If no offset is found for the timestamp, it throws
+   * a {@link PubSubClientException}. The calculated starting offset will always be greater than
+   * or equal to the partition's beginning offset to ensure it is within the valid range.
+   *
+   * @param consumer the {@link PubSubConsumerAdapter} used to fetch position
+   * @param partition the {@link PubSubTopicPartition} identifying the topic and partition
+   * @param startingPosition the default starting position to use if no timestamp is provided
+   * @param startingTimestamp the starting timestamp (epoch in milliseconds) to locate an position.
+   *                          If set to -1, the method uses the provided {@code startingPosition}.
+   * @return the calculated starting position for the consumption
+   * @throws PubSubClientException if no position is found for the provided timestamp
    */
-  public int fetchAndProcess() {
-    int countdownBeforeStop = maxConsumeAttempts;
-    int currentMessageCount = 0;
+  static PubSubPosition calculateStartingPosition(
+      PubSubConsumerAdapter consumer,
+      PubSubTopicPartition partition,
+      PubSubPosition startingPosition,
+      long startingTimestamp) {
+    if (startingTimestamp != -1) {
+      LOGGER.info("Searching for position for timestamp: {} in topic-partition: {}", partition, startingTimestamp);
+      PubSubPosition position = consumer.getPositionByTimestamp(partition, startingTimestamp);
+      if (position == null) {
+        LOGGER.error(
+            "No position found for the requested timestamp: {} in topic-partition: {}. "
+                + "This indicates that there are no messages in the topic-partition with a timestamp "
+                + "greater than or equal to the provided timestamp. Verify if the topic-partition has data "
+                + "in the specified time range.",
+            startingTimestamp,
+            partition);
+        throw new PubSubClientException(
+            "Failed to find an position for the requested timestamp: " + startingTimestamp + " in topic-partition: "
+                + partition + ". Ensure that messages exist in the specified time range.");
+      }
+      LOGGER
+          .info("Found position: {} for timestamp: {} in topic-partition: {}", position, startingTimestamp, partition);
+      startingPosition = position;
+    }
+    PubSubPosition beginningPosition = consumer.beginningPosition(partition);
+    if (consumer.comparePositions(partition, startingPosition, beginningPosition) <= 0) {
+      LOGGER.info(
+          "The calculated starting position: {} is earlier than the beginning position: {}. "
+              + "Adjusting to use the beginning position.",
+          startingPosition,
+          beginningPosition);
+      return beginningPosition;
+    }
+    return startingPosition;
+  }
 
-    int lastReportedConsumedCount = 0;
-    PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> lastProcessRecord = null;
-    do {
-      Map<PubSubTopicPartition, List<PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long>>> records =
-          consumer.poll(5000); // up to 5 seconds
-      Iterator<PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long>> recordsIterator =
-          Utils.iterateOnMapOfLists(records);
-      while (recordsIterator.hasNext() && currentMessageCount < messageCount) {
-        currentMessageCount++;
-        PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> record = recordsIterator.next();
-        lastProcessRecord = record;
-        processRecord(record);
+  /**
+   * Calculates the ending position for consuming messages from a PubSub topic partition.
+   *
+   * <p>This method determines the appropriate ending position based on the provided timestamp.
+   * If the {@code endTimestamp} is -1, it directly returns the end position of the partition.
+   * If a specific {@code endTimestamp} is provided, it attempts to find the position corresponding
+   * to the timestamp. If no position is found for the given timestamp, it falls back to the partition's
+   * end position and logs a warning.
+   *
+   * @param consumer the {@link PubSubConsumerAdapter} used to fetch position
+   * @param partition the {@link PubSubTopicPartition} identifying the topic and partition
+   * @param endTimestamp the ending timestamp (epoch in milliseconds). If set to -1, the method uses the end position.
+   * @return the calculated ending position for the consumption
+   */
+  static PubSubPosition calculateEndingPosition(
+      PubSubConsumerAdapter consumer,
+      PubSubTopicPartition partition,
+      long endTimestamp) {
+    PubSubPosition endPosition = consumer.endPosition(partition);
+    if (endTimestamp == -1) {
+      return endPosition;
+    }
+    PubSubPosition positionForTime = consumer.getPositionByTimestamp(partition, endTimestamp);
+    if (positionForTime != null) {
+      return positionForTime;
+    }
+    // if getPositionByTimestamp returns null, it means there is no message with timestamp >= endTimestamp;
+    // In this case we will use the endPosition
+    LOGGER.warn(
+        "No position found for the requested timestamp: {} in topic-partition: {}. "
+            + "This indicates that there are no messages in the topic-partition with a timestamp "
+            + "greater than or equal to the provided timestamp. Returning the end position: {}",
+        endTimestamp,
+        partition,
+        endPosition);
+    return endPosition;
+  }
+
+  /**
+   * Fetches and processes messages from a given PubSub topic partition between specified positions.
+   *
+   * <p>The method polls messages from the specified `startPosition` to `endPosition` and processes up to
+   * `messageCount` messages. It uses the consumer to fetch records in batches, processes them via
+   * {@code processRecord}, and stops under the following conditions:
+   * <ul>
+   *   <li>The number of processed messages reaches {@code messageCount}.</li>
+   *   <li>The position of the last processed message is greater than or equal to {@code endPosition}.</li>
+   *   <li>No new records are fetched within the allowed number of attempts.</li>
+   * </ul>
+   *
+   * @param startPosition the starting position (inclusive) to begin processing messages
+   * @param endPosition the ending position (exclusive) to stop processing messages
+   * @param messageCount the maximum number of messages to process
+   * @return the total number of messages processed
+   * @throws IllegalArgumentException if {@code messageCount} is less than or equal to zero, or if
+   *                                  {@code startPosition} is greater than {@code endPosition}
+   */
+  public int fetchAndProcess(PubSubPosition startPosition, PubSubPosition endPosition, long messageCount) {
+    if (messageCount <= 0) {
+      throw new IllegalArgumentException("Invalid message count: " + messageCount);
+    }
+    if (consumer.comparePositions(topicPartition, startPosition, endPosition) >= 0) {
+      throw new IllegalArgumentException(
+          "Start position: " + startPosition + " is greater than or equal to end position: " + endPosition);
+    }
+
+    int remainingAttempts = maxConsumeAttempts;
+    int processedMessageCount = 0;
+    int lastReportedCount = 0;
+
+    consumer.subscribe(topicPartition, startPosition, true);
+
+    try {
+      DefaultPubSubMessage lastProcessedRecord = null;
+      while (remainingAttempts > 0 && processedMessageCount < messageCount) {
+        // Poll for records
+        Map<PubSubTopicPartition, List<DefaultPubSubMessage>> records = consumer.poll(5000); // Poll for up to 5 seconds
+        Iterator<DefaultPubSubMessage> recordIterator = Utils.iterateOnMapOfLists(records);
+        boolean hasProcessedRecords = false;
+        while (recordIterator.hasNext() && processedMessageCount < messageCount) {
+          DefaultPubSubMessage record = recordIterator.next();
+          // Only process and count the record if we haven't reached the end
+          processedMessageCount++;
+          lastProcessedRecord = record;
+          hasProcessedRecords = true;
+          processRecord(record);
+          // Check if we've reached endPosition BEFORE processing the record
+          // endPosition is exclusive, so stop when record.getPosition() >= endPosition
+          long positionDelta = consumer.positionDifference(topicPartition, endPosition, record.getPosition());
+          if (positionDelta <= 1) {
+            LOGGER.info(
+                "Reached endPosition: {}. Total messages processed: {}. Position delta: {}",
+                endPosition,
+                processedMessageCount,
+                positionDelta);
+            return processedMessageCount;
+          }
+        }
+
+        // Log progress if sufficient messages have been processed since the last report
+        if (processedMessageCount - lastReportedCount >= 1000) {
+          LOGGER.info(
+              "Consumed {} messages; last consumed message position: {}",
+              processedMessageCount,
+              lastProcessedRecord.getPosition());
+          lastReportedCount = processedMessageCount;
+        }
+
+        // Adjust remaining attempts if no records were processed
+        remainingAttempts = hasProcessedRecords ? maxConsumeAttempts : remainingAttempts - 1;
       }
 
-      if (currentMessageCount - lastReportedConsumedCount > 1000) {
-        LOGGER.info(
-            "Consumed {} messages; last consumed message offset:{}",
-            currentMessageCount,
-            lastProcessRecord.getOffset());
-        lastReportedConsumedCount = currentMessageCount;
-      }
-      countdownBeforeStop = records.isEmpty() ? countdownBeforeStop - 1 : maxConsumeAttempts;
-    } while ((lastProcessRecord != null && lastProcessRecord.getOffset() < (this.endOffset - 2))
-        && currentMessageCount < messageCount && countdownBeforeStop > 0);
-    return currentMessageCount;
+      // Return the total number of processed messages
+      return processedMessageCount;
+
+    } finally {
+      // Ensure unsubscription to free resources
+      consumer.unSubscribe(topicPartition);
+    }
   }
 
   private void setupDumpFile() {
     // build file
-    File dataFile = new File(this.parentDirectory + this.topicName + "_" + this.partition + ".avro");
+    File dataFile = new File(
+        this.parentDirectory + this.topicPartition.getTopicName() + "_" + this.topicPartition.getPartitionNumber()
+            + ".avro");
     List<Schema.Field> outputSchemaFields = new ArrayList<>();
     for (Schema.Field field: VeniceKafkaDecodedRecord.SCHEMA$.getFields()) {
       if (field.name().equals(VENICE_ETL_KEY_FIELD)) {
@@ -332,7 +473,7 @@ public class KafkaTopicDumper implements AutoCloseable {
   /**
    * Log the metadata for each kafka message.
    */
-  private void logRecordMetadata(PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> record) {
+  private void logRecordMetadata(DefaultPubSubMessage record) {
     try {
       KafkaKey kafkaKey = record.getKey();
       KafkaMessageEnvelope kafkaMessageEnvelope = record.getValue();
@@ -347,8 +488,8 @@ public class KafkaTopicDumper implements AutoCloseable {
       final String chunkMetadata = getChunkMetadataLog(record);
 
       LOGGER.info(
-          "[Record Metadata] Offset:{}; {}; {}; ProducerMd=(guid:{},seg:{},seq:{},mts:{},lts:{}); LeaderMd=(host:{},uo:{},ukcId:{}){}",
-          record.getOffset(),
+          "Position:{}; {}; {}; ProducerMd=(guid:{},seg:{},seq:{},mts:{},lts:{}); LeaderMd=(host:{},uo:{},ukcId:{}){}",
+          record.getPosition(),
           kafkaKey.isControlMessage() ? CONTROL_REC : REGULAR_REC,
           msgType,
           GuidUtils.getHexFromGuid(producerMetadata.producerGUID),
@@ -357,18 +498,20 @@ public class KafkaTopicDumper implements AutoCloseable {
           producerMetadata.messageTimestamp,
           producerMetadata.logicalTimestamp,
           leaderMetadata == null ? "-" : leaderMetadata.hostName,
-          leaderMetadata == null ? "-" : leaderMetadata.upstreamOffset,
+          leaderMetadata == null
+              ? "-"
+              : PubSubUtil.deserializePositionWithOffsetFallback(
+                  leaderMetadata.upstreamPubSubPosition,
+                  leaderMetadata.upstreamOffset,
+                  pubSubPositionDeserializer),
           leaderMetadata == null ? "-" : leaderMetadata.upstreamKafkaClusterId,
           chunkMetadata);
     } catch (Exception e) {
-      LOGGER.error("Encounter exception when processing record for offset {}", record.getOffset(), e);
+      LOGGER.error("Encounter exception when processing record for position {}", record.getPosition(), e);
     }
   }
 
-  void logDataRecord(
-      PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> record,
-      boolean logRecordMetadata,
-      boolean logReplicationMetadata) {
+  void logDataRecord(DefaultPubSubMessage record, boolean logRecordMetadata, boolean logReplicationMetadata) {
     KafkaKey kafkaKey = record.getKey();
     if (kafkaKey.isControlMessage()) {
       return;
@@ -376,8 +519,8 @@ public class KafkaTopicDumper implements AutoCloseable {
     KafkaMessageEnvelope kafkaMessageEnvelope = record.getValue();
     MessageType msgType = MessageType.valueOf(kafkaMessageEnvelope);
     LOGGER.info(
-        "[Record Data] Offset:{}; {}; {}",
-        record.getOffset(),
+        "[Record Data] Position:{}; {}; {}",
+        record.getPosition(),
         msgType.toString(),
         buildDataRecordLog(record, logReplicationMetadata));
 
@@ -387,9 +530,7 @@ public class KafkaTopicDumper implements AutoCloseable {
     }
   }
 
-  String buildDataRecordLog(
-      PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> record,
-      boolean logReplicationMetadata) {
+  String buildDataRecordLog(DefaultPubSubMessage record, boolean logReplicationMetadata) {
     KafkaKey kafkaKey = record.getKey();
     KafkaMessageEnvelope kafkaMessageEnvelope = record.getValue();
     Object keyRecord = null;
@@ -445,7 +586,7 @@ public class KafkaTopicDumper implements AutoCloseable {
           throw new VeniceException("Unknown data type.");
       }
     } catch (Exception e) {
-      LOGGER.error("Encounter exception when processing record for offset: {}", record.getOffset(), e);
+      LOGGER.error("Encounter exception when processing record for position: {}", record.getPosition(), e);
     }
     return logReplicationMetadata
         ? String
@@ -453,8 +594,20 @@ public class KafkaTopicDumper implements AutoCloseable {
         : String.format("Key: %s; Value: %s; Schema: %s", keyRecord, valueRecord, valuePayloadSchemaId);
   }
 
-  private void processRecord(PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> record) {
-    if (logDataRecord) {
+  void processRecord(DefaultPubSubMessage record) {
+    if (record.getKey().isGlobalRtDiv()) {
+      /*
+       * Global RT DIV records carry Global RT DIV state (DIV metadata) rather than user data, and are only meant to be
+       * consumed by the server ingestion pipeline, which persists them to the metadata partition. Only their KafkaKey
+       * header byte marks them as GLOBAL_RT_DIV; their KafkaMessageEnvelope messageType is PUT and their Put schema id
+       * collides with a store value schema id, so routing them through the PUT path would deserialize the DIV payload
+       * with the store value schema and fail or misparse. Skip them here, as with other non-user-data records.
+       */
+      return;
+    }
+    if (logTsRecord) {
+      logIfTopicSwitchMessage(record, pubSubPositionDeserializer);
+    } else if (logDataRecord) {
       logDataRecord(record, logMetadata, logRmdRecord);
     } else if (logMetadata) {
       logRecordMetadata(record);
@@ -464,7 +617,63 @@ public class KafkaTopicDumper implements AutoCloseable {
     }
   }
 
-  private void writeToFile(PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> record) {
+  static void logIfTopicSwitchMessage(
+      DefaultPubSubMessage record,
+      PubSubPositionDeserializer pubSubPositionDeserializer) {
+    KafkaKey kafkaKey = record.getKey();
+    if (!kafkaKey.isControlMessage()) {
+      // TS message is a control message, so we only care about control messages.
+      return;
+    }
+
+    ControlMessage controlMessage = (ControlMessage) record.getValue().payloadUnion;
+    if (controlMessage.controlMessageType != ControlMessageType.TOPIC_SWITCH.getValue()) {
+      return;
+    }
+
+    String logMessage = constructTopicSwitchLog(record, pubSubPositionDeserializer);
+    LOGGER.info(logMessage);
+  }
+
+  /**
+   * Constructs the log message for a TopicSwitch message.
+   *
+   * @param record The PubSubMessage containing the TopicSwitch message.
+   * @return A formatted string representing the log message.
+   */
+  static String constructTopicSwitchLog(
+      DefaultPubSubMessage record,
+      PubSubPositionDeserializer pubSubPositionDeserializer) {
+    KafkaMessageEnvelope kafkaMessageEnvelope = record.getValue();
+    ProducerMetadata producerMetadata = kafkaMessageEnvelope.producerMetadata;
+    LeaderMetadata leaderMetadata = kafkaMessageEnvelope.leaderMetadataFooter;
+    ControlMessage controlMessage = (ControlMessage) kafkaMessageEnvelope.payloadUnion;
+    TopicSwitch topicSwitch = (TopicSwitch) controlMessage.controlMessageUnion;
+
+    return String.format(
+        "Position:%s; %s; SourceKafkaServers: %s; SourceTopicName: %s; RewindStartTimestamp: %s; "
+            + "ProducerMd=(guid:%s,seg:%s,seq:%s,mts:%s,lts:%s); LeaderMd=(host:%s,uo:%s,ukcId:%s)",
+        record.getPosition(),
+        ControlMessageType.TOPIC_SWITCH.name(),
+        topicSwitch.sourceKafkaServers,
+        topicSwitch.sourceTopicName,
+        topicSwitch.rewindStartTimestamp,
+        GuidUtils.getHexFromGuid(producerMetadata.producerGUID),
+        producerMetadata.segmentNumber,
+        producerMetadata.messageSequenceNumber,
+        producerMetadata.messageTimestamp,
+        producerMetadata.logicalTimestamp,
+        leaderMetadata == null ? "-" : leaderMetadata.hostName,
+        leaderMetadata == null
+            ? "-"
+            : PubSubUtil.deserializePositionWithOffsetFallback(
+                leaderMetadata.upstreamPubSubPosition,
+                leaderMetadata.upstreamOffset,
+                pubSubPositionDeserializer),
+        leaderMetadata == null ? "-" : leaderMetadata.upstreamKafkaClusterId);
+  }
+
+  private void writeToFile(DefaultPubSubMessage record) {
     try {
       KafkaKey kafkaKey = record.getKey();
       KafkaMessageEnvelope kafkaMessageEnvelope = record.getValue();
@@ -474,7 +683,7 @@ public class KafkaTopicDumper implements AutoCloseable {
       }
       // build the record
       GenericRecord convertedRecord = new GenericData.Record(outputSchema);
-      convertedRecord.put(VENICE_ETL_OFFSET_FIELD, record.getOffset());
+      convertedRecord.put(VENICE_ETL_POSITION_FIELD, record.getPosition().toString());
 
       byte[] keyBytes = kafkaKey.getKey();
       Decoder keyDecoder = decoderFactory.binaryDecoder(keyBytes, null);
@@ -501,7 +710,7 @@ public class KafkaTopicDumper implements AutoCloseable {
           convertedRecord.put(VENICE_ETL_VALUE_FIELD, valueRecord);
           break;
         case DELETE:
-          convertedRecord.put(VENICE_ETL_DELETED_TS_FIELD, record.getOffset());
+          convertedRecord.put(VENICE_ETL_DELETED_TS_FIELD, record.getPosition().getNumericOffset());
           break;
         case UPDATE:
           LOGGER.info("Found update message! continue");
@@ -511,12 +720,12 @@ public class KafkaTopicDumper implements AutoCloseable {
       }
       dataFileWriter.append(convertedRecord);
     } catch (Exception e) {
-      LOGGER.error("Failed when building record for offset {}", record.getOffset(), e);
+      LOGGER.error("Failed when building record for position {}", record.getPosition(), e);
     }
   }
 
   // Visible for testing
-  String getChunkMetadataLog(PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> record) throws IOException {
+  String getChunkMetadataLog(DefaultPubSubMessage record) throws IOException {
     KafkaKey kafkaKey = record.getKey();
     KafkaMessageEnvelope kafkaMessageEnvelope = record.getValue();
     if (this.isChunkingEnabled && !kafkaKey.isControlMessage()) {

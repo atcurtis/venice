@@ -6,6 +6,7 @@ import static com.linkedin.venice.pubsub.PubSubConstants.ETERNAL_TOPIC_RETENTION
 import static com.linkedin.venice.pubsub.PubSubConstants.PUBSUB_FAST_OPERATION_TIMEOUT_MS;
 import static com.linkedin.venice.pubsub.PubSubConstants.PUBSUB_TOPIC_DELETE_RETRY_TIMES;
 import static com.linkedin.venice.pubsub.PubSubConstants.PUBSUB_TOPIC_UNKNOWN_RETENTION;
+import static com.linkedin.venice.pubsub.PubSubConstants.TOPIC_METADATA_OP_RETRIABLE_EXCEPTIONS;
 import static com.linkedin.venice.pubsub.manager.TopicManagerStats.SENSOR_TYPE.CONTAINS_TOPIC_WITH_RETRY;
 import static com.linkedin.venice.pubsub.manager.TopicManagerStats.SENSOR_TYPE.CREATE_TOPIC;
 import static com.linkedin.venice.pubsub.manager.TopicManagerStats.SENSOR_TYPE.DELETE_TOPIC;
@@ -19,13 +20,15 @@ import static com.linkedin.venice.pubsub.manager.TopicManagerStats.SENSOR_TYPE.S
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
 import com.linkedin.venice.exceptions.VeniceException;
+import com.linkedin.venice.pubsub.PubSubAdminAdapterContext;
 import com.linkedin.venice.pubsub.PubSubConstants;
 import com.linkedin.venice.pubsub.PubSubTopicConfiguration;
-import com.linkedin.venice.pubsub.PubSubTopicPartitionImpl;
 import com.linkedin.venice.pubsub.PubSubTopicPartitionInfo;
 import com.linkedin.venice.pubsub.PubSubTopicRepository;
 import com.linkedin.venice.pubsub.api.PubSubAdminAdapter;
 import com.linkedin.venice.pubsub.api.PubSubConsumerAdapter;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
+import com.linkedin.venice.pubsub.api.PubSubSymbolicPosition;
 import com.linkedin.venice.pubsub.api.PubSubTopic;
 import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
 import com.linkedin.venice.pubsub.api.exceptions.PubSubClientException;
@@ -36,10 +39,11 @@ import com.linkedin.venice.pubsub.api.exceptions.PubSubTopicExistsException;
 import com.linkedin.venice.utils.ExceptionUtils;
 import com.linkedin.venice.utils.RetryUtils;
 import com.linkedin.venice.utils.Utils;
-import it.unimi.dsi.fastutil.ints.Int2LongMap;
 import java.io.Closeable;
+import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -69,7 +73,7 @@ public class TopicManager implements Closeable {
   private final PubSubTopicRepository pubSubTopicRepository;
   private final TopicManagerStats stats;
   private final TopicMetadataFetcher topicMetadataFetcher;
-  private AtomicBoolean isClosed = new AtomicBoolean(false);
+  private final AtomicBoolean isClosed = new AtomicBoolean(false);
 
   // TODO: Consider moving this cache to TopicMetadataFetcher
   // It's expensive to grab the topic config over and over again, and it changes infrequently.
@@ -82,10 +86,18 @@ public class TopicManager implements Closeable {
         TopicManager.class.getSimpleName() + " [" + Utils.getSanitizedStringForLogger(pubSubClusterAddress) + "]");
     this.pubSubClusterAddress = Objects.requireNonNull(pubSubClusterAddress, "pubSubClusterAddress cannot be null");
     this.topicManagerContext = context;
-    this.stats = new TopicManagerStats(context.getMetricsRepository(), pubSubClusterAddress);
+    this.stats =
+        new TopicManagerStats(context.getMetricsRepository(), pubSubClusterAddress, context.getVeniceComponent());
     this.pubSubTopicRepository = context.getPubSubTopicRepository();
     this.pubSubAdminAdapter = context.getPubSubAdminAdapterFactory()
-        .create(context.getPubSubProperties(pubSubClusterAddress), pubSubTopicRepository);
+        .create(
+            new PubSubAdminAdapterContext.Builder().setPubSubTopicRepository(context.getPubSubTopicRepository())
+                .setPubSubPositionTypeRegistry(context.getPubSubPositionTypeRegistry())
+                .setMetricsRepository(context.getMetricsRepository())
+                .setVeniceProperties(context.getPubSubProperties(pubSubClusterAddress))
+                .setAdminClientName("TopicManager")
+                .setStoreChangeNotifier(context.getStoreChangeNotifier())
+                .build());
     this.topicMetadataFetcher = new TopicMetadataFetcher(pubSubClusterAddress, context, stats, pubSubAdminAdapter);
     this.logger.info(
         "Created a topic manager for the pubsub cluster address: {} with context: {}",
@@ -136,6 +148,26 @@ public class TopicManager implements Closeable {
       boolean logCompaction,
       Optional<Integer> minIsr,
       boolean useFastPubSubOperationTimeout) {
+    createTopic(
+        topicName,
+        numPartitions,
+        replication,
+        eternal,
+        logCompaction,
+        minIsr,
+        useFastPubSubOperationTimeout,
+        false);
+  }
+
+  public void createTopic(
+      PubSubTopic topicName,
+      int numPartitions,
+      int replication,
+      boolean eternal,
+      boolean logCompaction,
+      Optional<Integer> minIsr,
+      boolean useFastPubSubOperationTimeout,
+      boolean useAlternativeBackend) {
     long retentionTimeMs;
     if (eternal) {
       retentionTimeMs = ETERNAL_TOPIC_RETENTION_POLICY_MS;
@@ -149,7 +181,8 @@ public class TopicManager implements Closeable {
         retentionTimeMs,
         logCompaction,
         minIsr,
-        useFastPubSubOperationTimeout);
+        useFastPubSubOperationTimeout,
+        useAlternativeBackend);
   }
 
   /**
@@ -174,6 +207,51 @@ public class TopicManager implements Closeable {
       boolean logCompaction,
       Optional<Integer> minIsr,
       boolean useFastPubSubOperationTimeout) {
+    createTopic(
+        topicName,
+        numPartitions,
+        replication,
+        retentionTimeMs,
+        logCompaction,
+        minIsr,
+        useFastPubSubOperationTimeout,
+        false);
+  }
+
+  /**
+   * @param useAlternativeBackend if true, signals that the topic should be created using an alternative PubSub backend
+   */
+  public void createTopic(
+      PubSubTopic topicName,
+      int numPartitions,
+      int replication,
+      long retentionTimeMs,
+      boolean logCompaction,
+      Optional<Integer> minIsr,
+      boolean useFastPubSubOperationTimeout,
+      boolean useAlternativeBackend) {
+    createTopic(
+        topicName,
+        numPartitions,
+        replication,
+        retentionTimeMs,
+        logCompaction,
+        minIsr,
+        useFastPubSubOperationTimeout,
+        useAlternativeBackend,
+        Optional.empty());
+  }
+
+  public void createTopic(
+      PubSubTopic topicName,
+      int numPartitions,
+      int replication,
+      long retentionTimeMs,
+      boolean logCompaction,
+      Optional<Integer> minIsr,
+      boolean useFastPubSubOperationTimeout,
+      boolean useAlternativeBackend,
+      Optional<Boolean> uncleanLeaderElectionEnable) {
     long startTimeMs = System.currentTimeMillis();
     long deadlineMs = startTimeMs + (useFastPubSubOperationTimeout
         ? PUBSUB_FAST_OPERATION_TIMEOUT_MS
@@ -183,7 +261,9 @@ public class TopicManager implements Closeable {
         logCompaction,
         minIsr,
         topicManagerContext.getTopicMinLogCompactionLagMs(),
-        Optional.empty());
+        Optional.empty(),
+        useAlternativeBackend,
+        uncleanLeaderElectionEnable);
     logger.info(
         "Creating topic: {} partitions: {} replication: {}, configuration: {}",
         topicName,
@@ -222,7 +302,7 @@ public class TopicManager implements Closeable {
   }
 
   protected void waitUntilTopicCreated(PubSubTopic topicName, int partitionCount, long deadlineMs) {
-    long startTimeMs = System.nanoTime();
+    long startTimeMs = System.currentTimeMillis();
     while (!containsTopicAndAllPartitionsAreOnline(topicName, partitionCount)) {
       if (System.currentTimeMillis() > deadlineMs) {
         throw new PubSubOpTimeoutException(
@@ -270,6 +350,35 @@ public class TopicManager implements Closeable {
     }
     // Retention time has already been updated for this topic before
     return false;
+  }
+
+  public boolean updateTopicRetentionWithRetries(PubSubTopic topicName, long expectedRetentionInMs) {
+    PubSubTopicConfiguration topicConfiguration;
+    try {
+      topicConfiguration = getCachedTopicConfig(topicName).clone();
+    } catch (Exception e) {
+      logger.error("Failed to get topic config for topic: {}", topicName, e);
+      throw new VeniceException(
+          "Failed to update topic retention for topic: " + topicName + " with retention: " + expectedRetentionInMs
+              + " in cluster: " + this.pubSubClusterAddress,
+          e);
+    }
+    if (topicConfiguration.retentionInMs().isPresent()
+        && topicConfiguration.retentionInMs().get() == expectedRetentionInMs) {
+      // Retention time has already been updated for this topic before
+      return false;
+    }
+
+    topicConfiguration.setRetentionInMs(Optional.of(expectedRetentionInMs));
+    RetryUtils.executeWithMaxAttemptAndExponentialBackoff(
+        () -> setTopicConfig(topicName, topicConfiguration),
+        5,
+        Duration.ofMillis(200),
+        Duration.ofSeconds(1),
+        Duration.ofMinutes(2),
+        TOPIC_METADATA_OP_RETRIABLE_EXCEPTIONS);
+    topicConfigCache.put(topicName, topicConfiguration);
+    return true;
   }
 
   public void updateTopicCompactionPolicy(PubSubTopic topic, boolean expectedLogCompacted) {
@@ -363,6 +472,19 @@ public class TopicManager implements Closeable {
     return false;
   }
 
+  public boolean updateTopicUncleanLeaderElection(PubSubTopic topicName, boolean uncleanLeaderElectionEnabled)
+      throws PubSubTopicDoesNotExistException {
+    PubSubTopicConfiguration pubSubTopicConfiguration = getTopicConfig(topicName);
+    Optional<Boolean> currentULE = pubSubTopicConfiguration.getUncleanLeaderElectionEnable();
+    if (!currentULE.isPresent() || !currentULE.get().equals(uncleanLeaderElectionEnabled)) {
+      pubSubTopicConfiguration.setUncleanLeaderElectionEnable(Optional.of(uncleanLeaderElectionEnabled));
+      setTopicConfig(topicName, pubSubTopicConfiguration);
+      logger.info("Updated topic: {} with unclean.leader.election.enable: {}", topicName, uncleanLeaderElectionEnabled);
+      return true;
+    }
+    return false;
+  }
+
   /**
    * Get retention time for all topics in the pubsub cluster.
    * @return a map of topic name to retention time in MS.
@@ -436,7 +558,7 @@ public class TopicManager implements Closeable {
       pubSubAdminAdapter.setTopicConfig(pubSubTopic, pubSubTopicConfiguration);
       stats.recordLatency(SET_TOPIC_CONFIG, startTime);
     } catch (Exception e) {
-      logger.debug("Failed to set topic config for topic: {}", pubSubTopic, e);
+      logger.info("Failed to set topic config for topic: {}", pubSubTopic, e);
       stats.recordPubSubAdminOpFailure();
       throw e;
     }
@@ -689,12 +811,129 @@ public class TopicManager implements Closeable {
   }
 
   /**
-   * Get the latest offsets for all partitions of a given topic.
-   * @param pubSubTopic the topic to get latest offsets for
-   * @return a Map of partition to the latest offset, or an empty map if there's any problem getting the offsets
+   * Retrieves the latest (end) positions for all partitions of the specified topic.
+   * <p>The returned offset represents the position of the next message that would be produced,
+   * which is effectively one greater than the offset of the last available message.</p>
+   *
+   * @param pubSubTopic the topic for which to retrieve latest offsets
+   * @return a map containing partition numbers mapped to their corresponding latest offsets
    */
-  public Int2LongMap getTopicLatestOffsets(PubSubTopic pubSubTopic) {
-    return topicMetadataFetcher.getTopicLatestOffsets(pubSubTopic);
+  public Map<PubSubTopicPartition, PubSubPosition> getEndPositionsForTopicWithRetries(PubSubTopic pubSubTopic) {
+    return RetryUtils.executeWithMaxAttempt(
+        () -> topicMetadataFetcher.getEndPositionsForTopic(pubSubTopic),
+        5,
+        Duration.ofMinutes(3),
+        Collections.singletonList(Exception.class));
+  }
+
+  public Map<PubSubTopicPartition, PubSubPosition> getStartPositionsForTopicWithRetries(PubSubTopic pubSubTopic) {
+    return RetryUtils.executeWithMaxAttempt(
+        () -> topicMetadataFetcher.getStartPositionsForTopic(pubSubTopic),
+        5,
+        Duration.ofMinutes(3),
+        Collections.singletonList(Exception.class));
+  }
+
+  public PubSubPosition getStartPositionsForPartitionWithRetries(PubSubTopicPartition pubSubTopicPartition) {
+    return RetryUtils.executeWithMaxAttempt(
+        () -> topicMetadataFetcher.getStartPositionsForPartition(pubSubTopicPartition),
+        10,
+        Duration.ofMinutes(1),
+        Collections.singletonList(Exception.class));
+  }
+
+  public PubSubPosition getEndPositionsForPartitionWithRetries(PubSubTopicPartition pubSubTopicPartition) {
+    return RetryUtils.executeWithMaxAttempt(
+        () -> topicMetadataFetcher.getEndPositionForPartition(pubSubTopicPartition),
+        10,
+        Duration.ofMinutes(1),
+        Collections.singletonList(Exception.class));
+  }
+
+  /**
+   * Returns the total number of records currently available in the given topic-partition.
+   *
+   * <p>This counts from {@link PubSubSymbolicPosition#EARLIEST} up to the latest available position.
+   *
+   * @param pubSubTopicPartition the topic-partition
+   * @return the number of records in the partition
+   */
+  public long getNumRecordsInPartition(PubSubTopicPartition pubSubTopicPartition) {
+    return countRecordsBetween(pubSubTopicPartition, PubSubSymbolicPosition.LATEST, PubSubSymbolicPosition.EARLIEST);
+  }
+
+  /**
+   * Returns the number of records in the given topic-partition from the earliest available position
+   * up to the specified end position.
+   *
+   * <p>Semantics follow {@code diffPosition(start, end)} of the underlying fetcher. In most
+   * implementations, {@code endPosition} represents "last + 1", so the count is effectively
+   * from EARLIEST inclusive to endPosition exclusive.
+   *
+   * @param pubSubTopicPartition the topic-partition
+   * @param endPosition the position up to which records are counted
+   * @return the number of records from EARLIEST to {@code endPosition}
+   */
+  public long countRecordsUntil(PubSubTopicPartition pubSubTopicPartition, PubSubPosition endPosition) {
+    return countRecordsBetween(pubSubTopicPartition, endPosition, PubSubSymbolicPosition.EARLIEST);
+  }
+
+  /**
+   * Returns the number of records in the given topic-partition between {@code startPosition} and
+   * {@code endPosition}.
+   *
+   * <p>Callers are responsible for providing valid positions for the chosen PubSub implementation.
+   * In typical usage, {@code endPosition} is "last + 1", so the range is
+   * {@code [startPosition, endPosition)}.
+   *
+   * <p>If {@code startPosition} is {@link PubSubSymbolicPosition#EARLIEST}, this method will use
+   * the cached earliest position to optimize performance.
+   *
+   * @param pubSubTopicPartition the topic-partition
+   * @param endPosition the upper bound of the range
+   * @param startPosition the lower bound of the range
+   * @return the number of records between {@code startPosition} and {@code endPosition}
+   * @throws NullPointerException if any argument is null
+   */
+  private long countRecordsBetween(
+      PubSubTopicPartition pubSubTopicPartition,
+      PubSubPosition endPosition,
+      PubSubPosition startPosition) {
+
+    Objects.requireNonNull(pubSubTopicPartition, "pubSubTopicPartition");
+    Objects.requireNonNull(endPosition, "endPosition");
+    Objects.requireNonNull(startPosition, "startPosition");
+
+    // Use cached earliest position when startPosition is EARLIEST to optimize performance.
+    // If it still resolves to EARLIEST, let diffPosition handle it.
+    PubSubPosition resolvedStartPosition = startPosition;
+    if (startPosition == PubSubSymbolicPosition.EARLIEST) {
+      resolvedStartPosition = topicMetadataFetcher.getEarliestPositionCached(pubSubTopicPartition);
+    }
+
+    return topicMetadataFetcher.diffPosition(pubSubTopicPartition, endPosition, resolvedStartPosition);
+  }
+
+  /**
+   * Indicates ingestion progress by returning the percentage of records in the given topic-partition
+   * up to the specified position.
+   * @param position the position up to which records are counted
+   * @return the percentage of records up to the specified position (0-100)
+   */
+  public int getIngestionProgressPercentage(PubSubTopicPartition topicPartition, PubSubPosition position) {
+    int percentage = 0;
+    try {
+      final long totalRecords = getNumRecordsInPartition(topicPartition);
+      if (totalRecords <= 0) {
+        return 0; // sanity check to avoid divide-by-zero
+      }
+      final long recordsUntilPosition = countRecordsUntil(topicPartition, position);
+      percentage = (int) ((recordsUntilPosition * 100) / totalRecords);
+    } catch (Exception e) {
+      // this log message is best-effort. there is no point in throwing an exception for the sake of this.
+      logger.warn("Swallowed an exception when trying to determine progress for {}", topicPartition, e);
+    }
+    return percentage;
   }
 
   /**
@@ -723,27 +962,23 @@ public class TopicManager implements Closeable {
     return topicMetadataFetcher.containsTopicWithRetries(pubSubTopic, retries);
   }
 
-  public long getLatestOffsetWithRetries(PubSubTopicPartition pubSubTopicPartition, int retries) {
-    return topicMetadataFetcher.getLatestOffsetWithRetries(pubSubTopicPartition, retries);
+  public PubSubPosition getLatestPositionWithRetries(PubSubTopicPartition pubSubTopicPartition, int retries) {
+    return topicMetadataFetcher.getLatestPositionWithRetries(pubSubTopicPartition, retries);
   }
 
-  public long getLatestOffsetCached(PubSubTopic pubSubTopic, int partitionId) {
-    return topicMetadataFetcher.getLatestOffsetCached(new PubSubTopicPartitionImpl(pubSubTopic, partitionId));
+  public PubSubPosition getLatestPositionCached(PubSubTopicPartition topicPartition) {
+    return topicMetadataFetcher.getLatestPositionCached(topicPartition);
   }
 
-  public long getProducerTimestampOfLastDataMessageWithRetries(PubSubTopicPartition pubSubTopicPartition, int retries) {
-    return topicMetadataFetcher.getProducerTimestampOfLastDataMessageWithRetries(pubSubTopicPartition, retries);
-  }
-
-  public long getProducerTimestampOfLastDataMessageCached(PubSubTopicPartition pubSubTopicPartition) {
-    return topicMetadataFetcher.getProducerTimestampOfLastDataMessageCached(pubSubTopicPartition);
+  public PubSubPosition getLatestPositionCachedNonBlocking(PubSubTopicPartition topicPartition) {
+    return topicMetadataFetcher.getLatestPositionCachedNonBlocking(topicPartition);
   }
 
   /**
-   * Get offsets for only one partition with a specific timestamp.
+   * Get position for only one partition with a specific timestamp.
    */
-  public long getOffsetByTime(PubSubTopicPartition pubSubTopicPartition, long timestamp) {
-    return topicMetadataFetcher.getOffsetForTimeWithRetries(pubSubTopicPartition, timestamp, 25);
+  public PubSubPosition getPositionByTime(PubSubTopicPartition pubSubTopicPartition, long timestamp) {
+    return topicMetadataFetcher.getPositionForTimeWithRetries(pubSubTopicPartition, timestamp, 25);
   }
 
   /**
@@ -755,11 +990,71 @@ public class TopicManager implements Closeable {
   }
 
   /**
+   * Invalidate the latest-position and earliest-position cache entries for one specific
+   * topic-partition. The next call to {@link #getLatestPositionCached(PubSubTopicPartition)} will
+   * synchronously fetch a fresh value from the broker.
+   *
+   * <p>Use this when an authoritative end-position is required at decision time (e.g., to confirm
+   * "we are caught up to live VT") and the caller cannot tolerate a value up to
+   * {@code server.source.topic.offset.check.interval.ms} stale (default 60s). Each call results in
+   * one extra broker round-trip on the next read, so prefer the cached path when the staleness is
+   * acceptable.
+   */
+  public void invalidatePartitionPositionCache(PubSubTopicPartition pubSubTopicPartition) {
+    topicMetadataFetcher.invalidateKey(pubSubTopicPartition);
+  }
+
+  /**
    * Prefetch and cache the latest offset for the given topic-partition.
    * @param pubSubTopicPartition the topic-partition to prefetch and cache the latest offset for
    */
   public void prefetchAndCacheLatestOffset(PubSubTopicPartition pubSubTopicPartition) {
     topicMetadataFetcher.populateCacheWithLatestOffset(pubSubTopicPartition);
+  }
+
+  /**
+   * Resolves a {@link PubSubPosition} from the given serialized buffer using the specified position type ID.
+   * This API is part of the Topic Manager (TM) interface because TM has access to a consumer instance
+   * capable of performing lookups from {@link PubSubTopicPartition} to PubSub-specific objects
+   * (e.g., {@code Shard} in LinkedIn's Xinfra clients), which may be required by some PubSub client implementations.
+   *
+   * @param partition The topic-partition context.
+   * @param positionTypeId The type ID used to identify how to deserialize the position.
+   * @param buffer The serialized form of the position.
+   * @return The resolved {@link PubSubPosition}.
+   */
+  public PubSubPosition resolvePosition(PubSubTopicPartition partition, int positionTypeId, ByteBuffer buffer) {
+    return topicMetadataFetcher.resolvePosition(partition, positionTypeId, buffer);
+  }
+
+  /**
+   * Computes the difference between two positions within a given topic-partition.
+   * This API is part of the Topic Manager (TM) interface because TM has access to a consumer instance
+   * capable of performing lookups from {@link PubSubTopicPartition} to PubSub-specific objects
+   * (e.g., {@code Shard} in LinkedIn's Xinfra clients), which may be required by some PubSub client implementations.
+   *
+   * @param partition The topic-partition context.
+   * @param position1 The first position.
+   * @param position2 The second position.
+   * @return The difference between the two positions, in number of records.
+   */
+  public long diffPosition(PubSubTopicPartition partition, PubSubPosition position1, PubSubPosition position2) {
+    return topicMetadataFetcher.diffPosition(partition, position1, position2);
+  }
+
+  /**
+   * Compares two positions within the context of a specific topic-partition.
+   * This API is part of the Topic Manager (TM) interface because TM has access to a consumer instance
+   * capable of performing lookups from {@link PubSubTopicPartition} to PubSub-specific objects
+   * (e.g., {@code Shard} in LinkedIn's Xinfra clients), which may be required by some PubSub client implementations.
+   *
+   * @param partition The topic-partition context.
+   * @param position1 The first position.
+   * @param position2 The second position.
+   * @return A negative number if position1 < position2, 0 if equal, and a positive number if position1 > position2.
+   */
+  public long comparePosition(PubSubTopicPartition partition, PubSubPosition position1, PubSubPosition position2) {
+    return topicMetadataFetcher.comparePosition(partition, position1, position2);
   }
 
   public String getPubSubClusterAddress() {
@@ -784,5 +1079,25 @@ public class TopicManager implements Closeable {
   @Override
   public String toString() {
     return "TopicManager{pubSubClusterAddress=" + pubSubClusterAddress + "}";
+  }
+
+  /**
+   * Advances a position within a {@link PubSubTopicPartition} by a specified number of records.
+   * Delegates to the underlying {@code PubSubConsumerAdapter} so that each implementation
+   * returns its own {@link PubSubPosition} type.
+   *
+   * @param tp the topic partition in which the position is being advanced; must not be {@code null}
+   * @param startInclusive the starting position (inclusive) from which advancement begins; must not be {@code null}
+   * @param n the number of records to advance; must be non-negative
+   * @return a new {@link PubSubPosition} representing the position {@code n} records after {@code startInclusive}
+   * @throws IllegalArgumentException if {@code n} is negative
+   * @throws NullPointerException if {@code tp} or {@code startInclusive} is {@code null}
+   */
+  public PubSubPosition advancePosition(PubSubTopicPartition tp, PubSubPosition startInclusive, long n) {
+    return topicMetadataFetcher.advancePosition(tp, startInclusive, n);
+  }
+
+  public PubSubTopicRepository getTopicRepository() {
+    return pubSubTopicRepository;
   }
 }

@@ -5,6 +5,10 @@ import static com.linkedin.venice.meta.Store.NUM_VERSION_PRESERVE_NOT_SET;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.linkedin.venice.compression.CompressionStrategy;
+import com.linkedin.venice.utils.ConfigCommonUtils.ActivationState;
+import com.linkedin.venice.writer.VeniceWriter;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -25,6 +29,8 @@ public class StoreInfo {
     storeInfo.setAccessControlled(store.isAccessControlled());
     storeInfo.setActiveActiveReplicationEnabled(store.isActiveActiveReplicationEnabled());
     storeInfo.setBackupStrategy(store.getBackupStrategy());
+    storeInfo.setIngestionPauseMode(store.getIngestionPauseMode());
+    storeInfo.setIngestionPausedRegions(store.getIngestionPausedRegions());
     storeInfo.setBackupVersionRetentionMs(store.getBackupVersionRetentionMs());
     storeInfo.setBatchGetLimit(store.getBatchGetLimit());
     storeInfo.setBootstrapToOnlineTimeoutInHours(store.getBootstrapToOnlineTimeoutInHours());
@@ -37,12 +43,17 @@ public class StoreInfo {
     storeInfo.setEnableStoreReads(store.isEnableReads());
     storeInfo.setEnableStoreWrites(store.isEnableWrites());
     storeInfo.setEtlStoreConfig(store.getEtlStoreConfig());
+    storeInfo.setExternalStorageReadMode(store.getExternalStorageReadMode());
+    storeInfo.setStorageMode(store.getStorageMode());
+    storeInfo.setVeniceUnits(store.getVeniceUnits());
+    storeInfo.setWorkloadType(store.getWorkloadType());
     if (store.isHybrid()) {
       storeInfo.setHybridStoreConfig(store.getHybridStoreConfig());
     }
     storeInfo.setHybridStoreDiskQuotaEnabled(store.isHybridStoreDiskQuotaEnabled());
     storeInfo.setIncrementalPushEnabled(store.isIncrementalPushEnabled());
     storeInfo.setLargestUsedVersionNumber(store.getLargestUsedVersionNumber());
+    storeInfo.setLargestUsedRTVersionNumber(store.getLargestUsedRTVersionNumber());
     storeInfo.setLatestSuperSetValueSchemaId(store.getLatestSuperSetValueSchemaId());
     storeInfo.setLowWatermark(store.getLowWatermark());
     storeInfo.setMigrating(store.isMigrating());
@@ -67,10 +78,35 @@ public class StoreInfo {
     storeInfo.setReplicationMetadataVersionId(store.getRmdVersion());
     storeInfo.setViewConfigs(store.getViewConfigs());
     storeInfo.setStorageNodeReadQuotaEnabled(store.isStorageNodeReadQuotaEnabled());
+    storeInfo.setCompactionEnabled(store.isCompactionEnabled());
+    storeInfo.setCompactionThreshold(store.getCompactionThresholdMilliseconds());
+    storeInfo.setEncryptionEnabled(store.isEncryptionEnabled());
+    storeInfo.setPubSubEncryptionKeyUrn(store.getPubSubEncryptionKeyUrn());
     storeInfo.setMinCompactionLagSeconds(store.getMinCompactionLagSeconds());
     storeInfo.setMaxCompactionLagSeconds(store.getMaxCompactionLagSeconds());
+    storeInfo.setMaxRecordSizeBytes(store.getMaxRecordSizeBytes());
+    storeInfo.setMaxNearlineRecordSizeBytes(store.getMaxNearlineRecordSizeBytes());
+    storeInfo.setThroughputQuotaInBytes(store.getThroughputQuotaInBytes());
+    storeInfo.setThroughputQuotaInRecords(store.getThroughputQuotaInRecords());
     storeInfo.setUnusedSchemaDeletionEnabled(store.isUnusedSchemaDeletionEnabled());
     storeInfo.setBlobTransferEnabled(store.isBlobTransferEnabled());
+    storeInfo.setBlobTransferInServerEnabled(store.getBlobTransferInServerEnabled());
+    storeInfo.setBlobDbEnabled(store.getBlobDbEnabled());
+    storeInfo.setNearlineProducerCompressionEnabled(store.isNearlineProducerCompressionEnabled());
+    storeInfo.setNearlineProducerCountPerWriter(store.getNearlineProducerCountPerWriter());
+    storeInfo.setTargetRegionSwap(store.getTargetSwapRegion());
+    storeInfo.setTargetRegionSwapWaitTime(store.getTargetSwapRegionWaitTime());
+    storeInfo.setIsDavinciHeartbeatReported(store.getIsDavinciHeartbeatReported());
+    storeInfo.setGlobalRtDivEnabled(store.isGlobalRtDivEnabled());
+    storeInfo.setTTLRepushEnabled(store.isTTLRepushEnabled());
+    storeInfo.setEnumSchemaEvolutionAllowed(store.isEnumSchemaEvolutionAllowed());
+    storeInfo.setStoreLifecycleHooks(store.getStoreLifecycleHooks());
+    storeInfo.setLatestVersionPromoteToCurrentTimestamp(store.getLatestVersionPromoteToCurrentTimestamp());
+    storeInfo.setKeyUrnCompressionEnabled(store.isKeyUrnCompressionEnabled());
+    storeInfo.setKeyUrnFields(store.getKeyUrnFields());
+    storeInfo.setFlinkVeniceViewsEnabled(store.isFlinkVeniceViewsEnabled());
+    storeInfo.setPreviousCurrentVersion(store.getPreviousCurrentVersion());
+    storeInfo.setSeparateRealTimeTopicEnabled(store.isSeparateRealTimeTopicEnabled());
     return storeInfo;
   }
 
@@ -178,6 +214,11 @@ public class StoreInfo {
   private int largestUsedVersionNumber;
 
   /**
+   * Largest used version number of the RT topic.
+   */
+  private int largestUsedRTVersionNumber;
+
+  /**
    * a flag to see if the store supports incremental push or not
    */
   private boolean incrementalPushEnabled;
@@ -237,6 +278,16 @@ public class StoreInfo {
    * Strategies to store backup versions of a store.
    */
   private BackupStrategy backupStrategy = BackupStrategy.KEEP_MIN_VERSIONS;
+
+  /**
+   * Ingestion pause mode for this store.
+   */
+  private IngestionPauseMode ingestionPauseMode = IngestionPauseMode.NOT_PAUSED;
+
+  /**
+   * Regions where ingestion is paused for this store.
+   */
+  private List<String> ingestionPausedRegions = Collections.emptyList();
 
   /**
    * Whether or not value schema auto registration from Push job enabled for this store.
@@ -307,13 +358,70 @@ public class StoreInfo {
    */
   private boolean storageNodeReadQuotaEnabled;
 
+  /**
+   * Reasons for why or why not the store is dead
+   */
+  private List<String> storeDeadStatusReasons = new ArrayList<>();
+
+  /**
+   * flag to indicate if the store is dead
+   */
+  private boolean isStoreDead;
+
+  private boolean compactionEnabled;
+
+  private long compactionThreshold;
+
+  private boolean encryptionEnabled;
+
+  private String pubSubEncryptionKeyUrn = "";
+
   private long minCompactionLagSeconds;
 
   private long maxCompactionLagSeconds;
 
+  private int maxRecordSizeBytes = VeniceWriter.UNLIMITED_MAX_RECORD_SIZE;
+
+  private int maxNearlineRecordSizeBytes = VeniceWriter.UNLIMITED_MAX_RECORD_SIZE;
+
+  private long throughputQuotaInBytes = -1;
+
+  private long throughputQuotaInRecords = -1;
+
   private boolean unusedSchemaDeletionEnabled;
 
   private boolean blobTransferEnabled;
+  private String blobTransferInServerEnable = ActivationState.NOT_SPECIFIED.name();
+  private String blobDbEnabled = ActivationState.NOT_SPECIFIED.name();
+
+  private boolean nearlineProducerCompressionEnabled;
+  private int nearlineProducerCountPerWriter;
+  private String targetRegionSwap;
+  private int targetRegionSwapWaitTime;
+  private boolean isDavinciHeartbeatReported;
+  private boolean globalRtDivEnabled = false;
+  /**
+   * Self-managed config that's set to true once there is a TTL re-push.
+   */
+  private boolean ttlRepushEnabled = false;
+  private boolean enumSchemaEvolutionAllowed = false;
+  private List<LifecycleHooksRecord> storeLifecycleHooks = new ArrayList<>();
+  private long getLatestVersionPromoteToCurrentTimestamp;
+  private boolean keyUrnCompressionEnabled = false;
+  private List<String> keyUrnFields = new ArrayList<>();
+  private boolean flinkVeniceViewsEnabled = false;
+  private int previousCurrentVersion = -1;
+  private boolean separateRealTimeTopicEnabled = false;
+  private ExternalStorageReadMode externalStorageReadMode = ExternalStorageReadMode.VENICE_ONLY;
+  private StorageMode storageMode = StorageMode.INTERNAL;
+  /**
+   * The forecasted Venice Units (VU) capacity ask for this store, or null when it has not been provided.
+   */
+  private Integer veniceUnits = null;
+  /**
+   * The requested class of service for this store, or null when it has not been provided.
+   */
+  private String workloadType = null;
 
   public StoreInfo() {
   }
@@ -532,6 +640,14 @@ public class StoreInfo {
     this.largestUsedVersionNumber = largestUsedVersionNumber;
   }
 
+  public int getLargestUsedRTVersionNumber() {
+    return largestUsedRTVersionNumber;
+  }
+
+  public void setLargestUsedRTVersionNumber(int largestUsedRTVersionNumber) {
+    this.largestUsedRTVersionNumber = largestUsedRTVersionNumber;
+  }
+
   public boolean isIncrementalPushEnabled() {
     return incrementalPushEnabled;
   }
@@ -618,6 +734,55 @@ public class StoreInfo {
 
   public BackupStrategy getBackupStrategy() {
     return backupStrategy;
+  }
+
+  public void setIngestionPauseMode(IngestionPauseMode value) {
+    ingestionPauseMode = value;
+  }
+
+  public IngestionPauseMode getIngestionPauseMode() {
+    return ingestionPauseMode;
+  }
+
+  public void setIngestionPausedRegions(List<String> regions) {
+    ingestionPausedRegions = regions;
+  }
+
+  public List<String> getIngestionPausedRegions() {
+    return ingestionPausedRegions;
+  }
+
+  public ExternalStorageReadMode getExternalStorageReadMode() {
+    return externalStorageReadMode == null ? ExternalStorageReadMode.VENICE_ONLY : externalStorageReadMode;
+  }
+
+  public void setExternalStorageReadMode(ExternalStorageReadMode externalStorageReadMode) {
+    this.externalStorageReadMode =
+        externalStorageReadMode == null ? ExternalStorageReadMode.VENICE_ONLY : externalStorageReadMode;
+  }
+
+  public StorageMode getStorageMode() {
+    return storageMode == null ? StorageMode.INTERNAL : storageMode;
+  }
+
+  public void setStorageMode(StorageMode storageMode) {
+    this.storageMode = storageMode == null ? StorageMode.INTERNAL : storageMode;
+  }
+
+  public Integer getVeniceUnits() {
+    return veniceUnits;
+  }
+
+  public void setVeniceUnits(Integer veniceUnits) {
+    this.veniceUnits = veniceUnits;
+  }
+
+  public String getWorkloadType() {
+    return workloadType;
+  }
+
+  public void setWorkloadType(String workloadType) {
+    this.workloadType = workloadType;
   }
 
   public boolean isSchemaAutoRegisterFromPushJobEnabled() {
@@ -756,6 +921,38 @@ public class StoreInfo {
     this.storageNodeReadQuotaEnabled = storageNodeReadQuotaEnabled;
   }
 
+  public boolean isCompactionEnabled() {
+    return this.compactionEnabled;
+  }
+
+  public void setCompactionEnabled(boolean compactionEnabled) {
+    this.compactionEnabled = compactionEnabled;
+  }
+
+  public long getCompactionThreshold() {
+    return this.compactionThreshold;
+  }
+
+  public void setCompactionThreshold(long compactionThreshold) {
+    this.compactionThreshold = compactionThreshold;
+  }
+
+  public boolean isEncryptionEnabled() {
+    return this.encryptionEnabled;
+  }
+
+  public void setEncryptionEnabled(boolean encryptionEnabled) {
+    this.encryptionEnabled = encryptionEnabled;
+  }
+
+  public String getPubSubEncryptionKeyUrn() {
+    return pubSubEncryptionKeyUrn;
+  }
+
+  public void setPubSubEncryptionKeyUrn(String pubSubEncryptionKeyUrn) {
+    this.pubSubEncryptionKeyUrn = pubSubEncryptionKeyUrn;
+  }
+
   public long getMinCompactionLagSeconds() {
     return minCompactionLagSeconds;
   }
@@ -772,6 +969,38 @@ public class StoreInfo {
     this.maxCompactionLagSeconds = maxCompactionLagSeconds;
   }
 
+  public int getMaxRecordSizeBytes() {
+    return this.maxRecordSizeBytes;
+  }
+
+  public void setMaxRecordSizeBytes(int maxRecordSizeBytes) {
+    this.maxRecordSizeBytes = maxRecordSizeBytes;
+  }
+
+  public int getMaxNearlineRecordSizeBytes() {
+    return this.maxNearlineRecordSizeBytes;
+  }
+
+  public void setMaxNearlineRecordSizeBytes(int maxNearlineRecordSizeBytes) {
+    this.maxNearlineRecordSizeBytes = maxNearlineRecordSizeBytes;
+  }
+
+  public long getThroughputQuotaInBytes() {
+    return this.throughputQuotaInBytes;
+  }
+
+  public void setThroughputQuotaInBytes(long throughputQuotaInBytes) {
+    this.throughputQuotaInBytes = throughputQuotaInBytes;
+  }
+
+  public long getThroughputQuotaInRecords() {
+    return this.throughputQuotaInRecords;
+  }
+
+  public void setThroughputQuotaInRecords(long throughputQuotaInRecords) {
+    this.throughputQuotaInRecords = throughputQuotaInRecords;
+  }
+
   public void setUnusedSchemaDeletionEnabled(boolean unusedSchemaDeletionEnabled) {
     this.unusedSchemaDeletionEnabled = unusedSchemaDeletionEnabled;
   }
@@ -786,5 +1015,157 @@ public class StoreInfo {
 
   public boolean isBlobTransferEnabled() {
     return this.blobTransferEnabled;
+  }
+
+  public void setBlobTransferInServerEnabled(String blobTransferInServerEnable) {
+    this.blobTransferInServerEnable = blobTransferInServerEnable;
+  }
+
+  public String getBlobTransferInServerEnabled() {
+    return this.blobTransferInServerEnable;
+  }
+
+  public void setBlobDbEnabled(String blobDbEnabled) {
+    this.blobDbEnabled = blobDbEnabled;
+  }
+
+  public String getBlobDbEnabled() {
+    return this.blobDbEnabled;
+  }
+
+  public boolean isNearlineProducerCompressionEnabled() {
+    return nearlineProducerCompressionEnabled;
+  }
+
+  public void setNearlineProducerCompressionEnabled(boolean nearlineProducerCompressionEnabled) {
+    this.nearlineProducerCompressionEnabled = nearlineProducerCompressionEnabled;
+  }
+
+  public int getNearlineProducerCountPerWriter() {
+    return nearlineProducerCountPerWriter;
+  }
+
+  public void setNearlineProducerCountPerWriter(int nearlineProducerCountPerWriter) {
+    this.nearlineProducerCountPerWriter = nearlineProducerCountPerWriter;
+  }
+
+  public String getTargetRegionSwap() {
+    return this.targetRegionSwap;
+  }
+
+  public void setTargetRegionSwap(String targetRegion) {
+    this.targetRegionSwap = targetRegion;
+  }
+
+  public int getTargetRegionSwapWaitTime() {
+    return this.targetRegionSwapWaitTime;
+  }
+
+  public void setTargetRegionSwapWaitTime(int waitTime) {
+    this.targetRegionSwapWaitTime = waitTime;
+  }
+
+  public void setIsDavinciHeartbeatReported(boolean isReported) {
+    this.isDavinciHeartbeatReported = isReported;
+  }
+
+  public boolean getIsDavinciHeartbeatReported() {
+    return this.isDavinciHeartbeatReported;
+  }
+
+  public void setIsStoreDead(boolean isStoreDead) {
+    this.isStoreDead = isStoreDead;
+  }
+
+  public boolean getIsStoreDead() {
+    return this.isStoreDead;
+  }
+
+  public void setStoreDeadStatusReasons(List<String> reasons) {
+    this.storeDeadStatusReasons = reasons == null ? Collections.emptyList() : new ArrayList<>(reasons);
+  }
+
+  public List<String> getStoreDeadStatusReasons() {
+    return storeDeadStatusReasons;
+  }
+
+  public void setGlobalRtDivEnabled(boolean globalRtDivEnabled) {
+    this.globalRtDivEnabled = globalRtDivEnabled;
+  }
+
+  public boolean isGlobalRtDivEnabled() {
+    return this.globalRtDivEnabled;
+  }
+
+  public void setTTLRepushEnabled(boolean ttlRepushEnabled) {
+    this.ttlRepushEnabled = ttlRepushEnabled;
+  }
+
+  public boolean isTTLRepushEnabled() {
+    return this.ttlRepushEnabled;
+  }
+
+  public boolean isEnumSchemaEvolutionAllowed() {
+    return enumSchemaEvolutionAllowed;
+  }
+
+  public void setEnumSchemaEvolutionAllowed(boolean enumSchemaEvolutionAllowed) {
+    this.enumSchemaEvolutionAllowed = enumSchemaEvolutionAllowed;
+  }
+
+  public boolean isFlinkVeniceViewsEnabled() {
+    return flinkVeniceViewsEnabled;
+  }
+
+  public void setFlinkVeniceViewsEnabled(boolean flinkVeniceViewsEnabled) {
+    this.flinkVeniceViewsEnabled = flinkVeniceViewsEnabled;
+  }
+
+  public List<LifecycleHooksRecord> getStoreLifecycleHooks() {
+    return this.storeLifecycleHooks;
+  }
+
+  public void setStoreLifecycleHooks(List<LifecycleHooksRecord> storeLifecycleHooks) {
+    this.storeLifecycleHooks = storeLifecycleHooks;
+  }
+
+  public long getLatestVersionPromoteToCurrentTimestamp() {
+    return this.getLatestVersionPromoteToCurrentTimestamp;
+  }
+
+  public void setLatestVersionPromoteToCurrentTimestamp(long latestVersionPromoteToCurrentTimestamp) {
+    this.getLatestVersionPromoteToCurrentTimestamp = latestVersionPromoteToCurrentTimestamp;
+  }
+
+  public boolean isKeyUrnCompressionEnabled() {
+    return keyUrnCompressionEnabled;
+  }
+
+  public void setKeyUrnCompressionEnabled(boolean keyUrnCompressionEnabled) {
+    this.keyUrnCompressionEnabled = keyUrnCompressionEnabled;
+  }
+
+  public List<String> getKeyUrnFields() {
+    return keyUrnFields;
+  }
+
+  public void setKeyUrnFields(List<String> keyUrnFields) {
+    this.keyUrnFields = keyUrnFields;
+  }
+
+  public int getPreviousCurrentVersion() {
+    return previousCurrentVersion;
+  }
+
+  public void setPreviousCurrentVersion(int previousCurrentVersion) {
+    this.previousCurrentVersion = previousCurrentVersion;
+  }
+
+  public boolean isSeparateRealTimeTopicEnabled() {
+    return separateRealTimeTopicEnabled;
+  }
+
+  public void setSeparateRealTimeTopicEnabled(boolean separateRealTimeTopicEnabled) {
+    this.separateRealTimeTopicEnabled = separateRealTimeTopicEnabled;
   }
 }

@@ -17,6 +17,7 @@ import com.linkedin.venice.kafka.protocol.state.ProducerPartitionState;
 import com.linkedin.venice.kafka.validation.checksum.CheckSum;
 import com.linkedin.venice.kafka.validation.checksum.CheckSumType;
 import com.linkedin.venice.message.KafkaKey;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
 import com.linkedin.venice.utils.CollectionUtils;
 import it.unimi.dsi.fastutil.objects.Object2ObjectArrayMap;
 import java.nio.ByteBuffer;
@@ -60,21 +61,21 @@ public class Segment {
   private final Map<CharSequence, Long> aggregates;
 
   // Mutable state
-  private int sequenceNumber;
-  private boolean registered;
-  private boolean started;
-  private boolean ended;
-  private boolean finalSegment;
+  private volatile int sequenceNumber;
+  private volatile boolean registered;
+  private volatile boolean started;
+  private volatile boolean ended;
+  private volatile boolean finalSegment;
   /**
    * Set this field to true when building a new segment for an incoming message, and update this flag to false immediately
    * after checking incoming message's sequence number.
    */
-  private boolean newSegment;
-  private long lastSuccessfulOffset;
+  private volatile boolean newSegment;
+  private volatile PubSubPosition lastSuccessfulPosition;
   // record the last timestamp that a validation for this segment happened and passed.
-  private long lastRecordTimestamp = -1;
+  private volatile long lastRecordTimestamp = -1;
   // record the last producer message time stamp passed within the ConsumerRecord
-  private long lastRecordProducerTimestamp = -1;
+  private volatile long lastRecordProducerTimestamp = -1;
 
   public Segment(
       int partition,
@@ -202,12 +203,12 @@ public class Segment {
     return this.registered;
   }
 
-  public long getLastSuccessfulOffset() {
-    return lastSuccessfulOffset;
+  public PubSubPosition getLastSuccessfulPosition() {
+    return lastSuccessfulPosition;
   }
 
-  public void setLastSuccessfulOffset(long lastSuccessfulOffset) {
-    this.lastSuccessfulOffset = lastSuccessfulOffset;
+  public void setLastSuccessfulPosition(PubSubPosition lastSuccessfulPosition) {
+    this.lastSuccessfulPosition = lastSuccessfulPosition;
   }
 
   public long getLastRecordTimestamp() {
@@ -291,6 +292,8 @@ public class Segment {
                     + controlMessage.getControlMessageType());
         }
       case PUT:
+      case GLOBAL_RT_DIV: // GLOBAL_RT_DIV is the same as PUT, but contains a DIV object rather than user data
+        // TODO: revisit to see if the GLOBAL_RT_DIV message is needed as part of the checksum
         updateCheckSum(messageEnvelope.getMessageType());
         updateCheckSum(key.getKey());
         Put putPayload = (Put) messageEnvelope.getPayloadUnion();
@@ -406,6 +409,41 @@ public class Segment {
       deduped.put(DEDUPED_DEBUG_INFO.get(entry.getKey(), k -> k), DEDUPED_DEBUG_INFO.get(entry.getValue(), k -> k));
     }
     return deduped;
+  }
+
+  public ProducerPartitionState toProducerPartitionState() {
+    ProducerPartitionState pps = new ProducerPartitionState();
+    /**
+     * The aggregates and debugInfo being stored in the {@link ProducerPartitionState} will add a bit
+     * of overhead when we checkpoint this metadata to disk, so we should be careful not to add a very
+     * large number of elements to these arbitrary collections.
+     * <p>
+     * In the case of the debugInfo, it is expected (at the time of writing this comment) that all
+     * partitions produced by the same producer GUID would have the same debug values (though nothing
+     * precludes us from having per-partition debug values in the future if there is a use case for
+     * that). It is redundant that we store the same debug values once per partition. In the future,
+     * if we want to eliminate this redundancy, we could move the per-producer debug info to another
+     * data structure, though that would increase bookkeeping complexity. This is expected to be a
+     * minor overhead, and therefore it appears to be premature to optimize this now.
+     */
+    pps.aggregates = CollectionUtils.substituteEmptyMap(getAggregates());
+    pps.debugInfo = CollectionUtils.substituteEmptyMap(getDebugInfo());
+    populateProducerPartitionState(pps);
+    return pps;
+  }
+
+  public void populateProducerPartitionState(ProducerPartitionState pps) {
+    /**
+     * {@link MD5Digest#getEncodedState()} is allocating a byte array to contain the intermediate,
+     * which is expensive. We should only invoke this closure when necessary.
+     */
+    pps.checksumState = ByteBuffer.wrap(getCheckSumState());
+    pps.checksumType = getCheckSumType().getValue();
+    pps.segmentNumber = getSegmentNumber();
+    pps.messageSequenceNumber = getSequenceNumber();
+    pps.messageTimestamp = getLastRecordProducerTimestamp();
+    pps.segmentStatus = getStatus().getValue();
+    pps.isRegistered = isRegistered();
   }
 
   // Only for testing.

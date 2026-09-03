@@ -3,6 +3,7 @@ package com.linkedin.venice.fastclient.meta;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.Iterator;
 import java.util.List;
 
 
@@ -23,57 +24,34 @@ public class LeastLoadedClientRoutingStrategy extends AbstractClientRoutingStrat
   }
 
   @Override
-  public List<String> getReplicas(long requestId, List<String> replicas, int requiredReplicaCount) {
+  public String getReplicas(long requestId, int groupId, List<String> replicas) {
     if (replicas.isEmpty()) {
-      return Collections.emptyList();
+      return null;
     }
-    int replicaCnt = replicas.size();
-    int startPos = (int) (requestId % replicaCnt);
-    List<String> availReplicas = new ArrayList<>();
-    for (int i = 0; i < replicaCnt; ++i) {
-      String replica = replicas.get((i + startPos) % replicaCnt);
-      if (!instanceHealthMonitor.isInstanceBlocked(replica)) {
-        availReplicas.add(replica);
+    /**
+     * Need to make a copy of the replicas list to avoid modifying the original list.
+     */
+    List<String> availReplicas = new ArrayList<>(replicas);
+    /**
+     * For even distribution, we need to shuffle the replicas.
+     */
+    Collections.shuffle(availReplicas);
+
+    Iterator<String> iterator = availReplicas.iterator();
+    while (iterator.hasNext()) {
+      String replica = iterator.next();
+      if (!instanceHealthMonitor.isRequestAllowed(replica)) {
+        iterator.remove();
       }
     }
-
+    if (availReplicas.isEmpty()) {
+      return null;
+    }
+    /**
+     * TODO: maybe we can apply the response-waiting-time-based rather than pending request counter based least-loaded strategy here
+     * since application QPS normally is much lower and pending request count can be very low.
+     */
     availReplicas.sort(Comparator.comparingInt(instanceHealthMonitor::getPendingRequestCounter));
-
-    if (requiredReplicaCount < availReplicas.size()) {
-      List<String> selectedReplicas = new ArrayList<>();
-      /**
-       * Check whether any unhealthy replica has been selected or not, if yes, try to add more healthy replicas.
-       */
-      int selectedUnhealthyReplicaCnt = 0;
-      for (int i = 0; i < requiredReplicaCount; ++i) {
-        String currentReplica = availReplicas.get(i);
-        selectedReplicas.add(currentReplica);
-        if (!instanceHealthMonitor.isInstanceHealthy(currentReplica)) {
-          ++selectedUnhealthyReplicaCnt;
-        }
-      }
-      if (selectedUnhealthyReplicaCnt > 0) {
-        /**
-         * If any unhealthy replica is selected, we will try to back-fill with the same number of healthy replicas.
-         * With this way, we could achieve the following goals:
-         * 1. The unhealthy replica will still receive some requests to bring it back once it is recovered.
-         * 2. The request latency won't be affected since we are still trying to return the required healthy replicas as
-         *    much as possible.
-         */
-        int backfillingHealthyReplicaCnt = 0;
-        for (int i = requiredReplicaCount; i < availReplicas.size()
-            && backfillingHealthyReplicaCnt < selectedUnhealthyReplicaCnt; ++i) {
-          String currentReplica = availReplicas.get(i);
-          if (instanceHealthMonitor.isInstanceHealthy(currentReplica)) {
-            selectedReplicas.add(currentReplica);
-            ++backfillingHealthyReplicaCnt;
-          }
-        }
-      }
-
-      return selectedReplicas;
-    } else {
-      return availReplicas;
-    }
+    return availReplicas.get(0);
   }
 }

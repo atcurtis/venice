@@ -1,7 +1,7 @@
 package com.linkedin.davinci.storage.chunking;
 
-import com.linkedin.davinci.listener.response.ReadResponse;
-import com.linkedin.davinci.store.AbstractStorageEngine;
+import com.linkedin.davinci.listener.response.ReadResponseStats;
+import com.linkedin.davinci.store.StorageEngine;
 import com.linkedin.davinci.store.record.ValueRecord;
 import com.linkedin.venice.read.protocol.response.MultiGetResponseRecordV1;
 import com.linkedin.venice.storage.protocol.ChunkedValueManifest;
@@ -58,11 +58,11 @@ public class BatchGetChunkingAdapter implements ChunkingAdapter<ByteBuffer, Mult
   }
 
   public static MultiGetResponseRecordV1 get(
-      AbstractStorageEngine store,
+      StorageEngine store,
       int partition,
       ByteBuffer key,
       boolean isChunked,
-      ReadResponse response) {
+      ReadResponseStats response) {
     if (isChunked) {
       key = ChunkingUtils.KEY_WITH_CHUNKING_SUFFIX_SERIALIZER.serializeNonChunkedKey(key);
     }

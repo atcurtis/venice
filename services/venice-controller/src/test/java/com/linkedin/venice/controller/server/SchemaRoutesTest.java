@@ -5,15 +5,22 @@ import static com.linkedin.venice.controllerapi.ControllerApiConstants.NAME;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.SCHEMA_COMPAT_TYPE;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.SCHEMA_ID;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.VALUE_SCHEMA;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
+import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertTrue;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.linkedin.venice.controller.Admin;
+import com.linkedin.venice.controllerapi.SchemaResponse;
+import com.linkedin.venice.exceptions.AdminMessageTooLargeException;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.exceptions.VeniceNoStoreException;
 import com.linkedin.venice.meta.Store;
@@ -21,14 +28,27 @@ import com.linkedin.venice.schema.GeneratedSchemaID;
 import com.linkedin.venice.schema.SchemaData;
 import com.linkedin.venice.schema.SchemaEntry;
 import com.linkedin.venice.schema.avro.DirectionalSchemaCompatibilityType;
+import com.linkedin.venice.utils.ObjectMapperFactory;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Optional;
+import org.apache.http.HttpStatus;
+import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
+import spark.QueryParamsMap;
 import spark.Request;
 import spark.Response;
 import spark.Route;
 
 
 public class SchemaRoutesTest {
+  private SchemaRequestHandler schemaRequestHandler;
+
+  @BeforeMethod
+  public void setUp() {
+    schemaRequestHandler = mock(SchemaRequestHandler.class);
+  }
+
   @Test
   public void schemaMismatchErrorMessage() {
     String cluster = "cluster_name";
@@ -38,7 +58,7 @@ public class SchemaRoutesTest {
     Admin admin = mock(Admin.class);
     when(admin.getValueSchemaId(cluster, store, schemaStr)).thenReturn(SchemaData.INVALID_VALUE_SCHEMA_ID);
     when(admin.getStore(cluster, store)).thenReturn(null);
-    SchemaRoutes schemaRoutes = new SchemaRoutes(false, Optional.empty());
+    SchemaRoutes schemaRoutes = new SchemaRoutes(false, Optional.empty(), schemaRequestHandler);
     try {
       schemaRoutes.populateSchemaResponseForValueOrDerivedSchemaID(admin, cluster, store, schemaStr);
     } catch (VeniceNoStoreException e) {
@@ -98,10 +118,192 @@ public class SchemaRoutesTest {
     doReturn(new SchemaEntry(schemaId, schemaStr)).when(admin)
         .addValueSchema(cluster, store, schemaStr, schemaId, schemaCompatType);
 
-    SchemaRoutes schemaRoutes = new SchemaRoutes(false, Optional.empty());
+    SchemaRoutes schemaRoutes = new SchemaRoutes(false, Optional.empty(), schemaRequestHandler);
     Route route = schemaRoutes.addValueSchema(admin);
     route.handle(request, response);
     verify(response, times(0)).status(anyInt()); // no error
   }
 
+  /**
+   * Pins the HTTP-413 contract: SchemaRoutes' catch must propagate AdminMessageTooLargeException's
+   * typed status code instead of wrapping it as a generic 500.
+   */
+  @Test
+  public void testAddValueSchemaPropagatesTypedHttpStatusOnOversize() throws Exception {
+    String cluster = "cluster_name";
+    String store = "store_name";
+    String schemaStr = "\"int\"";
+    int schemaId = 2;
+    DirectionalSchemaCompatibilityType schemaCompatType = DirectionalSchemaCompatibilityType.BACKWARD;
+
+    Admin admin = mock(Admin.class);
+    Request request = mock(Request.class);
+    Response response = mock(Response.class);
+
+    QueryParamsMap paramsMap = mock(QueryParamsMap.class);
+    doReturn(new HashMap<String, String[]>()).when(paramsMap).toMap();
+    doReturn(paramsMap).when(request).queryMap();
+
+    doReturn(cluster).when(request).queryParams(CLUSTER);
+    doReturn(store).when(request).queryParams(NAME);
+    doReturn(schemaStr).when(request).queryParams(VALUE_SCHEMA);
+    doReturn(Integer.toString(schemaId)).when(request).queryParams(SCHEMA_ID);
+    doReturn(schemaCompatType.toString()).when(request).queryParams(SCHEMA_COMPAT_TYPE);
+
+    doReturn(true).when(admin).isLeaderControllerFor(cluster);
+    doThrow(new AdminMessageTooLargeException("VALUE_SCHEMA_CREATION", 1_000_000, 950 * 1024)).when(admin)
+        .addValueSchema(
+            eq(cluster),
+            eq(store),
+            eq(schemaStr),
+            eq(schemaId),
+            any(DirectionalSchemaCompatibilityType.class));
+
+    SchemaRoutes schemaRoutes = new SchemaRoutes(false, Optional.empty(), schemaRequestHandler);
+    Route route = schemaRoutes.addValueSchema(admin);
+    route.handle(request, response);
+
+    verify(response).status(HttpStatus.SC_REQUEST_TOO_LONG); // 413, NOT 500
+  }
+
+  @Test
+  public void testGetValueSchemaSuccess() throws Exception {
+    String cluster = "cluster_name";
+    String store = "store_name";
+    int schemaId = 1;
+    String schemaStr = "\"string\"";
+
+    Admin admin = mock(Admin.class);
+    Request request = mock(Request.class);
+    Response response = mock(Response.class);
+
+    doReturn(cluster).when(request).queryParams(CLUSTER);
+    doReturn(store).when(request).queryParams(NAME);
+    doReturn(Integer.toString(schemaId)).when(request).queryParams(SCHEMA_ID);
+    doReturn(true).when(admin).isLeaderControllerFor(cluster);
+
+    // Mock handler to return POJO
+    SchemaResponse pojoResponse = new SchemaResponse();
+    pojoResponse.setCluster(cluster);
+    pojoResponse.setName(store);
+    pojoResponse.setId(schemaId);
+    pojoResponse.setSchemaStr(schemaStr);
+    when(schemaRequestHandler.getValueSchema(eq(cluster), eq(store), eq(schemaId))).thenReturn(pojoResponse);
+
+    SchemaRoutes schemaRoutes = new SchemaRoutes(false, Optional.empty(), schemaRequestHandler);
+    Route route = schemaRoutes.getValueSchema(admin);
+    String result = (String) route.handle(request, response);
+
+    verify(schemaRequestHandler, times(1)).getValueSchema(eq(cluster), eq(store), eq(schemaId));
+    verify(response, times(0)).status(anyInt()); // no error
+    assertTrue(result.contains("\"schemaStr\":\"\\\"string\\\"\""), "Response should contain the schema string");
+    assertTrue(result.contains("\"id\":1"), "Response should contain the schema ID");
+  }
+
+  @Test
+  public void testGetValueSchemaNotFound() throws Exception {
+    String cluster = "cluster_name";
+    String store = "store_name";
+    int schemaId = 99;
+
+    Admin admin = mock(Admin.class);
+    Request request = mock(Request.class);
+    Response response = mock(Response.class);
+
+    doReturn(cluster).when(request).queryParams(CLUSTER);
+    doReturn(store).when(request).queryParams(NAME);
+    doReturn(Integer.toString(schemaId)).when(request).queryParams(SCHEMA_ID);
+    doReturn(true).when(admin).isLeaderControllerFor(cluster);
+
+    // Mock queryMap for handleError method
+    QueryParamsMap paramsMap = mock(QueryParamsMap.class);
+    Map<String, String[]> queryMapResult = new HashMap<>();
+    queryMapResult.put(CLUSTER, new String[] { cluster });
+    queryMapResult.put(NAME, new String[] { store });
+    queryMapResult.put(SCHEMA_ID, new String[] { Integer.toString(schemaId) });
+    doReturn(queryMapResult).when(paramsMap).toMap();
+    doReturn(paramsMap).when(request).queryMap();
+
+    when(schemaRequestHandler.getValueSchema(eq(cluster), eq(store), eq(schemaId)))
+        .thenThrow(new VeniceException("Value schema for schema id: 99 of store: store_name doesn't exist"));
+
+    SchemaRoutes schemaRoutes = new SchemaRoutes(false, Optional.empty(), schemaRequestHandler);
+    Route route = schemaRoutes.getValueSchema(admin);
+    String result = (String) route.handle(request, response);
+
+    verify(schemaRequestHandler, times(1)).getValueSchema(eq(cluster), eq(store), eq(schemaId));
+    assertTrue(
+        result.contains("Value schema for schema id: 99 of store: store_name doesn't exist"),
+        "Response should contain error message");
+  }
+
+  @Test
+  public void testGetKeySchemaSuccess() throws Exception {
+    String cluster = "cluster_name";
+    String store = "store_name";
+
+    Admin admin = mock(Admin.class);
+    Request request = mock(Request.class);
+    Response response = mock(Response.class);
+
+    doReturn(cluster).when(request).queryParams(CLUSTER);
+    doReturn(store).when(request).queryParams(NAME);
+    doReturn(true).when(admin).isLeaderControllerFor(cluster);
+
+    // Mock handler to return POJO
+    SchemaResponse pojoResponse = new SchemaResponse();
+    pojoResponse.setCluster(cluster);
+    pojoResponse.setName(store);
+    pojoResponse.setId(1);
+    pojoResponse.setSchemaStr("\"string\"");
+    when(schemaRequestHandler.getKeySchema(eq(cluster), eq(store))).thenReturn(pojoResponse);
+
+    SchemaRoutes schemaRoutes = new SchemaRoutes(false, Optional.empty(), schemaRequestHandler);
+    Route route = schemaRoutes.getKeySchema(admin);
+    String result = (String) route.handle(request, response);
+
+    verify(response, times(0)).status(anyInt()); // no error
+    verify(schemaRequestHandler, times(1)).getKeySchema(eq(cluster), eq(store));
+
+    ObjectMapper mapper = ObjectMapperFactory.getInstance();
+    SchemaResponse schemaResponse = mapper.readValue(result, SchemaResponse.class);
+    assertEquals(schemaResponse.getCluster(), cluster);
+    assertEquals(schemaResponse.getName(), store);
+    assertEquals(schemaResponse.getId(), 1);
+    assertEquals(schemaResponse.getSchemaStr(), "\"string\"");
+  }
+
+  @Test
+  public void testGetKeySchemaNotFound() throws Exception {
+    String cluster = "cluster_name";
+    String store = "store_name";
+
+    Admin admin = mock(Admin.class);
+    Request request = mock(Request.class);
+    Response response = mock(Response.class);
+
+    doReturn(cluster).when(request).queryParams(CLUSTER);
+    doReturn(store).when(request).queryParams(NAME);
+
+    // Mock queryMap to avoid NullPointerException in handleError
+    spark.QueryParamsMap queryParamsMap = mock(spark.QueryParamsMap.class);
+    when(request.queryMap()).thenReturn(queryParamsMap);
+    when(queryParamsMap.toMap()).thenReturn(new java.util.HashMap<>());
+
+    doReturn(true).when(admin).isLeaderControllerFor(cluster);
+
+    when(schemaRequestHandler.getKeySchema(eq(cluster), eq(store)))
+        .thenThrow(new VeniceException("Key schema doesn't exist for store: " + store));
+
+    SchemaRoutes schemaRoutes = new SchemaRoutes(false, Optional.empty(), schemaRequestHandler);
+    Route route = schemaRoutes.getKeySchema(admin);
+    String result = (String) route.handle(request, response);
+
+    verify(schemaRequestHandler, times(1)).getKeySchema(eq(cluster), eq(store));
+
+    ObjectMapper mapper = ObjectMapperFactory.getInstance();
+    SchemaResponse schemaResponse = mapper.readValue(result, SchemaResponse.class);
+    assertTrue(schemaResponse.isError());
+    assertTrue(schemaResponse.getError().contains("Key schema doesn't exist for store"));
+  }
 }

@@ -7,6 +7,7 @@ import com.linkedin.venice.helix.HelixAdapterSerializer;
 import com.linkedin.venice.helix.HelixReadOnlyLiveClusterConfigRepository;
 import com.linkedin.venice.helix.HelixReadOnlySchemaRepository;
 import com.linkedin.venice.helix.HelixReadOnlySchemaRepositoryAdapter;
+import com.linkedin.venice.helix.HelixReadOnlyStoreConfigRepository;
 import com.linkedin.venice.helix.HelixReadOnlyStoreRepository;
 import com.linkedin.venice.helix.HelixReadOnlyStoreRepositoryAdapter;
 import com.linkedin.venice.helix.HelixReadOnlyZKSharedSchemaRepository;
@@ -31,7 +32,7 @@ import org.apache.logging.log4j.Logger;
 /**
  * VeniceMetadataRepositoryBuilder is a centralized builder class for constructing a variety of metadata components
  * including store repository, schema repository, ZK-shared schema repository, ZK client and cluster info provider
- * for Da Vinci, Venice Service and Isolated Ingestion Service.
+ * for Da Vinci and Venice Service.
  */
 public class VeniceMetadataRepositoryBuilder {
   private static final Logger LOGGER = LogManager.getLogger(VeniceMetadataRepositoryBuilder.class);
@@ -39,10 +40,10 @@ public class VeniceMetadataRepositoryBuilder {
   private final VeniceConfigLoader configLoader;
   private final ClientConfig clientConfig;
   private final MetricsRepository metricsRepository;
-  private final boolean isIngestionIsolation;
   private final ICProvider icProvider;
 
   private ReadOnlyStoreRepository storeRepo;
+  private HelixReadOnlyStoreConfigRepository storeConfigRepo;
   private ReadOnlySchemaRepository schemaRepo;
   private HelixReadOnlyZKSharedSchemaRepository readOnlyZKSharedSchemaRepository;
   private ReadOnlyLiveClusterConfigRepository liveClusterConfigRepo;
@@ -53,12 +54,13 @@ public class VeniceMetadataRepositoryBuilder {
       VeniceConfigLoader configLoader,
       ClientConfig clientConfig,
       MetricsRepository metricsRepository,
-      ICProvider icProvider,
-      boolean isIngestionIsolation) {
+      ICProvider icProvider) {
     this.configLoader = configLoader;
     this.clientConfig = clientConfig;
+    if (clientConfig != null) {
+      clientConfig.setMetricsRepository(metricsRepository);
+    }
     this.metricsRepository = metricsRepository;
-    this.isIngestionIsolation = isIngestionIsolation;
     this.icProvider = icProvider;
     if (isDaVinciClient()) {
       initDaVinciStoreAndSchemaRepository();
@@ -77,6 +79,10 @@ public class VeniceMetadataRepositoryBuilder {
 
   public ReadOnlyStoreRepository getStoreRepo() {
     return storeRepo;
+  }
+
+  public HelixReadOnlyStoreConfigRepository getStoreConfigRepo() {
+    return storeConfigRepo;
   }
 
   public ReadOnlySchemaRepository getSchemaRepo() {
@@ -104,17 +110,18 @@ public class VeniceMetadataRepositoryBuilder {
         NativeMetadataRepository.getInstance(clientConfig, veniceProperties, icProvider);
     systemStoreBasedRepository.start();
     systemStoreBasedRepository.refresh();
-    clusterInfoProvider = systemStoreBasedRepository;
-    storeRepo = systemStoreBasedRepository;
-    schemaRepo = systemStoreBasedRepository;
+    NativeMetadataRepositoryViewAdapter repositoryViewAdapter =
+        new NativeMetadataRepositoryViewAdapter(systemStoreBasedRepository);
+    clusterInfoProvider = repositoryViewAdapter;
+    storeRepo = repositoryViewAdapter;
+    schemaRepo = repositoryViewAdapter;
     liveClusterConfigRepo = null;
   }
 
   private void initServerStoreAndSchemaRepository() {
     VeniceClusterConfig clusterConfig = configLoader.getVeniceClusterConfig();
     zkClient = ZkClientFactory.newZkClient(clusterConfig.getZookeeperAddress());
-    String zkClientNamePrefix = isIngestionIsolation ? "ingestion-isolation-" : "";
-    zkClient.subscribeStateChanges(new ZkClientStatusStats(metricsRepository, zkClientNamePrefix + "server-zk-client"));
+    zkClient.subscribeStateChanges(new ZkClientStatusStats(metricsRepository, "server-zk-client"));
     HelixAdapterSerializer adapter = new HelixAdapterSerializer();
     String clusterName = clusterConfig.getClusterName();
 
@@ -122,12 +129,8 @@ public class VeniceMetadataRepositoryBuilder {
     HelixReadOnlyZKSharedSystemStoreRepository readOnlyZKSharedSystemStoreRepository =
         new HelixReadOnlyZKSharedSystemStoreRepository(zkClient, adapter, systemSchemaClusterName);
 
-    HelixReadOnlyStoreRepository readOnlyStoreRepository = new HelixReadOnlyStoreRepository(
-        zkClient,
-        adapter,
-        clusterName,
-        clusterConfig.getRefreshAttemptsForZkReconnect(),
-        clusterConfig.getRefreshIntervalForZkReconnectInMs());
+    HelixReadOnlyStoreRepository readOnlyStoreRepository =
+        new HelixReadOnlyStoreRepository(zkClient, adapter, clusterName);
 
     storeRepo = new HelixReadOnlyStoreRepositoryAdapter(
         readOnlyZKSharedSystemStoreRepository,
@@ -135,6 +138,9 @@ public class VeniceMetadataRepositoryBuilder {
         clusterName);
     // Load existing store config and setup watches
     storeRepo.refresh();
+
+    storeConfigRepo = new HelixReadOnlyStoreConfigRepository(zkClient, adapter);
+    storeConfigRepo.refresh();
 
     readOnlyZKSharedSchemaRepository = new HelixReadOnlyZKSharedSchemaRepository(
         readOnlyZKSharedSystemStoreRepository,

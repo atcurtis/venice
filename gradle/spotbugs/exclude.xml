@@ -15,6 +15,11 @@
       <Class name="com.linkedin.venice.serializer.ComputableSpecificDatumReader">
         <Method name="readArray"/>
       </Class>
+      <!--Uses Schema.getObjectProps() directly to avoid AvroCompatibilityHelper.getAllPropNames(Schema)
+          which routes through Avro16Adapter.getAllPropNames and calls Schema.getProps(), removed in Avro 1.11-->
+      <Class name="com.linkedin.venice.utils.AvroSupersetSchemaUtils">
+        <Method name="getSchemaPropNames"/>
+      </Class>
     </Or>
   </Match>
   <Match>
@@ -49,10 +54,25 @@
       <!--Not require to make use of every return value. Commonly this rule applies to methods like
       File.mkdir, Queue.offer, Executor.submit-->
       <Bug pattern="RV_RETURN_VALUE_IGNORED_BAD_PRACTICE"/>
+      <Bug pattern="RV_RETURN_VALUE_IGNORED_INFERRED"/>
     </Or>
   </Match>
   <Match>
     <Source name="~.*internal/alpini/.*" />
+  </Match>
+  <Match>
+    <!--Explicit "freeing" to encourage GC is intentional in some rare testing contexts-->
+    <Bug pattern="DLS_DEAD_LOCAL_STORE_OF_NULL"/>
+    <Or>
+      <Class name="com.linkedin.venice.memory.HeapSizeEstimatorTest"/>
+    </Or>
+  </Match>
+  <Match>
+    <!--Explicit GC is intentional in some rare testing contexts-->
+    <Bug pattern="DM_GC"/>
+    <Or>
+      <Class name="com.linkedin.venice.memory.HeapSizeEstimatorTest"/>
+    </Or>
   </Match>
   <Match>
     <!--These classes pass null intentionally for testing purposes-->
@@ -60,6 +80,12 @@
     <Or>
       <Class name="com.linkedin.venice.router.api.TestHostFinder"/>
       <Class name="com.linkedin.davinci.StoreBackendTest"/>
+      <Class name="com.linkedin.davinci.consumer.VeniceChangelogConsumerImplTest"/>
+      <Class name="com.linkedin.venice.memory.ClassSizeEstimatorTest"/>
+      <Class name="com.linkedin.venice.controller.server.VeniceControllerAccessManagerTest"/>
+      <Class name="com.linkedin.venice.sql.SQLUtilsTest"/>
+      <Class name="com.linkedin.venice.pubsub.adapter.kafka.consumer.ApacheKafkaConsumerAdapterTest"/>
+      <Class name="com.linkedin.venice.utils.LogContextTest"/>
     </Or>
   </Match>
   <Match>
@@ -83,10 +109,6 @@
       </Class>
       <Class name="com.linkedin.venice.controllerapi.ControllerTransport">
         <Field name="OBJECT_MAPPER"/>
-      </Class>
-      <Class name="com.linkedin.davinci.ingestion.utils.IsolatedIngestionUtils">
-        <Field name="DUMMY_COMMAND"/>
-        <Field name="DUMMY_CONTENT"/>
       </Class>
     </Or>
   </Match>
@@ -186,6 +208,16 @@
       <Class name="com.linkedin.venice.samza.VeniceSystemFactory">
         <Field name="systemProducerStatues"/>
       </Class>
+      <Class name="com.linkedin.venice.serialization.avro.AvroProtocolDefinition">
+        <Field name="currentProtocolVersion"/>
+        <Field name="magicByte"/>
+      </Class>
+    </Or>
+  </Match>
+  <Match>
+    <Bug pattern="UUF_UNUSED_FIELD"/>
+    <Or>
+      <Class name="com.linkedin.venice.utils.collections.MeasurableLinkedHashMap$PseudoHashMapNode"/>
     </Or>
   </Match>
   <Match>
@@ -234,6 +266,15 @@
       <Class name="com.linkedin.venice.views.VeniceView">
         <Field name="props"/>
       </Class>
+      <!--LilyPadUtils to be used by the VT Consistency Checker -->
+      <Class name="com.linkedin.venice.spark.consistency.LilyPadUtils$KeyRecord"/>
+      <Class name="com.linkedin.venice.spark.consistency.LilyPadUtils$Inconsistency"/>
+    </Or>
+  </Match>
+  <Match>
+    <Bug pattern="RC_REF_COMPARISON"/>
+    <Or>
+      <Class name="com.linkedin.venice.utils.CollectionUtilsTest"/>
     </Or>
   </Match>
   <Match>
@@ -251,8 +292,11 @@
       <Class name="com.linkedin.venice.client.store.schemas.TestValueRecordWithMoreFields"/>
       <Class name="com.linkedin.venice.fastclient.schema.TestValueSchema"/>
       <Class name="com.linkedin.venice.utils.TestMockTime"/>
-      <Class name="com.linkedin.davinci.ingestion.IsolatedIngestionBackend"/>
       <Class name="com.linkedin.venice.endToEnd.TestChangelogValue"/>
+      <Class name="com.linkedin.venice.endToEnd.TestChangelogValueV2"/>
+      <Class name="com.linkedin.venice.endToEnd.TestChangelogKey"/>
+      <Class name="com.linkedin.davinci.transformer.TestSpecificValue"/>
+      <Class name="com.linkedin.davinci.transformer.TestSpecificKey"/>
     </Or>
   </Match>
   <Match>
@@ -269,6 +313,12 @@
     <Or>
       <Class name="com.linkedin.venice.utils.DataProviderUtils"/>
       <Class name="com.linkedin.venice.fastclient.utils.ClientTestUtils"/>
+    </Or>
+  </Match>
+  <Match>
+    <Bug pattern="SE_NO_SUITABLE_CONSTRUCTOR_FOR_EXTERNALIZATION"/>
+    <Or>
+      <Class name="com.linkedin.venice.writer.VeniceWriter$DefaultLeaderMetadata"/>
     </Or>
   </Match>
   <Match>
@@ -295,6 +345,10 @@
   <Match>
     <Bug pattern="SE_COMPARATOR_SHOULD_BE_SERIALIZABLE"/>
     <Class name="com.linkedin.venice.utils.HashCodeComparator"/>
+  </Match>
+  <Match>
+    <Bug pattern="SE_NO_SERIALVERSIONID"/>
+    <Class name="com.linkedin.venice.utils.collections.MeasurableLinkedHashMap"/>
   </Match>
   <Match>
     <!--Legacy codes catch NPE and handle them-->
@@ -364,7 +418,6 @@
     <Bug pattern="DM_EXIT"/>
     <Or>
       <Class name="com.linkedin.venice.controller.spark.VeniceSparkEmbeddedJettyServer"/>
-      <Class name="com.linkedin.davinci.ingestion.isolated.IsolatedIngestionServer"/>
       <Class name="com.linkedin.venice.producer.online.ProducerTool"/>
     </Or>
   </Match>
@@ -374,6 +427,7 @@
     <Or>
       <Class name="com.linkedin.venice.integration.utils.ZkServerWrapper"/>
       <Class name="com.linkedin.davinci.kafka.consumer.StoreIngestionTaskTest"/>
+      <Class name="com.linkedin.venice.endToEnd.TestHybrid"/>
     </Or>
   </Match>
   <Match>
@@ -435,6 +489,15 @@
     </Or>
   </Match>
   <Match>
+    <!-- StoreIngestionTask's constructor calls overridable field-getter accessors (e.g. getVersionTopic,
+         getPubSubTopicRepository) that are intentionally left non-final because they are widely mocked in
+         unit tests (see reason #2 above). Scope the suppression to the constructor only, rather than the
+         whole class, so MC_OVERRIDABLE regressions elsewhere in the class are still surfaced. -->
+    <Bug pattern="MC_OVERRIDABLE_METHOD_CALL_IN_CONSTRUCTOR"/>
+    <Class name="com.linkedin.davinci.kafka.consumer.StoreIngestionTask"/>
+    <Method name="&lt;init&gt;"/>
+  </Match>
+  <Match>
     <Bug pattern="MS_MUTABLE_ARRAY"/>
     <Or>
       <!--Fields are being used for print-->
@@ -443,7 +506,47 @@
   </Match>
   <Match>
     <!--Ignore SpotBug Checks for the following package as classes are generated by protoc compiler-->
-    <Package name="com.linkedin.venice.protocols"/>
-    <Bug pattern="MS_EXPOSE_REP"/>
+    <Or>
+      <Package name="com.linkedin.venice.protocols"/>
+      <Package name="com.linkedin.venice.protocols.controller"/>
+      <Package name="com.linkedin.venice.protocols.hooks"/>
+    </Or>
+  </Match>
+  <Match>
+    <Bug pattern="SE_INNER_CLASS"/>
+    <Or>
+      <Class name="com.linkedin.venice.beam.consumer.PubSubMessageCoder$1"/>
+      <Class name="com.linkedin.venice.beam.consumer.VeniceMessageCoder$1"/>
+      <Class name="com.linkedin.venice.beam.consumer.VeniceMessageCoder$2"/>
+      <Class name="com.linkedin.venice.beam.consumer.VeniceChangelogConsumerIO$Read$CurrentValueTransform"/>
+      <Class name="com.linkedin.venice.beam.consumer.VeniceChangelogConsumerIO$Read$RemoveMetadata"/>
+    </Or>
+  </Match>
+  <Match>
+    <Bug pattern="SQL_NONCONSTANT_STRING_PASSED_TO_EXECUTE"/>
+    <Or>
+      <Class name="com.linkedin.venice.duckdb.DuckDBHelloWorldTest"/>
+      <Class name="com.linkedin.venice.duckdb.DuckDBAvroToSQLTest"/>
+      <Class name="com.linkedin.venice.duckdb.DuckDBDaVinciRecordTransformer"/>
+      <Class name="com.linkedin.venice.duckdb.DuckDBDaVinciRecordTransformerTest"/>
+      <Class name="com.linkedin.venice.endToEnd.DuckDBDaVinciRecordTransformerIntegrationTest"/>
+      <Class name="com.linkedin.venice.sql.SQLHelloWorldTest"/>
+      <Class name="com.linkedin.venice.sql.SQLUtilsTest"/>
+      <Class name="com.linkedin.venice.sql.SQLUtils"/>
+    </Or>
+  </Match>
+  <Match>
+    <Bug pattern="SQL_PREPARED_STATEMENT_GENERATED_FROM_NONCONSTANT_STRING"/>
+    <Or>
+      <Class name="com.linkedin.venice.duckdb.DuckDBAvroToSQLTest"/>
+      <Class name="com.linkedin.venice.duckdb.DuckDBDaVinciRecordTransformer"/>
+    </Or>
+  </Match>
+  <Match>
+    <Bug pattern="DB_DUPLICATE_SWITCH_CLAUSES"/>
+    <Or>
+      <!-- Copied class from Avro-1.9 -->
+      <Class name="com.linkedin.venice.schema.avro.SchemaCompatibility19$ReaderWriterCompatibilityChecker"/>
+    </Or>
   </Match>
 </FindBugsFilter>

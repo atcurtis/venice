@@ -9,6 +9,7 @@ import com.linkedin.venice.kafka.protocol.Put;
 import com.linkedin.venice.kafka.protocol.Update;
 import com.linkedin.venice.utils.EnumUtils;
 import com.linkedin.venice.utils.VeniceEnumValue;
+import java.util.List;
 
 
 /**
@@ -20,9 +21,11 @@ import com.linkedin.venice.utils.VeniceEnumValue;
  */
 public enum MessageType implements VeniceEnumValue {
   PUT(0, Constants.PUT_KEY_HEADER_BYTE), DELETE(1, Constants.PUT_KEY_HEADER_BYTE),
-  CONTROL_MESSAGE(2, Constants.CONTROL_MESSAGE_KEY_HEADER_BYTE), UPDATE(3, Constants.UPDATE_KEY_HEADER_BYTE);
+  CONTROL_MESSAGE(2, Constants.CONTROL_MESSAGE_KEY_HEADER_BYTE), UPDATE(3, Constants.UPDATE_KEY_HEADER_BYTE),
+  // GLOBAL_RT_DIV is the same as PUT, but contains a DIV object rather than user data
+  GLOBAL_RT_DIV(4, Constants.GLOBAL_RT_DIV_KEY_HEADER_BYTE);
 
-  private static final MessageType[] TYPES_ARRAY = EnumUtils.getEnumValuesArray(MessageType.class);
+  private static final List<MessageType> TYPES = EnumUtils.getEnumValuesList(MessageType.class);
 
   private final int value;
   private final byte keyHeaderByte;
@@ -36,6 +39,7 @@ public enum MessageType implements VeniceEnumValue {
    * @return This is the value used in {@link com.linkedin.venice.kafka.protocol.KafkaMessageEnvelope#messageType}
    *         to distinguish message types.
    */
+  @Override
   public int getValue() {
     return value;
   }
@@ -56,10 +60,12 @@ public enum MessageType implements VeniceEnumValue {
    *         - {@link com.linkedin.venice.kafka.protocol.Put}
    *         - {@link com.linkedin.venice.kafka.protocol.Delete}
    *         - {@link com.linkedin.venice.kafka.protocol.ControlMessage}
+   *         - {@link com.linkedin.venice.kafka.protocol.Update}
    */
   public Object getNewInstance() {
     switch (valueOf(value)) {
       case PUT:
+      case GLOBAL_RT_DIV: // GLOBAL_RT_DIV is the same as PUT, but contains a DIV object rather than user data
         return new Put();
       case DELETE:
         return new Delete();
@@ -73,20 +79,17 @@ public enum MessageType implements VeniceEnumValue {
   }
 
   public static MessageType valueOf(int value) {
-    try {
-      return TYPES_ARRAY[value];
-    } catch (IndexOutOfBoundsException e) {
-      throw new VeniceMessageException("Invalid message type: " + value);
-    }
+    return EnumUtils.valueOf(TYPES, value, MessageType.class, VeniceMessageException::new);
   }
 
   public static MessageType valueOf(KafkaMessageEnvelope kafkaMessageEnvelope) {
-    return valueOf(kafkaMessageEnvelope.messageType);
+    return valueOf(kafkaMessageEnvelope.getMessageType());
   }
 
   public static class Constants {
     public static final byte PUT_KEY_HEADER_BYTE = 0;
     public static final byte CONTROL_MESSAGE_KEY_HEADER_BYTE = 2;
     public static final byte UPDATE_KEY_HEADER_BYTE = 4;
+    public static final byte GLOBAL_RT_DIV_KEY_HEADER_BYTE = 8;
   }
 }

@@ -1,11 +1,12 @@
 package com.linkedin.venice.hadoop.input.kafka;
 
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.COMPRESSION_DICTIONARY_SAMPLE_SIZE;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.COMPRESSION_DICTIONARY_SIZE_LIMIT;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.KAFKA_INPUT_BROKER_URL;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.KAFKA_INPUT_SOURCE_TOPIC_CHUNKING_ENABLED;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.KAFKA_INPUT_TOPIC;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.KAFKA_SOURCE_KEY_SCHEMA_STRING_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.COMPRESSION_DICTIONARY_SAMPLE_SIZE;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.COMPRESSION_DICTIONARY_SIZE_LIMIT;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.KAFKA_INPUT_SOURCE_TOPIC_CHUNKING_ENABLED;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.KAFKA_INPUT_TOPIC;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.KAFKA_SOURCE_KEY_SCHEMA_STRING_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.PUBSUB_INPUT_SPLIT_STRATEGY;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_REPUSH_SOURCE_PUBSUB_BROKER;
 
 import com.github.luben.zstd.ZstdDictTrainer;
 import com.linkedin.venice.compression.CompressionStrategy;
@@ -16,15 +17,20 @@ import com.linkedin.venice.hadoop.PushJobZstdConfig;
 import com.linkedin.venice.hadoop.input.kafka.avro.KafkaInputMapperKey;
 import com.linkedin.venice.hadoop.input.kafka.avro.KafkaInputMapperValue;
 import com.linkedin.venice.kafka.protocol.KafkaMessageEnvelope;
-import com.linkedin.venice.pubsub.adapter.kafka.consumer.ApacheKafkaConsumerAdapterFactory;
+import com.linkedin.venice.pubsub.PubSubClientsFactory;
+import com.linkedin.venice.pubsub.PubSubConsumerAdapterContext;
+import com.linkedin.venice.pubsub.PubSubPositionTypeRegistry;
+import com.linkedin.venice.pubsub.PubSubTopicRepository;
 import com.linkedin.venice.pubsub.api.PubSubConsumerAdapter;
 import com.linkedin.venice.pubsub.api.PubSubMessageDeserializer;
 import com.linkedin.venice.utils.ByteUtils;
 import com.linkedin.venice.utils.VeniceProperties;
 import com.linkedin.venice.utils.pools.LandFillObjectPool;
+import com.linkedin.venice.vpj.pubsub.input.PartitionSplitStrategy;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
 import org.apache.hadoop.mapred.InputSplit;
@@ -44,22 +50,24 @@ public class KafkaInputDictTrainer {
     private final String kafkaInputBroker;
     private final String topicName;
     private final String keySchema;
-    private final Properties sslProperties;
+    private final Properties consumerProperties;
     private final int compressionDictSize;
     private final int dictSampleSize;
     private final CompressionStrategy sourceVersionCompressionStrategy;
 
     private final boolean sourceVersionChunkingEnabled;
+    private Map<Integer, String> newKMESchemasFromController;
 
     Param(ParamBuilder builder) {
       this.kafkaInputBroker = builder.kafkaInputBroker;
       this.topicName = builder.topicName;
       this.keySchema = builder.keySchema;
-      this.sslProperties = builder.sslProperties;
+      this.consumerProperties = builder.consumerProperties;
       this.compressionDictSize = builder.compressionDictSize;
       this.dictSampleSize = builder.dictSampleSize;
       this.sourceVersionCompressionStrategy = builder.sourceVersionCompressionStrategy;
       this.sourceVersionChunkingEnabled = builder.sourceVersionChunkingEnabled;
+      this.newKMESchemasFromController = builder.newKMESchemasFromController;
     }
   }
 
@@ -67,11 +75,12 @@ public class KafkaInputDictTrainer {
     private String kafkaInputBroker;
     private String topicName;
     private String keySchema;
-    private Properties sslProperties;
+    private Properties consumerProperties;
     private int compressionDictSize;
     private int dictSampleSize;
     private CompressionStrategy sourceVersionCompressionStrategy;
     private boolean sourceVersionChunkingEnabled;
+    private Map<Integer, String> newKMESchemasFromController;
 
     public ParamBuilder setKafkaInputBroker(String kafkaInputBroker) {
       this.kafkaInputBroker = kafkaInputBroker;
@@ -88,8 +97,8 @@ public class KafkaInputDictTrainer {
       return this;
     }
 
-    public ParamBuilder setSslProperties(Properties sslProperties) {
-      this.sslProperties = sslProperties;
+    public ParamBuilder setConsumerProperties(Properties consumerProperties) {
+      this.consumerProperties = consumerProperties;
       return this;
     }
 
@@ -113,12 +122,18 @@ public class KafkaInputDictTrainer {
       return this;
     }
 
+    public ParamBuilder setNewKMESchemasFromController(Map<Integer, String> newKMESchemasFromController) {
+      this.newKMESchemasFromController = newKMESchemasFromController;
+      return this;
+    }
+
     public Param build() {
       return new Param(this);
     }
   }
 
   private static final Logger LOGGER = LogManager.getLogger(KafkaInputDictTrainer.class);
+  private static final PubSubTopicRepository PUBSUB_TOPIC_REPOSITORY = new PubSubTopicRepository();
   private final VeniceProperties props;
   private final JobConf jobConf;
   private final String sourceTopicName;
@@ -151,15 +166,16 @@ public class KafkaInputDictTrainer {
     this.trainerSupplier = trainerSupplier;
     this.sourceVersionCompressionStrategy = param.sourceVersionCompressionStrategy;
     Properties properties = new Properties();
-    properties.setProperty(KAFKA_INPUT_BROKER_URL, param.kafkaInputBroker);
+    properties.putAll(param.consumerProperties);
+    properties.setProperty(VENICE_REPUSH_SOURCE_PUBSUB_BROKER, param.kafkaInputBroker);
     properties.setProperty(KAFKA_INPUT_TOPIC, param.topicName);
     properties.setProperty(KAFKA_SOURCE_KEY_SCHEMA_STRING_PROP, param.keySchema);
     this.sourceTopicName = param.topicName;
-    properties.putAll(param.sslProperties);
     properties.setProperty(COMPRESSION_DICTIONARY_SIZE_LIMIT, Integer.toString(param.compressionDictSize));
     properties.setProperty(COMPRESSION_DICTIONARY_SAMPLE_SIZE, Integer.toString(param.dictSampleSize));
     properties
         .setProperty(KAFKA_INPUT_SOURCE_TOPIC_CHUNKING_ENABLED, Boolean.toString(param.sourceVersionChunkingEnabled));
+    properties.putAll(KafkaInputUtils.putSchemaMapIntoProperties(param.newKMESchemasFromController));
 
     props = new VeniceProperties(properties);
     jobConf = new JobConf();
@@ -178,11 +194,13 @@ public class KafkaInputDictTrainer {
       return dict;
     }
 
-    // Prepare input
-    // Get one split per partition
-    KafkaInputSplit[] splits = (KafkaInputSplit[]) kafkaInputFormat.getSplitsByRecordsPerSplit(jobConf, Long.MAX_VALUE);
+    // Prepare input: Get one split per partition
+    Properties splitProps = new Properties();
+    splitProps.put(PUBSUB_INPUT_SPLIT_STRATEGY, PartitionSplitStrategy.SINGLE_SPLIT_PER_PARTITION.name());
+    VeniceProperties veniceProperties = KafkaInputUtils.getConsumerProperties(jobConf, splitProps);
+    KafkaInputSplit[] splits = kafkaInputFormat.getSplits(veniceProperties);
     // The following sort is trying to get a deterministic dict with the same input.
-    Arrays.sort(splits, Comparator.comparingInt(o -> o.getTopicPartition().partition()));
+    Arrays.sort(splits, Comparator.comparingInt(o -> o.getTopicPartition().getPartitionNumber()));
     // Try to gather some records from each partition
     PushJobZstdConfig zstdConfig = new PushJobZstdConfig(props, splits.length);
     ZstdDictTrainer trainer = trainerSupplier.orElseGet(zstdConfig::getZstdDictTrainer);
@@ -193,7 +211,7 @@ public class KafkaInputDictTrainer {
     VeniceCompressor sourceVersionCompressor = compressorBuilder.getCompressor(
         compressorFactory,
         sourceVersionCompressionStrategy,
-        jobConf.get(KAFKA_INPUT_BROKER_URL),
+        jobConf.get(VENICE_REPUSH_SOURCE_PUBSUB_BROKER),
         jobConf.get(KAFKA_INPUT_TOPIC),
         props);
     boolean isSourceVersionUsingNoopCompressionStrategy =
@@ -207,20 +225,23 @@ public class KafkaInputDictTrainer {
 
     // Reuse the same Kafka Consumer across all partitions avoid log flooding
     PubSubConsumerAdapter reusedConsumer = reusedConsumerOptional.orElseGet(
-        () -> new ApacheKafkaConsumerAdapterFactory().create(
-            KafkaInputUtils.getConsumerProperties(jobConf),
-            false,
-            new PubSubMessageDeserializer(
-                KafkaInputUtils.getKafkaValueSerializer(jobConf),
-                new LandFillObjectPool<>(KafkaMessageEnvelope::new),
-                new LandFillObjectPool<>(KafkaMessageEnvelope::new)),
-            null));
+        () -> PubSubClientsFactory.createConsumerFactory(veniceProperties)
+            .create(
+                new PubSubConsumerAdapterContext.Builder()
+                    .setConsumerName("KafkaInputDictTrainer-for-" + sourceTopicName)
+                    .setVeniceProperties(veniceProperties)
+                    .setPubSubTopicRepository(PUBSUB_TOPIC_REPOSITORY)
+                    .setPubSubPositionTypeRegistry(PubSubPositionTypeRegistry.fromPropertiesOrDefault(veniceProperties))
+                    .setPubSubMessageDeserializer(
+                        new PubSubMessageDeserializer(
+                            KafkaInputUtils.getKafkaValueSerializer(jobConf),
+                            new LandFillObjectPool<>(KafkaMessageEnvelope::new),
+                            new LandFillObjectPool<>(KafkaMessageEnvelope::new)))
+                    .build()));
     try {
       for (InputSplit split: splits) {
         long currentFilledSize = 0;
         long sampledRecordCnt = 0;
-        // Reset Kafka consumer before using it
-        reusedConsumer.batchUnsubscribe(reusedConsumer.getAssignment());
         RecordReader<KafkaInputMapperKey, KafkaInputMapperValue> recordReader =
             kafkaInputFormat.getRecordReader(split, jobConf, Reporter.NULL, reusedConsumer);
         try {

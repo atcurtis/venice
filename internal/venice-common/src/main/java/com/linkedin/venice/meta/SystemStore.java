@@ -4,6 +4,7 @@ import com.linkedin.venice.common.VeniceSystemStoreType;
 import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.systemstore.schemas.StoreVersion;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -187,6 +188,18 @@ public class SystemStore extends AbstractStore {
   }
 
   @Override
+  public int getLargestUsedRTVersionNumber() {
+    SystemStoreAttributes systemStoreAttributes = fetchAndBackfillSystemStoreAttributes(true);
+    return systemStoreAttributes.getLargestUsedRTVersionNumber();
+  }
+
+  @Override
+  public void setLargestUsedRTVersionNumber(int largestUsedRTVersionNumber) {
+    SystemStoreAttributes systemStoreAttributes = fetchAndBackfillSystemStoreAttributes(false);
+    systemStoreAttributes.setLargestUsedRTVersionNumber(largestUsedRTVersionNumber);
+  }
+
+  @Override
   public long getStorageQuotaInByte() {
     return zkSharedStore.getStorageQuotaInByte();
   }
@@ -275,6 +288,16 @@ public class SystemStore extends AbstractStore {
   }
 
   @Override
+  public boolean isFlinkVeniceViewsEnabled() {
+    return zkSharedStore.isFlinkVeniceViewsEnabled();
+  }
+
+  @Override
+  public void setFlinkVeniceViewsEnabled(boolean flinkVeniceViewsEnabled) {
+    throwUnsupportedOperationException("setFlinkVeniceViewsEnabled");
+  }
+
+  @Override
   public boolean isHybrid() {
     return zkSharedStore.isHybrid();
   }
@@ -337,6 +360,16 @@ public class SystemStore extends AbstractStore {
   @Override
   public void setIncrementalPushEnabled(boolean incrementalPushEnabled) {
     throwUnsupportedOperationException("setIncrementalPushEnabled");
+  }
+
+  @Override
+  public boolean isSeparateRealTimeTopicEnabled() {
+    return zkSharedStore.isSeparateRealTimeTopicEnabled();
+  }
+
+  @Override
+  public void setSeparateRealTimeTopicEnabled(boolean separateRealTimeTopicEnabled) {
+    throwUnsupportedOperationException("setSeparateRealTimeTopicEnabled");
   }
 
   @Override
@@ -441,6 +474,66 @@ public class SystemStore extends AbstractStore {
   @Override
   public void setBackupStrategy(BackupStrategy value) {
     throwUnsupportedOperationException("setBackupStrategy");
+  }
+
+  @Override
+  public IngestionPauseMode getIngestionPauseMode() {
+    return zkSharedStore.getIngestionPauseMode();
+  }
+
+  @Override
+  public void setIngestionPauseMode(IngestionPauseMode value) {
+    throwUnsupportedOperationException("setIngestionPauseMode");
+  }
+
+  @Override
+  public List<String> getIngestionPausedRegions() {
+    return zkSharedStore.getIngestionPausedRegions();
+  }
+
+  @Override
+  public void setIngestionPausedRegions(List<String> regions) {
+    throwUnsupportedOperationException("setIngestionPausedRegions");
+  }
+
+  @Override
+  public ExternalStorageReadMode getExternalStorageReadMode() {
+    return zkSharedStore.getExternalStorageReadMode();
+  }
+
+  @Override
+  public void setExternalStorageReadMode(ExternalStorageReadMode externalStorageReadMode) {
+    throwUnsupportedOperationException("setExternalStorageReadMode");
+  }
+
+  @Override
+  public StorageMode getStorageMode() {
+    return zkSharedStore.getStorageMode();
+  }
+
+  @Override
+  public void setStorageMode(StorageMode storageMode) {
+    throwUnsupportedOperationException("setStorageMode");
+  }
+
+  @Override
+  public Integer getVeniceUnits() {
+    return zkSharedStore.getVeniceUnits();
+  }
+
+  @Override
+  public void setVeniceUnits(Integer veniceUnits) {
+    throwUnsupportedOperationException("setVeniceUnits");
+  }
+
+  @Override
+  public String getWorkloadType() {
+    return zkSharedStore.getWorkloadType();
+  }
+
+  @Override
+  public void setWorkloadType(String workloadType) {
+    throwUnsupportedOperationException("setWorkloadType");
   }
 
   @Override
@@ -610,6 +703,46 @@ public class SystemStore extends AbstractStore {
   }
 
   @Override
+  public boolean isCompactionEnabled() {
+    return zkSharedStore.isCompactionEnabled();
+  }
+
+  @Override
+  public void setCompactionEnabled(boolean compactionEnabled) {
+    throwUnsupportedOperationException("setCompactionEnabled");
+  }
+
+  @Override
+  public long getCompactionThresholdMilliseconds() {
+    return zkSharedStore.getCompactionThresholdMilliseconds();
+  }
+
+  @Override
+  public void setCompactionThresholdMilliseconds(long compactionThreshold) {
+    throwUnsupportedOperationException("setCompactionThresholdMilliseconds");
+  }
+
+  @Override
+  public boolean isEncryptionEnabled() {
+    return zkSharedStore.isEncryptionEnabled();
+  }
+
+  @Override
+  public void setEncryptionEnabled(boolean encryptionEnabled) {
+    throwUnsupportedOperationException("setEncryptionEnabled");
+  }
+
+  @Override
+  public String getPubSubEncryptionKeyUrn() {
+    return zkSharedStore.getPubSubEncryptionKeyUrn();
+  }
+
+  @Override
+  public void setPubSubEncryptionKeyUrn(String pubSubEncryptionKeyUrn) {
+    throwUnsupportedOperationException("setPubSubEncryptionKeyUrn");
+  }
+
+  @Override
   public long getMinCompactionLagSeconds() {
     return zkSharedStore.getMinCompactionLagSeconds();
   }
@@ -645,8 +778,188 @@ public class SystemStore extends AbstractStore {
   }
 
   @Override
+  public void setBlobTransferInServerEnabled(String blobTransferInServerEnabled) {
+    throwUnsupportedOperationException("setBlobTransferServerEnabled is not supported in SystemStore");
+  }
+
+  @Override
+  public String getBlobTransferInServerEnabled() {
+    return zkSharedStore.getBlobTransferInServerEnabled();
+  }
+
+  @Override
+  public void setBlobDbEnabled(String blobDbEnabled) {
+    throwUnsupportedOperationException("setBlobDbEnabled is not supported in SystemStore");
+  }
+
+  @Override
+  public String getBlobDbEnabled() {
+    return zkSharedStore.getBlobDbEnabled();
+  }
+
+  @Override
   public void setMaxCompactionLagSeconds(long maxCompactionLagSeconds) {
     throwUnsupportedOperationException("setMaxCompactionLagSeconds");
+  }
+
+  @Override
+  public int getMaxRecordSizeBytes() {
+    return zkSharedStore.getMaxRecordSizeBytes();
+  }
+
+  @Override
+  public void setMaxRecordSizeBytes(int maxRecordSizeBytes) {
+    throwUnsupportedOperationException("setMaxRecordSizeBytes");
+  }
+
+  @Override
+  public int getMaxNearlineRecordSizeBytes() {
+    return zkSharedStore.getMaxNearlineRecordSizeBytes();
+  }
+
+  @Override
+  public void setMaxNearlineRecordSizeBytes(int maxNearlineRecordSizeBytes) {
+    throwUnsupportedOperationException("setMaxNearlineRecordSizeBytes");
+  }
+
+  @Override
+  public long getThroughputQuotaInBytes() {
+    return zkSharedStore.getThroughputQuotaInBytes();
+  }
+
+  @Override
+  public void setThroughputQuotaInBytes(long throughputQuotaInBytes) {
+    throwUnsupportedOperationException("setThroughputQuotaInBytes");
+  }
+
+  @Override
+  public long getThroughputQuotaInRecords() {
+    return zkSharedStore.getThroughputQuotaInRecords();
+  }
+
+  @Override
+  public void setThroughputQuotaInRecords(long throughputQuotaInRecords) {
+    throwUnsupportedOperationException("setThroughputQuotaInRecords");
+  }
+
+  @Override
+  public boolean isNearlineProducerCompressionEnabled() {
+    return zkSharedStore.isNearlineProducerCompressionEnabled();
+  }
+
+  @Override
+  public void setNearlineProducerCompressionEnabled(boolean compressionEnabled) {
+    throwUnsupportedOperationException("setNearlineProducerCompressionEnabled");
+  }
+
+  @Override
+  public int getNearlineProducerCountPerWriter() {
+    return zkSharedStore.getNearlineProducerCountPerWriter();
+  }
+
+  @Override
+  public void setNearlineProducerCountPerWriter(int producerCnt) {
+    throwUnsupportedOperationException("setNearlineProducerCountPerWriter");
+  }
+
+  @Override
+  public int getTargetSwapRegionWaitTime() {
+    return zkSharedStore.getTargetSwapRegionWaitTime();
+  }
+
+  @Override
+  public String getTargetSwapRegion() {
+    return zkSharedStore.getTargetSwapRegion();
+  }
+
+  @Override
+  public void setTargetSwapRegion(String targetRegion) {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public void setTargetSwapRegionWaitTime(int waitTime) {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public void setIsDavinciHeartbeatReported(boolean isReported) {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public boolean getIsDavinciHeartbeatReported() {
+    return zkSharedStore.getIsDavinciHeartbeatReported();
+  }
+
+  @Override
+  public void setGlobalRtDivEnabled(boolean globalRtDivEnabled) {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public boolean isTTLRepushEnabled() {
+    return zkSharedStore.isTTLRepushEnabled();
+  }
+
+  @Override
+  public void setTTLRepushEnabled(boolean ttlRepushEnabled) {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public boolean isEnumSchemaEvolutionAllowed() {
+    return false;
+  }
+
+  @Override
+  public void setEnumSchemaEvolutionAllowed(boolean enumSchemaEvolutionAllowed) {
+    throwUnsupportedOperationException("setEnumSchemaEvolutionAllowed");
+  }
+
+  @Override
+  public List<LifecycleHooksRecord> getStoreLifecycleHooks() {
+    return zkSharedStore.getStoreLifecycleHooks();
+  }
+
+  @Override
+  public void setStoreLifecycleHooks(List<LifecycleHooksRecord> storeLifecycleHooks) {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public void setKeyUrnCompressionEnabled(boolean keyUrnCompressionEnabled) {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public boolean isKeyUrnCompressionEnabled() {
+    return false;
+  }
+
+  @Override
+  public void setKeyUrnFields(List<String> keyUrnFieldList) {
+    throw new UnsupportedOperationException();
+  }
+
+  @Override
+  public List<String> getKeyUrnFields() {
+    return Collections.emptyList();
+  }
+
+  @Override
+  public int getPreviousCurrentVersion() {
+    return zkSharedStore.getPreviousCurrentVersion();
+  }
+
+  @Override
+  public void setPreviousCurrentVersion(int previousCurrentVersion) {
+    throwUnsupportedOperationException("setPreviousCurrentVersion");
+  }
+
+  @Override
+  public boolean isGlobalRtDivEnabled() {
+    return zkSharedStore.isGlobalRtDivEnabled();
   }
 
   @Override

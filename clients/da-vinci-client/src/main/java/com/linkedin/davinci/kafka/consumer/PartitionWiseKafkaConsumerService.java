@@ -1,14 +1,13 @@
 package com.linkedin.davinci.kafka.consumer;
 
+import com.linkedin.davinci.config.VeniceServerConfig;
 import com.linkedin.davinci.stats.AggKafkaConsumerServiceStats;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.meta.ReadOnlyStoreRepository;
-import com.linkedin.venice.pubsub.PubSubConsumerAdapterFactory;
+import com.linkedin.venice.pubsub.PubSubContext;
 import com.linkedin.venice.pubsub.api.PubSubConsumerAdapter;
-import com.linkedin.venice.pubsub.api.PubSubMessageDeserializer;
 import com.linkedin.venice.pubsub.api.PubSubTopic;
 import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
-import com.linkedin.venice.throttle.EventThrottler;
 import com.linkedin.venice.utils.Time;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import io.tehuti.metrics.MetricsRepository;
@@ -16,6 +15,7 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -33,7 +33,7 @@ public class PartitionWiseKafkaConsumerService extends KafkaConsumerService {
    * have same real-time topics, we should avoid same real-time topic partition from different version topics sharing
    * the same consumer from consumer pool.
    */
-  private final Map<PubSubTopicPartition, Set<PubSubConsumerAdapter>> rtTopicPartitionToConsumerMap =
+  protected final Map<PubSubTopicPartition, Set<PubSubConsumerAdapter>> rtTopicPartitionToConsumerMap =
       new VeniceConcurrentHashMap<>();
 
   private final Logger LOGGER;
@@ -41,44 +41,90 @@ public class PartitionWiseKafkaConsumerService extends KafkaConsumerService {
   private int shareConsumerIndex = 0;
 
   PartitionWiseKafkaConsumerService(
-      final PubSubConsumerAdapterFactory consumerFactory,
+      final ConsumerPoolType poolType,
       final Properties consumerProperties,
       final long readCycleDelayMs,
       final int numOfConsumersPerKafkaCluster,
-      final EventThrottler bandwidthThrottler,
-      final EventThrottler recordsThrottler,
+      final IngestionThrottler ingestionThrottler,
       final KafkaClusterBasedRecordThrottler kafkaClusterBasedRecordThrottler,
       final MetricsRepository metricsRepository,
-      final String kafkaClusterAlias,
+      final String pubsubRegionAlias,
       final long sharedConsumerNonExistingTopicCleanupDelayMS,
-      final TopicExistenceChecker topicExistenceChecker,
+      final StaleTopicChecker staleTopicChecker,
       final boolean liveConfigBasedKafkaThrottlingEnabled,
-      final PubSubMessageDeserializer pubSubDeserializer,
       final Time time,
       final AggKafkaConsumerServiceStats stats,
       final boolean isKafkaConsumerOffsetCollectionEnabled,
       final ReadOnlyStoreRepository metadataRepository,
-      final boolean isUnregisterMetricForDeletedStoreEnabled) {
-    super(
-        consumerFactory,
+      final boolean isUnregisterMetricForDeletedStoreEnabled,
+      final VeniceServerConfig veniceServerConfig,
+      final PubSubContext pubSubContext,
+      final ExecutorService crossTpProcessingPool) {
+    this(
+        poolType,
         consumerProperties,
         readCycleDelayMs,
         numOfConsumersPerKafkaCluster,
-        bandwidthThrottler,
-        recordsThrottler,
+        ingestionThrottler,
         kafkaClusterBasedRecordThrottler,
         metricsRepository,
-        kafkaClusterAlias,
+        pubsubRegionAlias,
         sharedConsumerNonExistingTopicCleanupDelayMS,
-        topicExistenceChecker,
+        staleTopicChecker,
         liveConfigBasedKafkaThrottlingEnabled,
-        pubSubDeserializer,
         time,
         stats,
         isKafkaConsumerOffsetCollectionEnabled,
         metadataRepository,
-        isUnregisterMetricForDeletedStoreEnabled);
-    this.LOGGER = LogManager.getLogger(PartitionWiseKafkaConsumerService.class + " [" + kafkaUrlForLogger + "]");
+        isUnregisterMetricForDeletedStoreEnabled,
+        PartitionWiseKafkaConsumerService.class.toString(),
+        veniceServerConfig,
+        pubSubContext,
+        crossTpProcessingPool);
+  }
+
+  PartitionWiseKafkaConsumerService(
+      final ConsumerPoolType poolType,
+      final Properties consumerProperties,
+      final long readCycleDelayMs,
+      final int numOfConsumersPerKafkaCluster,
+      final IngestionThrottler ingestionThrottler,
+      final KafkaClusterBasedRecordThrottler kafkaClusterBasedRecordThrottler,
+      final MetricsRepository metricsRepository,
+      final String pubsubRegionAlias,
+      final long sharedConsumerNonExistingTopicCleanupDelayMS,
+      final StaleTopicChecker staleTopicChecker,
+      final boolean liveConfigBasedKafkaThrottlingEnabled,
+      final Time time,
+      final AggKafkaConsumerServiceStats stats,
+      final boolean isKafkaConsumerOffsetCollectionEnabled,
+      final ReadOnlyStoreRepository metadataRepository,
+      final boolean isUnregisterMetricForDeletedStoreEnabled,
+      final String loggerNamePrefix,
+      final VeniceServerConfig veniceServerConfig,
+      final PubSubContext pubSubContext,
+      final ExecutorService crossTpProcessingPool) {
+    super(
+        poolType,
+        consumerProperties,
+        readCycleDelayMs,
+        numOfConsumersPerKafkaCluster,
+        ingestionThrottler,
+        kafkaClusterBasedRecordThrottler,
+        metricsRepository,
+        pubsubRegionAlias,
+        sharedConsumerNonExistingTopicCleanupDelayMS,
+        staleTopicChecker,
+        liveConfigBasedKafkaThrottlingEnabled,
+        time,
+        stats,
+        isKafkaConsumerOffsetCollectionEnabled,
+        metadataRepository,
+        isUnregisterMetricForDeletedStoreEnabled,
+        veniceServerConfig,
+        pubSubContext,
+        crossTpProcessingPool);
+    this.LOGGER = LogManager.getLogger(loggerNamePrefix + " [" + kafkaUrlForLogger + "]");
   }
 
   @Override
@@ -131,27 +177,39 @@ public class PartitionWiseKafkaConsumerService extends KafkaConsumerService {
           "Did not find a suitable consumer after checking " + consumersChecked + " instances.");
     }
     LOGGER.info(
-        "Get shared consumer for: {} from the ingestion task belonging to version topic: {} with index: {}",
+        "Get shared consumer: {} for: {} from the ingestion task belonging to version topic: {} with index: {}",
+        consumer,
         topicPartition,
         versionTopic,
         consumerIndex);
     return consumer;
   }
 
-  private boolean alreadySubscribedRealtimeTopicPartition(
+  protected boolean alreadySubscribedRealtimeTopicPartition(
       SharedKafkaConsumer consumer,
       PubSubTopicPartition topicPartition) {
-    Set<PubSubConsumerAdapter> consumers = rtTopicPartitionToConsumerMap.get(topicPartition);
+    Set<PubSubConsumerAdapter> consumers = getRtTopicPartitionToConsumerMap().get(topicPartition);
     return consumers != null && consumers.contains(consumer);
   }
 
   @Override
-  void handleUnsubscription(SharedKafkaConsumer consumer, PubSubTopicPartition pubSubTopicPartition) {
+  void handleUnsubscription(
+      SharedKafkaConsumer consumer,
+      PubSubTopic versionTopic,
+      PubSubTopicPartition pubSubTopicPartition) {
     if (pubSubTopicPartition.getPubSubTopic().isRealTime()) {
       Set<PubSubConsumerAdapter> rtTopicConsumers = rtTopicPartitionToConsumerMap.get(pubSubTopicPartition);
       if (rtTopicConsumers != null) {
         rtTopicConsumers.remove(consumer);
       }
     }
+  }
+
+  Map<PubSubTopicPartition, Set<PubSubConsumerAdapter>> getRtTopicPartitionToConsumerMap() {
+    return rtTopicPartitionToConsumerMap;
+  }
+
+  Logger getLOGGER() {
+    return LOGGER;
   }
 }

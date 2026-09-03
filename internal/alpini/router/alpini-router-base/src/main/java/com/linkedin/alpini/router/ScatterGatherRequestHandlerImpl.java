@@ -15,7 +15,6 @@ import com.linkedin.alpini.base.misc.Http2TooManyStreamsException;
 import com.linkedin.alpini.base.misc.MetricNames;
 import com.linkedin.alpini.base.misc.Metrics;
 import com.linkedin.alpini.base.misc.Time;
-import com.linkedin.alpini.base.misc.TimeValue;
 import com.linkedin.alpini.netty4.misc.Http2Utils;
 import com.linkedin.alpini.router.api.HostHealthMonitor;
 import com.linkedin.alpini.router.api.ResourcePath;
@@ -43,8 +42,8 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.function.LongSupplier;
-import java.util.function.Supplier;
 import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 
 
 /**
@@ -76,28 +75,45 @@ public abstract class ScatterGatherRequestHandlerImpl<H, P extends ResourcePath<
   });
 
   private final @Nonnull SCATTER_GATHER_HELPER _scatterGatherHelper;
+  private final @Nullable Executor _responseAggregationExecutor;
 
   protected ScatterGatherRequestHandlerImpl(
       @Nonnull SCATTER_GATHER_HELPER scatterGatherHelper,
       @Nonnull TimeoutProcessor timeoutProcessor) {
-    super(timeoutProcessor);
-    _scatterGatherHelper = Objects.requireNonNull(scatterGatherHelper, "scatterGatherHelper");
+    this(scatterGatherHelper, timeoutProcessor, null);
   }
 
   protected ScatterGatherRequestHandlerImpl(
       @Nonnull SCATTER_GATHER_HELPER scatterGatherHelper,
       @Nonnull RouterTimeoutProcessor timeoutProcessor) {
+    this(scatterGatherHelper, timeoutProcessor, null);
+  }
+
+  protected ScatterGatherRequestHandlerImpl(
+      @Nonnull SCATTER_GATHER_HELPER scatterGatherHelper,
+      @Nonnull TimeoutProcessor timeoutProcessor,
+      Executor responseAggregationExecutor) {
     super(timeoutProcessor);
     _scatterGatherHelper = Objects.requireNonNull(scatterGatherHelper, "scatterGatherHelper");
+    _responseAggregationExecutor = responseAggregationExecutor;
+  }
+
+  protected ScatterGatherRequestHandlerImpl(
+      @Nonnull SCATTER_GATHER_HELPER scatterGatherHelper,
+      @Nonnull RouterTimeoutProcessor timeoutProcessor,
+      Executor responseAggregationExecutor) {
+    super(timeoutProcessor);
+    _scatterGatherHelper = Objects.requireNonNull(scatterGatherHelper, "scatterGatherHelper");
+    _responseAggregationExecutor = responseAggregationExecutor;
   }
 
   public final @Nonnull SCATTER_GATHER_HELPER getScatterGatherHelper() {
     return _scatterGatherHelper;
   }
 
-  public static void setMetric(Metrics metric, @Nonnull MetricNames metricName, @Nonnull Supplier<TimeValue> supplier) {
+  public static void setMetric(Metrics metric, @Nonnull MetricNames metricName, long value) {
     if (metric != null) {
-      metric.setMetric(metricName, supplier.get());
+      metric.setMetric(metricName, value);
     }
   }
 
@@ -154,11 +170,12 @@ public abstract class ScatterGatherRequestHandlerImpl<H, P extends ResourcePath<
   }
 
   protected @Nonnull AsyncFuture<HR> handler(@Nonnull CHC ctx, @Nonnull BHS request) throws Exception {
-    Metrics m = null;
     AsyncPromise<HR> promise = AsyncFuture.deferred(false);
     try {
+      long handlerEntryNanos = Time.nanoTime();
       LOG.debug("[{}] handler", request.getRequestId());
-      final Metrics m2 = (m = _scatterGatherHelper.initializeMetrics(request)); // SUPPRESS CHECKSTYLE InnerAssignment
+      final Metrics m2 = _scatterGatherHelper.initializeMetrics(request);
+      setMetric(m2, MetricNames.ROUTER_PIPELINE_LATENCY, handlerEntryNanos - request.getRequestNanos());
       CompletableFuture.completedFuture(retainRequest(request))
           .thenCompose(r -> handler0(ctx, m2, r))
           .exceptionally(ex -> {
@@ -244,8 +261,6 @@ public abstract class ScatterGatherRequestHandlerImpl<H, P extends ResourcePath<
     final @Nonnull ScatterGatherStats.Delta stats =
         (_scatterGatherHelper.getScatterGatherStatsByPath(path)).new Delta();
 
-    stats.incrementTotalRequestsReceived();
-
     long requestTimeout = _scatterGatherHelper.getRequestTimeout(request.getRequestHeaders());
     long requestDeadline = request.getRequestTimestamp() + requestTimeout;
 
@@ -261,6 +276,10 @@ public abstract class ScatterGatherRequestHandlerImpl<H, P extends ResourcePath<
       hostHealthMonitor = _scatterGatherHelper::isHostHealthy;
     }
     return scatter(request.getMethodName(), path, request.getRequestHeaders(), hostHealthMonitor, m, null)
+        .thenApply(s -> {
+          setMetric(m, MetricNames.ROUTER_SCATTER_LATENCY, Time.nanoTime() - beforeScatter);
+          return s;
+        })
         .thenComposeAsync(
             scatter -> handler1(
                 ctx,
@@ -291,14 +310,12 @@ public abstract class ScatterGatherRequestHandlerImpl<H, P extends ResourcePath<
     // TODO : Uncomment once we figure out why determining log level takes time.
     // LOG.debug("[{}] scatter {}", request.getRequestId(), scatter);
 
-    setMetric(
-        m,
-        MetricNames.ROUTER_PARSE_URI,
-        () -> new TimeValue(afterParseUri - beforeParseUri, TimeUnit.NANOSECONDS));
-    setMetric(
-        m,
-        MetricNames.ROUTER_ROUTING_TIME,
-        () -> new TimeValue(afterScatter - beforeScatter, TimeUnit.NANOSECONDS));
+    setMetric(m, MetricNames.ROUTER_PARSE_URI, afterParseUri - beforeParseUri);
+    setMetric(m, MetricNames.ROUTER_ROUTING_TIME, afterScatter - beforeScatter);
+    long scatterLatency = m != null ? m.get(MetricNames.ROUTER_SCATTER_LATENCY) : Metrics.UNSET_VALUE;
+    if (scatterLatency != Metrics.UNSET_VALUE) {
+      setMetric(m, MetricNames.ROUTER_QUEUE_LATENCY, (afterScatter - beforeScatter) - scatterLatency);
+    }
 
     boolean retryableRequest = !longTailMilliseconds.isDone() || longTailMilliseconds.isSuccess();
 
@@ -405,8 +422,6 @@ public abstract class ScatterGatherRequestHandlerImpl<H, P extends ResourcePath<
       }
     }
 
-    stats.incrementFanoutRequestsSent(scatter.getOnlineRequestCount());
-
     // We are done sending out requests...
     // We can decrement the reference count obtained before the call to handler0()
     releaseRequest(request);
@@ -420,7 +435,8 @@ public abstract class ScatterGatherRequestHandlerImpl<H, P extends ResourcePath<
         stats,
         requestDeadline,
         timeoutCancel,
-        longTailTimeoutFuture);
+        longTailTimeoutFuture,
+        afterScatter);
   }
 
   CompletableFuture<HR> gatherResponses(
@@ -432,7 +448,8 @@ public abstract class ScatterGatherRequestHandlerImpl<H, P extends ResourcePath<
       ScatterGatherStats.Delta stats,
       long requestDeadline,
       Runnable timeoutCancel,
-      AsyncPromise<HRS> longTailTimeoutFuture) {
+      AsyncPromise<HRS> longTailTimeoutFuture,
+      long handler1EntryNanos) {
     LOG.debug("[{}] gatherResponses", request.getRequestId());
 
     // Wait for all of the responses to come back.
@@ -481,23 +498,20 @@ public abstract class ScatterGatherRequestHandlerImpl<H, P extends ResourcePath<
     CompletableFuture<HR> response = new CompletableFuture<>();
     long arrivalNanoseconds = request.getRequestNanos();
     long responseWaitStartNanos = Time.nanoTime();
+    setMetric(m, MetricNames.ROUTER_DISPATCH_LATENCY, responseWaitStartNanos - handler1EntryNanos);
 
     // BHS req = retainRequest(request); -- request will have refCnt of 0 at this point!
     BHS req = request;
+    // Use dedicated response aggregation executor if provided, otherwise use stageExecutor(ctx)
+    Executor executor = _responseAggregationExecutor != null ? _responseAggregationExecutor : stageExecutor(ctx);
     gatheredResponses.whenCompleteAsync((responseList, throwable) -> {
       // LOG.debug("[{}] respond", req.getRequestId());
       try {
         CANCEL_EXECUTOR.get().execute(timeoutCancel);
         long now = Time.nanoTime();
 
-        setMetric(
-            m,
-            MetricNames.ROUTER_SERVER_TIME,
-            () -> new TimeValue(now - arrivalNanoseconds, TimeUnit.NANOSECONDS));
-        setMetric(
-            m,
-            MetricNames.ROUTER_RESPONSE_WAIT_TIME,
-            () -> new TimeValue(now - responseWaitStartNanos, TimeUnit.NANOSECONDS));
+        setMetric(m, MetricNames.ROUTER_SERVER_TIME, now - arrivalNanoseconds);
+        setMetric(m, MetricNames.ROUTER_RESPONSE_WAIT_TIME, now - responseWaitStartNanos);
 
         if (response.isDone()) {
           LOG.debug("[{}] response discarded", req.getRequestId());
@@ -529,7 +543,7 @@ public abstract class ScatterGatherRequestHandlerImpl<H, P extends ResourcePath<
         // releaseRequest(req);
         stats.apply();
       }
-    }, stageExecutor(ctx));
+    }, executor);
 
     return response;
   }
@@ -573,8 +587,6 @@ public abstract class ScatterGatherRequestHandlerImpl<H, P extends ResourcePath<
 
   protected abstract HRS gatewayTimeout();
 
-  protected abstract HRS tooManyRequests();
-
   protected abstract HRS serviceUnavailable();
 
   protected abstract HRS internalServerError();
@@ -582,8 +594,6 @@ public abstract class ScatterGatherRequestHandlerImpl<H, P extends ResourcePath<
   protected abstract boolean isSuccessStatus(HRS status);
 
   protected abstract boolean isRequestRetriable(P path, R role, HRS status);
-
-  protected abstract boolean isServiceUnavailable(HRS status);
 
   protected abstract String getReasonPhrase(HRS status);
 
@@ -769,13 +779,8 @@ public abstract class ScatterGatherRequestHandlerImpl<H, P extends ResourcePath<
                 return;
               }
 
-              incrementTotalRetries(stats, retryStatus);
+              incrementTotalRetries(stats);
               stats.incrementTotalRetriedKeys(path.getPartitionKeys().size());
-
-              if (HttpResponseStatus.TOO_MANY_REQUESTS.equals(retryStatus)) {
-                LOG.info("Long tail retry on TOO_MANY_REQUESTS for initial request {}", request);
-                stats.incrementTotalRetriesOn429();
-              }
 
               List<AsyncFuture<List<HR>>> responseFutures =
                   new ArrayList<>(scatter.getOnlineRequestCount() + scatter.getOfflineRequestCount());
@@ -820,7 +825,7 @@ public abstract class ScatterGatherRequestHandlerImpl<H, P extends ResourcePath<
 
                 AsyncFuture.collect(responseFutures, false).whenCompleteAsync((responses, failure) -> {
                   if (failure != null) {
-                    incrementTotalRetriesError(stats, retryStatus);
+                    incrementTotalRetriesError(stats);
                     if (lastAttempt) {
                       setFailure(responseFuture, failure, "Retry failure");
                     }
@@ -831,12 +836,12 @@ public abstract class ScatterGatherRequestHandlerImpl<H, P extends ResourcePath<
                       && responses.stream().allMatch(r -> isSuccessStatus(statusOf(getResponseCode(r))));
 
                   if (!allSuccess) {
-                    incrementTotalRetriesError(stats, retryStatus);
+                    incrementTotalRetriesError(stats);
                   }
 
                   if ((lastAttempt || allSuccess) && responseFuture.setSuccess(responses)) {
                     if (allSuccess) {
-                      incrementTotalRetriesWinner(stats, retryStatus);
+                      incrementTotalRetriesWinner(stats);
                     }
                     return;
                   }
@@ -844,7 +849,7 @@ public abstract class ScatterGatherRequestHandlerImpl<H, P extends ResourcePath<
                   long contentBytes =
                       responses.stream().mapToInt(ScatterGatherRequestHandlerImpl.this::getResponseReadable).sum();
                   releaseResponses(responses);
-                  stats.incrementTotalRetriesDiscarded(contentBytes);
+                  stats.incrementTotalRetriesDiscarded();
                   LOG.debug("Long tail response discarded, contentBytes={}", contentBytes);
                 }, stageExecutor);
               }
@@ -853,25 +858,16 @@ public abstract class ScatterGatherRequestHandlerImpl<H, P extends ResourcePath<
     };
   }
 
-  protected void incrementTotalRetries(ScatterGatherStats.Delta stats, HRS responseStatus) {
+  protected void incrementTotalRetries(ScatterGatherStats.Delta stats) {
     stats.incrementTotalRetries();
-    if (isServiceUnavailable(responseStatus)) {
-      stats.incrementTotalRetriesOn503();
-    }
   }
 
-  protected void incrementTotalRetriesError(ScatterGatherStats.Delta stats, HRS responseStatus) {
+  protected void incrementTotalRetriesError(ScatterGatherStats.Delta stats) {
     stats.incrementTotalRetriesError();
-    if (isServiceUnavailable(responseStatus)) {
-      stats.incrementTotalRetriesOn503Error();
-    }
   }
 
-  protected void incrementTotalRetriesWinner(ScatterGatherStats.Delta stats, HRS responseStatus) {
+  protected void incrementTotalRetriesWinner(ScatterGatherStats.Delta stats) {
     stats.incrementTotalRetriesWinner();
-    if (isServiceUnavailable(responseStatus)) {
-      stats.incrementTotalRetriesOn503Winner();
-    }
   }
 
   protected abstract int getResponseCode(HR response);

@@ -1,5 +1,7 @@
 package com.linkedin.davinci.store.rocksdb;
 
+import static com.linkedin.venice.utils.ByteUtils.generateHumanReadableByteCountString;
+import static com.linkedin.venice.utils.Utils.getOSMemorySize;
 import static org.rocksdb.RateLimiter.DEFAULT_FAIRNESS;
 import static org.rocksdb.RateLimiter.DEFAULT_MODE;
 import static org.rocksdb.RateLimiter.DEFAULT_REFILL_PERIOD_MICROS;
@@ -7,7 +9,7 @@ import static org.rocksdb.RateLimiter.DEFAULT_REFILL_PERIOD_MICROS;
 import com.linkedin.davinci.config.VeniceServerConfig;
 import com.linkedin.davinci.config.VeniceStoreVersionConfig;
 import com.linkedin.davinci.stats.RocksDBMemoryStats;
-import com.linkedin.davinci.store.AbstractStorageEngine;
+import com.linkedin.davinci.store.StorageEngine;
 import com.linkedin.davinci.store.StorageEngineFactory;
 import com.linkedin.venice.exceptions.StorageInitializationException;
 import com.linkedin.venice.exceptions.VeniceException;
@@ -17,6 +19,7 @@ import com.linkedin.venice.meta.PersistenceType;
 import com.linkedin.venice.serialization.avro.AvroProtocolDefinition;
 import com.linkedin.venice.serialization.avro.InternalAvroSpecificSerializer;
 import com.linkedin.venice.store.rocksdb.RocksDBUtils;
+import com.linkedin.venice.utils.ByteUtils;
 import java.io.File;
 import java.io.IOException;
 import java.util.Arrays;
@@ -79,13 +82,6 @@ public class RocksDBStorageEngineFactory extends StorageEngineFactory {
    * We would like to share the same SstFileManager across all the databases.
    */
   private final SstFileManager sstFileManager;
-  /**
-   * This class will allocate a separate {@link SstFileManager} for memory enforcement since
-   * there is a method: {@link VeniceServerConfig#enforceMemoryLimitInStore(String)} to decide whether
-   * the memory enforcement should apply to all stores or not.
-   * Memory limiter will apply per {@link SstFileManager}.
-   */
-  private final SstFileManager sstFileManagerForMemoryLimiter;
 
   private final RocksDBMemoryStats rocksDBMemoryStats;
 
@@ -101,8 +97,6 @@ public class RocksDBStorageEngineFactory extends StorageEngineFactory {
 
   private final InternalAvroSpecificSerializer<StoreVersionState> storeVersionStateSerializer;
   private final InternalAvroSpecificSerializer<PartitionState> partitionStateSerializer;
-
-  private final long memoryLimit;
 
   private final long memtableSize;
 
@@ -123,7 +117,7 @@ public class RocksDBStorageEngineFactory extends StorageEngineFactory {
       InternalAvroSpecificSerializer<PartitionState> partitionStateSerializer) {
     this.serverConfig = serverConfig;
     this.rocksDBServerConfig = serverConfig.getRocksDBServerConfig();
-    this.rocksDBPath = serverConfig.getDataBasePath() + File.separator + "rocksdb";
+    this.rocksDBPath = serverConfig.getRocksDBPath();
     this.rocksDBMemoryStats = rocksDBMemoryStats;
     this.storeVersionStateSerializer = storeVersionStateSerializer;
     this.partitionStateSerializer = partitionStateSerializer;
@@ -139,6 +133,21 @@ public class RocksDBStorageEngineFactory extends StorageEngineFactory {
     this.env.setBackgroundThreads(rocksDBServerConfig.getRocksDBEnvFlushPoolSize(), Priority.HIGH);
     this.env.setBackgroundThreads(rocksDBServerConfig.getRocksDBEnvCompactionPoolSize(), Priority.LOW);
 
+    if (!rocksDBServerConfig.isRocksDBPlainTableFormatEnabled()) {
+      long cacheBytesNeeded =
+          rocksDBServerConfig.getRocksDBBlockCacheSizeInBytes() + (rocksDBServerConfig.isUseSeparateRMDCacheEnabled()
+              ? rocksDBServerConfig.getRocksDBRMDBlockCacheSizeInBytes()
+              : 0);
+
+      long systemMemorySize = getOSMemorySize();
+      if (systemMemorySize > 0
+          && (systemMemorySize * rocksDBServerConfig.getRocksdbBlockCacheMemoryLimit() < cacheBytesNeeded)) {
+        throw new RuntimeException(
+            "Cannot setup rocksdb instance with block-cache size "
+                + generateHumanReadableByteCountString(cacheBytesNeeded) + ". System memory : "
+                + generateHumanReadableByteCountString(systemMemorySize));
+      }
+    }
     // Shared cache across all the RocksDB databases
     if (RocksDBBlockCacheImplementations.CLOCK.equals(rocksDBServerConfig.getRocksDBBlockCacheImplementation())) {
       if (rocksDBServerConfig.isUseSeparateRMDCacheEnabled()) {
@@ -177,19 +186,26 @@ public class RocksDBStorageEngineFactory extends StorageEngineFactory {
     // The memory usage of all the memtables will cost to the shared block cache
     this.writeBufferManager =
         new WriteBufferManager(rocksDBServerConfig.getRocksDBTotalMemtableUsageCapInBytes(), this.sharedCache);
-    this.memoryLimit = serverConfig.getIngestionMemoryLimit();
     this.memtableSize = rocksDBServerConfig.getRocksDBMemtableSizeInBytes();
     try {
       this.sstFileManager = new SstFileManager(this.env);
-      if (this.memoryLimit > 0) {
-        this.sstFileManagerForMemoryLimiter = new SstFileManager(this.env);
-        this.sstFileManagerForMemoryLimiter.setMaxAllowedSpaceUsage(this.memoryLimit);
-        LOGGER.info("Setup the max allowed SST space usage: {} in RocksDB factory", this.memoryLimit);
-        rocksDBMemoryStats.setMemoryLimit(this.memoryLimit);
-        rocksDBMemoryStats.setSstFileManager(this.sstFileManagerForMemoryLimiter);
+
+      // Configure deletion rate limiting to prevent I/O saturation during store cleanup
+      long deleteRateBytesPerSecond = rocksDBServerConfig.getSstFileManagerDeleteRateBytesPerSecond();
+      if (deleteRateBytesPerSecond > 0) {
+        this.sstFileManager.setDeleteRateBytesPerSecond(deleteRateBytesPerSecond);
+        LOGGER.info(
+            "Configured SstFileManager deletion rate limit: {} MB/sec",
+            deleteRateBytesPerSecond / ByteUtils.BYTES_PER_MB);
       } else {
-        this.sstFileManagerForMemoryLimiter = null;
+        LOGGER.info("SstFileManager deletion rate limiting is disabled (deleteRateBytesPerSecond = 0)");
       }
+
+      // Configure max trash-to-DB ratio
+      double maxTrashRatio = rocksDBServerConfig.getSstFileManagerMaxTrashDBRatio();
+      this.sstFileManager.setMaxTrashDBRatio(maxTrashRatio);
+      LOGGER.info("Configured SstFileManager max trash DB ratio: {}", maxTrashRatio);
+
     } catch (RocksDBException e) {
       throw new VeniceException("Failed to create the shared SstFileManager", e);
     }
@@ -200,10 +216,11 @@ public class RocksDBStorageEngineFactory extends StorageEngineFactory {
         DEFAULT_FAIRNESS,
         DEFAULT_MODE,
         rocksDBServerConfig.isAutoTunedRateLimiterEnabled());
-  }
 
-  public long getMemoryLimit() {
-    return memoryLimit;
+    if (rocksDBMemoryStats != null && sharedRMDCache != null
+        && !rocksDBServerConfig.isRocksDBPlainTableFormatEnabled()) {
+      rocksDBMemoryStats.setRMDBlockCache(sharedRMDCache, rocksDBServerConfig.getRocksDBRMDBlockCacheSizeInBytes());
+    }
   }
 
   public long getMemtableSize() {
@@ -226,17 +243,6 @@ public class RocksDBStorageEngineFactory extends StorageEngineFactory {
     return sstFileManager;
   }
 
-  public SstFileManager getSstFileManagerForMemoryLimiter() {
-    return sstFileManagerForMemoryLimiter;
-  }
-
-  /**
-   * Whether memory limiter applies or not.
-   */
-  public boolean enforceMemoryLimit(String storeNameWithoutVersionSuffix) {
-    return this.memoryLimit > 0 && serverConfig.enforceMemoryLimitInStore(storeNameWithoutVersionSuffix);
-  }
-
   public Env getEnv() {
     return env;
   }
@@ -246,13 +252,13 @@ public class RocksDBStorageEngineFactory extends StorageEngineFactory {
   }
 
   @Override
-  public synchronized AbstractStorageEngine getStorageEngine(VeniceStoreVersionConfig storeConfig)
+  public synchronized StorageEngine getStorageEngine(VeniceStoreVersionConfig storeConfig)
       throws StorageInitializationException {
     return getStorageEngine(storeConfig, false);
   }
 
   @Override
-  public synchronized AbstractStorageEngine getStorageEngine(
+  public synchronized StorageEngine getStorageEngine(
       VeniceStoreVersionConfig storeConfig,
       boolean replicationMetadataEnabled) throws StorageInitializationException {
     verifyPersistenceType(storeConfig);
@@ -280,7 +286,7 @@ public class RocksDBStorageEngineFactory extends StorageEngineFactory {
     File databaseDir = new File(rocksDBPath);
     if (databaseDir.exists() && databaseDir.isDirectory()) {
       String[] storeDirs = databaseDir.list();
-      LOGGER.info("Found the following RocksDB databases: {}", Arrays.toString(storeDirs));
+      LOGGER.debug("Found the following RocksDB databases: {}", Arrays.toString(storeDirs));
       if (storeDirs != null) {
         return new HashSet<>(Arrays.asList(storeDirs));
       }
@@ -297,6 +303,11 @@ public class RocksDBStorageEngineFactory extends StorageEngineFactory {
       storageEngine.close();
     });
     storageEngineMap.clear();
+    // Null out the RMD cache reference in metrics BEFORE closing the native object.
+    // This prevents OTel/Tehuti async gauge callbacks from dereferencing a freed JNI handle.
+    if (rocksDBMemoryStats != null) {
+      rocksDBMemoryStats.closeRMDBlockCache();
+    }
     sharedCache.close();
     if (sharedRMDCache != null) {
       sharedRMDCache.close();
@@ -307,14 +318,11 @@ public class RocksDBStorageEngineFactory extends StorageEngineFactory {
     if (sstFileManager != null) {
       sstFileManager.close();
     }
-    if (sstFileManagerForMemoryLimiter != null) {
-      sstFileManagerForMemoryLimiter.close();
-    }
     LOGGER.info("Closed RocksDBStorageEngineFactory");
   }
 
   @Override
-  public synchronized void removeStorageEngine(AbstractStorageEngine engine) {
+  public synchronized void removeStorageEngine(StorageEngine engine) {
     verifyPersistenceType(engine);
     final String storeName = engine.getStoreVersionName();
     if (storageEngineMap.containsKey(storeName)) {
@@ -368,7 +376,7 @@ public class RocksDBStorageEngineFactory extends StorageEngineFactory {
   }
 
   @Override
-  public synchronized void closeStorageEngine(AbstractStorageEngine engine) {
+  public synchronized void closeStorageEngine(StorageEngine engine) {
     verifyPersistenceType(engine);
     final String storeName = engine.getStoreVersionName();
     if (storageEngineMap.containsKey(storeName)) {

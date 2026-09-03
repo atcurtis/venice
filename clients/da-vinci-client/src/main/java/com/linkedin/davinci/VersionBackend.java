@@ -4,30 +4,40 @@ import static com.linkedin.venice.ConfigKeys.PUSH_STATUS_STORE_ENABLED;
 import static com.linkedin.venice.ConfigKeys.PUSH_STATUS_STORE_HEARTBEAT_INTERVAL_IN_SECONDS;
 import static com.linkedin.venice.ConfigKeys.SERVER_STOP_CONSUMPTION_TIMEOUT_IN_SECONDS;
 
+import com.linkedin.davinci.client.InternalDaVinciRecordTransformerConfig;
 import com.linkedin.davinci.config.VeniceStoreVersionConfig;
+import com.linkedin.davinci.kafka.consumer.StoreIngestionTask;
+import com.linkedin.davinci.listener.response.NoOpReadResponseStats;
+import com.linkedin.davinci.notifier.DaVinciPushStatusUpdateTask;
+import com.linkedin.davinci.stats.ingestion.heartbeat.HeartbeatLagMonitorAction;
 import com.linkedin.davinci.storage.chunking.AbstractAvroChunkingAdapter;
-import com.linkedin.davinci.store.AbstractStorageEngine;
+import com.linkedin.davinci.store.StorageEngine;
 import com.linkedin.venice.client.store.streaming.StreamingCallback;
 import com.linkedin.venice.compression.VeniceCompressor;
 import com.linkedin.venice.compute.ComputeRequestWrapper;
 import com.linkedin.venice.compute.ComputeUtils;
 import com.linkedin.venice.exceptions.VeniceException;
-import com.linkedin.venice.meta.IngestionMode;
 import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.partitioner.VenicePartitioner;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
+import com.linkedin.venice.pushmonitor.ExecutionStatus;
 import com.linkedin.venice.serialization.AvroStoreDeserializerCache;
 import com.linkedin.venice.serialization.StoreDeserializerCache;
 import com.linkedin.venice.serializer.RecordDeserializer;
 import com.linkedin.venice.utils.ComplementSet;
 import com.linkedin.venice.utils.ExceptionUtils;
+import com.linkedin.venice.utils.LogContext;
 import com.linkedin.venice.utils.PartitionUtils;
+import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import com.linkedin.venice.utils.lazy.Lazy;
+import com.linkedin.venice.views.VeniceView;
 import java.nio.ByteBuffer;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -35,6 +45,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import org.apache.avro.Schema;
@@ -48,6 +59,7 @@ public class VersionBackend {
   private static final Logger LOGGER = LogManager.getLogger(VersionBackend.class);
 
   private static final int DEFAULT_PUSH_STATUS_HEARTBEAT_INTERVAL_IN_SECONDS = 10;
+  private static final int MAX_INCREMENTAL_PUSH_ENTRY_NUM = 50;
 
   private final DaVinciBackend backend;
   private final Version version;
@@ -55,12 +67,17 @@ public class VersionBackend {
   private final VenicePartitioner partitioner;
   private final boolean reportPushStatus;
   private final boolean suppressLiveUpdates;
-  private final AtomicReference<AbstractStorageEngine> storageEngine = new AtomicReference<>();
+  private final AtomicReference<StorageEngine> storageEngine = new AtomicReference<>();
   private final Map<Integer, CompletableFuture<Void>> partitionFutures = new VeniceConcurrentHashMap<>();
   private final int stopConsumptionTimeoutInSeconds;
   private final StoreBackendStats storeBackendStats;
   private final StoreDeserializerCache storeDeserializerCache;
   private final Lazy<VeniceCompressor> compressor;
+  private final Map<Integer, List<String>> partitionToPendingReportIncrementalPushList =
+      new VeniceConcurrentHashMap<>();
+  private final Map<Integer, Boolean> partitionToBatchReportEOIPEnabled = new VeniceConcurrentHashMap<>();
+  private final boolean batchReportEOIPStatusEnabled;
+  private final InternalDaVinciRecordTransformerConfig internalRecordTransformerConfig;
 
   /*
    * if daVinciPushStatusStoreEnabled, VersionBackend will schedule a periodic job sending heartbeats
@@ -68,36 +85,58 @@ public class VersionBackend {
    */
   private Future heartbeat;
   private final int heartbeatInterval;
+  private final DaVinciPushStatusUpdateTask daVinciPushStatusUpdateTask;
+  private boolean updateTaskStarted = false;
 
   VersionBackend(DaVinciBackend backend, Version version, StoreBackendStats storeBackendStats) {
     this.backend = backend;
     this.version = version;
     this.config = backend.getConfigLoader().getStoreConfig(version.kafkaTopicName());
-    if (this.config.getIngestionMode().equals(IngestionMode.ISOLATED)) {
-      /*
-       * Explicitly disable the store restore since we don't want to open other partitions that should be controlled by
-       * child process. All the finished partitions will be closed by child process and reopened in parent process.
-       */
-      this.config.setRestoreDataPartitions(false);
-      this.config.setRestoreMetadataPartition(false);
-    }
+    this.batchReportEOIPStatusEnabled = config.getBatchReportEOIPEnabled();
+
     this.partitioner = PartitionUtils.getUserPartitionLevelVenicePartitioner(version.getPartitionerConfig());
     this.suppressLiveUpdates = this.config.freezeIngestionIfReadyToServeOrLocalDataExists();
     this.storageEngine.set(backend.getStorageService().getStorageEngine(version.kafkaTopicName()));
     this.backend.getIngestionBackend().setStorageEngineReference(version.kafkaTopicName(), storageEngine);
     Store store = backend.getStoreRepository().getStoreOrThrow(version.getStoreName());
     this.storeBackendStats = storeBackendStats;
-    // push status store must be enabled both in Da Vinci and the store
-    this.reportPushStatus = store.isDaVinciPushStatusStoreEnabled()
-        && this.config.getClusterProperties().getBoolean(PUSH_STATUS_STORE_ENABLED, false);
+    // push status store must be enabled both in Da Vinci and the store, and disabled for version-specific clients
+    boolean isVersionSpecificClient =
+        DaVinciBackend.ClientType.VERSION_SPECIFIC.equals(backend.getStoreClientType(version.getStoreName()));
+    // View stores inherit the parent store's push-status-store setting but have no push-status system store of their
+    // own, so attempting to report push status for them blocks the shared push-status writer. Exclude them here.
+    this.reportPushStatus = !isVersionSpecificClient && store.isDaVinciPushStatusStoreEnabled()
+        && !VeniceView.isViewStore(version.getStoreName())
+        && this.config.getClusterProperties().getBoolean(PUSH_STATUS_STORE_ENABLED, true);
     this.heartbeatInterval = this.config.getClusterProperties()
         .getInt(PUSH_STATUS_STORE_HEARTBEAT_INTERVAL_IN_SECONDS, DEFAULT_PUSH_STATUS_HEARTBEAT_INTERVAL_IN_SECONDS);
     this.stopConsumptionTimeoutInSeconds =
         backend.getConfigLoader().getCombinedProperties().getInt(SERVER_STOP_CONSUMPTION_TIMEOUT_IN_SECONDS, 60);
     this.storeDeserializerCache = backend.getStoreOrThrow(store.getName()).getStoreDeserializerCache();
     this.compressor = Lazy.of(
-        () -> backend.getCompressorFactory().getCompressor(version.getCompressionStrategy(), version.kafkaTopicName()));
+        () -> backend.getCompressorFactory()
+            .getCompressor(
+                version.getCompressionStrategy(),
+                version.kafkaTopicName(),
+                config.getZstdDictCompressionLevel()));
     backend.getVersionByTopicMap().put(version.kafkaTopicName(), this);
+    long daVinciPushStatusCheckIntervalInMs = this.config.getDaVinciPushStatusCheckIntervalInMs();
+    // Only run the version-level push-status batching task when push-status reporting is actually enabled, so the same
+    // reportPushStatus gate (store setting, version-specific/view-store exclusions, and the cluster flag) reliably
+    // disables both the per-partition and batched push-status write paths.
+    if (reportPushStatus && daVinciPushStatusCheckIntervalInMs >= 0) {
+      LogContext logContext =
+          backend.getConfigLoader() != null ? backend.getConfigLoader().getVeniceServerConfig().getLogContext() : null;
+      this.daVinciPushStatusUpdateTask = new DaVinciPushStatusUpdateTask(
+          version,
+          daVinciPushStatusCheckIntervalInMs,
+          backend.getPushStatusStoreWriter(),
+          this::areAllPartitionFuturesCompletedSuccessfully,
+          logContext);
+    } else {
+      this.daVinciPushStatusUpdateTask = null;
+    }
+    this.internalRecordTransformerConfig = backend.getInternalRecordTransformerConfig(version.getStoreName());
   }
 
   synchronized void close() {
@@ -116,6 +155,9 @@ public class VersionBackend {
     } catch (VeniceException e) {
       LOGGER.error("Encounter exception when killing consumption task: {}", version.kafkaTopicName(), e);
     }
+    if (daVinciPushStatusUpdateTask != null) {
+      daVinciPushStatusUpdateTask.shutdown();
+    }
   }
 
   synchronized void delete() {
@@ -131,9 +173,9 @@ public class VersionBackend {
       }
       /**
        * The following function is used to forcibly clean up any leaking data partitions, which are not
-       * visibile to the corresponding {@link AbstractStorageEngine} since some data partitions can fail
+       * visible to the corresponding {@link StorageEngine} since some data partitions can fail
        * to open because of DaVinci memory limiter.
-        */
+       */
       backend.getStorageService().forceStorageEngineCleanup(topicName);
       backend.getCompressorFactory().removeVersionSpecificCompressor(topicName);
     } catch (VeniceException e) {
@@ -150,8 +192,8 @@ public class VersionBackend {
     return version;
   }
 
-  private AbstractStorageEngine getStorageEngineOrThrow() {
-    AbstractStorageEngine engine = storageEngine.get();
+  private StorageEngine getStorageEngineOrThrow() {
+    StorageEngine engine = storageEngine.get();
     if (engine == null) {
       throw new VeniceException("Storage engine is not ready, version=" + this);
     }
@@ -166,11 +208,27 @@ public class VersionBackend {
     if (isReportingPushStatus() && heartbeat == null) {
       heartbeat = backend.getExecutor().scheduleAtFixedRate(() -> {
         try {
-          backend.getPushStatusStoreWriter().writeHeartbeat(version.getStoreName());
+          sendOutHeartbeat(backend, version);
         } catch (Throwable t) {
           LOGGER.error("Unable to send heartbeat for {}", this);
         }
       }, 0, heartbeatInterval, TimeUnit.SECONDS);
+    }
+  }
+
+  protected static void sendOutHeartbeat(DaVinciBackend backend, Version version) {
+    if (backend.hasCurrentVersionBootstrapping()) {
+      LOGGER.info(
+          "DaVinci is still bootstrapping, so it will send heart-beat message with a special timestamp"
+              + " for store: {} to avoid delaying the new push job",
+          version.getStoreName());
+      /**
+       * Tell backend that the report from the bootstrapping instance doesn't count to avoid
+       * delaying new pushes.
+       */
+      backend.getPushStatusStoreWriter().writeHeartbeatForBootstrappingInstance(version.getStoreName());
+    } else {
+      backend.getPushStatusStoreWriter().writeHeartbeat(version.getStoreName());
     }
   }
 
@@ -198,7 +256,7 @@ public class VersionBackend {
         reusableValue,
         binaryDecoder,
         version.isChunkingEnabled(),
-        null,
+        NoOpReadResponseStats.SINGLETON,
         readerSchemaId,
         storeDeserializerCache,
         compressor.get());
@@ -225,7 +283,7 @@ public class VersionBackend {
         reusableValueRecord,
         binaryDecoder,
         version.isChunkingEnabled(),
-        null,
+        NoOpReadResponseStats.SINGLETON,
         readerSchemaId,
         storeDeserializerCache,
         compressor.get());
@@ -279,7 +337,6 @@ public class VersionBackend {
         reusableBinaryDecoder,
         keyRecordDeserializer,
         this.version.isChunkingEnabled(),
-        null,
         getSupersetOrLatestValueSchemaId(),
         this.storeDeserializerCache,
         this.compressor.get(),
@@ -311,13 +368,29 @@ public class VersionBackend {
     return getPartitions(partitions).stream().allMatch(this::isPartitionReadyToServe);
   }
 
-  synchronized CompletableFuture<Void> subscribe(ComplementSet<Integer> partitions) {
+  synchronized CompletableFuture<Void> subscribe(
+      ComplementSet<Integer> partitions,
+      Map<Integer, Long> timestampsMap,
+      Map<Integer, PubSubPosition> positionMap,
+      boolean createPaused) {
     Instant startTime = Instant.now();
     List<Integer> partitionList = getPartitions(partitions);
+    if (partitionList.isEmpty()) {
+      LOGGER.error("No partitions to subscribe to for {}", this);
+      return CompletableFuture.completedFuture(null);
+    }
+    if (daVinciPushStatusUpdateTask != null && !updateTaskStarted) {
+      this.daVinciPushStatusUpdateTask.start();
+      this.updateTaskStarted = true;
+    }
+
     LOGGER.info("Subscribing to partitions {} of {}", partitionList, this);
-    List<CompletableFuture<Void>> futures = new ArrayList<>(partitionList.size());
+    int partitionCount = partitionList.size();
+    List<Integer> partitionsToStartConsumption = new ArrayList<>(partitionCount);
+    List<CompletableFuture<Void>> futures = new ArrayList<>(partitionCount);
+
     for (int partition: partitionList) {
-      AbstractStorageEngine engine = storageEngine.get();
+      StorageEngine engine = storageEngine.get();
       if (partitionFutures.containsKey(partition)) {
         LOGGER.info("Partition {} of {}  is subscribed, ignoring subscribe request.", partition, this);
       } else if (suppressLiveUpdates && engine != null && engine.containsPartition(partition)) {
@@ -325,16 +398,73 @@ public class VersionBackend {
         partitionFutures.computeIfAbsent(partition, k -> CompletableFuture.completedFuture(null));
       } else {
         partitionFutures.computeIfAbsent(partition, k -> new CompletableFuture<>());
-        // AtomicReference of storage engine will be updated internally.
-        backend.getIngestionBackend().startConsumption(config, partition);
-        tryStartHeartbeat();
+        partitionsToStartConsumption.add(partition);
       }
+      partitionToBatchReportEOIPEnabled.put(partition, batchReportEOIPStatusEnabled);
       futures.add(partitionFutures.get(partition));
     }
 
-    return CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).whenComplete((v, e) -> {
-      storeBackendStats.recordSubscribeDuration(Duration.between(startTime, Instant.now()));
+    if (internalRecordTransformerConfig != null
+        && internalRecordTransformerConfig.getStartConsumptionLatchCount() == 0) {
+      internalRecordTransformerConfig.setStartConsumptionLatchCount(partitionsToStartConsumption.size());
+    }
+
+    for (int partition: partitionsToStartConsumption) {
+      String replicaId = Utils.getReplicaId(version.kafkaTopicName(), partition);
+      // Start monitoring the heartbeat lag of the partition
+      backend.getHeartbeatMonitoringService()
+          .updateLagMonitor(
+              version.kafkaTopicName(),
+              partition,
+              HeartbeatLagMonitorAction.SET_FOLLOWER_MONITOR,
+              replicaId);
+      // AtomicReference of storage engine will be updated internally.
+      Optional<PubSubPosition> pubSubPosition = (timestampsMap == null && positionMap == null)
+          ? Optional.empty()
+          : backend.getIngestionService().getPubSubPosition(config, partition, timestampsMap, positionMap);
+      backend.getIngestionBackend().startConsumption(config, partition, pubSubPosition, replicaId, createPaused);
+      tryStartHeartbeat();
+    }
+
+    CompletableFuture<Void> bootstrappingAwareSubscriptionFuture = new CompletableFuture<>();
+
+    CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).whenComplete((v, e) -> {
+      Duration endDuration = Duration.between(startTime, Instant.now());
+      storeBackendStats.recordSubscribeDuration(endDuration);
+      if (e != null) {
+        bootstrappingAwareSubscriptionFuture.completeExceptionally(e);
+        LOGGER.warn("Bootstrapping store: {}, version: {} failed", version.getStoreName(), version.getNumber(), e);
+      } else {
+        LOGGER.info(
+            "Bootstrapping store: {}, version: {} is completed after {}ms",
+            version.getStoreName(),
+            version.getNumber(),
+            endDuration.toMillis());
+        /**
+         * It is important to start polling the bootstrapping status after the version ingestion is completed to
+         * make sure the bootstrapping status polling is valid (not doing polling without any past/active ingestion tasks).
+         */
+        new DaVinciBackend.BootstrappingAwareCompletableFuture(backend).getBootstrappingFuture()
+            .whenComplete((ignored, ee) -> {
+              if (ee != null) {
+                bootstrappingAwareSubscriptionFuture.completeExceptionally(ee);
+                LOGGER.warn(
+                    "Bootstrapping aware subscription to store: {}, version: {} failed",
+                    version.getStoreName(),
+                    version.getNumber(),
+                    ee);
+              } else {
+                bootstrappingAwareSubscriptionFuture.complete(null);
+                LOGGER.info(
+                    "Bootstrapping aware subscription to store: {}, version: {} is completed",
+                    version.getStoreName(),
+                    version.getNumber());
+              }
+            });
+      }
     });
+
+    return bootstrappingAwareSubscriptionFuture;
   }
 
   synchronized void unsubscribe(ComplementSet<Integer> partitions) {
@@ -347,10 +477,32 @@ public class VersionBackend {
         return;
       }
       completePartition(partition);
-      backend.getIngestionBackend().dropStoragePartitionGracefully(config, partition, stopConsumptionTimeoutInSeconds);
+      String replicaId = Utils.getReplicaId(version.kafkaTopicName(), partition);
+      backend.getHeartbeatMonitoringService()
+          .updateLagMonitor(version.kafkaTopicName(), partition, HeartbeatLagMonitorAction.REMOVE_MONITOR, replicaId);
+      backend.getIngestionBackend()
+          .dropStoragePartitionGracefully(config, partition, stopConsumptionTimeoutInSeconds, replicaId);
       partitionFutures.remove(partition);
+      partitionToPendingReportIncrementalPushList.remove(partition);
+      partitionToBatchReportEOIPEnabled.remove(partition);
     }
     tryStopHeartbeat();
+  }
+
+  void resume() {
+    StoreIngestionTask task = backend.getIngestionService().getStoreIngestionTask(version.kafkaTopicName());
+    if (task != null) {
+      task.resumeFromFutureSlotPause();
+    }
+  }
+
+  boolean isPaused() {
+    StoreIngestionTask task = backend.getIngestionService().getStoreIngestionTask(version.kafkaTopicName());
+    // Gate on the SIT-level intent (pause-after-SOP), not the per-partition physical flag which the
+    // reconciler only sets a tick after SOP. Intent is the durable "held until promotion" signal and
+    // covers the pre-SOP window, so maybeResumeDaVinciFutureVersion() still resumes even if promotion
+    // is observed before the first SOP is processed.
+    return task != null && task.isPauseAfterStartOfPush();
   }
 
   void completePartition(int partition) {
@@ -363,10 +515,87 @@ public class VersionBackend {
     partitionFutures.computeIfAbsent(partition, k -> new CompletableFuture<>()).completeExceptionally(failure);
   }
 
-  private List<Integer> getPartitions(ComplementSet<Integer> partitions) {
+  boolean areAllPartitionFuturesCompletedSuccessfully() {
+    if (partitionFutures.isEmpty()) {
+      return false;
+    }
+    return partitionFutures.values().stream().allMatch(f -> (f.isDone() && !f.isCompletedExceptionally()));
+  }
+
+  /**
+   *  This method will batch report {@link ExecutionStatus#END_OF_INCREMENTAL_PUSH_RECEIVED} for incremental push status
+   *  prior to ready-to-serve. It will only report last 50 incremental pushes as stale incremental pushes are not
+   *  being tracked, and it could reduce the volumes to system store.
+   */
+  void maybeReportBatchEOIPStatus(int partition, Consumer<String> reportConsumer) {
+    getPartitionToBatchReportEOIPEnabled().put(partition, false);
+    List<String> pendingReportIncPushVersionList =
+        getPartitionToPendingReportIncrementalPushList().getOrDefault(partition, Collections.emptyList());
+    if (pendingReportIncPushVersionList.isEmpty()) {
+      return;
+    }
+    LOGGER.info(
+        "Replica: {} batch report END_OF_INCREMENTAL_PUSH for inc push versions: {}",
+        Utils.getReplicaId(getVersion().kafkaTopicName(), partition),
+        pendingReportIncPushVersionList);
+    for (String incPushVersion: pendingReportIncPushVersionList) {
+      reportConsumer.accept(incPushVersion);
+    }
+  }
+
+  /**
+   *  This method may report incremental push status based on ingestion status.
+   *  Prior to ready-to-serve, if we enable batch report feature, it will accumulate the version and will not write to
+   *  system store.
+   *  When ready-to-serve is reported, we will invoke {@link VersionBackend#maybeReportIncrementalPushStatus(int, String, ExecutionStatus, Consumer)}
+   *  to clear all accumulated incremental push status. After that, it will fall back to default behavior and report
+   *  every incremental push status it received.
+   */
+  void maybeReportIncrementalPushStatus(
+      int partition,
+      String incrementalPushVersion,
+      ExecutionStatus executionStatus,
+      Consumer<String> reportConsumer) {
+    if (!getPartitionToBatchReportEOIPEnabled().getOrDefault(partition, false)) {
+      reportConsumer.accept(incrementalPushVersion);
+      return;
+    }
+    if (executionStatus.equals(ExecutionStatus.START_OF_INCREMENTAL_PUSH_RECEIVED)) {
+      return;
+    }
+    LOGGER.info(
+        "Adding incremental push version: {} to pending report list for replica: {}",
+        incrementalPushVersion,
+        Utils.getReplicaId(getVersion().kafkaTopicName(), partition));
+    List<String> pendingReportIncPushVersionList =
+        getPartitionToPendingReportIncrementalPushList().computeIfAbsent(partition, p -> new ArrayList<>());
+    pendingReportIncPushVersionList.add(incrementalPushVersion);
+    int versionCount = pendingReportIncPushVersionList.size();
+    if (versionCount > MAX_INCREMENTAL_PUSH_ENTRY_NUM) {
+      getPartitionToPendingReportIncrementalPushList().put(
+          partition,
+          pendingReportIncPushVersionList.subList(versionCount - MAX_INCREMENTAL_PUSH_ENTRY_NUM, versionCount));
+    }
+  }
+
+  Map<Integer, Boolean> getPartitionToBatchReportEOIPEnabled() {
+    return partitionToBatchReportEOIPEnabled;
+  }
+
+  Map<Integer, List<String>> getPartitionToPendingReportIncrementalPushList() {
+    return partitionToPendingReportIncrementalPushList;
+  }
+
+  public List<Integer> getPartitions(ComplementSet<Integer> partitions) {
     return IntStream.range(0, version.getPartitionCount())
         .filter(partitions::contains)
         .boxed()
         .collect(Collectors.toList());
+  }
+
+  public void updatePartitionStatus(int partition, ExecutionStatus status, Optional<String> incrementalPushVersion) {
+    if (daVinciPushStatusUpdateTask != null) {
+      daVinciPushStatusUpdateTask.updatePartitionStatus(partition, status, incrementalPushVersion);
+    }
   }
 }

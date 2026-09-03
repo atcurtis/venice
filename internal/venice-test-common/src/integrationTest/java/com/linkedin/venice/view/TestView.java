@@ -1,6 +1,5 @@
 package com.linkedin.venice.view;
 
-import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.utils.VeniceProperties;
 import com.linkedin.venice.views.VeniceView;
 import java.util.Collections;
@@ -21,8 +20,8 @@ public class TestView extends VeniceView {
   // The highest version encountered by this store
   private static Map<String, Integer> storeHighestVersionEncountered = new HashMap<>();
 
-  public TestView(Properties props, Store store, Map<String, String> viewParameters) {
-    super(props, store, viewParameters);
+  public TestView(Properties props, String storeName, Map<String, String> viewParameters) {
+    super(props, storeName, viewParameters);
     synchronized (TestView.class) {
       if (thisView == null) {
         thisView = this;
@@ -41,7 +40,7 @@ public class TestView extends VeniceView {
   }
 
   @Override
-  public void close() {
+  public void close(boolean gracefulClose) {
     // close out anything which should be shutdown
   }
 

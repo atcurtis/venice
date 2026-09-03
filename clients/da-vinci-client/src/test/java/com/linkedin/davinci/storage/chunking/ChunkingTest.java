@@ -1,13 +1,16 @@
 package com.linkedin.davinci.storage.chunking;
 
-import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 
+import com.github.luben.zstd.Zstd;
 import com.linkedin.davinci.compression.StorageEngineBackedCompressorFactory;
+import com.linkedin.davinci.listener.response.NoOpReadResponseStats;
 import com.linkedin.davinci.storage.StorageMetadataService;
-import com.linkedin.davinci.store.AbstractStorageEngine;
+import com.linkedin.davinci.store.StorageEngine;
 import com.linkedin.davinci.store.record.ByteBufferValueRecord;
 import com.linkedin.davinci.store.record.ValueRecord;
 import com.linkedin.venice.compression.CompressionStrategy;
@@ -23,7 +26,6 @@ import com.linkedin.venice.storage.protocol.ChunkedValueManifest;
 import com.linkedin.venice.utils.ByteUtils;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
 import java.util.concurrent.ThreadLocalRandom;
@@ -38,6 +40,10 @@ import org.testng.annotations.Test;
 
 
 public class ChunkingTest {
+  private static final int SCHEMA_ID = 1;
+  private static final Schema SIMPLE_SCHEMA = new Schema.Parser()
+      .parse("{\"type\":\"record\",\"name\":\"SimpleRecord\",\"fields\":[{\"name\":\"field\",\"type\":\"string\"}]}");
+
   @DataProvider(name = "recordProvider")
   public Object[][] recordProvider() {
     List<GenericRecord> params = new ArrayList<>();
@@ -184,22 +190,24 @@ public class ChunkingTest {
         ValueRecord.SCHEMA_HEADER_LENGTH,
         serializedRecord.length - cutOff);
 
-    SchemaEntry schemaEntry = new SchemaEntry(1, schema);
+    SchemaEntry schemaEntry = new SchemaEntry(SCHEMA_ID, schema);
     HelixReadOnlySchemaRepository schemaRepository = mock(HelixReadOnlySchemaRepository.class);
-    doReturn(schemaEntry).when(schemaRepository).getValueSchema(storeName, 1);
+    doReturn(schemaEntry).when(schemaRepository).getValueSchema(storeName, SCHEMA_ID);
     doReturn(schemaEntry).when(schemaRepository).getSupersetOrLatestValueSchema(storeName);
 
-    AbstractStorageEngine storageEngine = mock(AbstractStorageEngine.class);
-    byte[] firstKey = ByteUtils.fromHexString(
-        "040647454FF4BAF2630A5449544C45440010494D504C494349540036EB0A5300374C6A9C5EEBB468C58E4300CE984E0001");
-    byte[] secondKey = ByteUtils.fromHexString(
-        "040647454FF4BAF2630A5449544C45440010494D504C494349540036EB0A5300374C6A9C5EEBB468C58E4300CE984E0201");
+    StorageEngine storageEngine = mock(StorageEngine.class);
+    ByteBuffer firstKey = ByteBuffer.wrap(
+        ByteUtils.fromHexString(
+            "040647454FF4BAF2630A5449544C45440010494D504C494349540036EB0A5300374C6A9C5EEBB468C58E4300CE984E0001"));
+    ByteBuffer secondKey = ByteBuffer.wrap(
+        ByteUtils.fromHexString(
+            "040647454FF4BAF2630A5449544C45440010494D504C494349540036EB0A5300374C6A9C5EEBB468C58E4300CE984E0201"));
 
     ChunkedValueManifest chunkedValueManifest = new ChunkedValueManifest();
     chunkedValueManifest.keysWithChunkIdSuffix = new ArrayList<>(2);
-    chunkedValueManifest.keysWithChunkIdSuffix.add(ByteBuffer.wrap(firstKey));
-    chunkedValueManifest.keysWithChunkIdSuffix.add(ByteBuffer.wrap(secondKey));
-    chunkedValueManifest.schemaId = 1;
+    chunkedValueManifest.keysWithChunkIdSuffix.add(firstKey);
+    chunkedValueManifest.keysWithChunkIdSuffix.add(secondKey);
+    chunkedValueManifest.schemaId = SCHEMA_ID;
     chunkedValueManifest.size = chunk1Bytes.length + chunk2Bytes.length
         - chunkedValueManifest.keysWithChunkIdSuffix.size() * ValueRecord.SCHEMA_HEADER_LENGTH;
     byte[] serializedCVM = SerializerDeserializerFactory.getAvroGenericSerializer(ChunkedValueManifest.SCHEMA$)
@@ -216,16 +224,16 @@ public class ChunkingTest {
     doReturn(chunk1Bytes).when(storageEngine).get(eq(partition), eq(firstKey));
     doReturn(chunk2Bytes).when(storageEngine).get(eq(partition), eq(secondKey));
 
-    doReturn(Arrays.asList(chunk1Bytes, chunk2Bytes)).when(storageEngine).multiGet(eq(partition), any());
-
     StoreDeserializerCache storeDeserializerCache = rawBytesStoreDeserializerCache
         ? RawBytesStoreDeserializerCache.getInstance()
         : new AvroStoreDeserializerCache(schemaRepository, storeName, true);
     int readerSchemaId = schemaEntry.getId();
     try (StorageEngineBackedCompressorFactory compressorFactory =
         new StorageEngineBackedCompressorFactory(mock(StorageMetadataService.class))) {
-      VeniceCompressor compressor =
-          compressorFactory.getCompressor(CompressionStrategy.NO_OP, storageEngine.getStoreVersionName());
+      VeniceCompressor compressor = compressorFactory.getCompressor(
+          CompressionStrategy.NO_OP,
+          storageEngine.getStoreVersionName(),
+          Zstd.defaultCompressionLevel());
       Object retrievedObject;
       if (getWithSchemaId) {
         retrievedObject = chunkingAdapter.getWithSchemaId(
@@ -237,7 +245,7 @@ public class ChunkingTest {
             null,
             storeDeserializerCache,
             compressor,
-            null);
+            new ChunkedValueManifestContainer());
       } else {
         retrievedObject = chunkingAdapter.get(
             storageEngine,
@@ -246,7 +254,7 @@ public class ChunkingTest {
             true,
             null,
             null,
-            null,
+            NoOpReadResponseStats.SINGLETON,
             readerSchemaId,
             storeDeserializerCache,
             compressor,
@@ -282,10 +290,182 @@ public class ChunkingTest {
         SerializerDeserializerFactory.getAvroGenericSerializer(record.getSchema()).serialize(record);
     runTest(record, RawBytesChunkingAdapter.INSTANCE, true, (valueFromStorageEngine) -> {
       Assert.assertTrue(valueFromStorageEngine instanceof ByteBufferValueRecord<?>);
-      Object value = ((ByteBufferValueRecord) valueFromStorageEngine).value();
+      ByteBufferValueRecord byteBufferValueRecord = (ByteBufferValueRecord) valueFromStorageEngine;
+      Object value = byteBufferValueRecord.value();
       Assert.assertTrue(value instanceof ByteBuffer);
-      Assert.assertEquals(ByteUtils.extractByteArray((ByteBuffer) value), serializedRecord);
+      ByteBuffer bbValue = (ByteBuffer) value;
+      Assert.assertEquals(ByteUtils.extractByteArray(bbValue), serializedRecord);
+      Assert.assertEquals(byteBufferValueRecord.writerSchemaId(), SCHEMA_ID);
       return null;
     }, true);
+  }
+
+  /**
+   * The A/A path reads the old value via {@code getWithSchemaId}. A vetoed read must come back with a {@code null}
+   * value and, critically, without fetching any chunks — assembling a pathological multi-megabyte record just to
+   * discover the write has to be rejected is exactly the ingestion cost nearline large-record skipping exists to
+   * avoid. The wrapper itself is non-null, which is what {@code unwrapByteBufferFromOldValueProvider} relies on.
+   */
+  @Test
+  public void testChunkedReadWithSchemaIdIsVetoedBeforeAssembly() {
+    ChunkingFixture fixture = new ChunkingFixture();
+    ChunkedValueManifestContainer container = new ChunkedValueManifestContainer(fixture.assembledSize - 1);
+
+    ByteBufferValueRecord<?> retrieved = (ByteBufferValueRecord<?>) fixture.readWithSchemaId(container);
+
+    Assert.assertNull(retrieved.value(), "An over-ceiling value must not be assembled");
+    Assert.assertTrue(container.isSizeLimitExceeded(), "The caller must be able to tell this from 'not found'");
+    Assert.assertEquals(container.getManifest().size, fixture.assembledSize);
+    fixture.verifyNoChunksFetched();
+  }
+
+  /** The non-A/A path reads the old value via the plain {@code get}, which returns the value directly. */
+  @Test
+  public void testChunkedPlainReadIsVetoedBeforeAssembly() {
+    ChunkingFixture fixture = new ChunkingFixture();
+    ChunkedValueManifestContainer container = new ChunkedValueManifestContainer(fixture.assembledSize - 1);
+
+    Object retrieved = fixture.readPlain(container);
+
+    Assert.assertNull(retrieved, "An over-ceiling value must not be returned");
+    Assert.assertTrue(container.isSizeLimitExceeded());
+    fixture.verifyNoChunksFetched();
+  }
+
+  @Test
+  public void testChunkedReadUnderCeilingStillAssembles() {
+    ChunkingFixture fixture = new ChunkingFixture();
+    ChunkedValueManifestContainer container = new ChunkedValueManifestContainer(fixture.assembledSize);
+
+    ByteBufferValueRecord<?> retrieved = (ByteBufferValueRecord<?>) fixture.readWithSchemaId(container);
+
+    Assert.assertNotNull(retrieved.value(), "A value exactly at the ceiling is within the limit");
+    Assert.assertFalse(container.isSizeLimitExceeded());
+    fixture.verifyChunksFetched();
+  }
+
+  @Test
+  public void testChunkedReadWithoutCeilingIsUnaffected() {
+    ChunkingFixture fixture = new ChunkingFixture();
+    ChunkedValueManifestContainer container = new ChunkedValueManifestContainer();
+
+    ByteBufferValueRecord<?> retrieved = (ByteBufferValueRecord<?>) fixture.readWithSchemaId(container);
+
+    Assert.assertNotNull(retrieved.value(), "Read paths that declare no ceiling must behave exactly as before");
+    Assert.assertFalse(container.isSizeLimitExceeded());
+    fixture.verifyChunksFetched();
+  }
+
+  /** Minimal two-chunk value in a mocked storage engine, so chunk fetches can be asserted on. */
+  private static final class ChunkingFixture {
+    private static final int PARTITION = 9;
+    private final StorageEngine storageEngine = mock(StorageEngine.class);
+    private final byte[] keyBytes = ByteUtils.fromHexString("040647454ff4baf2630a5449544c45440010494d504c49434954");
+    private final ByteBuffer firstKey;
+    private final ByteBuffer secondKey;
+    private final int assembledSize;
+
+    private ChunkingFixture() {
+      byte[] serializeNonChunkedKey =
+          ByteUtils.fromHexString("040647454ff4baf2630a5449544c45440010494d504c494349540200");
+      firstKey = ByteBuffer.wrap(
+          ByteUtils.fromHexString(
+              "040647454FF4BAF2630A5449544C45440010494D504C494349540036EB0A5300374C6A9C5EEBB468C58E4300CE984E0001"));
+      secondKey = ByteBuffer.wrap(
+          ByteUtils.fromHexString(
+              "040647454FF4BAF2630A5449544C45440010494D504C494349540036EB0A5300374C6A9C5EEBB468C58E4300CE984E0201"));
+
+      GenericRecord record = new GenericData.Record(SIMPLE_SCHEMA);
+      record.put("field", new Utf8("a value long enough to split across two chunks"));
+      byte[] serializedRecord = SerializerDeserializerFactory.getAvroGenericSerializer(SIMPLE_SCHEMA).serialize(record);
+      int cutOff = serializedRecord.length / 2;
+      byte[] chunk1Bytes = new byte[cutOff + ValueRecord.SCHEMA_HEADER_LENGTH];
+      byte[] chunk2Bytes = new byte[serializedRecord.length - cutOff + ValueRecord.SCHEMA_HEADER_LENGTH];
+      ByteUtils.writeInt(chunk1Bytes, AvroProtocolDefinition.CHUNK.currentProtocolVersion.get(), 0);
+      ByteUtils.writeInt(chunk2Bytes, AvroProtocolDefinition.CHUNK.currentProtocolVersion.get(), 0);
+      System.arraycopy(serializedRecord, 0, chunk1Bytes, ValueRecord.SCHEMA_HEADER_LENGTH, cutOff);
+      System.arraycopy(
+          serializedRecord,
+          cutOff,
+          chunk2Bytes,
+          ValueRecord.SCHEMA_HEADER_LENGTH,
+          serializedRecord.length - cutOff);
+
+      ChunkedValueManifest manifest = new ChunkedValueManifest();
+      manifest.keysWithChunkIdSuffix = new ArrayList<>(2);
+      manifest.keysWithChunkIdSuffix.add(firstKey);
+      manifest.keysWithChunkIdSuffix.add(secondKey);
+      manifest.schemaId = SCHEMA_ID;
+      manifest.size = chunk1Bytes.length + chunk2Bytes.length
+          - manifest.keysWithChunkIdSuffix.size() * ValueRecord.SCHEMA_HEADER_LENGTH;
+      assembledSize = manifest.size;
+
+      byte[] serializedCVM =
+          SerializerDeserializerFactory.getAvroGenericSerializer(ChunkedValueManifest.SCHEMA$).serialize(manifest);
+      byte[] serializedCVMwithHeader = new byte[serializedCVM.length + ValueRecord.SCHEMA_HEADER_LENGTH];
+      ByteUtils.writeInt(
+          serializedCVMwithHeader,
+          AvroProtocolDefinition.CHUNKED_VALUE_MANIFEST.currentProtocolVersion.get(),
+          0);
+      System
+          .arraycopy(serializedCVM, 0, serializedCVMwithHeader, ValueRecord.SCHEMA_HEADER_LENGTH, serializedCVM.length);
+
+      doReturn(serializedCVMwithHeader).when(storageEngine)
+          .get(eq(PARTITION), eq(ByteBuffer.wrap(serializeNonChunkedKey)));
+      doReturn(chunk1Bytes).when(storageEngine).get(eq(PARTITION), eq(firstKey));
+      doReturn(chunk2Bytes).when(storageEngine).get(eq(PARTITION), eq(secondKey));
+    }
+
+    private Object readWithSchemaId(ChunkedValueManifestContainer container) {
+      try (StorageEngineBackedCompressorFactory compressorFactory =
+          new StorageEngineBackedCompressorFactory(mock(StorageMetadataService.class))) {
+        VeniceCompressor compressor = compressorFactory.getCompressor(
+            CompressionStrategy.NO_OP,
+            storageEngine.getStoreVersionName(),
+            Zstd.defaultCompressionLevel());
+        return RawBytesChunkingAdapter.INSTANCE.getWithSchemaId(
+            storageEngine,
+            PARTITION,
+            ByteBuffer.wrap(keyBytes),
+            true,
+            null,
+            null,
+            RawBytesStoreDeserializerCache.getInstance(),
+            compressor,
+            container);
+      }
+    }
+
+    private Object readPlain(ChunkedValueManifestContainer container) {
+      try (StorageEngineBackedCompressorFactory compressorFactory =
+          new StorageEngineBackedCompressorFactory(mock(StorageMetadataService.class))) {
+        VeniceCompressor compressor = compressorFactory.getCompressor(
+            CompressionStrategy.NO_OP,
+            storageEngine.getStoreVersionName(),
+            Zstd.defaultCompressionLevel());
+        return RawBytesChunkingAdapter.INSTANCE.get(
+            storageEngine,
+            PARTITION,
+            ByteBuffer.wrap(keyBytes),
+            true,
+            null,
+            null,
+            NoOpReadResponseStats.SINGLETON,
+            SCHEMA_ID,
+            RawBytesStoreDeserializerCache.getInstance(),
+            compressor,
+            container);
+      }
+    }
+
+    private void verifyNoChunksFetched() {
+      verify(storageEngine, never()).get(eq(PARTITION), eq(firstKey));
+      verify(storageEngine, never()).get(eq(PARTITION), eq(secondKey));
+    }
+
+    private void verifyChunksFetched() {
+      verify(storageEngine).get(eq(PARTITION), eq(firstKey));
+      verify(storageEngine).get(eq(PARTITION), eq(secondKey));
+    }
   }
 }

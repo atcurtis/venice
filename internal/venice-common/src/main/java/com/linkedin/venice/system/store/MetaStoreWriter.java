@@ -4,15 +4,12 @@ import com.linkedin.venice.common.VeniceSystemStoreType;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.helix.HelixReadOnlySchemaRepository;
 import com.linkedin.venice.helix.HelixReadOnlyZKSharedSchemaRepository;
-import com.linkedin.venice.meta.Instance;
 import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.StoreConfig;
-import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.meta.ZKStore;
 import com.linkedin.venice.pubsub.PubSubTopicRepository;
 import com.linkedin.venice.pubsub.api.PubSubTopic;
 import com.linkedin.venice.pubsub.manager.TopicManager;
-import com.linkedin.venice.pushmonitor.ExecutionStatus;
 import com.linkedin.venice.schema.GeneratedSchemaID;
 import com.linkedin.venice.schema.SchemaEntry;
 import com.linkedin.venice.schema.writecompute.WriteComputeSchemaConverter;
@@ -21,9 +18,9 @@ import com.linkedin.venice.serialization.avro.VeniceAvroKafkaSerializer;
 import com.linkedin.venice.systemstore.schemas.StoreKeySchemas;
 import com.linkedin.venice.systemstore.schemas.StoreMetaKey;
 import com.linkedin.venice.systemstore.schemas.StoreMetaValue;
-import com.linkedin.venice.systemstore.schemas.StoreReplicaStatus;
 import com.linkedin.venice.systemstore.schemas.StoreValueSchema;
 import com.linkedin.venice.systemstore.schemas.StoreValueSchemas;
+import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.VeniceResourceCloseResult;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import com.linkedin.venice.writer.VeniceWriter;
@@ -177,6 +174,7 @@ public class MetaStoreWriter implements Closeable {
   }
 
   public void writeHeartbeat(String storeName, long heartbeatTimestamp) {
+    LOGGER.info("Sending heartbeat: {} for meta store of: {}", heartbeatTimestamp, storeName);
     write(
         storeName,
         MetaStoreDataType.HEARTBEAT,
@@ -224,39 +222,6 @@ public class MetaStoreWriter implements Closeable {
   }
 
   /**
-   * This function is used to produce a snapshot for replica statuses.
-   */
-  public void writeReadyToServerStoreReplicas(
-      String clusterName,
-      String storeName,
-      int version,
-      int partitionId,
-      Collection<Instance> readyToServeInstances) {
-    write(storeName, MetaStoreDataType.STORE_REPLICA_STATUSES, () -> new HashMap<String, String>() {
-      {
-        put(KEY_STRING_STORE_NAME, storeName);
-        put(KEY_STRING_CLUSTER_NAME, clusterName);
-        put(KEY_STRING_VERSION_NUMBER, Integer.toString(version));
-        put(KEY_STRING_PARTITION_ID, Integer.toString(partitionId));
-      }
-    }, () -> {
-      StoreMetaValue value = new StoreMetaValue();
-      Map<CharSequence, StoreReplicaStatus> replicaMap = new HashMap<>();
-      for (Instance instance: readyToServeInstances) {
-        StoreReplicaStatus storeReplicaStatus = new StoreReplicaStatus();
-        storeReplicaStatus.status = ExecutionStatus.COMPLETED.getValue();
-        replicaMap.put(instance.getUrl(true), storeReplicaStatus);
-      }
-      value.storeReplicaStatuses = replicaMap;
-      return value;
-    });
-  }
-
-  Schema getDerivedComputeSchema() {
-    return this.derivedComputeSchema;
-  }
-
-  /**
    * Write {@link com.linkedin.venice.meta.StoreConfig} equivalent to the meta system store. This is still only invoked
    * by child controllers only.
    */
@@ -269,26 +234,6 @@ public class MetaStoreWriter implements Closeable {
       StoreMetaValue value = new StoreMetaValue();
       value.storeClusterConfig = storeConfig.dataModel();
       return value;
-    });
-  }
-
-  /**
-   * Clean up deprecated replica statuses.
-   * Currently, it is being used when cleaning up a deprecated version topic, where it guarantees all the
-   * partition replicas have been removed from Venice Cluster in {@literal TopicCleanupService}.
-   */
-  public void deleteStoreReplicaStatus(String clusterName, String storeName, int version, int partitionId) {
-    String metaStoreName = VeniceSystemStoreType.META_STORE.getSystemStoreName(storeName);
-    StoreMetaKey key = MetaStoreDataType.STORE_REPLICA_STATUSES.getStoreMetaKey(new HashMap<String, String>() {
-      {
-        put(KEY_STRING_STORE_NAME, storeName);
-        put(KEY_STRING_CLUSTER_NAME, clusterName);
-        put(KEY_STRING_VERSION_NUMBER, Integer.toString(version));
-        put(KEY_STRING_PARTITION_ID, Integer.toString(partitionId));
-      }
-    });
-    writeMessageWithRetry(metaStoreName, vw -> {
-      vw.delete(key, null);
     });
   }
 
@@ -415,19 +360,19 @@ public class MetaStoreWriter implements Closeable {
 
   VeniceWriter getOrCreateMetaStoreWriter(String metaStoreName) {
     return metaStoreWriterMap.computeIfAbsent(metaStoreName, k -> {
-      PubSubTopic rtTopic = pubSubTopicRepository.getTopic(Version.composeRealTimeTopic(metaStoreName));
+      PubSubTopic rtTopic = pubSubTopicRepository.getTopic(Utils.composeRealTimeTopic(metaStoreName));
       if (!topicManager.containsTopicAndAllPartitionsAreOnline(rtTopic)) {
         throw new VeniceException("Realtime topic: " + rtTopic + " doesn't exist or some partitions are not online");
       }
 
       VeniceWriterOptions options = new VeniceWriterOptions.Builder(rtTopic.getName())
-          .setKeySerializer(
+          .setKeyPayloadSerializer(
               new VeniceAvroKafkaSerializer(
                   AvroProtocolDefinition.METADATA_SYSTEM_SCHEMA_STORE_KEY.getCurrentProtocolVersionSchema()))
-          .setValueSerializer(
+          .setValuePayloadSerializer(
               new VeniceAvroKafkaSerializer(
                   AvroProtocolDefinition.METADATA_SYSTEM_SCHEMA_STORE.getCurrentProtocolVersionSchema()))
-          .setWriteComputeSerializer(new VeniceAvroKafkaSerializer(derivedComputeSchema))
+          .setWriteComputePayloadSerializer(new VeniceAvroKafkaSerializer(derivedComputeSchema))
           .setChunkingEnabled(false)
           .setPartitionCount(1)
           .build();
@@ -460,7 +405,7 @@ public class MetaStoreWriter implements Closeable {
      * to write a Control Message to the RT topic, and it could hang if the topic doesn't exist.
      * This check is a best-effort since the race condition is still there between topic check and closing VeniceWriter.
      */
-    PubSubTopic rtTopic = pubSubTopicRepository.getTopic(Version.composeRealTimeTopic(metaStoreName));
+    PubSubTopic rtTopic = pubSubTopicRepository.getTopic(Utils.composeRealTimeTopic(metaStoreName));
     if (!topicManager.containsTopicAndAllPartitionsAreOnline(rtTopic)) {
       LOGGER.info(
           "RT topic: {} for meta system store: {} doesn't exist, will only close the internal producer without sending END_OF_SEGMENT control messages",

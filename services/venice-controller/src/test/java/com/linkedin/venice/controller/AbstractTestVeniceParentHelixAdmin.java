@@ -1,6 +1,9 @@
 package com.linkedin.venice.controller;
 
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.anyString;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
@@ -8,8 +11,8 @@ import static org.mockito.Mockito.when;
 
 import com.linkedin.venice.authorization.AuthorizerService;
 import com.linkedin.venice.authorization.DefaultIdentityParser;
-import com.linkedin.venice.common.VeniceSystemStoreUtils;
 import com.linkedin.venice.controller.kafka.AdminTopicUtils;
+import com.linkedin.venice.controller.kafka.consumer.AdminMetadata;
 import com.linkedin.venice.controller.kafka.protocol.serializer.AdminOperationSerializer;
 import com.linkedin.venice.controller.stats.VeniceAdminStats;
 import com.linkedin.venice.controllerapi.ControllerClient;
@@ -23,11 +26,14 @@ import com.linkedin.venice.helix.ParentHelixOfflinePushAccessor;
 import com.linkedin.venice.helix.StoragePersonaRepository;
 import com.linkedin.venice.helix.ZkRoutersClusterManager;
 import com.linkedin.venice.helix.ZkStoreConfigAccessor;
-import com.linkedin.venice.meta.HybridStoreConfig;
+import com.linkedin.venice.meta.ConcurrentPushDetectionStrategy;
+import com.linkedin.venice.meta.IngestionPauseMode;
 import com.linkedin.venice.meta.OfflinePushStrategy;
 import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.StoreInfo;
 import com.linkedin.venice.pubsub.PubSubTopicRepository;
+import com.linkedin.venice.pubsub.adapter.SimplePubSubProduceResultImpl;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
 import com.linkedin.venice.pubsub.api.PubSubTopic;
 import com.linkedin.venice.pubsub.manager.TopicManager;
 import com.linkedin.venice.schema.SchemaEntry;
@@ -35,12 +41,14 @@ import com.linkedin.venice.utils.TestUtils;
 import com.linkedin.venice.utils.Time;
 import com.linkedin.venice.utils.locks.ClusterLockManager;
 import com.linkedin.venice.writer.VeniceWriter;
+import io.tehuti.metrics.MetricsRepository;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.CompletableFuture;
 import org.apache.helix.zookeeper.impl.client.ZkClient;
 
 
@@ -50,22 +58,21 @@ import org.apache.helix.zookeeper.impl.client.ZkClient;
 public class AbstractTestVeniceParentHelixAdmin {
   static final int TIMEOUT_IN_MS = 60 * Time.MS_PER_SECOND;
   static int KAFKA_REPLICA_FACTOR = 3;
-  static final String PUSH_JOB_DETAILS_STORE_NAME = VeniceSystemStoreUtils.getPushJobDetailsStoreName();
   static final int MAX_PARTITION_NUM = 1024;
   static final String TEST_SCHEMA =
       "{\"type\":\"record\", \"name\":\"ValueRecord\", \"fields\": [{\"name\":\"number\", " + "\"type\":\"int\"}]}";
 
-  static final String clusterName = "test-cluster";
+  protected static final String clusterName = "test-cluster";
   static final String regionName = "test-region";
   static final String topicName = AdminTopicUtils.getTopicNameFromClusterName(clusterName);
-  static final String zkMetadataNodePath = ZkAdminTopicMetadataAccessor.getAdminTopicMetadataNodePath(clusterName);
   static final int partitionId = AdminTopicUtils.ADMIN_TOPIC_PARTITION_ID;
   static final AdminOperationSerializer adminOperationSerializer = new AdminOperationSerializer();
   static final PubSubTopicRepository pubSubTopicRepository = new PubSubTopicRepository();
 
   TopicManager topicManager;
   VeniceHelixAdmin internalAdmin;
-  VeniceControllerConfig config;
+  StoreSchemaManager storeSchemaManager;
+  VeniceControllerClusterConfig config;
   ZkClient zkClient;
   VeniceWriter veniceWriter;
   VeniceParentHelixAdmin parentAdmin = null;
@@ -77,6 +84,7 @@ public class AbstractTestVeniceParentHelixAdmin {
   Map<String, ControllerClient> controllerClients = new HashMap<>();
   ClusterLockManager clusterLockManager;
   StoragePersonaRepository personaRepository;
+  AdminTopicMetadataAccessor adminTopicMetadataAccessor;
 
   public void setupInternalMocks() {
     topicManager = mock(TopicManager.class);
@@ -88,10 +96,16 @@ public class AbstractTestVeniceParentHelixAdmin {
     doReturn(true).when(topicManager).containsTopicAndAllPartitionsAreOnline(pubSubTopicRepository.getTopic(topicName));
 
     internalAdmin = mock(VeniceHelixAdmin.class);
-    when(internalAdmin.isHybrid((HybridStoreConfig) any())).thenCallRealMethod();
+    storeSchemaManager = mock(StoreSchemaManager.class);
+    doReturn(storeSchemaManager).when(internalAdmin).getStoreSchemaManager();
     doReturn(topicManager).when(internalAdmin).getTopicManager();
     SchemaEntry mockEntry = new SchemaEntry(0, TEST_SCHEMA);
     doReturn(mockEntry).when(internalAdmin).getKeySchema(anyString(), anyString());
+    // Outside a store-migration context, schema normalization is a passthrough. Mirror that here so
+    // the mocked schema manager doesn't return null and blank out the value schema during createStore/
+    // addValueSchema.
+    when(storeSchemaManager.normalizeSchemaForMigration(anyString(), anyString(), any()))
+        .thenAnswer(invocation -> invocation.getArgument(2));
 
     zkClient = mock(ZkClient.class);
     doReturn(zkClient).when(internalAdmin).getZkClient();
@@ -107,14 +121,18 @@ public class AbstractTestVeniceParentHelixAdmin {
     // list of store configs for the sake of correctness, but async scheduled threads can be the bane
     // of reliable unit tests. TODO: Return a real list of store configs in this mock.
     readOnlyStoreConfigRepository = mock(HelixReadOnlyStoreConfigRepository.class);
-    doReturn(Collections.emptyList()).when(readOnlyStoreConfigRepository).getAllStoreConfigs();
     doReturn(readOnlyStoreConfigRepository).when(internalAdmin).getStoreConfigRepo();
 
     personaRepository = mock(StoragePersonaRepository.class);
 
-    store = mock(Store.class);
+    store = mock(Store.class, RETURNS_DEEP_STUBS);
     doReturn(OfflinePushStrategy.WAIT_N_MINUS_ONE_REPLCIA_PER_PARTITION).when(store).getOffLinePushStrategy();
     doReturn(false).when(store).isMigrating();
+    // Stub pause-mode getters so RETURNS_DEEP_STUBS doesn't hand back a mock enum/list,
+    // which would trip the ingestion-pause guard in incrementVersionIdempotent.
+    doReturn(IngestionPauseMode.NOT_PAUSED).when(store).getIngestionPauseMode();
+    doReturn(java.util.Collections.emptyList()).when(store).getIngestionPausedRegions();
+    when(store.getHybridStoreConfig().getRealTimeTopicName()).thenReturn("test_real_time_topic_rt");
     doReturn(store).when(internalAdmin).checkPreConditionForAclOp(any(), any());
 
     HelixReadWriteStoreRepository storeRepository = mock(HelixReadWriteStoreRepository.class);
@@ -122,10 +140,28 @@ public class AbstractTestVeniceParentHelixAdmin {
 
     config = mockConfig(clusterName);
     doReturn(1).when(config).getReplicationMetadataVersion();
+    doReturn(ConcurrentPushDetectionStrategy.PARENT_VERSION_STATUS_ONLY)
+        .doReturn(ConcurrentPushDetectionStrategy.PARENT_VERSION_STATUS_ONLY)
+        .when(config)
+        .getConcurrentPushDetectionStrategy();
 
     controllerClients
         .put(regionName, ControllerClient.constructClusterControllerClient(clusterName, "localhost", Optional.empty()));
     doReturn(controllerClients).when(internalAdmin).getControllerClientMap(any());
+    // The parent's cross-fabric buildout path now routes through the child's FabricControllerClientProvider rather
+    // than calling getControllerClientMap() directly. Stub the provider on the mocked child so that any test driving
+    // a buildout-dependent path (data recovery, compareStore, copy-over) resolves clients from the same
+    // controllerClients map instead of NPEing on an un-stubbed provider getter.
+    FabricControllerClientProvider fabricControllerClientProvider = mock(FabricControllerClientProvider.class);
+    doReturn(controllerClients).when(fabricControllerClientProvider).getControllerClientMap(any());
+    when(fabricControllerClientProvider.getFabricBuildoutControllerClient(any(), any()))
+        .thenAnswer(invocation -> controllerClients.get(invocation.getArgument(1)));
+    // queryAllRegions is a pure fan-out over the supplied client map, so let the real implementation run; this keeps
+    // the parent's multi-fabric version queries behaving exactly as the old inline loops did against the mocked
+    // clients.
+    when(fabricControllerClientProvider.queryAllRegions(any(), any(), anyInt(), any(), any(), any()))
+        .thenCallRealMethod();
+    doReturn(fabricControllerClientProvider).when(internalAdmin).getFabricControllerClientProvider();
 
     resources = mockResources(config, clusterName);
     doReturn(storeRepository).when(resources).getStoreMetadataRepository();
@@ -147,19 +183,27 @@ public class AbstractTestVeniceParentHelixAdmin {
 
     // Need to bypass VeniceWriter initialization
     veniceWriter = mock(VeniceWriter.class);
+    doReturn(
+        CompletableFuture
+            .completedFuture(new SimplePubSubProduceResultImpl(topicName, partitionId, mock(PubSubPosition.class), -1)))
+                .when(veniceWriter)
+                .put(any(), any(), anyInt(), any(), any(), anyLong(), any(), any(), any(), any());
   }
 
   /**
    * Separate internal mocks setup and initialization so tests can change the behavior of the mocks without running into
    * concurrency issues. i.e. change mock's behavior in test thread while it's being used in some background threads.
    */
-  public void initializeParentAdmin(Optional<AuthorizerService> authorizerService) {
+  public void initializeParentAdmin(
+      Optional<AuthorizerService> authorizerService,
+      Optional<MetricsRepository> metricsRepository) {
     parentAdmin = new VeniceParentHelixAdmin(
         internalAdmin,
         TestUtils.getMultiClusterConfigFromOneCluster(config),
         false,
         Optional.empty(),
-        authorizerService);
+        authorizerService,
+        metricsRepository.orElseGet(() -> mock(MetricsRepository.class)));
     ControllerClient mockControllerClient = mock(ControllerClient.class);
     doReturn(new ControllerResponse()).when(mockControllerClient).checkResourceCleanupForStoreCreation(anyString());
     StoreResponse storeResponse = mock(StoreResponse.class);
@@ -176,6 +220,11 @@ public class AbstractTestVeniceParentHelixAdmin {
         .put(regionName, mockControllerClient);
     parentAdmin.setOfflinePushAccessor(accessor);
     parentAdmin.setVeniceWriterForCluster(clusterName, veniceWriter);
+
+    // Set up mock admin topic metadata accessor to avoid ZK interaction issues
+    adminTopicMetadataAccessor = mock(AdminTopicMetadataAccessor.class);
+    doReturn(new AdminMetadata()).when(adminTopicMetadataAccessor).getMetadata(anyString());
+    parentAdmin.setAdminTopicMetadataAccessor(adminTopicMetadataAccessor);
   }
 
   public void cleanupTestCase() {
@@ -186,8 +235,8 @@ public class AbstractTestVeniceParentHelixAdmin {
     }
   }
 
-  VeniceControllerConfig mockConfig(String clusterName) {
-    VeniceControllerConfig config = mock(VeniceControllerConfig.class);
+  VeniceControllerClusterConfig mockConfig(String clusterName) {
+    VeniceControllerClusterConfig config = mock(VeniceControllerClusterConfig.class);
     doReturn(clusterName).when(config).getClusterName();
     doReturn(KAFKA_REPLICA_FACTOR).when(config).getKafkaReplicationFactor();
     doReturn(KAFKA_REPLICA_FACTOR).when(config).getAdminTopicReplicationFactor();
@@ -199,15 +248,17 @@ public class AbstractTestVeniceParentHelixAdmin {
     doReturn(false).when(config).isParticipantMessageStoreEnabled();
     // Disable background threads that may interfere when we try to re-mock internalAdmin later in the tests.
     doReturn(Long.MAX_VALUE).when(config).getTerminalStateTopicCheckerDelayMs();
+    doReturn(Long.MAX_VALUE).when(config).getSystemStoreAclSynchronizationDelayMs();
     Map<String, String> childClusterMap = new HashMap<>();
     childClusterMap.put(regionName, "localhost");
     doReturn(childClusterMap).when(config).getChildDataCenterControllerUrlMap();
     doReturn(MAX_PARTITION_NUM).when(config).getMaxNumberOfPartitions();
+    doReturn(1L << 30).when(config).getPartitionSize();
     doReturn(DefaultIdentityParser.class.getName()).when(config).getIdentityParserClassName();
     return config;
   }
 
-  HelixVeniceClusterResources mockResources(VeniceControllerConfig config, String clusterName) {
+  HelixVeniceClusterResources mockResources(VeniceControllerClusterConfig config, String clusterName) {
     HelixVeniceClusterResources resources = mock(HelixVeniceClusterResources.class);
     doReturn(config).when(resources).getConfig();
     doReturn(resources).when(internalAdmin).getHelixVeniceClusterResources(clusterName);
@@ -215,4 +266,10 @@ public class AbstractTestVeniceParentHelixAdmin {
     return resources;
   }
 
+  /**
+   * Expose the config object to configure specific config values for testing.
+   */
+  protected VeniceControllerClusterConfig getConfig() {
+    return config;
+  }
 }

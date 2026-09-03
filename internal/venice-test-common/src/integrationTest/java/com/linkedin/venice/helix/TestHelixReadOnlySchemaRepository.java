@@ -1,5 +1,7 @@
 package com.linkedin.venice.helix;
 
+import static com.linkedin.venice.zk.VeniceZkPaths.STORES;
+
 import com.linkedin.venice.exceptions.VeniceNoStoreException;
 import com.linkedin.venice.integration.utils.ServiceFactory;
 import com.linkedin.venice.integration.utils.ZkServerWrapper;
@@ -30,7 +32,7 @@ public class TestHelixReadOnlySchemaRepository {
   private ZkClient zkClient;
   private String cluster = "test-metadata-cluster";
   private String clusterPath = "/test-metadata-cluster";
-  private String storesPath = "/Stores";
+  private String storesPath = "/" + STORES;
   private ZkServerWrapper zkServerWrapper;
   private HelixAdapterSerializer adapter = new HelixAdapterSerializer();
 
@@ -55,10 +57,10 @@ public class TestHelixReadOnlySchemaRepository {
         Optional.empty(),
         new ClusterLockManager(cluster));
     storeRWRepo.refresh();
-    storeRORepo = new HelixReadOnlyStoreRepository(zkClient, adapter, cluster, 1, 1000);
+    storeRORepo = new HelixReadOnlyStoreRepository(zkClient, adapter, cluster);
     storeRORepo.refresh();
-    schemaRWRepo = new HelixReadWriteSchemaRepository(storeRWRepo, zkClient, adapter, cluster, Optional.empty());
-    schemaRORepo = new HelixReadOnlySchemaRepository(storeRORepo, zkClient, adapter, cluster, 1, 1000);
+    schemaRWRepo = new HelixReadWriteSchemaRepository(storeRWRepo, zkClient, adapter, cluster, Optional.empty(), 9);
+    schemaRORepo = new HelixReadOnlySchemaRepository(storeRORepo, zkClient, adapter, cluster, 9, 1000);
   }
 
   @AfterMethod
@@ -148,6 +150,7 @@ public class TestHelixReadOnlySchemaRepository {
         3,
         TimeUnit.SECONDS,
         () -> schemaRORepo.getValueSchemas(storeName).size() == 2);
+
     SchemaEntry valueSchema1 = schemaRORepo.getValueSchema(storeName, 1);
     Assert.assertNotNull(valueSchema1);
     Assert.assertEquals(valueSchema1.getSchema().toString(), Schema.parse(valueSchemaStr1).toString());

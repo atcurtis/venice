@@ -132,6 +132,8 @@ public abstract class CheckSum {
         return new CRC32CheckSum();
       case MD5:
         return new MD5CheckSum();
+      case ADHASH:
+        return new AdHash();
       default:
         return null;
     }
@@ -144,13 +146,15 @@ public abstract class CheckSum {
           return null;
         case MD5:
           return new MD5CheckSum(encodedState);
+        case ADHASH:
+          return new AdHash(encodedState);
         default:
           return null;
       }
     } else {
       // TODO: Consider throwing exception here, instead.
       LOGGER.warn(
-          "CheckSum.getInstance(type, encodedState) called for a type which does not support checkpointing: {}",
+          "CheckSum.createDefaultDeserializer(type, encodedState) called for a type which does not support checkpointing: {}",
           type);
       // Not a very big deal since the default checksumming strategy is MD5 anyway.
       return null;

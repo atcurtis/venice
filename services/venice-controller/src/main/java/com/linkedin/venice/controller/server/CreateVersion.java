@@ -8,14 +8,17 @@ import static com.linkedin.venice.controllerapi.ControllerApiConstants.IS_WRITE_
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.NAME;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PARTITIONERS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PARTITION_COUNT;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.PARTITION_RECORD_COUNTS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PUSH_IN_SORTED_ORDER;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PUSH_JOB_ID;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PUSH_TYPE;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.REMOTE_KAFKA_BOOTSTRAP_SERVERS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.REPLICATION_METADATA_VERSION_ID;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.REPUSH_SOURCE_VERSION;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.REPUSH_TTL_SECONDS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.REWIND_TIME_IN_SECONDS_OVERRIDE;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.SEND_START_OF_PUSH;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.SEPARATE_REAL_TIME_TOPIC_ENABLED;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.SOURCE_GRID_FABRIC;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.TARGETED_REGIONS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.VERSION;
@@ -27,29 +30,37 @@ import static com.linkedin.venice.controllerapi.ControllerRoute.REQUEST_TOPIC;
 import static com.linkedin.venice.meta.Version.PushType;
 import static com.linkedin.venice.meta.Version.REPLICATION_METADATA_VERSION_ID_UNSET;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.linkedin.venice.HttpConstants;
 import com.linkedin.venice.acl.DynamicAccessController;
 import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.controller.Admin;
 import com.linkedin.venice.controllerapi.ControllerResponse;
+import com.linkedin.venice.controllerapi.RequestTopicForPushRequest;
 import com.linkedin.venice.controllerapi.VersionCreationResponse;
 import com.linkedin.venice.controllerapi.VersionResponse;
 import com.linkedin.venice.exceptions.ErrorType;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.exceptions.VeniceHttpException;
 import com.linkedin.venice.exceptions.VeniceNoStoreException;
+import com.linkedin.venice.exceptions.VeniceStoreAclException;
 import com.linkedin.venice.exceptions.VeniceUnsupportedOperationException;
-import com.linkedin.venice.meta.DataReplicationPolicy;
+import com.linkedin.venice.meta.DegradedDcInfo;
 import com.linkedin.venice.meta.PartitionerConfig;
 import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.lazy.Lazy;
-import java.security.cert.X509Certificate;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import org.apache.http.HttpStatus;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import spark.Request;
 import spark.Route;
 
 
@@ -59,16 +70,401 @@ import spark.Route;
 public class CreateVersion extends AbstractRoute {
   private static final Logger LOGGER = LogManager.getLogger(CreateVersion.class);
   private final boolean checkReadMethodForKafka;
-  private final boolean disableParentRequestTopicForStreamPushes;
 
   public CreateVersion(
       boolean sslEnabled,
       Optional<DynamicAccessController> accessController,
-      boolean checkReadMethodForKafka,
-      boolean disableParentRequestTopicForStreamPushes) {
+      boolean checkReadMethodForKafka) {
     super(sslEnabled, accessController);
     this.checkReadMethodForKafka = checkReadMethodForKafka;
-    this.disableParentRequestTopicForStreamPushes = disableParentRequestTopicForStreamPushes;
+  }
+
+  protected static void extractOptionalParamsFromRequestTopicRequest(
+      Request httpRequest,
+      RequestTopicForPushRequest request,
+      boolean isAclEnabled) {
+    request.setPartitioners(httpRequest.queryParamOrDefault(PARTITIONERS, null));
+
+    request.setSendStartOfPush(
+        Utils.parseBooleanOrThrow(httpRequest.queryParamOrDefault(SEND_START_OF_PUSH, "false"), SEND_START_OF_PUSH));
+
+    request.setSorted(
+        Utils
+            .parseBooleanOrThrow(httpRequest.queryParamOrDefault(PUSH_IN_SORTED_ORDER, "false"), PUSH_IN_SORTED_ORDER));
+
+    request.setWriteComputeEnabled(
+        Utils.parseBooleanOrThrow(
+            httpRequest.queryParamOrDefault(IS_WRITE_COMPUTE_ENABLED, "false"),
+            IS_WRITE_COMPUTE_ENABLED));
+
+    request.setSeparateRealTimeTopicEnabled(
+        Utils.parseBooleanOrThrow(
+            httpRequest.queryParamOrDefault(SEPARATE_REAL_TIME_TOPIC_ENABLED, "false"),
+            SEPARATE_REAL_TIME_TOPIC_ENABLED));
+
+    /*
+     * Version-level rewind time override, and it is only valid for hybrid stores.
+     */
+    request.setRewindTimeInSecondsOverride(
+        Long.parseLong(httpRequest.queryParamOrDefault(REWIND_TIME_IN_SECONDS_OVERRIDE, "-1")));
+
+    /*
+     * Version level override to defer marking this new version to the serving version post push completion.
+     */
+    request.setDeferVersionSwap(
+        Utils.parseBooleanOrThrow(httpRequest.queryParamOrDefault(DEFER_VERSION_SWAP, "false"), DEFER_VERSION_SWAP));
+
+    request.setTargetedRegions(httpRequest.queryParamOrDefault(TARGETED_REGIONS, null));
+
+    request.setRepushSourceVersion(Integer.parseInt(httpRequest.queryParamOrDefault(REPUSH_SOURCE_VERSION, "-1")));
+
+    request.setSourceGridFabric(httpRequest.queryParamOrDefault(SOURCE_GRID_FABRIC, null));
+
+    request.setCompressionDictionary(httpRequest.queryParamOrDefault(COMPRESSION_DICTIONARY, null));
+
+    // Retrieve certificate from request if ACL is enabled
+    request.setCertificateInRequest(isAclEnabled ? getCertificate(httpRequest) : null);
+
+    request.setRepushTtlSeconds(Integer.parseInt(httpRequest.queryParamOrDefault(REPUSH_TTL_SECONDS, "-1")));
+  }
+
+  /**
+   * Verifies that the partitioner class specified in the request is valid
+   * based on the store's partitioner configuration.
+   *
+   * <p>
+   * If no partitioners are provided (null or empty), the validation is skipped.
+   * (The store's partitioner configuration is used when no partitioners are provided).
+   * </p>
+   *
+   * @param partitionersFromRequest An optional set of partitioners provided in the request.
+   * @param storePartitionerConfig The store's partitioner configuration to use for validation.
+   * @throws VeniceException if the store's partitioner is not in the provided partitioners.
+   */
+  private static void validatePartitionerAgainstStoreConfig(
+      Set<String> partitionersFromRequest,
+      PartitionerConfig storePartitionerConfig) {
+    // Skip validation if the user didn't provide any partitioner. Partitioner from store config will be used.
+    if (partitionersFromRequest == null || partitionersFromRequest.isEmpty()) {
+      return;
+    }
+
+    // Validate if the store's partitioner matches one of the provided partitioners
+    if (!partitionersFromRequest.contains(storePartitionerConfig.getPartitionerClass())) {
+      throw new VeniceException(
+          "Expected partitioner class " + storePartitionerConfig.getPartitionerClass() + " cannot be found.");
+    }
+  }
+
+  protected void verifyAndConfigurePartitionerSettings(
+      PartitionerConfig storePartitionerConfig,
+      Set<String> partitionersFromRequest,
+      VersionCreationResponse response) {
+    validatePartitionerAgainstStoreConfig(partitionersFromRequest, storePartitionerConfig);
+    partitionersFromRequest = partitionersFromRequest != null ? partitionersFromRequest : Collections.emptySet();
+    // Get the first partitioner that matches the store partitioner
+    for (String partitioner: partitionersFromRequest) {
+      if (storePartitionerConfig.getPartitionerClass().equals(partitioner)) {
+        response.setPartitionerClass(partitioner);
+        response.setPartitionerParams(storePartitionerConfig.getPartitionerParams());
+        response.setAmplificationFactor(storePartitionerConfig.getAmplificationFactor());
+        return;
+      }
+    }
+    response.setPartitionerClass(storePartitionerConfig.getPartitionerClass());
+    response.setPartitionerParams(storePartitionerConfig.getPartitionerParams());
+    response.setAmplificationFactor(storePartitionerConfig.getAmplificationFactor());
+  }
+
+  protected Lazy<Boolean> getActiveActiveReplicationCheck(
+      Admin admin,
+      Store store,
+      String clusterName,
+      String storeName,
+      boolean checkCurrentVersion) {
+    return Lazy.of(
+        () -> admin.isParent() && store.isActiveActiveReplicationEnabled()
+            && admin.isActiveActiveReplicationEnabledInAllRegion(clusterName, storeName, checkCurrentVersion));
+  }
+
+  protected String applyConfigBasedOnReplication(
+      String configType,
+      String configValue,
+      String storeName,
+      Lazy<Boolean> isActiveActiveReplicationEnabledInAllRegion) {
+    if (configValue != null && !isActiveActiveReplicationEnabledInAllRegion.get()) {
+      LOGGER.info(
+          "Ignoring config {} : {}, as store {} is not set up for Active/Active replication in all regions",
+          configType,
+          configValue,
+          storeName);
+      return null;
+    }
+    return configValue;
+  }
+
+  /**
+   * Configures the source fabric to align with the native replication source fabric selection.
+   * <p>
+   * For incremental pushes using a real-time (RT) policy, the push job produces to the parent Kafka cluster.
+   * In such cases, this method ensures that the source fabric is not overridden with the native replication (NR)
+   * source fabric to maintain proper configuration.
+   */
+  protected void configureSourceFabric(
+      Admin admin,
+      Version version,
+      Lazy<Boolean> isActiveActiveReplicationEnabledInAllRegions,
+      RequestTopicForPushRequest request,
+      VersionCreationResponse response) {
+    PushType pushType = request.getPushType();
+    // Handle native replication for non-incremental push types
+    if (version.isNativeReplicationEnabled() && !pushType.isIncremental()) {
+      String childDataCenterKafkaBootstrapServer = version.getPushStreamSourceAddress();
+      if (childDataCenterKafkaBootstrapServer != null) {
+        response.setKafkaBootstrapServers(childDataCenterKafkaBootstrapServer);
+      }
+      response.setKafkaSourceRegion(version.getNativeReplicationSourceFabric());
+    }
+
+    // Handle incremental push with override for source region
+    if (admin.isParent() && pushType.isIncremental()) {
+      overrideSourceRegionAddressForIncrementalPushJob(
+          admin,
+          response,
+          request.getClusterName(),
+          request.getStoreName(),
+          request.getEmergencySourceRegion(),
+          request.getSourceGridFabric(),
+          isActiveActiveReplicationEnabledInAllRegions.get(),
+          version.isNativeReplicationEnabled());
+      LOGGER.info(
+          "Using source region: {} for incremental push job: {} on store: {} cluster: {}",
+          response.getKafkaBootstrapServers(),
+          request.getPushJobId(),
+          request.getStoreName(),
+          request.getClusterName());
+    }
+  }
+
+  protected CompressionStrategy getCompressionStrategy(Version version, String responseTopic) {
+    if (Version.isRealTimeTopic(responseTopic)) {
+      return CompressionStrategy.NO_OP;
+    }
+    return version.getCompressionStrategy();
+  }
+
+  protected String determineResponseTopic(String storeName, Version version, RequestTopicForPushRequest request) {
+    String responseTopic;
+    PushType pushType = request.getPushType();
+    if (pushType == PushType.INCREMENTAL) {
+      // If incremental push with a dedicated real-time topic is enabled then use the separate real-time topic
+      if (version.isSeparateRealTimeTopicEnabled() && request.isSeparateRealTimeTopicEnabled()) {
+        responseTopic = Utils.getSeparateRealTimeTopicName(version);
+      } else {
+        responseTopic = Utils.getRealTimeTopicName(version);
+      }
+    } else if (pushType == PushType.STREAM) {
+      responseTopic = Utils.getRealTimeTopicName(version);
+    } else if (pushType == PushType.STREAM_REPROCESSING) {
+      responseTopic = Version.composeStreamReprocessingTopic(storeName, version.getNumber());
+    } else {
+      responseTopic = version.kafkaTopicName();
+    }
+    return responseTopic;
+  }
+
+  protected void handleNonStreamPushType(
+      Admin admin,
+      Store store,
+      RequestTopicForPushRequest request,
+      VersionCreationResponse response,
+      Lazy<Boolean> isActiveActiveReplicationEnabledInAllRegions) {
+    String clusterName = request.getClusterName();
+    String storeName = request.getStoreName();
+    PushType pushType = request.getPushType();
+    // Check if requestTopicForPush can be handled by child controllers for the given store
+    if (!admin.whetherEnableBatchPushFromAdmin(clusterName, storeName)) {
+      throw new VeniceUnsupportedOperationException(
+          request.getPushType().name(),
+          "Please push data to Venice Parent Colo instead");
+    }
+    int computedPartitionCount = admin.calculateNumberOfPartitions(clusterName, storeName);
+    final Version version = admin.incrementVersionIdempotent(
+        clusterName,
+        storeName,
+        request.getPushJobId(),
+        computedPartitionCount,
+        response.getReplicas(),
+        pushType,
+        request.isSendStartOfPush(),
+        request.isSorted(),
+        request.getCompressionDictionary(),
+        Optional.ofNullable(request.getSourceGridFabric()),
+        Optional.ofNullable(request.getCertificateInRequest()),
+        request.getRewindTimeInSecondsOverride(),
+        Optional.ofNullable(request.getEmergencySourceRegion()),
+        request.isDeferVersionSwap(),
+        request.getTargetedRegions(),
+        request.getRepushSourceVersion(),
+        request.getRepushTtlSeconds());
+
+    // Set the partition count
+    response.setPartitions(version.getPartitionCount());
+    // Set the version number
+    response.setVersion(version.getNumber());
+    // Set the response topic
+    response.setKafkaTopic(determineResponseTopic(storeName, version, request));
+    // Set the compression strategy
+    response.setCompressionStrategy(getCompressionStrategy(version, response.getKafkaTopic()));
+    // Set the bootstrap servers
+    configureSourceFabric(admin, version, isActiveActiveReplicationEnabledInAllRegions, request, response);
+
+    populateDegradedDatacenters(admin, request, response);
+  }
+
+  /**
+   * Populates the degraded datacenters field in the response for non-incremental pushes.
+   * This allows VPJ to detect degraded-mode auto-conversion and accept PARTIALLY_ONLINE.
+   *
+   * <p>Note: We intentionally do NOT exclude hybrid stores here. The auto-conversion guard in
+   * {@code VeniceParentHelixAdmin.incrementVersionIdempotent} skips hybrid stores, but this method
+   * just populates the response field for VPJ detection. Hybrid stores won't be auto-converted,
+   * but VPJ still benefits from knowing which DCs are degraded for logging/metrics.
+   */
+  static void populateDegradedDatacenters(
+      Admin admin,
+      RequestTopicForPushRequest request,
+      VersionCreationResponse response) {
+    // Gate behind isDegradedModeEnabled to avoid the read on every push, consistent with the
+    // same gate in VeniceParentHelixAdmin.incrementVersionIdempotent().
+    if (!request.getPushType().isIncremental() && admin.isDegradedModeEnabled(request.getClusterName())) {
+      Map<String, DegradedDcInfo> degradedDcs = admin.getDegradedDatacenters(request.getClusterName());
+      if (!degradedDcs.isEmpty()) {
+        response.setDegradedDatacenters(new HashSet<>(degradedDcs.keySet()));
+      }
+    }
+  }
+
+  /**
+   * Method handle request to get a topic for pushing data to Venice with {@link PushType#STREAM}
+   */
+  protected void handleStreamPushType(
+      Admin admin,
+      Store store,
+      RequestTopicForPushRequest request,
+      VersionCreationResponse response) {
+    if (admin.isParent()) {
+      throw new VeniceException(
+          "Write operations to the parent region are not permitted with push type: STREAM, as this feature is currently disabled.");
+    }
+
+    Version referenceHybridVersion = admin.getReferenceVersionForStreamingWrites(
+        request.getClusterName(),
+        request.getStoreName(),
+        request.getPushJobId());
+    if (referenceHybridVersion == null) {
+      LOGGER.error(
+          "Request to get topic for STREAM push: {} for store: {} in cluster: {} is rejected as no hybrid version found",
+          request.getPushJobId(),
+          store.getName(),
+          request.getClusterName());
+      throw new VeniceException(
+          "No hybrid version found for store: " + store.getName() + " in cluster: " + request.getClusterName()
+              + ". Create a hybrid version before starting a stream push job.");
+    }
+    response.setPartitions(referenceHybridVersion.getPartitionCount());
+    response.setCompressionStrategy(CompressionStrategy.NO_OP);
+    response.setKafkaTopic(Utils.getRealTimeTopicName(referenceHybridVersion));
+
+    // Override Kafka bootstrap servers if source grid fabric is set and feature is enabled
+    String sourceGridFabric = request.getSourceGridFabric();
+    if (sourceGridFabric != null
+        && admin.getControllerConfig(request.getClusterName()).isEnableStreamPushSourceGridFabricOverride()
+        && referenceHybridVersion.isActiveActiveReplicationEnabled()) {
+      String bootstrapServerAddress = admin.getPubSubBootstrapServersForRegion(sourceGridFabric);
+      if (bootstrapServerAddress == null) {
+        LOGGER.error(
+            "Failed to get the broker server URL for source grid fabric: {} for pushJob: {} store: {} in cluster: {}. Will use default PubSub bootstrap servers.",
+            sourceGridFabric,
+            request.getPushJobId(),
+            store.getName(),
+            request.getClusterName());
+      } else {
+        LOGGER.info(
+            "Stream push job source region is being overridden with: {} address: {} for pushJob: {} on store: {} in cluster: {}",
+            sourceGridFabric,
+            bootstrapServerAddress,
+            request.getPushJobId(),
+            store.getName(),
+            request.getClusterName());
+        response.setKafkaBootstrapServers(bootstrapServerAddress);
+      }
+    }
+  }
+
+  /**
+   * This method is used to handle the request to get a topic for pushing data to Venice.
+   */
+  void handleRequestTopicForPushing(Admin admin, RequestTopicForPushRequest request, VersionCreationResponse response) {
+    String clusterName = request.getClusterName();
+    String storeName = request.getStoreName();
+    response.setCluster(clusterName);
+    response.setName(storeName);
+
+    // Check if the store exists
+    Store store = admin.getStore(clusterName, storeName);
+    if (store == null) {
+      throw new VeniceNoStoreException(storeName, clusterName);
+    }
+
+    // Verify and configure the partitioner
+    verifyAndConfigurePartitionerSettings(store.getPartitionerConfig(), request.getPartitioners(), response);
+
+    // Validate push type
+    validatePushType(request.getPushType(), store);
+
+    // Create aa replication checks with lazy evaluation
+    Lazy<Boolean> isActiveActiveReplicationEnabledInAllRegions =
+        getActiveActiveReplicationCheck(admin, store, clusterName, storeName, false);
+
+    // Validate source and emergency region details and update request object
+    String sourceGridFabric = applyConfigBasedOnReplication(
+        SOURCE_GRID_FABRIC,
+        request.getSourceGridFabric(),
+        storeName,
+        isActiveActiveReplicationEnabledInAllRegions);
+    String emergencySourceRegion = applyConfigBasedOnReplication(
+        EMERGENCY_SOURCE_REGION,
+        admin.getEmergencySourceRegion(clusterName).orElse(null),
+        storeName,
+        isActiveActiveReplicationEnabledInAllRegions);
+
+    request.setSourceGridFabric(sourceGridFabric);
+    request.setEmergencySourceRegion(emergencySourceRegion);
+    LOGGER.info(
+        "Request to push to store: {} in cluster: {} with source grid fabric: {} and emergency source region: {}",
+        storeName,
+        clusterName,
+        sourceGridFabric != null ? sourceGridFabric : "N/A",
+        emergencySourceRegion != null ? emergencySourceRegion : "N/A");
+
+    // Set the store's replication factor and partition count
+    response.setReplicas(admin.getReplicationFactor(clusterName, storeName));
+
+    boolean isSSL = admin.isSSLEnabledForPush(clusterName, storeName);
+    response.setKafkaBootstrapServers(admin.getKafkaBootstrapServers(isSSL));
+    response.setKafkaSourceRegion(admin.getRegionName());
+    response.setEnableSSL(isSSL);
+
+    PushType pushType = request.getPushType();
+    if (pushType == PushType.STREAM) {
+      handleStreamPushType(admin, store, request, response);
+    } else {
+      handleNonStreamPushType(admin, store, request, response, isActiveActiveReplicationEnabledInAllRegions);
+    }
+
+    response.setDaVinciPushStatusStoreEnabled(store.isDaVinciPushStatusStoreEnabled());
+    response.setAmplificationFactor(1);
   }
 
   /**
@@ -82,322 +478,31 @@ public class CreateVersion extends AbstractRoute {
       response.type(HttpConstants.JSON);
       try {
         // Also allow allowList users to run this command
-        if (!isAllowListUser(request)
-            && (!hasWriteAccessToTopic(request) || (this.checkReadMethodForKafka && !hasReadAccessToTopic(request)))) {
-          response.status(HttpStatus.SC_FORBIDDEN);
-          String userId = getPrincipalId(request);
-          String storeName = request.queryParams(NAME);
-
-          /**
-           * When partners have ACL issues for their push, we should provide an accurate and informative messages that
-           * help partners to unblock by themselves.
-           */
-          String errorMsg;
-          boolean missingWriteAccess = !hasWriteAccessToTopic(request);
-          boolean missingReadAccess = this.checkReadMethodForKafka && !hasReadAccessToTopic(request);
-          if (missingWriteAccess && missingReadAccess) {
-            errorMsg = "[Error] Missing [read] and [write] ACLs for user \"" + userId
-                + "\". Please setup ACLs for your store.";
-          } else if (missingWriteAccess) {
-            errorMsg = "[Error] Missing [write] ACLs for user \"" + userId + "\". Please setup ACLs for your store.";
-          } else {
-            errorMsg = "[Error] Missing [read] ACLs for user \"" + userId + "\". Please setup ACLs for your store.";
+        if (!isAllowListUser(request)) {
+          if (!hasWriteAccessToTopic(request)) {
+            buildStoreAclErrorAndThrowException(request, true, false);
           }
-          responseObject.setError(errorMsg);
-          responseObject.setErrorType(ErrorType.BAD_REQUEST);
-          return AdminSparkServer.OBJECT_MAPPER.writeValueAsString(responseObject);
+
+          if (this.checkReadMethodForKafka && !hasReadAccessToTopic(request)) {
+            buildStoreAclErrorAndThrowException(request, false, true);
+          }
         }
 
+        // Validate the request parameters
         AdminSparkServer.validateParams(request, REQUEST_TOPIC.getParams(), admin);
 
-        // Query params
-        String clusterName = request.queryParams(CLUSTER);
-        String storeName = request.queryParams(NAME);
-        Store store = admin.getStore(clusterName, storeName);
-        if (store == null) {
-          throw new VeniceNoStoreException(storeName);
-        }
-        responseObject.setCluster(clusterName);
-        responseObject.setName(storeName);
-        responseObject.setDaVinciPushStatusStoreEnabled(store.isDaVinciPushStatusStoreEnabled());
+        // Extract request parameters and create a RequestTopicForPushRequest object
+        RequestTopicForPushRequest requestTopicForPushRequest = new RequestTopicForPushRequest(
+            request.queryParams(CLUSTER),
+            request.queryParams(NAME),
+            PushType.extractPushType(request.queryParams(PUSH_TYPE)),
+            request.queryParams(PUSH_JOB_ID));
 
-        // Retrieve partitioner config from the store
-        PartitionerConfig storePartitionerConfig = store.getPartitionerConfig();
-        if (request.queryParams(PARTITIONERS) == null) {
-          // Request does not contain partitioner info
-          responseObject.setPartitionerClass(storePartitionerConfig.getPartitionerClass());
-          responseObject.setAmplificationFactor(storePartitionerConfig.getAmplificationFactor());
-          responseObject.setPartitionerParams(storePartitionerConfig.getPartitionerParams());
-        } else {
-          // Retrieve provided partitioner class list from the request
-          boolean hasMatchedPartitioner = false;
-          for (String partitioner: request.queryParams(PARTITIONERS).split(",")) {
-            if (partitioner.equals(storePartitionerConfig.getPartitionerClass())) {
-              responseObject.setPartitionerClass(storePartitionerConfig.getPartitionerClass());
-              responseObject.setAmplificationFactor(storePartitionerConfig.getAmplificationFactor());
-              responseObject.setPartitionerParams(storePartitionerConfig.getPartitionerParams());
-              hasMatchedPartitioner = true;
-              break;
-            }
-          }
-          if (!hasMatchedPartitioner) {
-            throw new VeniceException(
-                "Expected partitioner class " + storePartitionerConfig.getPartitionerClass() + " cannot be found.");
-          }
-        }
+        // populate the request object with optional parameters
+        extractOptionalParamsFromRequestTopicRequest(request, requestTopicForPushRequest, isAclEnabled());
 
-        String pushTypeString = request.queryParams(PUSH_TYPE);
-        PushType pushType;
-        try {
-          pushType = PushType.valueOf(pushTypeString);
-        } catch (RuntimeException e) {
-          throw new VeniceHttpException(
-              HttpStatus.SC_BAD_REQUEST,
-              pushTypeString + " is an invalid " + PUSH_TYPE,
-              e,
-              ErrorType.BAD_REQUEST);
-        }
-        validatePushType(pushType, store);
-
-        boolean sendStartOfPush = false;
-        // Make this optional so that it is compatible with old version controller client
-        if (request.queryParams().contains(SEND_START_OF_PUSH)) {
-          sendStartOfPush = Utils.parseBooleanFromString(request.queryParams(SEND_START_OF_PUSH), SEND_START_OF_PUSH);
-        }
-
-        int replicationFactor = admin.getReplicationFactor(clusterName, storeName);
-        int partitionCount = admin.calculateNumberOfPartitions(clusterName, storeName);
-        responseObject.setReplicas(replicationFactor);
-        responseObject.setPartitions(partitionCount);
-
-        boolean isSSL = admin.isSSLEnabledForPush(clusterName, storeName);
-        responseObject.setKafkaBootstrapServers(admin.getKafkaBootstrapServers(isSSL));
-        responseObject.setKafkaSourceRegion(admin.getRegionName());
-        responseObject.setEnableSSL(isSSL);
-
-        String pushJobId = request.queryParams(PUSH_JOB_ID);
-
-        boolean sorted = false; // an inefficient but safe default
-        String sortedParam = request.queryParams(PUSH_IN_SORTED_ORDER);
-        if (sortedParam != null) {
-          sorted = Utils.parseBooleanFromString(sortedParam, PUSH_IN_SORTED_ORDER);
-        }
-
-        boolean isWriteComputeEnabled = false;
-        String wcEnabledParam = request.queryParams(IS_WRITE_COMPUTE_ENABLED);
-        if (wcEnabledParam != null) {
-          isWriteComputeEnabled = Utils.parseBooleanFromString(wcEnabledParam, IS_WRITE_COMPUTE_ENABLED);
-        }
-
-        Optional<String> sourceGridFabric = Optional.ofNullable(request.queryParams(SOURCE_GRID_FABRIC));
-
-        /**
-         * We can't honor source grid fabric and emergency source region config untill the store is A/A enabled in all regions. This is because
-         * if push job start producing to a different prod region then non A/A enabled region will not have the capability to consume from that region.
-         * This resets this config in such cases.
-         */
-        Lazy<Boolean> isActiveActiveReplicationEnabledInAllRegion = Lazy.of(() -> {
-          if (admin.isParent() && store.isActiveActiveReplicationEnabled()) {
-            return admin.isActiveActiveReplicationEnabledInAllRegion(clusterName, storeName, false);
-          } else {
-            return false;
-          }
-        });
-
-        Lazy<Boolean> isActiveActiveReplicationEnabledInAllRegionAllVersions = Lazy.of(() -> {
-          if (admin.isParent() && store.isActiveActiveReplicationEnabled()) {
-            return admin.isActiveActiveReplicationEnabledInAllRegion(clusterName, storeName, true);
-          } else {
-            return false;
-          }
-        });
-
-        if (sourceGridFabric.isPresent() && !isActiveActiveReplicationEnabledInAllRegion.get()) {
-          LOGGER.info(
-              "Ignoring config {} : {}, as store {} is not set up for Active/Active replication in all regions",
-              SOURCE_GRID_FABRIC,
-              sourceGridFabric.get(),
-              storeName);
-          sourceGridFabric = Optional.empty();
-        }
-        Optional<String> emergencySourceRegion = admin.getEmergencySourceRegion(clusterName);
-        if (emergencySourceRegion.isPresent() && !isActiveActiveReplicationEnabledInAllRegion.get()) {
-          LOGGER.info(
-              "Ignoring config {} : {}, as store {} is not set up for Active/Active replication in all regions",
-              EMERGENCY_SOURCE_REGION,
-              emergencySourceRegion.get(),
-              storeName);
-        }
-        LOGGER.info(
-            "requestTopicForPushing: source grid fabric: {}, emergency source region: {}",
-            sourceGridFabric.orElse(""),
-            emergencySourceRegion.orElse(""));
-
-        /**
-         * Version-level rewind time override, and it is only valid for hybrid stores.
-         */
-        Optional<String> rewindTimeInSecondsOverrideOptional =
-            Optional.ofNullable(request.queryParams(REWIND_TIME_IN_SECONDS_OVERRIDE));
-        long rewindTimeInSecondsOverride = -1;
-        if (rewindTimeInSecondsOverrideOptional.isPresent()) {
-          rewindTimeInSecondsOverride = Long.parseLong(rewindTimeInSecondsOverrideOptional.get());
-        }
-
-        /**
-         * Version level override to defer marking this new version to the serving version post push completion.
-         */
-        boolean deferVersionSwap = Boolean.parseBoolean(request.queryParams(DEFER_VERSION_SWAP));
-
-        String targetedRegions = request.queryParams(TARGETED_REGIONS);
-
-        int repushSourceVersion = Integer.parseInt(request.queryParamOrDefault(REPUSH_SOURCE_VERSION, "-1"));
-
-        switch (pushType) {
-          case BATCH:
-          case INCREMENTAL:
-          case STREAM_REPROCESSING:
-            if (!admin.whetherEnableBatchPushFromAdmin(storeName)) {
-              throw new VeniceUnsupportedOperationException(
-                  pushTypeString,
-                  "Please push data to Venice Parent Colo instead");
-            }
-            String dictionaryStr = request.queryParams(COMPRESSION_DICTIONARY);
-
-            /**
-             * Before trying to get the version, create the RT topic in parent kafka since it's needed anyway in following cases.
-             * Otherwise topic existence check fails internally.
-             */
-            if (pushType.isIncremental() && isWriteComputeEnabled) {
-              admin.getRealTimeTopic(clusterName, storeName);
-            }
-
-            final Optional<X509Certificate> certInRequest =
-                isAclEnabled() ? Optional.of(getCertificate(request)) : Optional.empty();
-            final Version version = admin.incrementVersionIdempotent(
-                clusterName,
-                storeName,
-                pushJobId,
-                partitionCount,
-                replicationFactor,
-                pushType,
-                sendStartOfPush,
-                sorted,
-                dictionaryStr,
-                sourceGridFabric,
-                certInRequest,
-                rewindTimeInSecondsOverride,
-                emergencySourceRegion,
-                deferVersionSwap,
-                targetedRegions,
-                repushSourceVersion);
-
-            // If Version partition count different from calculated partition count use the version count as store count
-            // may have been updated later.
-            if (version.getPartitionCount() != partitionCount) {
-              responseObject.setPartitions(version.getPartitionCount());
-            }
-            String responseTopic;
-            /**
-             * Override the source fabric to respect the native replication source fabric selection.
-             */
-            boolean overrideSourceFabric = true;
-            boolean isTopicRT = false;
-            if (pushType.isStreamReprocessing()) {
-              responseTopic = Version.composeStreamReprocessingTopic(storeName, version.getNumber());
-            } else if (pushType.isIncremental()) {
-              isTopicRT = true;
-              responseTopic = Version.composeRealTimeTopic(storeName);
-              // disable amplificationFactor logic on real-time topic
-              responseObject.setAmplificationFactor(1);
-
-              if (version.isNativeReplicationEnabled()) {
-                /**
-                 * For incremental push with RT policy store the push job produces to parent corp kafka cluster. We should not override the
-                 * source fabric in such cases with NR source fabric.
-                 */
-                overrideSourceFabric = false;
-              }
-            } else {
-              responseTopic = version.kafkaTopicName();
-            }
-
-            responseObject.setVersion(version.getNumber());
-            responseObject.setKafkaTopic(responseTopic);
-            if (isTopicRT) {
-              // RT topic only supports NO_OP compression
-              responseObject.setCompressionStrategy(CompressionStrategy.NO_OP);
-            } else {
-              responseObject.setCompressionStrategy(version.getCompressionStrategy());
-            }
-            if (version.isNativeReplicationEnabled() && overrideSourceFabric) {
-              String childDataCenterKafkaBootstrapServer = version.getPushStreamSourceAddress();
-              if (childDataCenterKafkaBootstrapServer != null) {
-                responseObject.setKafkaBootstrapServers(childDataCenterKafkaBootstrapServer);
-              }
-              responseObject.setKafkaSourceRegion(version.getNativeReplicationSourceFabric());
-            }
-
-            if (pushType.isIncremental() && admin.isParent()) {
-              overrideSourceRegionAddressForIncrementalPushJob(
-                  admin,
-                  responseObject,
-                  clusterName,
-                  emergencySourceRegion.orElse(null),
-                  sourceGridFabric.orElse(null),
-                  isActiveActiveReplicationEnabledInAllRegion.get(),
-                  version.isNativeReplicationEnabled());
-              LOGGER.info(
-                  "Incremental push job final source region address is: {}",
-                  responseObject.getKafkaBootstrapServers());
-            }
-            break;
-          case STREAM:
-
-            if (admin.isParent()) {
-
-              // Conditionally check if the controller allows for fetching this information
-              if (disableParentRequestTopicForStreamPushes) {
-                throw new VeniceException(
-                    String.format(
-                        "Parent request topic is disabled!!  Cannot push data to topic in parent colo for store %s.  Aborting!!",
-                        storeName));
-              }
-
-              // Conditionally check if this store has aggregate mode enabled. If not, throw an exception (as aggregate
-              // mode is required to produce to parent colo)
-              // We check the store config instead of the version config because we want this policy to go into affect
-              // without needing to perform empty pushes everywhere
-              if (!store.getHybridStoreConfig().getDataReplicationPolicy().equals(DataReplicationPolicy.AGGREGATE)) {
-                if (!isActiveActiveReplicationEnabledInAllRegionAllVersions.get()) {
-                  throw new VeniceException("Store is not in aggregate mode!  Cannot push data to parent topic!!");
-                } else {
-                  LOGGER.info(
-                      "Store: {} samza job running in Aggregate mode, Store config is in Non-Aggregate mode, "
-                          + "AA is enabled in all regions, letting the job continue",
-                      storeName);
-                }
-              }
-            } else {
-              if (store.getHybridStoreConfig().getDataReplicationPolicy().equals(DataReplicationPolicy.AGGREGATE)) {
-                if (!store.isActiveActiveReplicationEnabled()) {
-                  throw new VeniceException("Store is in aggregate mode!  Cannot push data to child topic!!");
-                } else {
-                  LOGGER.info(
-                      "Store: {} samza job running in Non-Aggregate mode, Store config is in Aggregate mode, "
-                          + "AA is enabled in the local region, letting the job continue",
-                      storeName);
-                }
-              }
-            }
-
-            String realTimeTopic = admin.getRealTimeTopic(clusterName, storeName);
-            responseObject.setKafkaTopic(realTimeTopic);
-            // disable amplificationFactor logic on real-time topic
-            responseObject.setAmplificationFactor(1);
-            break;
-          default:
-            throw new VeniceException(pushTypeString + " is an unrecognized " + PUSH_TYPE);
-        }
+        // Invoke the handler to get the topic for pushing data
+        handleRequestTopicForPushing(admin, requestTopicForPushRequest, responseObject);
       } catch (Throwable e) {
         responseObject.setError(e);
         AdminSparkServer.handleError(e, request, response);
@@ -405,6 +510,29 @@ public class CreateVersion extends AbstractRoute {
 
       return AdminSparkServer.OBJECT_MAPPER.writeValueAsString(responseObject);
     };
+  }
+
+  /**
+   * When partners have ACL issues for their push, we should provide an accurate and informative messages that
+   * help partners to unblock by themselves.
+   */
+  private void buildStoreAclErrorAndThrowException(
+      Request request,
+      boolean missingWriteAccess,
+      boolean missingReadAccess) {
+    // Status is set authoritatively by AdminSparkServer.handleError() from
+    // VeniceStoreAclException.getHttpStatusCode() (403) when the exception below is caught.
+    String userId = getPrincipalId(request);
+    String errorMessage = "Missing [%s] ACLs for user \"" + userId + "\". Please setup ACLs for your store.";
+    if (missingWriteAccess) {
+      errorMessage = String.format(errorMessage, "write");
+    } else if (missingReadAccess) {
+      errorMessage = String.format(errorMessage, "read");
+    } else {
+      errorMessage = String.format(errorMessage, "read and write");
+    }
+
+    throw new VeniceStoreAclException(errorMessage);
   }
 
   /**
@@ -422,6 +550,7 @@ public class CreateVersion extends AbstractRoute {
       Admin admin,
       VersionCreationResponse response,
       String clusterName,
+      String storeName,
       String emergencySourceRegion,
       String pushJobSourceGridFabric,
       boolean isAAEnabledInAllRegions,
@@ -429,7 +558,17 @@ public class CreateVersion extends AbstractRoute {
     if (!isAAEnabledInAllRegions && isNativeReplicationEnabled) {
       // P2: When AA is not enabled in all the regions we use aggregate RT address, if it is available,
       // for inc-pushes if native-replication is enabled.
-      admin.getAggregateRealTimeTopicSource(clusterName).ifPresent(response::setKafkaBootstrapServers);
+      Optional<String> aggregateRealTimeTopicSource = admin.getAggregateRealTimeTopicSource(clusterName);
+      if (aggregateRealTimeTopicSource.isPresent()) {
+        response.setKafkaBootstrapServers(aggregateRealTimeTopicSource.get());
+        LOGGER.info(
+            "Incremental push job source region is being overridden with: {} address: {} for store: {} in cluster: {}",
+            aggregateRealTimeTopicSource.get(),
+            response.getKafkaBootstrapServers(),
+            storeName,
+            clusterName);
+      }
+
       return;
     } else if (!isAAEnabledInAllRegions) {
       // When AA is not enabled in all regions and native replication is also disabled, don't do anything.
@@ -446,18 +585,20 @@ public class CreateVersion extends AbstractRoute {
     if (overRideSourceRegion == null) {
       return;
     }
-    String bootstrapServerAddress = admin.getNativeReplicationKafkaBootstrapServerAddress(overRideSourceRegion);
+    String bootstrapServerAddress = admin.getPubSubBootstrapServersForRegion(overRideSourceRegion);
     if (bootstrapServerAddress == null) {
       throw new VeniceException("Failed to get the broker server URL for the source region: " + overRideSourceRegion);
     }
     LOGGER.info(
-        "Incremental push job source region is being overridden with: {} address: {}",
+        "Incremental push job source region is being overridden with: {} address: {} for store: {} in cluster: {}",
         overRideSourceRegion,
-        bootstrapServerAddress);
+        bootstrapServerAddress,
+        storeName,
+        clusterName);
     response.setKafkaBootstrapServers(bootstrapServerAddress);
   }
 
-  private void validatePushType(PushType pushType, Store store) {
+  static void validatePushType(PushType pushType, Store store) {
     if (pushType.equals(PushType.STREAM) && !store.isHybrid()) {
       throw new VeniceHttpException(
           HttpStatus.SC_BAD_REQUEST,
@@ -465,29 +606,19 @@ public class CreateVersion extends AbstractRoute {
               + " which is not configured to be a hybrid store",
           ErrorType.BAD_REQUEST);
     }
-    if (pushType.equals(PushType.STREAM)
-        && store.getHybridStoreConfig().getDataReplicationPolicy().equals(DataReplicationPolicy.NONE)) {
+    if (pushType.isIncremental() && !store.isHybrid()) {
       throw new VeniceHttpException(
           HttpStatus.SC_BAD_REQUEST,
-          "requesting topic for streaming writes to store " + store.getName()
-              + " which is configured to have a hybrid data replication policy "
-              + store.getHybridStoreConfig().getDataReplicationPolicy(),
+          "requesting topic for incremental push to store: " + store.getName()
+              + " which does not have hybrid mode enabled.",
           ErrorType.BAD_REQUEST);
     }
-    if (pushType.isIncremental()) {
-      if (!store.isIncrementalPushEnabled()) {
-        throw new VeniceHttpException(
-            HttpStatus.SC_BAD_REQUEST,
-            "requesting topic for incremental push to store: " + store.getName()
-                + " which does not have incremental push enabled.",
-            ErrorType.BAD_REQUEST);
-      } else if (!store.isHybrid()) {
-        throw new VeniceHttpException(
-            HttpStatus.SC_BAD_REQUEST,
-            "requesting topic for incremental push to store: " + store.getName()
-                + " which does not have hybrid mode enabled.",
-            ErrorType.BAD_REQUEST);
-      }
+    if (pushType.isIncremental() && !store.isIncrementalPushEnabled()) {
+      throw new VeniceHttpException(
+          HttpStatus.SC_BAD_REQUEST,
+          "requesting topic for incremental push to store: " + store.getName()
+              + " which does not have incremental push enabled.",
+          ErrorType.BAD_REQUEST);
     }
   }
 
@@ -556,6 +687,7 @@ public class CreateVersion extends AbstractRoute {
             rewindTimeInSecondsOverride,
             replicationMetadataVersionId,
             false,
+            -1,
             -1);
         responseObject.setCluster(clusterName);
         responseObject.setName(storeName);
@@ -625,7 +757,24 @@ public class CreateVersion extends AbstractRoute {
         responseObject.setCluster(clusterName);
         responseObject.setName(storeName);
 
-        admin.writeEndOfPush(clusterName, storeName, versionNumber, false);
+        String partitionRecordCountsJson = request.queryParams(PARTITION_RECORD_COUNTS);
+        Map<Integer, Long> partitionRecordCounts = Collections.emptyMap();
+        if (partitionRecordCountsJson != null && !partitionRecordCountsJson.isEmpty()) {
+          try {
+            partitionRecordCounts = AdminSparkServer.OBJECT_MAPPER
+                .readValue(partitionRecordCountsJson, new TypeReference<Map<Integer, Long>>() {
+                });
+          } catch (JsonProcessingException jpe) {
+            throw new VeniceHttpException(
+                HttpStatus.SC_BAD_REQUEST,
+                "Malformed " + PARTITION_RECORD_COUNTS + " query parameter for store " + storeName + " version "
+                    + versionNumber + ": " + jpe.getOriginalMessage(),
+                ErrorType.BAD_REQUEST);
+          }
+        }
+        // alsoWriteStartOfPush is hardcoded false for this route (current contract). If this route ever needs to
+        // support alsoWriteStartOfPush=true, change this single literal rather than two branches.
+        admin.writeEndOfPush(clusterName, storeName, versionNumber, false, partitionRecordCounts);
 
       } catch (Throwable e) {
         responseObject.setError(e);
@@ -652,19 +801,55 @@ public class CreateVersion extends AbstractRoute {
         AdminSparkServer.validateParams(request, EMPTY_PUSH.getParams(), admin);
 
         String storeName = request.queryParams(NAME);
-        if (!admin.whetherEnableBatchPushFromAdmin(storeName)) {
+        clusterName = request.queryParams(CLUSTER);
+        if (!admin.whetherEnableBatchPushFromAdmin(clusterName, storeName)) {
           throw new VeniceUnsupportedOperationException(
               "EMPTY PUSH",
               "Please push data to Venice Parent Colo instead or use Aggregate mode if you are running Samza GF Job.");
         }
 
-        clusterName = request.queryParams(CLUSTER);
         String pushJobId = request.queryParams(PUSH_JOB_ID);
         int partitionNum = admin.calculateNumberOfPartitions(clusterName, storeName);
         int replicationFactor = admin.getReplicationFactor(clusterName, storeName);
-        version = admin.incrementVersionIdempotent(clusterName, storeName, pushJobId, partitionNum, replicationFactor);
-        int versionNumber = version.getNumber();
 
+        Store store = admin.getStore(clusterName, storeName);
+        if (store == null) {
+          LOGGER.error(
+              "Request to empty push with job id: {} for store: {} in cluster: {} is rejected as no store found",
+              pushJobId,
+              storeName,
+              clusterName);
+          throw new VeniceNoStoreException(storeName, clusterName);
+        }
+
+        Set<Version> previousVersions = new HashSet<>(store.getVersions());
+        boolean isDeferredVersionSwapForEmptyPushEnabled = admin.isDeferredVersionSwapForEmptyPushEnabled(storeName);
+        if (isDeferredVersionSwapForEmptyPushEnabled) {
+          String targetRegion = admin.getDeferredVersionSwapRegionRollforwardOrder(storeName);
+          version = admin.incrementVersionIdempotent(
+              clusterName,
+              storeName,
+              pushJobId,
+              partitionNum,
+              replicationFactor,
+              Version.PushType.BATCH,
+              true,
+              false,
+              null,
+              Optional.empty(),
+              Optional.empty(),
+              -1,
+              Optional.empty(),
+              true,
+              targetRegion,
+              -1,
+              -1);
+        } else {
+          version =
+              admin.incrementVersionIdempotent(clusterName, storeName, pushJobId, partitionNum, replicationFactor);
+        }
+
+        int versionNumber = version.getNumber();
         responseObject.setCluster(clusterName);
         responseObject.setName(storeName);
         responseObject.setVersion(versionNumber);
@@ -673,7 +858,20 @@ public class CreateVersion extends AbstractRoute {
         responseObject.setKafkaTopic(version.kafkaTopicName());
         responseObject.setKafkaBootstrapServers(version.getPushStreamSourceAddress());
 
-        admin.writeEndOfPush(clusterName, storeName, versionNumber, true);
+        if (!previousVersions.contains(version)) {
+          LOGGER.info(
+              "Sending SOP and EOP for empty push job: {} for store: {} in cluster: {}",
+              pushJobId,
+              storeName,
+              clusterName);
+          admin.writeEndOfPush(clusterName, storeName, versionNumber, true);
+        } else {
+          LOGGER.info(
+              "Empty push job: {} for store: {} in cluster: {} is a duplicate empty push. No new version was created and no SOP/EOP was sent again.",
+              pushJobId,
+              storeName,
+              clusterName);
+        }
 
         /** TODO: Poll {@link com.linkedin.venice.controller.VeniceParentHelixAdmin#getOffLineJobStatus(String, String, Map, TopicManager)} until it is terminal... */
 

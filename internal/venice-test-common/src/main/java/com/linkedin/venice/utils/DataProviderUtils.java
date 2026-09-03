@@ -6,8 +6,10 @@ import static com.linkedin.venice.compression.CompressionStrategy.ZSTD_WITH_DICT
 
 import com.linkedin.avroutil1.compatibility.AvroCompatibilityHelper;
 import com.linkedin.davinci.client.DaVinciConfig;
+import com.linkedin.davinci.ingestion.utils.IngestionTaskReusableObjects;
+import com.linkedin.davinci.kafka.consumer.KafkaConsumerService;
 import com.linkedin.davinci.store.cache.backend.ObjectCacheConfig;
-import com.linkedin.venice.meta.IngestionMode;
+import com.linkedin.venice.kafka.validation.checksum.CheckSumType;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
@@ -24,8 +26,11 @@ import org.testng.collections.Lists;
 public class DataProviderUtils {
   public static final Object[] BOOLEAN = { false, true };
   public static final Object[] BOOLEAN_FALSE = { false };
+  public static final Object[] OPTIONAL_BOOLEAN = { false, true, null };
   public static final Object[] COMPRESSION_STRATEGIES = { NO_OP, GZIP, ZSTD_WITH_DICT };
   public static final Object[] PARTITION_COUNTS = { 1, 2, 3, 4, 8, 10, 16, 19, 92, 128 };
+
+  public static final Object[] CHECKSUM_TYPES = { CheckSumType.MD5, CheckSumType.ADHASH };
 
   /**
    * To use these data providers, add (dataProvider = "<provider_name>", dataProviderClass = DataProviderUtils.class)
@@ -46,6 +51,11 @@ public class DataProviderUtils {
     return allPermutationGenerator(BOOLEAN, BOOLEAN);
   }
 
+  @DataProvider(name = "Boolean-and-Optional-Boolean")
+  public static Object[][] booleanAndOptionalBoolean() {
+    return allPermutationGenerator(BOOLEAN, OPTIONAL_BOOLEAN);
+  }
+
   @DataProvider(name = "Three-True-and-False")
   public static Object[][] threeBoolean() {
     return allPermutationGenerator(BOOLEAN, BOOLEAN, BOOLEAN);
@@ -59,6 +69,16 @@ public class DataProviderUtils {
   @DataProvider(name = "Five-True-and-False")
   public static Object[][] fiveBoolean() {
     return allPermutationGenerator(BOOLEAN, BOOLEAN, BOOLEAN, BOOLEAN, BOOLEAN);
+  }
+
+  @DataProvider(name = "Six-True-and-False", parallel = true)
+  public static Object[][] sixBoolean() {
+    return allPermutationGenerator(BOOLEAN, BOOLEAN, BOOLEAN, BOOLEAN, BOOLEAN, BOOLEAN);
+  }
+
+  @DataProvider(name = "CheckpointingSupported-CheckSum-Types")
+  public static Object[][] checkpointingSupportedCheckSumTypes() {
+    return new Object[][] { { CheckSumType.MD5 }, { CheckSumType.ADHASH } };
   }
 
   @DataProvider(name = "dv-client-config-provider")
@@ -77,9 +97,9 @@ public class DataProviderUtils {
     return new Object[][] { { 1 }, { 3 } };
   }
 
-  @DataProvider(name = "Isolated-Ingestion")
-  public static Object[][] isolatedIngestion() {
-    return new Object[][] { { IngestionMode.BUILT_IN }, { IngestionMode.ISOLATED } };
+  @DataProvider(name = "D2-Client-Enabled")
+  public static Object[][] d2ClientEnabled() {
+    return new Object[][] { { true }, { false } };
   }
 
   @DataProvider(name = "Chunking-And-Partition-Counts")
@@ -92,9 +112,19 @@ public class DataProviderUtils {
     return allPermutationGenerator(BOOLEAN, COMPRESSION_STRATEGIES);
   }
 
+  @DataProvider(name = "Compression-Boolean")
+  public static Object[][] compressionBoolean() {
+    return allPermutationGenerator(COMPRESSION_STRATEGIES, BOOLEAN);
+  }
+
   @DataProvider(name = "Boolean-Boolean-Compression")
   public static Object[][] booleanBooleanCompression() {
     return allPermutationGenerator(BOOLEAN, BOOLEAN, COMPRESSION_STRATEGIES);
+  }
+
+  @DataProvider(name = "Boolean-Checksum")
+  public static Object[][] booleanChecksumType() {
+    return allPermutationGenerator(BOOLEAN, CHECKSUM_TYPES);
   }
 
   @DataProvider(name = "All-Avro-Schemas-Except-Null-And-Union")
@@ -126,6 +156,16 @@ public class DataProviderUtils {
     }
 
     return resultingArray.toArray(new Object[resultingArray.size()][]);
+  }
+
+  @DataProvider(name = "sharedConsumerStrategy")
+  public static Object[][] sharedConsumerStrategy() {
+    return allPermutationGenerator(KafkaConsumerService.ConsumerAssignmentStrategy.values());
+  }
+
+  @DataProvider(name = "ingestionTaskReusableObjectsStrategy")
+  public static Object[][] ingestionTaskReusableObjectsStrategy() {
+    return allPermutationGenerator(IngestionTaskReusableObjects.Strategy.values());
   }
 
   /**

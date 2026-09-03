@@ -1,13 +1,16 @@
 package com.linkedin.venice.hadoop.input.recordreader.avro;
 
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.DEFAULT_EXTENDED_SCHEMA_VALIDITY_CHECK_ENABLED;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.ETL_VALUE_SCHEMA_TRANSFORMATION;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.EXTENDED_SCHEMA_VALIDITY_CHECK_ENABLED;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.GENERATE_PARTIAL_UPDATE_RECORD_FROM_INPUT;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.KEY_FIELD_PROP;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.SCHEMA_STRING_PROP;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.UPDATE_SCHEMA_STRING_PROP;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.VALUE_FIELD_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.DEFAULT_EXTENDED_SCHEMA_VALIDITY_CHECK_ENABLED;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.ETL_VALUE_SCHEMA_TRANSFORMATION;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.EXTENDED_SCHEMA_VALIDITY_CHECK_ENABLED;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.GENERATE_PARTIAL_UPDATE_RECORD_FROM_INPUT;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.KEY_FIELD_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.RMD_FIELD_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.SCHEMA_STRING_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.UPDATE_SCHEMA_STRING_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VALUE_FIELD_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.WRITER_RMD_SCHEMA_STRING_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.WRITER_VALUE_SCHEMA_STRING_PROP;
 
 import com.linkedin.venice.etl.ETLValueSchemaTransformation;
 import com.linkedin.venice.schema.AvroSchemaParseUtils;
@@ -33,9 +36,30 @@ public class VeniceAvroRecordReader extends AbstractAvroRecordReader<AvroWrapper
       Schema dataSchema,
       String keyFieldStr,
       String valueFieldStr,
+      String rmdFieldStr,
       ETLValueSchemaTransformation etlValueSchemaTransformation,
       Schema updateSchema) {
-    super(dataSchema, keyFieldStr, valueFieldStr, etlValueSchemaTransformation, updateSchema);
+    this(dataSchema, keyFieldStr, valueFieldStr, rmdFieldStr, etlValueSchemaTransformation, updateSchema, null, null);
+  }
+
+  public VeniceAvroRecordReader(
+      Schema dataSchema,
+      String keyFieldStr,
+      String valueFieldStr,
+      String rmdFieldStr,
+      ETLValueSchemaTransformation etlValueSchemaTransformation,
+      Schema updateSchema,
+      Schema writerValueSchema,
+      Schema writerRmdSchema) {
+    super(
+        dataSchema,
+        keyFieldStr,
+        valueFieldStr,
+        rmdFieldStr,
+        etlValueSchemaTransformation,
+        updateSchema,
+        writerValueSchema,
+        writerRmdSchema);
   }
 
   public static VeniceAvroRecordReader fromProps(VeniceProperties props) {
@@ -45,6 +69,7 @@ public class VeniceAvroRecordReader extends AbstractAvroRecordReader<AvroWrapper
 
     String keyFieldStr = props.getString(KEY_FIELD_PROP);
     String valueFieldStr = props.getString(VALUE_FIELD_PROP);
+    String rmdFieldStr = props.getOrDefault(RMD_FIELD_PROP, "");
 
     ETLValueSchemaTransformation etlValueSchemaTransformation = ETLValueSchemaTransformation
         .valueOf(props.getString(ETL_VALUE_SCHEMA_TRANSFORMATION, ETLValueSchemaTransformation.NONE.name()));
@@ -56,12 +81,27 @@ public class VeniceAvroRecordReader extends AbstractAvroRecordReader<AvroWrapper
           AvroSchemaParseUtils.parseSchemaFromJSONLooseValidation(props.getString(UPDATE_SCHEMA_STRING_PROP));
     }
 
+    Schema writerValueSchema = null;
+    String writerValueSchemaString = props.getString(WRITER_VALUE_SCHEMA_STRING_PROP, "");
+    if (!writerValueSchemaString.isEmpty()) {
+      writerValueSchema = AvroSchemaParseUtils.parseSchemaFromJSONLooseValidation(writerValueSchemaString);
+    }
+
+    Schema writerRmdSchema = null;
+    String writerRmdSchemaString = props.getString(WRITER_RMD_SCHEMA_STRING_PROP, "");
+    if (!writerRmdSchemaString.isEmpty()) {
+      writerRmdSchema = AvroSchemaParseUtils.parseSchemaFromJSONLooseValidation(writerRmdSchemaString);
+    }
+
     return new VeniceAvroRecordReader(
         dataSchema,
         keyFieldStr,
         valueFieldStr,
+        rmdFieldStr,
         etlValueSchemaTransformation,
-        updateSchema);
+        updateSchema,
+        writerValueSchema,
+        writerRmdSchema);
   }
 
   @Override

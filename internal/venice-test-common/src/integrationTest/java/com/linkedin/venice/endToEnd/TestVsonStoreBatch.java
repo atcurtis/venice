@@ -1,12 +1,5 @@
 package com.linkedin.venice.endToEnd;
 
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.DATA_WRITER_COMPUTE_JOB_CLASS;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.KAFKA_INPUT_BROKER_URL;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.KAFKA_INPUT_MAX_RECORDS_PER_MAPPER;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.KAFKA_INPUT_TOPIC;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.KEY_FIELD_PROP;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.SOURCE_KAFKA;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.VALUE_FIELD_PROP;
 import static com.linkedin.venice.utils.IntegrationTestPushUtils.createStoreForJob;
 import static com.linkedin.venice.utils.IntegrationTestPushUtils.defaultVPJPropsWithoutD2Routing;
 import static com.linkedin.venice.utils.TestWriteUtils.getTempDataDirectory;
@@ -16,6 +9,14 @@ import static com.linkedin.venice.utils.TestWriteUtils.writeMultiLevelVsonFile2;
 import static com.linkedin.venice.utils.TestWriteUtils.writeSimpleVsonFile;
 import static com.linkedin.venice.utils.TestWriteUtils.writeSimpleVsonFileWithUserSchema;
 import static com.linkedin.venice.utils.TestWriteUtils.writeVsonByteAndShort;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.DATA_WRITER_COMPUTE_JOB_CLASS;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.KAFKA_INPUT_MAX_RECORDS_PER_MAPPER;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.KAFKA_INPUT_TOPIC;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.KEY_FIELD_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.SOURCE_KAFKA;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.SPARK_NATIVE_INPUT_FORMAT_ENABLED;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VALUE_FIELD_PROP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_REPUSH_SOURCE_PUBSUB_BROKER;
 
 import com.linkedin.venice.client.store.AvroGenericStoreClient;
 import com.linkedin.venice.client.store.ClientConfig;
@@ -23,12 +24,14 @@ import com.linkedin.venice.client.store.ClientFactory;
 import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.controllerapi.ControllerClient;
 import com.linkedin.venice.controllerapi.UpdateStoreQueryParams;
-import com.linkedin.venice.hadoop.spark.datawriter.jobs.DataWriterSparkJob;
 import com.linkedin.venice.integration.utils.ServiceFactory;
+import com.linkedin.venice.integration.utils.VeniceClusterCreateOptions;
 import com.linkedin.venice.integration.utils.VeniceClusterWrapper;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.schema.vson.VsonAvroSchemaAdapter;
 import com.linkedin.venice.schema.vson.VsonSchema;
+import com.linkedin.venice.spark.datawriter.jobs.DataWriterSparkJob;
+import com.linkedin.venice.utils.IntegrationTestPushUtils;
 import com.linkedin.venice.utils.KeyAndValueSchemas;
 import com.linkedin.venice.utils.Pair;
 import com.linkedin.venice.utils.TestWriteUtils;
@@ -68,7 +71,9 @@ public class TestVsonStoreBatch {
 
   @BeforeClass
   public void setUp() {
-    veniceCluster = ServiceFactory.getVeniceCluster();
+    VeniceClusterCreateOptions options =
+        new VeniceClusterCreateOptions.Builder().numberOfControllers(1).numberOfServers(1).numberOfRouters(1).build();
+    veniceCluster = ServiceFactory.getVeniceCluster(options);
     controllerClient = new ControllerClient(
         veniceCluster.getClusterName(),
         veniceCluster.getLeaderVeniceController().getControllerUrl());
@@ -266,7 +271,8 @@ public class TestVsonStoreBatch {
         properties -> {
           properties.setProperty(SOURCE_KAFKA, "true");
           properties.setProperty(KAFKA_INPUT_TOPIC, Version.composeKafkaTopic(storeName, 1));
-          properties.setProperty(KAFKA_INPUT_BROKER_URL, veniceCluster.getPubSubBrokerWrapper().getAddress());
+          properties
+              .setProperty(VENICE_REPUSH_SOURCE_PUBSUB_BROKER, veniceCluster.getPubSubBrokerWrapper().getAddress());
           properties.setProperty(KAFKA_INPUT_MAX_RECORDS_PER_MAPPER, "5");
         },
         validator,
@@ -322,6 +328,7 @@ public class TestVsonStoreBatch {
       String inputDirPath = "file://" + inputDir.getAbsolutePath();
       Properties props = defaultVPJPropsWithoutD2Routing(veniceCluster, inputDirPath, storeName);
       props.setProperty(DATA_WRITER_COMPUTE_JOB_CLASS, DataWriterSparkJob.class.getCanonicalName());
+      props.setProperty(SPARK_NATIVE_INPUT_FORMAT_ENABLED, String.valueOf(true));
       extraProps.accept(props);
 
       if (!storeNameOptional.isPresent()) {
@@ -338,7 +345,7 @@ public class TestVsonStoreBatch {
       }
 
       LOGGER.info("Start of push job #" + testBatchStoreRunCount.get());
-      TestWriteUtils.runPushJob("Test Batch push job", props);
+      IntegrationTestPushUtils.runVPJ(props);
       LOGGER.info("End of push job #" + testBatchStoreRunCount.get());
       MetricsRepository metricsRepository = new MetricsRepository();
       avroClient = ClientFactory.getAndStartGenericAvroClient(

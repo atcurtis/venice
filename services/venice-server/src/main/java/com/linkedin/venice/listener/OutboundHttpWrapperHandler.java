@@ -10,11 +10,12 @@ import static io.netty.handler.codec.http.HttpVersion.HTTP_1_1;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.linkedin.davinci.listener.response.AdminResponse;
 import com.linkedin.davinci.listener.response.MetadataResponse;
-import com.linkedin.davinci.listener.response.ReadResponse;
+import com.linkedin.davinci.listener.response.ReplicaIngestionResponse;
 import com.linkedin.davinci.listener.response.ServerCurrentVersionResponse;
-import com.linkedin.davinci.listener.response.TopicPartitionIngestionContextResponse;
+import com.linkedin.davinci.listener.response.StorePropertiesPayload;
 import com.linkedin.venice.HttpConstants;
 import com.linkedin.venice.compression.CompressionStrategy;
+import com.linkedin.venice.listener.response.AbstractReadResponse;
 import com.linkedin.venice.listener.response.BinaryResponse;
 import com.linkedin.venice.listener.response.HttpShortcutResponse;
 import com.linkedin.venice.utils.ExceptionUtils;
@@ -52,9 +53,11 @@ public class OutboundHttpWrapperHandler extends ChannelOutboundHandlerAdapter {
     int responseRcu = 1;
     CompressionStrategy compressionStrategy = CompressionStrategy.NO_OP;
     boolean isStreamingResponse = false;
+
+    FullHttpResponse response = null;
     try {
-      if (msg instanceof ReadResponse) {
-        ReadResponse obj = (ReadResponse) msg;
+      if (msg instanceof AbstractReadResponse) {
+        AbstractReadResponse obj = (AbstractReadResponse) msg;
         ServerStatsContext statsContext = statsHandler.getServerStatsContext();
         setStats(statsContext, obj);
 
@@ -62,9 +65,11 @@ public class OutboundHttpWrapperHandler extends ChannelOutboundHandlerAdapter {
         if (obj.isFound()) {
           body = obj.getResponseBody();
           schemaIdHeader = obj.getResponseSchemaIdHeader();
+          statsContext.setResponseSize(body.readableBytes());
         } else {
           body = Unpooled.EMPTY_BUFFER;
           responseStatus = NOT_FOUND;
+          statsContext.setResponseSize(0);
         }
         isStreamingResponse = obj.isStreamingResponse();
         responseRcu = obj.getRCU();
@@ -74,9 +79,10 @@ public class OutboundHttpWrapperHandler extends ChannelOutboundHandlerAdapter {
         responseStatus = shortcutResponse.getStatus();
         String message = shortcutResponse.getMessage();
         if (message == null) {
-          message = "";
+          body = Unpooled.EMPTY_BUFFER;
+        } else {
+          body = Unpooled.wrappedBuffer(message.getBytes(StandardCharsets.UTF_8));
         }
-        body = Unpooled.wrappedBuffer(message.getBytes(StandardCharsets.UTF_8));
         contentType = HttpConstants.TEXT_PLAIN;
         if (shortcutResponse.getStatus().equals(VeniceRequestEarlyTerminationException.getHttpResponseStatus())) {
           statsHandler.setRequestTerminatedEarly();
@@ -118,6 +124,20 @@ public class OutboundHttpWrapperHandler extends ChannelOutboundHandlerAdapter {
           contentType = HttpConstants.TEXT_PLAIN;
           responseStatus = INTERNAL_SERVER_ERROR;
         }
+      } else if (msg instanceof StorePropertiesPayload) {
+        StorePropertiesPayload storePropertiesPayload = (StorePropertiesPayload) msg;
+        if (!storePropertiesPayload.isError()) {
+          body = storePropertiesPayload.getResponseBody();
+          schemaIdHeader = storePropertiesPayload.getResponseSchemaIdHeader();
+        } else {
+          String errorMessage = storePropertiesPayload.getMessage();
+          if (errorMessage == null) {
+            errorMessage = "Unknown error";
+          }
+          body = Unpooled.wrappedBuffer(errorMessage.getBytes(StandardCharsets.UTF_8));
+          contentType = HttpConstants.TEXT_PLAIN;
+          responseStatus = INTERNAL_SERVER_ERROR;
+        }
       } else if (msg instanceof ServerCurrentVersionResponse) {
         ServerCurrentVersionResponse currentVersionResponse = (ServerCurrentVersionResponse) msg;
         if (!currentVersionResponse.isError()) {
@@ -132,15 +152,15 @@ public class OutboundHttpWrapperHandler extends ChannelOutboundHandlerAdapter {
           responseStatus = INTERNAL_SERVER_ERROR;
         }
       } else if (msg instanceof DefaultFullHttpResponse) {
-        ctx.writeAndFlush(msg);
-        return;
-      } else if (msg instanceof TopicPartitionIngestionContextResponse) {
-        TopicPartitionIngestionContextResponse topicPartitionIngestionContextResponse =
-            (TopicPartitionIngestionContextResponse) msg;
-        if (!topicPartitionIngestionContextResponse.isError()) {
-          body = Unpooled.wrappedBuffer(OBJECT_MAPPER.writeValueAsBytes(topicPartitionIngestionContextResponse));
+        responseStatus = ((DefaultFullHttpResponse) msg).getStatus();
+        response = (DefaultFullHttpResponse) msg;
+        body = response.content();
+      } else if (msg instanceof ReplicaIngestionResponse) {
+        ReplicaIngestionResponse replicaIngestionResponse = (ReplicaIngestionResponse) msg;
+        if (!replicaIngestionResponse.isError()) {
+          body = Unpooled.wrappedBuffer(OBJECT_MAPPER.writeValueAsBytes(replicaIngestionResponse));
         } else {
-          String errorMessage = topicPartitionIngestionContextResponse.getMessage();
+          String errorMessage = replicaIngestionResponse.getMessage();
           if (errorMessage == null) {
             errorMessage = "Unknown error";
           }
@@ -165,7 +185,12 @@ public class OutboundHttpWrapperHandler extends ChannelOutboundHandlerAdapter {
       statsHandler.setResponseStatus(responseStatus);
     }
 
-    FullHttpResponse response = new DefaultFullHttpResponse(HTTP_1_1, responseStatus, body);
+    if (response != null) {
+      ctx.writeAndFlush(response);
+      return;
+    }
+
+    response = new DefaultFullHttpResponse(HTTP_1_1, responseStatus, body);
     response.headers().set(CONTENT_TYPE, contentType);
     response.headers().set(CONTENT_LENGTH, body.readableBytes());
     response.headers().set(HttpConstants.VENICE_COMPRESSION_STRATEGY, compressionStrategy.getValue());
@@ -183,22 +208,7 @@ public class OutboundHttpWrapperHandler extends ChannelOutboundHandlerAdapter {
     ctx.writeAndFlush(response);
   }
 
-  public void setStats(ServerStatsContext statsContext, ReadResponse obj) {
-    statsContext.setDatabaseLookupLatency(obj.getDatabaseLookupLatency());
-    statsContext.setStorageExecutionHandlerSubmissionWaitTime(obj.getStorageExecutionHandlerSubmissionWaitTime());
-    statsContext.setStorageExecutionQueueLen(obj.getStorageExecutionQueueLen());
-    statsContext.setSuccessRequestKeyCount(obj.getRecordCount());
-    statsContext.setMultiChunkLargeValueCount(obj.getMultiChunkLargeValueCount());
-    statsContext.setReadComputeLatency(obj.getReadComputeLatency());
-    statsContext.setReadComputeDeserializationLatency(obj.getReadComputeDeserializationLatency());
-    statsContext.setReadComputeSerializationLatency(obj.getReadComputeSerializationLatency());
-    statsContext.setDotProductCount(obj.getDotProductCount());
-    statsContext.setCosineSimilarityCount(obj.getCosineSimilarityCount());
-    statsContext.setHadamardProductCount(obj.getHadamardProductCount());
-    statsContext.setCountOperatorCount(obj.getCountOperatorCount());
-    statsContext.setKeySizeList(obj.getKeySizeList());
-    statsContext.setValueSizeList(obj.getValueSizeList());
-    statsContext.setValueSize(obj.getValueSize());
-    statsContext.setReadComputeOutputSize(obj.getReadComputeOutputSize());
+  public void setStats(ServerStatsContext statsContext, AbstractReadResponse obj) {
+    statsContext.setReadResponseStats(obj.getStatsRecorder());
   }
 }

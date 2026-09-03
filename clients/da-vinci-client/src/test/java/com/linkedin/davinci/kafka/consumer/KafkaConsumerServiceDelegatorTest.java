@@ -1,27 +1,52 @@
 package com.linkedin.davinci.kafka.consumer;
 
+import static com.linkedin.venice.ConfigKeys.KAFKA_BOOTSTRAP_SERVERS;
+import static com.linkedin.venice.utils.TestUtils.waitForNonDeterministicAssertion;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.verify;
-import static org.testng.Assert.assertFalse;
+import static org.mockito.Mockito.when;
 import static org.testng.Assert.assertTrue;
 
 import com.linkedin.davinci.config.VeniceServerConfig;
 import com.linkedin.davinci.ingestion.consumption.ConsumedDataReceiver;
+import com.linkedin.davinci.stats.AggKafkaConsumerServiceStats;
+import com.linkedin.venice.meta.ReadOnlyStoreRepository;
+import com.linkedin.venice.meta.Version;
+import com.linkedin.venice.pubsub.PubSubClientsFactory;
+import com.linkedin.venice.pubsub.PubSubConsumerAdapterContext;
+import com.linkedin.venice.pubsub.PubSubConsumerAdapterFactory;
+import com.linkedin.venice.pubsub.PubSubContext;
+import com.linkedin.venice.pubsub.PubSubPositionTypeRegistry;
 import com.linkedin.venice.pubsub.PubSubTopicPartitionImpl;
 import com.linkedin.venice.pubsub.PubSubTopicRepository;
+import com.linkedin.venice.pubsub.adapter.kafka.common.ApacheKafkaOffsetPosition;
+import com.linkedin.venice.pubsub.adapter.kafka.consumer.ApacheKafkaConsumerAdapter;
+import com.linkedin.venice.pubsub.api.PubSubMessageDeserializer;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
 import com.linkedin.venice.pubsub.api.PubSubTopic;
 import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
+import com.linkedin.venice.server.VersionRole;
+import com.linkedin.venice.utils.SystemTime;
+import com.linkedin.venice.utils.Utils;
+import io.tehuti.metrics.MetricsRepository;
+import io.tehuti.metrics.Sensor;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Properties;
 import java.util.Set;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.BiFunction;
-import java.util.function.Function;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import org.testng.Assert;
 import org.testng.annotations.DataProvider;
 import org.testng.annotations.Test;
 
@@ -31,95 +56,24 @@ public class KafkaConsumerServiceDelegatorTest {
   private static final String VERSION_TOPIC_NAME = "test_store_v1";
   private static final String RT_TOPIC_NAME = "test_store_rt";
   private static final int PARTITION_ID = 1;
+  private static final PubSubPosition position0 = ApacheKafkaOffsetPosition.of(0);
 
   @DataProvider(name = "Method-List")
   public static Object[][] methodList() {
     return new Object[][] { { "getConsumerAssignedToVersionTopicPartition" }, { "assignConsumerFor" },
-        { "unSubscribe" }, { "getOffsetLagBasedOnMetrics" }, { "getLatestOffsetBasedOnMetrics" } };
-  }
-
-  @Test(dataProvider = "Method-List")
-  public void chooseConsumerServiceTest(String methodName)
-      throws NoSuchMethodException, InvocationTargetException, IllegalAccessException {
-    KafkaConsumerService mockDefaultConsumerService = mock(KafkaConsumerService.class);
-    KafkaConsumerService mockDedicatedConsumerService = mock(KafkaConsumerService.class);
-    VeniceServerConfig mockConfig = mock(VeniceServerConfig.class);
-    doReturn(true).when(mockConfig).isDedicatedConsumerPoolForAAWCLeaderEnabled();
-
-    Function<String, Boolean> isAAWCStoreFunc = vt -> true;
-    BiFunction<Integer, String, KafkaConsumerService> consumerServiceConstructor =
-        (ignored, statSuffix) -> statSuffix.isEmpty() ? mockDefaultConsumerService : mockDedicatedConsumerService;
-
-    KafkaConsumerServiceDelegator delegator =
-        new KafkaConsumerServiceDelegator(mockConfig, consumerServiceConstructor, isAAWCStoreFunc);
-
-    PubSubTopic versionTopic = TOPIC_REPOSITORY.getTopic(VERSION_TOPIC_NAME);
-    PubSubTopic rtTopic = TOPIC_REPOSITORY.getTopic(RT_TOPIC_NAME);
-    PubSubTopicPartition topicPartitionForVT = new PubSubTopicPartitionImpl(versionTopic, PARTITION_ID);
-    PubSubTopicPartition topicPartitionForRT = new PubSubTopicPartitionImpl(rtTopic, PARTITION_ID);
-
-    Method testMethod =
-        KafkaConsumerServiceDelegator.class.getMethod(methodName, PubSubTopic.class, PubSubTopicPartition.class);
-    Method verifyMethod =
-        KafkaConsumerService.class.getMethod(methodName, PubSubTopic.class, PubSubTopicPartition.class);
-
-    testMethod.invoke(delegator, versionTopic, topicPartitionForVT);
-    verifyMethod.invoke(verify(mockDefaultConsumerService), versionTopic, topicPartitionForVT);
-    verifyMethod.invoke(verify(mockDedicatedConsumerService, never()), versionTopic, topicPartitionForVT);
-    reset(mockDefaultConsumerService);
-    reset(mockDedicatedConsumerService);
-    testMethod.invoke(delegator, versionTopic, topicPartitionForRT);
-    verifyMethod.invoke(verify(mockDedicatedConsumerService), versionTopic, topicPartitionForRT);
-    verifyMethod.invoke(verify(mockDefaultConsumerService, never()), versionTopic, topicPartitionForRT);
-    reset(mockDefaultConsumerService);
-    reset(mockDedicatedConsumerService);
-
-    isAAWCStoreFunc = vt -> false;
-    delegator = new KafkaConsumerServiceDelegator(mockConfig, consumerServiceConstructor, isAAWCStoreFunc);
-
-    testMethod.invoke(delegator, versionTopic, topicPartitionForVT);
-    verifyMethod.invoke(verify(mockDefaultConsumerService), versionTopic, topicPartitionForVT);
-    verifyMethod.invoke(verify(mockDedicatedConsumerService, never()), versionTopic, topicPartitionForVT);
-    reset(mockDefaultConsumerService);
-    reset(mockDedicatedConsumerService);
-    testMethod.invoke(delegator, versionTopic, topicPartitionForRT);
-    verifyMethod.invoke(verify(mockDefaultConsumerService), versionTopic, topicPartitionForRT);
-    verifyMethod.invoke(verify(mockDedicatedConsumerService, never()), versionTopic, topicPartitionForRT);
-  }
-
-  @Test
-  public void unsubscribeAllTest() {
-    KafkaConsumerService mockDefaultConsumerService = mock(KafkaConsumerService.class);
-    KafkaConsumerService mockDedicatedConsumerService = mock(KafkaConsumerService.class);
-    VeniceServerConfig mockConfig = mock(VeniceServerConfig.class);
-    doReturn(true).when(mockConfig).isDedicatedConsumerPoolForAAWCLeaderEnabled();
-
-    Function<String, Boolean> isAAWCStoreFunc = vt -> true;
-    BiFunction<Integer, String, KafkaConsumerService> consumerServiceConstructor =
-        (ignored, statSuffix) -> statSuffix.isEmpty() ? mockDefaultConsumerService : mockDedicatedConsumerService;
-
-    KafkaConsumerServiceDelegator delegator =
-        new KafkaConsumerServiceDelegator(mockConfig, consumerServiceConstructor, isAAWCStoreFunc);
-    PubSubTopic versionTopic = TOPIC_REPOSITORY.getTopic(VERSION_TOPIC_NAME);
-    delegator.unsubscribeAll(versionTopic);
-    verify(mockDefaultConsumerService).unsubscribeAll(versionTopic);
-    verify(mockDedicatedConsumerService).unsubscribeAll(versionTopic);
+        { "unSubscribe" }, { "getLatestOffsetBasedOnMetrics" } };
   }
 
   @Test
   public void batchUnsubscribe_start_stop_getMaxElapsedTimeMSSinceLastPollInConsumerPool_hasAnySubscriptionFor_Test()
       throws Exception {
-    KafkaConsumerService mockDefaultConsumerService = mock(KafkaConsumerService.class);
-    KafkaConsumerService mockDedicatedConsumerService = mock(KafkaConsumerService.class);
+    KafkaConsumerService mockConsumerService = mock(KafkaConsumerService.class);
     VeniceServerConfig mockConfig = mock(VeniceServerConfig.class);
-    doReturn(true).when(mockConfig).isDedicatedConsumerPoolForAAWCLeaderEnabled();
+    doReturn(true).when(mockConfig).isResubscriptionTriggeredByVersionIngestionContextChangeEnabled();
+    KafkaConsumerServiceDelegator.KafkaConsumerServiceBuilder consumerServiceBuilder =
+        (ignored, poolType) -> mockConsumerService;
 
-    Function<String, Boolean> isAAWCStoreFunc = vt -> true;
-    BiFunction<Integer, String, KafkaConsumerService> consumerServiceConstructor =
-        (ignored, statSuffix) -> statSuffix.isEmpty() ? mockDefaultConsumerService : mockDedicatedConsumerService;
-
-    KafkaConsumerServiceDelegator delegator =
-        new KafkaConsumerServiceDelegator(mockConfig, consumerServiceConstructor, isAAWCStoreFunc);
+    KafkaConsumerServiceDelegator delegator = new KafkaConsumerServiceDelegator(mockConfig, consumerServiceBuilder);
     PubSubTopic versionTopic = TOPIC_REPOSITORY.getTopic(VERSION_TOPIC_NAME);
     PubSubTopic rtTopic = TOPIC_REPOSITORY.getTopic(RT_TOPIC_NAME);
     PubSubTopicPartition topicPartitionForVT = new PubSubTopicPartitionImpl(versionTopic, PARTITION_ID);
@@ -128,161 +82,302 @@ public class KafkaConsumerServiceDelegatorTest {
     partitionSet.add(topicPartitionForVT);
     partitionSet.add(topicPartitionForRT);
 
-    delegator.batchUnsubscribe(versionTopic, partitionSet);
-    verify(mockDefaultConsumerService).batchUnsubscribe(versionTopic, partitionSet);
-    verify(mockDedicatedConsumerService).batchUnsubscribe(versionTopic, partitionSet);
+    ConsumedDataReceiver dataReceiver = mock(ConsumedDataReceiver.class);
+    doReturn(versionTopic).when(dataReceiver).destinationIdentifier();
 
-    reset(mockDefaultConsumerService);
-    reset(mockDedicatedConsumerService);
+    PartitionReplicaIngestionContext topicPartitionIngestionContextForVT = new PartitionReplicaIngestionContext(
+        versionTopic,
+        topicPartitionForVT,
+        VersionRole.CURRENT,
+        PartitionReplicaIngestionContext.WorkloadType.NON_AA_OR_WRITE_COMPUTE);
+    delegator.startConsumptionIntoDataReceiver(topicPartitionIngestionContextForVT, position0, dataReceiver, false);
+    PartitionReplicaIngestionContext topicPartitionIngestionContextForRT = new PartitionReplicaIngestionContext(
+        versionTopic,
+        topicPartitionForRT,
+        VersionRole.CURRENT,
+        PartitionReplicaIngestionContext.WorkloadType.NON_AA_OR_WRITE_COMPUTE);
+    delegator.startConsumptionIntoDataReceiver(topicPartitionIngestionContextForRT, position0, dataReceiver, false);
+
+    reset(mockConsumerService);
     delegator.startInner();
-    verify(mockDefaultConsumerService).start();
-    verify(mockDedicatedConsumerService).start();
+    // All 5 pool services are the same mock, so start() is called 5 times.
+    verify(mockConsumerService, atLeast(1)).start();
 
-    reset(mockDefaultConsumerService);
-    reset(mockDedicatedConsumerService);
+    reset(mockConsumerService);
     delegator.stopInner();
-    verify(mockDefaultConsumerService).stop();
-    verify(mockDedicatedConsumerService).stop();
+    verify(mockConsumerService, atLeast(1)).stop();
 
-    reset(mockDefaultConsumerService);
-    reset(mockDedicatedConsumerService);
-    delegator.getMaxElapsedTimeMSSinceLastPollInConsumerPool();
-    verify(mockDedicatedConsumerService).getMaxElapsedTimeMSSinceLastPollInConsumerPool();
-    verify(mockDefaultConsumerService).getMaxElapsedTimeMSSinceLastPollInConsumerPool();
-
-    reset(mockDefaultConsumerService);
-    reset(mockDedicatedConsumerService);
-    doReturn(false).when(mockDefaultConsumerService).hasAnySubscriptionFor(any());
-    doReturn(true).when(mockDedicatedConsumerService).hasAnySubscriptionFor(any());
-    assertTrue(delegator.hasAnySubscriptionFor(versionTopic));
-    verify(mockDedicatedConsumerService).hasAnySubscriptionFor(versionTopic);
-    verify(mockDefaultConsumerService).hasAnySubscriptionFor(versionTopic);
-
-    reset(mockDefaultConsumerService);
-    reset(mockDedicatedConsumerService);
-    doReturn(true).when(mockDefaultConsumerService).hasAnySubscriptionFor(any());
-    doReturn(true).when(mockDedicatedConsumerService).hasAnySubscriptionFor(any());
-    assertTrue(delegator.hasAnySubscriptionFor(versionTopic));
-    verify(mockDedicatedConsumerService, never()).hasAnySubscriptionFor(versionTopic);
-    verify(mockDefaultConsumerService).hasAnySubscriptionFor(versionTopic);
-
-    reset(mockDefaultConsumerService);
-    reset(mockDedicatedConsumerService);
-    doReturn(false).when(mockDefaultConsumerService).hasAnySubscriptionFor(any());
-    doReturn(false).when(mockDedicatedConsumerService).hasAnySubscriptionFor(any());
-    assertFalse(delegator.hasAnySubscriptionFor(versionTopic));
-    verify(mockDedicatedConsumerService).hasAnySubscriptionFor(versionTopic);
-    verify(mockDefaultConsumerService).hasAnySubscriptionFor(versionTopic);
-
-    // When dedicated consumer pool is disabled.
-    reset(mockConfig);
-    doReturn(false).when(mockConfig).isDedicatedConsumerPoolForAAWCLeaderEnabled();
-    delegator = new KafkaConsumerServiceDelegator(mockConfig, consumerServiceConstructor, isAAWCStoreFunc);
-    reset(mockDefaultConsumerService);
-    reset(mockDedicatedConsumerService);
-    delegator.startInner();
-    verify(mockDefaultConsumerService).start();
-    verify(mockDedicatedConsumerService, never()).start();
-
-    reset(mockDefaultConsumerService);
-    reset(mockDedicatedConsumerService);
-    delegator.stopInner();
-    verify(mockDefaultConsumerService).stop();
-    verify(mockDedicatedConsumerService, never()).stop();
-
-    reset(mockDefaultConsumerService);
-    reset(mockDedicatedConsumerService);
+    reset(mockConsumerService);
     delegator.batchUnsubscribe(versionTopic, partitionSet);
-    verify(mockDefaultConsumerService).batchUnsubscribe(versionTopic, partitionSet);
-    verify(mockDedicatedConsumerService, never()).batchUnsubscribe(versionTopic, partitionSet);
+    verify(mockConsumerService, atLeast(1)).batchUnsubscribe(versionTopic, partitionSet);
 
-    reset(mockDefaultConsumerService);
-    reset(mockDedicatedConsumerService);
+    reset(mockConsumerService);
     delegator.getMaxElapsedTimeMSSinceLastPollInConsumerPool();
-    verify(mockDefaultConsumerService).getMaxElapsedTimeMSSinceLastPollInConsumerPool();
-    verify(mockDedicatedConsumerService, never()).getMaxElapsedTimeMSSinceLastPollInConsumerPool();
-  }
-
-  @Test
-  public void consumerAssignmentStickiness() {
-    KafkaConsumerService mockDefaultConsumerService = mock(KafkaConsumerService.class);
-    KafkaConsumerService mockDedicatedConsumerService = mock(KafkaConsumerService.class);
-    VeniceServerConfig mockConfig = mock(VeniceServerConfig.class);
-    doReturn(true).when(mockConfig).isDedicatedConsumerPoolForAAWCLeaderEnabled();
-
-    AtomicBoolean retValueForIsAAWCStoreFunc = new AtomicBoolean(false);
-    Function<String, Boolean> isAAWCStoreFunc = vt -> retValueForIsAAWCStoreFunc.get();
-    BiFunction<Integer, String, KafkaConsumerService> consumerServiceConstructor =
-        (ignored, statSuffix) -> statSuffix.isEmpty() ? mockDefaultConsumerService : mockDedicatedConsumerService;
-
-    KafkaConsumerServiceDelegator delegator =
-        new KafkaConsumerServiceDelegator(mockConfig, consumerServiceConstructor, isAAWCStoreFunc);
-
-    PubSubTopic versionTopic = TOPIC_REPOSITORY.getTopic(VERSION_TOPIC_NAME);
-    PubSubTopic rtTopic = TOPIC_REPOSITORY.getTopic(RT_TOPIC_NAME);
-    PubSubTopicPartition topicPartitionForRT = new PubSubTopicPartitionImpl(rtTopic, PARTITION_ID);
-
-    delegator.assignConsumerFor(versionTopic, topicPartitionForRT);
-    verify(mockDefaultConsumerService).assignConsumerFor(versionTopic, topicPartitionForRT);
-    verify(mockDedicatedConsumerService, never()).assignConsumerFor(versionTopic, topicPartitionForRT);
-
-    reset(mockDefaultConsumerService);
-    reset(mockDedicatedConsumerService);
-    // Change the AAWC flag
-    retValueForIsAAWCStoreFunc.set(true);
-    delegator.unSubscribe(versionTopic, topicPartitionForRT);
-    verify(mockDefaultConsumerService).unSubscribe(versionTopic, topicPartitionForRT);
-    verify(mockDedicatedConsumerService, never()).unSubscribe(versionTopic, topicPartitionForRT);
+    verify(mockConsumerService, atLeast(1)).getMaxElapsedTimeMSSinceLastPollInConsumerPool();
   }
 
   @Test
   public void startConsumptionIntoDataReceiverTest() {
-    KafkaConsumerService mockDefaultConsumerService = mock(KafkaConsumerService.class);
-    KafkaConsumerService mockDedicatedConsumerService = mock(KafkaConsumerService.class);
     VeniceServerConfig mockConfig = mock(VeniceServerConfig.class);
-    doReturn(true).when(mockConfig).isDedicatedConsumerPoolForAAWCLeaderEnabled();
 
-    Function<String, Boolean> isAAWCStoreFunc = vt -> true;
-    BiFunction<Integer, String, KafkaConsumerService> consumerServiceConstructor =
-        (ignored, statSuffix) -> statSuffix.isEmpty() ? mockDefaultConsumerService : mockDedicatedConsumerService;
+    KafkaConsumerServiceDelegator.KafkaConsumerServiceBuilder consumerServiceBuilder;
 
-    KafkaConsumerServiceDelegator delegator =
-        new KafkaConsumerServiceDelegator(mockConfig, consumerServiceConstructor, isAAWCStoreFunc);
+    KafkaConsumerServiceDelegator delegator;
     PubSubTopic versionTopic = TOPIC_REPOSITORY.getTopic(VERSION_TOPIC_NAME);
     PubSubTopic rtTopic = TOPIC_REPOSITORY.getTopic(RT_TOPIC_NAME);
-    PubSubTopicPartition topicPartitionForVT = new PubSubTopicPartitionImpl(versionTopic, PARTITION_ID);
-    PubSubTopicPartition topicPartitionForRT = new PubSubTopicPartitionImpl(rtTopic, PARTITION_ID);
 
     ConsumedDataReceiver dataReceiver = mock(ConsumedDataReceiver.class);
-    doReturn(versionTopic).when(dataReceiver).destinationIdentifier();
 
-    delegator.startConsumptionIntoDataReceiver(topicPartitionForVT, 0, dataReceiver);
-    verify(mockDefaultConsumerService).startConsumptionIntoDataReceiver(topicPartitionForVT, 0, dataReceiver);
-    verify(mockDedicatedConsumerService, never())
-        .startConsumptionIntoDataReceiver(topicPartitionForVT, 0, dataReceiver);
+    // Test current version prioritization strategy
+    PartitionReplicaIngestionContext tpForCurrentAAWCLeader = new PartitionReplicaIngestionContext(
+        versionTopic,
+        new PubSubTopicPartitionImpl(rtTopic, PARTITION_ID),
+        VersionRole.CURRENT,
+        PartitionReplicaIngestionContext.WorkloadType.AA_OR_WRITE_COMPUTE);
+    PartitionReplicaIngestionContext tpForCurrentAAWCFollower = new PartitionReplicaIngestionContext(
+        versionTopic,
+        new PubSubTopicPartitionImpl(versionTopic, PARTITION_ID),
+        VersionRole.CURRENT,
+        PartitionReplicaIngestionContext.WorkloadType.AA_OR_WRITE_COMPUTE);
 
-    reset(mockDefaultConsumerService);
-    reset(mockDedicatedConsumerService);
-    delegator.startConsumptionIntoDataReceiver(topicPartitionForRT, 0, dataReceiver);
-    verify(mockDefaultConsumerService, never()).startConsumptionIntoDataReceiver(topicPartitionForRT, 0, dataReceiver);
-    verify(mockDedicatedConsumerService).startConsumptionIntoDataReceiver(topicPartitionForRT, 0, dataReceiver);
+    PubSubTopic futureVersionTopic = TOPIC_REPOSITORY.getTopic("test_store_v2");
+    PartitionReplicaIngestionContext tpForNonCurrentAAWCLeader = new PartitionReplicaIngestionContext(
+        versionTopic,
+        new PubSubTopicPartitionImpl(rtTopic, PARTITION_ID),
+        VersionRole.FUTURE,
+        PartitionReplicaIngestionContext.WorkloadType.AA_OR_WRITE_COMPUTE);
+    PartitionReplicaIngestionContext tpForNonCurrentAAWCFollower = new PartitionReplicaIngestionContext(
+        versionTopic,
+        new PubSubTopicPartitionImpl(futureVersionTopic, PARTITION_ID),
+        VersionRole.BACKUP,
+        PartitionReplicaIngestionContext.WorkloadType.AA_OR_WRITE_COMPUTE);
 
-    // Test non-AA/WC cases
-    isAAWCStoreFunc = vt -> false;
-    delegator = new KafkaConsumerServiceDelegator(mockConfig, consumerServiceConstructor, isAAWCStoreFunc);
+    doReturn(true).when(mockConfig).isResubscriptionTriggeredByVersionIngestionContextChangeEnabled();
+    doReturn(KafkaConsumerServiceDelegator.ConsumerPoolStrategyType.CURRENT_VERSION_PRIORITIZATION).when(mockConfig)
+        .getConsumerPoolStrategyType();
 
-    reset(mockDefaultConsumerService);
-    reset(mockDedicatedConsumerService);
-    delegator.startConsumptionIntoDataReceiver(topicPartitionForVT, 0, dataReceiver);
-    verify(mockDefaultConsumerService).startConsumptionIntoDataReceiver(topicPartitionForVT, 0, dataReceiver);
-    verify(mockDedicatedConsumerService, never())
-        .startConsumptionIntoDataReceiver(topicPartitionForVT, 0, dataReceiver);
+    KafkaConsumerService consumerServiceForCurrentVersionAAWCLeader = mock(KafkaConsumerService.class);
+    KafkaConsumerService consumerServiceForCurrentVersionNonAAWCLeader = mock(KafkaConsumerService.class);
+    KafkaConsumerService consumerServiceForNonCurrentVersionAAWCLeader = mock(KafkaConsumerService.class);
+    KafkaConsumerService consumerServiceForNonCurrentVersionNonAAWCLeader = mock(KafkaConsumerService.class);
 
-    reset(mockDefaultConsumerService);
-    reset(mockDedicatedConsumerService);
-    delegator.startConsumptionIntoDataReceiver(topicPartitionForRT, 0, dataReceiver);
-    verify(mockDefaultConsumerService).startConsumptionIntoDataReceiver(topicPartitionForRT, 0, dataReceiver);
-    verify(mockDedicatedConsumerService, never())
-        .startConsumptionIntoDataReceiver(topicPartitionForRT, 0, dataReceiver);
+    Map<PartitionReplicaIngestionContext, KafkaConsumerService> consumerServiceMap = new HashMap<>();
+    consumerServiceMap.put(tpForCurrentAAWCLeader, consumerServiceForCurrentVersionAAWCLeader);
+    consumerServiceMap.put(tpForCurrentAAWCFollower, consumerServiceForCurrentVersionNonAAWCLeader);
+    consumerServiceMap.put(tpForNonCurrentAAWCLeader, consumerServiceForNonCurrentVersionAAWCLeader);
+    consumerServiceMap.put(tpForNonCurrentAAWCFollower, consumerServiceForNonCurrentVersionNonAAWCLeader);
+
+    consumerServiceBuilder = (ignored, poolType) -> {
+      if (poolType.equals(ConsumerPoolType.CURRENT_VERSION_AA_WC_LEADER_POOL)) {
+        return consumerServiceForCurrentVersionAAWCLeader;
+      } else if (poolType.equals(ConsumerPoolType.CURRENT_VERSION_NON_AA_WC_LEADER_POOL)) {
+        return consumerServiceForCurrentVersionNonAAWCLeader;
+      } else if (poolType.equals(ConsumerPoolType.NON_CURRENT_VERSION_AA_WC_LEADER_POOL)) {
+        return consumerServiceForNonCurrentVersionAAWCLeader;
+      } else if (poolType.equals(ConsumerPoolType.NON_CURRENT_VERSION_NON_AA_WC_LEADER_POOL)) {
+        return consumerServiceForNonCurrentVersionNonAAWCLeader;
+      }
+      return null;
+    };
+
+    delegator = new KafkaConsumerServiceDelegator(mockConfig, consumerServiceBuilder);
+    verifyConsumerServiceStartConsumptionIntoDataReceiver(
+        delegator,
+        consumerServiceMap,
+        tpForCurrentAAWCLeader,
+        dataReceiver);
+    verifyConsumerServiceStartConsumptionIntoDataReceiver(
+        delegator,
+        consumerServiceMap,
+        tpForCurrentAAWCFollower,
+        dataReceiver);
+    verifyConsumerServiceStartConsumptionIntoDataReceiver(
+        delegator,
+        consumerServiceMap,
+        tpForNonCurrentAAWCFollower,
+        dataReceiver);
+    verifyConsumerServiceStartConsumptionIntoDataReceiver(
+        delegator,
+        consumerServiceMap,
+        tpForNonCurrentAAWCLeader,
+        dataReceiver);
+  }
+
+  private void verifyConsumerServiceStartConsumptionIntoDataReceiver(
+      KafkaConsumerServiceDelegator delegator,
+      Map<PartitionReplicaIngestionContext, KafkaConsumerService> consumerServiceMap,
+      PartitionReplicaIngestionContext partitionReplicaIngestionContext,
+      ConsumedDataReceiver dataReceiver) {
+    delegator.startConsumptionIntoDataReceiver(partitionReplicaIngestionContext, position0, dataReceiver, false);
+    for (Map.Entry<PartitionReplicaIngestionContext, KafkaConsumerService> entry: consumerServiceMap.entrySet()) {
+      if (entry.getKey().equals(partitionReplicaIngestionContext)) {
+        verify(entry.getValue())
+            .startConsumptionIntoDataReceiver(partitionReplicaIngestionContext, position0, dataReceiver, false);
+      } else {
+        verify(entry.getValue(), never())
+            .startConsumptionIntoDataReceiver(partitionReplicaIngestionContext, position0, dataReceiver, false);
+      }
+    }
+    for (KafkaConsumerService consumerService: consumerServiceMap.values()) {
+      reset(consumerService);
+    }
+    delegator.unSubscribe(
+        partitionReplicaIngestionContext.getVersionTopic(),
+        partitionReplicaIngestionContext.getPubSubTopicPartition());
+  }
+
+  /**
+   * This test simulates multiple threads resubscribing to the same real-time topic partition for different store
+   * versions. It verifies if the lock effectively protects the handoff between {@link ConsumptionTask} and
+   * {@link ConsumedDataReceiver} during the re-subscription process. Previously, an unprotected handoff led to an
+   * {@link IllegalStateException} being thrown within {@link ConsumptionTask#setDataReceiver}.
+   * To induce the race condition, we assume there are 5 store versions, with each version assigned to a dedicated
+   * thread that continuously resubscribes to the same real-time topic partition. This continues until either a race
+   * condition is encountered or the test times out (30 seconds).
+   */
+  @Test
+  public void testKafkaConsumerServiceResubscriptionConcurrency() throws Exception {
+    ApacheKafkaConsumerAdapter consumer1 = mock(ApacheKafkaConsumerAdapter.class);
+    PubSubConsumerAdapterFactory factory = mock(PubSubConsumerAdapterFactory.class);
+    when(factory.create(any(PubSubConsumerAdapterContext.class))).thenReturn(consumer1);
+
+    Properties properties = new Properties();
+    String testKafkaUrl = "test_kafka_url";
+    properties.put(KAFKA_BOOTSTRAP_SERVERS, testKafkaUrl);
+    MetricsRepository mockMetricsRepository = mock(MetricsRepository.class);
+    final Sensor mockSensor = mock(Sensor.class);
+    doReturn(mockSensor).when(mockMetricsRepository).sensor(anyString(), any());
+
+    int versionNum = 5;
+    PubSubMessageDeserializer pubSubDeserializer = PubSubMessageDeserializer.createOptimizedDeserializer();
+    VeniceServerConfig mockVeniceServerConfig = mock(VeniceServerConfig.class);
+    doReturn(PubSubPositionTypeRegistry.RESERVED_POSITION_TYPE_REGISTRY).when(mockVeniceServerConfig)
+        .getPubSubPositionTypeRegistry();
+
+    PubSubClientsFactory mockPubSubClientsFactory = mock(PubSubClientsFactory.class);
+    doReturn(factory).when(mockPubSubClientsFactory).getConsumerAdapterFactory();
+
+    PubSubContext mockPubSubContext = mock(PubSubContext.class);
+    doReturn(pubSubDeserializer).when(mockPubSubContext).getPubSubMessageDeserializer();
+    doReturn(mockPubSubClientsFactory).when(mockPubSubContext).getPubSubClientsFactory();
+
+    KafkaConsumerService consumerService = new PartitionWiseKafkaConsumerService(
+        ConsumerPoolType.REGULAR_POOL,
+        properties,
+        1000l,
+        versionNum + 2, // To simulate real production cases: consumers # >> version # per store.
+        mock(IngestionThrottler.class),
+        mock(KafkaClusterBasedRecordThrottler.class),
+        mockMetricsRepository,
+        "test-region",
+        TimeUnit.MINUTES.toMillis(1),
+        mock(StaleTopicChecker.class),
+        false,
+        SystemTime.INSTANCE,
+        mock(AggKafkaConsumerServiceStats.class),
+        false,
+        mock(ReadOnlyStoreRepository.class),
+        false,
+        mockVeniceServerConfig,
+        mockPubSubContext,
+        null);
+    String storeName = Utils.getUniqueString("test_consumer_service");
+
+    KafkaConsumerServiceDelegator.KafkaConsumerServiceBuilder consumerServiceBuilder =
+        (ignored, poolType) -> consumerService;
+    VeniceServerConfig mockConfig = mock(VeniceServerConfig.class);
+    doReturn(true).when(mockConfig).isResubscriptionTriggeredByVersionIngestionContextChangeEnabled();
+    doReturn(KafkaConsumerServiceDelegator.ConsumerPoolStrategyType.CURRENT_VERSION_PRIORITIZATION).when(mockConfig)
+        .getConsumerPoolStrategyType();
+    KafkaConsumerServiceDelegator delegator = new KafkaConsumerServiceDelegator(mockConfig, consumerServiceBuilder);
+    PubSubTopicPartition realTimeTopicPartition =
+        new PubSubTopicPartitionImpl(TOPIC_REPOSITORY.getTopic(Utils.composeRealTimeTopic(storeName)), 0);
+
+    CountDownLatch countDownLatch = new CountDownLatch(1);
+    List<Thread> infiniteSubUnSubThreads = new ArrayList<>();
+    for (int i = 0; i < versionNum; i++) {
+      PubSubTopic versionTopicForStoreName3 = TOPIC_REPOSITORY.getTopic(Version.composeKafkaTopic(storeName, i));
+      StoreIngestionTask task = mock(StoreIngestionTask.class);
+      when(task.getVersionTopic()).thenReturn(versionTopicForStoreName3);
+      when(task.isHybridMode()).thenReturn(true);
+
+      PartitionReplicaIngestionContext partitionReplicaIngestionContext = new PartitionReplicaIngestionContext(
+          versionTopicForStoreName3,
+          realTimeTopicPartition,
+          VersionRole.CURRENT,
+          PartitionReplicaIngestionContext.WorkloadType.AA_OR_WRITE_COMPUTE);
+      ConsumedDataReceiver consumedDataReceiver = mock(ConsumedDataReceiver.class);
+      when(consumedDataReceiver.destinationIdentifier()).thenReturn(versionTopicForStoreName3);
+      Runnable infiniteSubUnSub = getResubscriptionRunnableFor(
+          delegator,
+          partitionReplicaIngestionContext,
+          consumedDataReceiver,
+          countDownLatch);
+      Thread infiniteSubUnSubThread = new Thread(infiniteSubUnSub, "infiniteResubscribe: " + versionTopicForStoreName3);
+      infiniteSubUnSubThread.start();
+      infiniteSubUnSubThreads.add(infiniteSubUnSubThread);
+      // Wait for the thread to start.
+      waitForNonDeterministicAssertion(10, TimeUnit.SECONDS, () -> {
+        assertTrue(
+            infiniteSubUnSubThread.getState().equals(Thread.State.WAITING)
+                || infiniteSubUnSubThread.getState().equals(Thread.State.TIMED_WAITING)
+                || infiniteSubUnSubThread.getState().equals(Thread.State.BLOCKED)
+                || infiniteSubUnSubThread.getState().equals(Thread.State.RUNNABLE));
+      });
+    }
+    long currentTime = System.currentTimeMillis();
+    boolean raceConditionFound = countDownLatch.await(30, TimeUnit.SECONDS);
+    long elapsedTime = System.currentTimeMillis() - currentTime;
+    // Always clean up threads before asserting so leaked threads don't affect subsequent tests.
+    for (Thread infiniteSubUnSubThread: infiniteSubUnSubThreads) {
+      infiniteSubUnSubThread.interrupt();
+      infiniteSubUnSubThread.join();
+    }
+    delegator.close();
+    Assert.assertFalse(
+        raceConditionFound,
+        "Found race condition in KafkaConsumerService with time passed in milliseconds: " + elapsedTime);
+  }
+
+  private Runnable getResubscriptionRunnableFor(
+      KafkaConsumerServiceDelegator consumerServiceDelegator,
+      PartitionReplicaIngestionContext partitionReplicaIngestionContext,
+      ConsumedDataReceiver consumedDataReceiver,
+      CountDownLatch countDownLatch) {
+    PubSubTopic versionTopic = partitionReplicaIngestionContext.getVersionTopic();
+    PubSubTopicPartition pubSubTopicPartition = partitionReplicaIngestionContext.getPubSubTopicPartition();
+    return () -> {
+      try {
+        while (true) {
+          if (Thread.currentThread().isInterrupted()) {
+            consumerServiceDelegator.unSubscribe(versionTopic, pubSubTopicPartition);
+            break;
+          }
+          consumerServiceDelegator.startConsumptionIntoDataReceiver(
+              partitionReplicaIngestionContext,
+              position0,
+              consumedDataReceiver,
+              false);
+          // Use low wait time to trigger unsubscribe and poll lock handoff. 100ms is enough to
+          // trigger the race while giving CI enough headroom for thread scheduling under load.
+          consumerServiceDelegator.assignConsumerFor(versionTopic, pubSubTopicPartition).setTimeoutMsOverride(100L);
+          int versionNum =
+              Version.parseVersionFromKafkaTopicName(partitionReplicaIngestionContext.getVersionTopic().getName());
+          if (versionNum % 3 == 0) {
+            consumerServiceDelegator.unSubscribe(versionTopic, pubSubTopicPartition);
+          } else if (versionNum % 3 == 1) {
+            consumerServiceDelegator.unsubscribeAll(partitionReplicaIngestionContext.getVersionTopic());
+          } else {
+            consumerServiceDelegator.batchUnsubscribe(
+                partitionReplicaIngestionContext.getVersionTopic(),
+                Collections.singleton(partitionReplicaIngestionContext.getPubSubTopicPartition()));
+          }
+        }
+      } catch (Exception e) {
+        // If any thread encounter an exception, count down the latch to 0 to indicate main thread to catch the issue.
+        e.printStackTrace();
+        countDownLatch.countDown();
+      }
+    };
   }
 }

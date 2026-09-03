@@ -2,6 +2,7 @@ package com.linkedin.venice.controller;
 
 import static com.linkedin.venice.common.VeniceSystemStoreType.BATCH_JOB_HEARTBEAT_STORE;
 import static com.linkedin.venice.common.VeniceSystemStoreType.DAVINCI_PUSH_STATUS_STORE;
+import static com.linkedin.venice.meta.Version.DEFAULT_RT_VERSION_NUMBER;
 
 import com.linkedin.venice.authorization.AuthorizerService;
 import com.linkedin.venice.authorization.Resource;
@@ -12,6 +13,7 @@ import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.pushmonitor.PushMonitorDelegator;
 import com.linkedin.venice.system.store.MetaStoreWriter;
+import com.linkedin.venice.utils.Utils;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
@@ -47,7 +49,7 @@ public class UserSystemStoreLifeCycleHelper {
     this.parentAdmin = parentAdmin;
     this.authorizerService = authorizerService;
     for (String cluster: multiClusterConfig.getClusters()) {
-      VeniceControllerConfig controllerConfig = multiClusterConfig.getControllerConfig(cluster);
+      VeniceControllerClusterConfig controllerConfig = multiClusterConfig.getControllerConfig(cluster);
       Set<VeniceSystemStoreType> autoCreateEnabledSystemStores = new HashSet<>();
       if (controllerConfig.isZkSharedMetaSystemSchemaStoreAutoCreationEnabled()
           && controllerConfig.isAutoMaterializeMetaSystemStoreEnabled()) {
@@ -80,12 +82,15 @@ public class UserSystemStoreLifeCycleHelper {
       String systemStoreName,
       String pushJobId) {
     Version version;
-    final int systemStoreLargestUsedVersionNumber =
-        parentAdmin.getLargestUsedVersionFromStoreGraveyard(clusterName, systemStoreName);
 
     int partitionCount = parentAdmin.calculateNumberOfPartitions(clusterName, systemStoreName);
     int replicationFactor = parentAdmin.getReplicationFactor(clusterName, systemStoreName);
-
+    final int systemStoreLargestUsedVersionNumber = parentAdmin.getLargestUsedVersion(clusterName, systemStoreName);
+    LOGGER.info(
+        "Get largest used version: {} for system store: {} in cluster: {}",
+        systemStoreLargestUsedVersionNumber,
+        systemStoreName,
+        clusterName);
     if (systemStoreLargestUsedVersionNumber == Store.NON_EXISTING_VERSION) {
       version = parentAdmin
           .incrementVersionIdempotent(clusterName, systemStoreName, pushJobId, partitionCount, replicationFactor);
@@ -106,7 +111,10 @@ public class UserSystemStoreLifeCycleHelper {
           Optional.empty(),
           false,
           null,
-          -1);
+          -1,
+          DEFAULT_RT_VERSION_NUMBER,
+          -1,
+          false);
     }
     parentAdmin.writeEndOfPush(clusterName, systemStoreName, version.getNumber(), true);
     return version;
@@ -134,7 +142,11 @@ public class UserSystemStoreLifeCycleHelper {
     admin.deleteAllVersionsInStore(clusterName, systemStoreName);
     pushMonitor.cleanupStoreStatus(systemStoreName);
     if (!isStoreMigrating) {
-      switch (VeniceSystemStoreType.getSystemStoreType(systemStoreName)) {
+      VeniceSystemStoreType storeType = VeniceSystemStoreType.getSystemStoreType(systemStoreName);
+      if (storeType == null) {
+        throw new VeniceException("Unknown system store type: " + systemStoreName);
+      }
+      switch (storeType) {
         case META_STORE:
           // Clean up venice writer before truncating RT topic
           metaStoreWriter.removeMetaStoreWriter(systemStoreName);
@@ -152,7 +164,10 @@ public class UserSystemStoreLifeCycleHelper {
         default:
           throw new VeniceException("Unknown system store type: " + systemStoreName);
       }
-      admin.truncateKafkaTopic(Version.composeRealTimeTopic(systemStoreName));
+      // skip truncating system store RT topics if it's parent fabric as it's not created for parent fabric
+      if (!admin.isParent()) {
+        admin.truncateKafkaTopic(Utils.composeRealTimeTopic(systemStoreName));
+      }
     } else {
       LOGGER.info("The RT topic for: {} will not be deleted since the user store is migrating", systemStoreName);
     }

@@ -1,7 +1,11 @@
 package com.linkedin.venice.controllerapi;
 
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.ACCESS_PERMISSION;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.ADMIN_OPERATION_PROTOCOL_VERSION;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.AMPLIFICATION_FACTOR;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.AUTO_STORE_MIGRATION_ABORT_ON_FAILURE;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.AUTO_STORE_MIGRATION_CURRENT_STEP;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.AUTO_STORE_MIGRATION_PAUSE_AFTER_STEP;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.BATCH_JOB_HEARTBEAT_ENABLED;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.CLUSTER;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.CLUSTER_DEST;
@@ -20,28 +24,28 @@ import static com.linkedin.venice.controllerapi.ControllerApiConstants.FABRIC_B;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.HEARTBEAT_TIMESTAMP;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.INCLUDE_SYSTEM_STORES;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.INCREMENTAL_PUSH_VERSION;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.IS_ABORT_MIGRATION_CLEANUP;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.IS_SYSTEM_STORE;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.IS_WRITE_COMPUTE_ENABLED;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.KAFKA_TOPIC_LOG_COMPACTION_ENABLED;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.KAFKA_TOPIC_MIN_IN_SYNC_REPLICA;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.KAFKA_TOPIC_RETENTION_IN_MS;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.KAFKA_TOPIC_UNCLEAN_LEADER_ELECTION_ENABLED;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.KEY_SCHEMA;
-import static com.linkedin.venice.controllerapi.ControllerApiConstants.LOCKED_NODE_ID_LIST_SEPARATOR;
-import static com.linkedin.venice.controllerapi.ControllerApiConstants.LOCKED_STORAGE_NODE_IDS;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.LOOK_BACK_MS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.NAME;
-import static com.linkedin.venice.controllerapi.ControllerApiConstants.NATIVE_REPLICATION_SOURCE_FABRIC;
-import static com.linkedin.venice.controllerapi.ControllerApiConstants.OFFSET;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.OPERATION;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.OWNER;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PARTITIONERS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PARTITION_COUNT;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PARTITION_DETAIL_ENABLED;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.PARTITION_RECORD_COUNTS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PERSONA_NAME;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PERSONA_OWNERS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PERSONA_QUOTA;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PERSONA_STORES;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.POSITION;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PUSH_IN_SORTED_ORDER;
-import static com.linkedin.venice.controllerapi.ControllerApiConstants.PUSH_JOB_DETAILS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PUSH_JOB_ID;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PUSH_STRATEGY;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PUSH_TYPE;
@@ -51,29 +55,36 @@ import static com.linkedin.venice.controllerapi.ControllerApiConstants.REGIONS_F
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.REMOTE_KAFKA_BOOTSTRAP_SERVERS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.REPLICATION_METADATA_VERSION_ID;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.REPUSH_SOURCE_VERSION;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.REPUSH_TTL_SECONDS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.REWIND_TIME_IN_SECONDS_OVERRIDE;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.SCHEMA_COMPAT_TYPE;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.SCHEMA_ID;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.SEND_START_OF_PUSH;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.SEPARATE_REAL_TIME_TOPIC_ENABLED;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.SKIP_DIV;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.SOURCE_FABRIC;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.SOURCE_FABRIC_VERSION_INCLUDED;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.SOURCE_GRID_FABRIC;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.STATUS;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORAGE_MODE;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORAGE_NODE_ID;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORE_CONFIG_NAME_FILTER;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORE_CONFIG_VALUE_FILTER;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORE_SIZE;
-import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORE_TYPE;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.TARGETED_REGIONS;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.TARGET_REGION_PUSH_WITH_DEFERRED_SWAP;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.TOPIC;
-import static com.linkedin.venice.controllerapi.ControllerApiConstants.UPSTREAM_OFFSET;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.TO_BE_STOPPED_INSTANCES;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.UPSTREAM_POSITION;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.VALUE_SCHEMA;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.VERSION;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.VERSION_STORAGE_MODE_UPDATE_REASON;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.VOLDEMORT_STORE_NAME;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.WRITE_OPERATION;
 import static com.linkedin.venice.meta.Version.PushType;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.linkedin.venice.HttpConstants;
 import com.linkedin.venice.LastSucceedExecutionIdResponse;
 import com.linkedin.venice.controllerapi.routes.AdminCommandExecutionResponse;
@@ -81,12 +92,14 @@ import com.linkedin.venice.exceptions.ErrorType;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.exceptions.VeniceHttpException;
 import com.linkedin.venice.helix.VeniceJsonSerializer;
-import com.linkedin.venice.meta.VeniceUserStoreType;
+import com.linkedin.venice.meta.StorageMode;
 import com.linkedin.venice.meta.Version;
+import com.linkedin.venice.meta.VersionStorageModeUpdateReason;
 import com.linkedin.venice.pushmonitor.ExecutionStatus;
 import com.linkedin.venice.schema.avro.DirectionalSchemaCompatibilityType;
 import com.linkedin.venice.security.SSLFactory;
 import com.linkedin.venice.utils.ExceptionUtils;
+import com.linkedin.venice.utils.ObjectMapperFactory;
 import com.linkedin.venice.utils.Time;
 import com.linkedin.venice.utils.Utils;
 import java.io.Closeable;
@@ -98,6 +111,7 @@ import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
@@ -113,10 +127,17 @@ import org.apache.logging.log4j.Logger;
 
 public class ControllerClient implements Closeable {
   private static final Logger LOGGER = LogManager.getLogger(ControllerClient.class);
+  private static final ObjectMapper OBJECT_MAPPER = ObjectMapperFactory.getInstance();
 
   private static final int DEFAULT_MAX_ATTEMPTS = 10;
+  private static final int DEFAULT_RETRY_BACKOFF_MS = 5 * Time.MS_PER_SECOND;
   private static final int QUERY_JOB_STATUS_TIMEOUT = 60 * Time.MS_PER_SECOND;
-  private static final int DEFAULT_REQUEST_TIMEOUT_MS = 600 * Time.MS_PER_SECOND;
+  private static final int QUERY_HEARTBEAT_TIMEOUT = 10 * Time.MS_PER_SECOND;
+  // Default per-request timeout for controller calls. This should exceed the configured
+  // offline.job.start.timeout.ms (default 16 min): the request_topic (version creation) call can block
+  // on the controller while it waits for the new version's replicas to be assigned, so a shorter client
+  // timeout would expire first and retry the non-idempotent create.
+  private static final int DEFAULT_REQUEST_TIMEOUT_MS = 17 * Time.MS_PER_MINUTE;
   private final Optional<SSLFactory> sslFactory;
   private final String clusterName;
   private final VeniceJsonSerializer<Version> versionVeniceJsonSerializer = new VeniceJsonSerializer<>(Version.class);
@@ -199,7 +220,11 @@ public class ControllerClient implements Closeable {
           String leaderControllerUrl =
               transport.request(url, ControllerRoute.LEADER_CONTROLLER, newParams(), LeaderControllerResponse.class)
                   .getUrl();
-          LOGGER.info("Discovered leader controller {} from {}", leaderControllerUrl, url);
+          LOGGER.debug(
+              "Discovered leader controller: {} from: {} for cluster: {}",
+              leaderControllerUrl,
+              url,
+              clusterName);
           return leaderControllerUrl;
         } catch (Exception e) {
           LOGGER.warn("Unable to discover leader controller from {}", url);
@@ -237,7 +262,7 @@ public class ControllerClient implements Closeable {
 
   public StoreResponse getStore(String storeName, int timeoutMs) {
     QueryParams params = newParams().add(NAME, storeName);
-    return request(ControllerRoute.STORE, params, StoreResponse.class, timeoutMs, 1, null);
+    return request(ControllerRoute.STORE, params, StoreResponse.class, timeoutMs, 1, null, null);
   }
 
   public RepushInfoResponse getRepushInfo(String storeName, Optional<String> fabricName) {
@@ -271,6 +296,11 @@ public class ControllerClient implements Closeable {
   public SchemaUsageResponse getInUseSchemaIds(String storeName) {
     QueryParams params = newParams().add(NAME, storeName);
     return request(ControllerRoute.GET_INUSE_SCHEMA_IDS, params, SchemaUsageResponse.class);
+  }
+
+  public StoreDeletedValidationResponse validateStoreDeleted(String storeName) {
+    QueryParams params = newParams().add(NAME, storeName);
+    return request(ControllerRoute.VALIDATE_STORE_DELETED, params, StoreDeletedValidationResponse.class);
   }
 
   public ControllerResponse deleteValueSchemas(String storeName, List<String> schemaIds) {
@@ -307,6 +337,8 @@ public class ControllerClient implements Closeable {
         rewindTimeInSecondsOverride,
         false,
         null,
+        -1,
+        false,
         -1);
   }
 
@@ -339,6 +371,8 @@ public class ControllerClient implements Closeable {
         rewindTimeInSecondsOverride,
         deferVersionSwap,
         null,
+        -1,
+        false,
         -1);
   }
 
@@ -365,6 +399,7 @@ public class ControllerClient implements Closeable {
    * @param deferVersionSwap            whether to defer version swap after the push is done
    * @param targetedRegions             the list of regions that is separated by comma for targeted region push.
    * @param repushSourceVersion
+   * @param repushTtlSeconds            TTL in seconds for repush operation, or -1 if not applicable
    * @return VersionCreationResponse includes topic and partitioning
    */
   public VersionCreationResponse requestTopicForWrites(
@@ -382,7 +417,9 @@ public class ControllerClient implements Closeable {
       long rewindTimeInSecondsOverride,
       boolean deferVersionSwap,
       String targetedRegions,
-      int repushSourceVersion) {
+      int repushSourceVersion,
+      boolean pushToSeparateRealtimeTopic,
+      int repushTtlSeconds) {
     QueryParams params = newParams().add(NAME, storeName)
         // TODO: Store size is not used anymore. Remove it after the next round of controller deployment.
         .add(STORE_SIZE, Long.toString(storeSize))
@@ -397,7 +434,9 @@ public class ControllerClient implements Closeable {
         .add(BATCH_JOB_HEARTBEAT_ENABLED, batchJobHeartbeatEnabled)
         .add(REWIND_TIME_IN_SECONDS_OVERRIDE, rewindTimeInSecondsOverride)
         .add(DEFER_VERSION_SWAP, deferVersionSwap)
-        .add(REPUSH_SOURCE_VERSION, repushSourceVersion);
+        .add(REPUSH_SOURCE_VERSION, repushSourceVersion)
+        .add(SEPARATE_REAL_TIME_TOPIC_ENABLED, pushToSeparateRealtimeTopic)
+        .add(REPUSH_TTL_SECONDS, repushTtlSeconds);
     if (StringUtils.isNotEmpty(targetedRegions)) {
       params.add(TARGETED_REGIONS, targetedRegions);
     }
@@ -443,6 +482,21 @@ public class ControllerClient implements Closeable {
 
   public ControllerResponse writeEndOfPush(String storeName, int version) {
     QueryParams params = newParams().add(NAME, storeName).add(VERSION, version);
+    return request(ControllerRoute.END_OF_PUSH, params, ControllerResponse.class);
+  }
+
+  public ControllerResponse writeEndOfPush(String storeName, int version, Map<Integer, Long> partitionRecordCounts) {
+    QueryParams params = newParams().add(NAME, storeName).add(VERSION, version);
+    if (partitionRecordCounts != null && !partitionRecordCounts.isEmpty()) {
+      try {
+        params
+            .add(PARTITION_RECORD_COUNTS, ObjectMapperFactory.getInstance().writeValueAsString(partitionRecordCounts));
+      } catch (JsonProcessingException e) {
+        throw new VeniceException(
+            "Failed to serialize partitionRecordCounts for store " + storeName + " version " + version,
+            e);
+      }
+    }
     return request(ControllerRoute.END_OF_PUSH, params, ControllerResponse.class);
   }
 
@@ -595,8 +649,26 @@ public class ControllerClient implements Closeable {
   }
 
   public TrackableControllerResponse deleteStore(String storeName) {
-    QueryParams params = newParams().add(NAME, storeName);
+    return deleteStore(storeName, false);
+  }
+
+  public TrackableControllerResponse deleteStore(String storeName, boolean isAbortMigrationCleanup) {
+    QueryParams params = newParams().add(NAME, storeName).add(IS_ABORT_MIGRATION_CLEANUP, isAbortMigrationCleanup);
     return request(ControllerRoute.DELETE_STORE, params, TrackableControllerResponse.class);
+  }
+
+  public StoreMigrationResponse autoMigrateStore(
+      String storeName,
+      String destClusterName,
+      Optional<Integer> currStep,
+      Optional<Integer> pauseAfterStep,
+      Optional<Boolean> abortOnFailure) {
+    QueryParams params = newParams().add(NAME, storeName).add(CLUSTER_DEST, destClusterName);
+    currStep.ifPresent(cs -> params.add(AUTO_STORE_MIGRATION_CURRENT_STEP, cs));
+    pauseAfterStep.ifPresent(pas -> params.add(AUTO_STORE_MIGRATION_PAUSE_AFTER_STEP, pas));
+    abortOnFailure.ifPresent(aof -> params.add(AUTO_STORE_MIGRATION_ABORT_ON_FAILURE, aof));
+    params.add(AUTO_STORE_MIGRATION_ABORT_ON_FAILURE, abortOnFailure);
+    return request(ControllerRoute.AUTO_MIGRATE_STORE, params, StoreMigrationResponse.class);
   }
 
   public ControllerResponse wipeCluster(String fabric, Optional<String> storeName, Optional<Integer> versionNum) {
@@ -639,6 +711,18 @@ public class ControllerClient implements Closeable {
     return rollbackToBackupVersion(storeName, "");
   }
 
+  public ControllerResponse rollForwardToFutureVersion(String storeName, String regionFilter, int timeoutMs) {
+    QueryParams params = newParams().add(NAME, storeName).add(REGIONS_FILTER, regionFilter);
+    return request(
+        ControllerRoute.ROLL_FORWARD_TO_FUTURE_VERSION,
+        params,
+        ControllerResponse.class,
+        timeoutMs,
+        1,
+        null,
+        null);
+  }
+
   public ControllerResponse rollForwardToFutureVersion(String storeName, String regionFilter) {
     QueryParams params = newParams().add(NAME, storeName).add(REGIONS_FILTER, regionFilter);
     return request(ControllerRoute.ROLL_FORWARD_TO_FUTURE_VERSION, params, ControllerResponse.class);
@@ -658,9 +742,20 @@ public class ControllerClient implements Closeable {
     return request(ControllerRoute.KILL_OFFLINE_PUSH_JOB, params, ControllerResponse.class);
   }
 
-  public ControllerResponse skipAdminMessage(String offset, boolean skipDIV) {
-    QueryParams params = newParams().add(OFFSET, offset).add(SKIP_DIV, skipDIV);
-    return request(ControllerRoute.SKIP_ADMIN, params, ControllerResponse.class);
+  public ControllerResponse skipAdminMessage(String typeIdAndBase64PositionBytes, boolean skipDIV, String executionId) {
+    if (typeIdAndBase64PositionBytes != null && executionId != null) {
+      throw new IllegalArgumentException(
+          "Only one of position or executionId can be specified, position " + typeIdAndBase64PositionBytes
+              + ", execution id " + executionId);
+    }
+    QueryParams params = newParams().add(SKIP_DIV, skipDIV);
+    if (typeIdAndBase64PositionBytes != null) {
+      params.add(POSITION, typeIdAndBase64PositionBytes);
+    }
+    if (executionId != null) {
+      params.add(EXECUTION_ID, executionId);
+    }
+    return request(ControllerRoute.SKIP_ADMIN_MESSAGE, params, ControllerResponse.class);
   }
 
   public PubSubTopicConfigResponse getKafkaTopicConfigs(String kafkaTopicName) {
@@ -682,6 +777,14 @@ public class ControllerClient implements Closeable {
   public ControllerResponse updateKafkaTopicMinInSyncReplica(String kafkaTopicName, int minISR) {
     QueryParams params = newParams().add(TOPIC, kafkaTopicName).add(KAFKA_TOPIC_MIN_IN_SYNC_REPLICA, minISR);
     return request(ControllerRoute.UPDATE_KAFKA_TOPIC_MIN_IN_SYNC_REPLICA, params, ControllerResponse.class);
+  }
+
+  public ControllerResponse updateKafkaTopicUncleanLeaderElection(
+      String kafkaTopicName,
+      boolean uncleanLeaderElectionEnabled) {
+    QueryParams params = newParams().add(TOPIC, kafkaTopicName)
+        .add(KAFKA_TOPIC_UNCLEAN_LEADER_ELECTION_ENABLED, uncleanLeaderElectionEnabled);
+    return request(ControllerRoute.UPDATE_KAFKA_TOPIC_UNCLEAN_LEADER_ELECTION, params, ControllerResponse.class);
   }
 
   public <R extends ControllerResponse> R retryableRequest(int totalAttempts, Function<ControllerClient, R> request) {
@@ -710,27 +813,58 @@ public class ControllerClient implements Closeable {
       int totalAttempts,
       Function<C, R> request,
       Function<R, Boolean> abortRetryCondition) {
+    return retryableRequest(client, totalAttempts, DEFAULT_RETRY_BACKOFF_MS, request, abortRetryCondition);
+  }
+
+  // Package-private overload exposing the backoff so tests can run without the production delay.
+  static <C extends ControllerClient, R extends ControllerResponse> R retryableRequest(
+      C client,
+      int totalAttempts,
+      int retryBackoffMs,
+      Function<C, R> request,
+      Function<R, Boolean> abortRetryCondition) {
     if (totalAttempts < 1) {
       throw new VeniceException(
           "Querying with retries requires at least one attempt, called with " + totalAttempts + " attempts");
     }
-    int currentAttempt = 1;
-    while (true) {
-      R response = request.apply(client);
+    Exception exception = null;
+    R response = null;
+
+    for (int currentAttempt = 1; currentAttempt <= totalAttempts; currentAttempt++) {
+      // Reset per attempt so a previous failure never masks a later successful attempt.
+      exception = null;
+      response = null;
+      try {
+        response = request.apply(client);
+      } catch (Exception e) {
+        exception = e;
+      }
       // Do not retry if value schema is not found. TODO: Ideally response should not be an error but should return
       // INVALID schema ID in the response.
-      if (!response.isError() || currentAttempt == totalAttempts || valueSchemaNotFoundSchemaResponse(response)
-          || abortRetryCondition.apply(response)) {
+      if (exception == null && (!response.isError() || valueSchemaNotFoundSchemaResponse(response)
+          || abortRetryCondition.apply(response))) {
         return response;
       } else {
-        LOGGER.warn(
-            "Error on attempt {}/{} of querying the Controller: {}",
-            currentAttempt,
-            totalAttempts,
-            response.getError());
-        currentAttempt++;
-        Utils.sleep(2000);
+        if (exception != null) {
+          LOGGER
+              .warn("Exception on attempt {}/{} of querying the Controller", currentAttempt, totalAttempts, exception);
+        } else {
+          LOGGER.warn(
+              "Error on attempt {}/{} of querying the Controller: {}",
+              currentAttempt,
+              totalAttempts,
+              response.getError());
+        }
+        // Back off before the next attempt; skip after the final attempt since no retry follows.
+        if (currentAttempt < totalAttempts) {
+          Utils.sleep(retryBackoffMs);
+        }
       }
+    }
+    if (exception != null) {
+      throw new VeniceException("Could not execute query even after " + totalAttempts + " attempts.", exception);
+    } else {
+      return response;
     }
   }
 
@@ -752,8 +886,21 @@ public class ControllerClient implements Closeable {
   public JobStatusQueryResponse queryOverallJobStatus(
       String kafkaTopic,
       Optional<String> incrementalPushVersion,
+      String targetedRegions,
+      boolean isTargetRegionPushWithDeferredSwap) {
+    return queryJobStatus(
+        kafkaTopic,
+        incrementalPushVersion,
+        5 * QUERY_JOB_STATUS_TIMEOUT,
+        targetedRegions,
+        isTargetRegionPushWithDeferredSwap);
+  }
+
+  public JobStatusQueryResponse queryOverallJobStatus(
+      String kafkaTopic,
+      Optional<String> incrementalPushVersion,
       String targetedRegions) {
-    return queryJobStatus(kafkaTopic, incrementalPushVersion, 5 * QUERY_JOB_STATUS_TIMEOUT, targetedRegions);
+    return queryOverallJobStatus(kafkaTopic, incrementalPushVersion, null, false);
   }
 
   public JobStatusQueryResponse queryOverallJobStatus(String kafkaTopic, Optional<String> incrementalPushVersion) {
@@ -761,7 +908,7 @@ public class ControllerClient implements Closeable {
   }
 
   public JobStatusQueryResponse queryJobStatus(String kafkaTopic) {
-    return queryJobStatus(kafkaTopic, Optional.empty(), QUERY_JOB_STATUS_TIMEOUT, null);
+    return queryJobStatus(kafkaTopic, Optional.empty(), QUERY_JOB_STATUS_TIMEOUT, null, false);
   }
 
   /**
@@ -770,30 +917,33 @@ public class ControllerClient implements Closeable {
    * target is a parent controller.
    */
   public JobStatusQueryResponse queryJobStatus(String kafkaTopic, Optional<String> incrementalPushVersion) {
-    return queryJobStatus(kafkaTopic, incrementalPushVersion, QUERY_JOB_STATUS_TIMEOUT, null);
+    return queryJobStatus(kafkaTopic, incrementalPushVersion, QUERY_JOB_STATUS_TIMEOUT, null, false);
   }
 
   public JobStatusQueryResponse queryJobStatus(
       String kafkaTopic,
       Optional<String> incrementalPushVersion,
       String targetedRegions) {
-    return queryJobStatus(kafkaTopic, incrementalPushVersion, QUERY_JOB_STATUS_TIMEOUT, targetedRegions);
+    return queryJobStatus(kafkaTopic, incrementalPushVersion, QUERY_JOB_STATUS_TIMEOUT, targetedRegions, false);
   }
 
   public JobStatusQueryResponse queryJobStatus(
       String kafkaTopic,
       Optional<String> incrementalPushVersion,
       int timeoutMs,
-      String targetedRegions) {
+      String targetedRegions,
+      boolean isTargetRegionPushWithDeferredSwap) {
     String storeName = Version.parseStoreFromKafkaTopicName(kafkaTopic);
     int version = Version.parseVersionFromKafkaTopicName(kafkaTopic);
-    QueryParams params =
-        newParams().add(NAME, storeName).add(VERSION, version).add(INCREMENTAL_PUSH_VERSION, incrementalPushVersion);
+    QueryParams params = newParams().add(NAME, storeName)
+        .add(VERSION, version)
+        .add(INCREMENTAL_PUSH_VERSION, incrementalPushVersion)
+        .add(TARGET_REGION_PUSH_WITH_DEFERRED_SWAP, isTargetRegionPushWithDeferredSwap);
 
     if (StringUtils.isNotEmpty(targetedRegions)) {
       params.add(TARGETED_REGIONS, targetedRegions);
     }
-    return request(ControllerRoute.JOB, params, JobStatusQueryResponse.class, timeoutMs, 1, null);
+    return request(ControllerRoute.JOB, params, JobStatusQueryResponse.class, timeoutMs, 1, null, null);
   }
 
   /**
@@ -805,14 +955,7 @@ public class ControllerClient implements Closeable {
     String storeName = Version.parseStoreFromKafkaTopicName(kafkaTopic);
     int version = Version.parseVersionFromKafkaTopicName(kafkaTopic);
     QueryParams params = newParams().add(NAME, storeName).add(VERSION, version).add(FABRIC, region);
-    return request(ControllerRoute.JOB, params, JobStatusQueryResponse.class, QUERY_JOB_STATUS_TIMEOUT, 1, null);
-  }
-
-  // TODO remove passing PushJobDetails as JSON string once all VPJ plugins are updated.
-  public ControllerResponse sendPushJobDetails(String storeName, int version, String pushJobDetailsString) {
-    QueryParams params =
-        newParams().add(NAME, storeName).add(VERSION, version).add(PUSH_JOB_DETAILS, pushJobDetailsString);
-    return request(ControllerRoute.SEND_PUSH_JOB_DETAILS, params, ControllerResponse.class);
+    return request(ControllerRoute.JOB, params, JobStatusQueryResponse.class, QUERY_JOB_STATUS_TIMEOUT, 1, null, null);
   }
 
   public ControllerResponse sendPushJobDetails(String storeName, int version, byte[] pushJobDetails) {
@@ -844,6 +987,11 @@ public class ControllerClient implements Closeable {
     configNameFilter.ifPresent(c -> queryParams.add(STORE_CONFIG_NAME_FILTER, c));
     configValueFilter.ifPresent(c -> queryParams.add(STORE_CONFIG_VALUE_FILTER, c));
     return request(ControllerRoute.LIST_STORES, queryParams, MultiStoreResponse.class);
+  }
+
+  public CleanExecutionIdsResponse cleanExecutionIds(String clusterName) {
+    QueryParams queryParams = newParams().add(CLUSTER, clusterName);
+    return request(ControllerRoute.CLEAN_EXECUTION_IDS, queryParams, CleanExecutionIdsResponse.class);
   }
 
   public MultiStoreStatusResponse listStoresStatuses() {
@@ -883,8 +1031,8 @@ public class ControllerClient implements Closeable {
   }
 
   public NodeStatusResponse isNodeRemovable(String instanceId, List<String> lockedNodeIds) {
-    QueryParams params = newParams().add(STORAGE_NODE_ID, instanceId)
-        .add(LOCKED_STORAGE_NODE_IDS, String.join(LOCKED_NODE_ID_LIST_SEPARATOR, lockedNodeIds));
+    QueryParams params =
+        newParams().add(STORAGE_NODE_ID, instanceId).add(TO_BE_STOPPED_INSTANCES, String.join(",", lockedNodeIds));
     return request(ControllerRoute.NODE_REMOVABLE, params, NodeStatusResponse.class);
   }
 
@@ -905,6 +1053,21 @@ public class ControllerClient implements Closeable {
 
   public MultiNodeResponse listStorageNodes() {
     return request(ControllerRoute.LIST_NODES, newParams(), MultiNodeResponse.class);
+  }
+
+  public StoppableNodeStatusResponse getAggregatedHealthStatus(
+      String clusterName,
+      List<String> instances,
+      List<String> toBeStoppedInstances) throws JsonProcessingException {
+
+    AggregatedHealthStatusRequest request =
+        new AggregatedHealthStatusRequest(clusterName, instances, toBeStoppedInstances);
+    String requestString = OBJECT_MAPPER.writeValueAsString(request);
+    return request(
+        ControllerRoute.AGGREGATED_HEALTH_STATUS,
+        newParams(),
+        StoppableNodeStatusResponse.class,
+        requestString.getBytes());
   }
 
   public MultiNodesStatusResponse listInstancesStatuses(boolean enableReplicas) {
@@ -1000,6 +1163,44 @@ public class ControllerClient implements Closeable {
   public ControllerResponse updateStore(String storeName, UpdateStoreQueryParams queryParams) {
     QueryParams params = addCommonParams(queryParams).add(NAME, storeName);
     return request(ControllerRoute.UPDATE_STORE, params, ControllerResponse.class);
+  }
+
+  public ControllerResponse updateStoreVersionStorageMode(String storeName, int version, StorageMode storageMode) {
+    return updateStoreVersionStorageMode(storeName, version, storageMode, null);
+  }
+
+  public ControllerResponse updateStoreVersionStorageMode(
+      String storeName,
+      int version,
+      StorageMode storageMode,
+      String regionsFilter) {
+    return updateStoreVersionStorageMode(
+        storeName,
+        version,
+        storageMode,
+        regionsFilter,
+        VersionStorageModeUpdateReason.UNSPECIFIED);
+  }
+
+  /**
+   * Update the storage mode of a single store version, optionally restricted to {@code regionsFilter} and
+   * optionally annotated with why the update is being made. The reason is telemetry intent only: it never changes
+   * the resulting storage mode, and a controller that does not understand it simply ignores it.
+   */
+  public ControllerResponse updateStoreVersionStorageMode(
+      String storeName,
+      int version,
+      StorageMode storageMode,
+      String regionsFilter,
+      VersionStorageModeUpdateReason reason) {
+    QueryParams params = newParams().add(NAME, storeName).add(VERSION, version).add(STORAGE_MODE, storageMode.name());
+    if (StringUtils.isNotEmpty(regionsFilter)) {
+      params.add(REGIONS_FILTER, regionsFilter);
+    }
+    if (reason != null && reason != VersionStorageModeUpdateReason.UNSPECIFIED) {
+      params.add(VERSION_STORAGE_MODE_UPDATE_REASON, reason.name());
+    }
+    return request(ControllerRoute.UPDATE_STORE_VERSION_STORAGE_MODE, params, ControllerResponse.class);
   }
 
   public SchemaResponse getValueSchema(String storeName, int valueSchemaId) {
@@ -1098,31 +1299,11 @@ public class ControllerClient implements Closeable {
     return request(
         ControllerRoute.GET_HEARTBEAT_TIMESTAMP_FROM_SYSTEM_STORE,
         params,
-        SystemStoreHeartbeatResponse.class);
-  }
-
-  public ControllerResponse configureNativeReplicationForCluster(
-      boolean enableNativeReplication,
-      String storeType,
-      Optional<String> sourceFabric,
-      Optional<String> regionsFilter) {
-    // Verify the input storeType is valid
-    VeniceUserStoreType.valueOf(storeType.toUpperCase());
-    QueryParams params = newParams().add(STATUS, enableNativeReplication).add(STORE_TYPE, storeType);
-    sourceFabric.ifPresent(s -> params.add(NATIVE_REPLICATION_SOURCE_FABRIC, s));
-    regionsFilter.ifPresent(f -> params.add(REGIONS_FILTER, f));
-    return request(ControllerRoute.CONFIGURE_NATIVE_REPLICATION_FOR_CLUSTER, params, ControllerResponse.class);
-  }
-
-  public ControllerResponse configureActiveActiveReplicationForCluster(
-      boolean enableActiveActiveReplication,
-      String storeType,
-      Optional<String> regionsFilter) {
-    // Verify the input storeType is valid
-    VeniceUserStoreType.valueOf(storeType.toUpperCase());
-    QueryParams params = newParams().add(STATUS, enableActiveActiveReplication).add(STORE_TYPE, storeType);
-    regionsFilter.ifPresent(f -> params.add(REGIONS_FILTER, f));
-    return request(ControllerRoute.CONFIGURE_ACTIVE_ACTIVE_REPLICATION_FOR_CLUSTER, params, ControllerResponse.class);
+        SystemStoreHeartbeatResponse.class,
+        QUERY_HEARTBEAT_TIMEOUT,
+        DEFAULT_MAX_ATTEMPTS,
+        null,
+        null);
   }
 
   public ControllerResponse checkResourceCleanupForStoreCreation(String storeName) {
@@ -1163,6 +1344,55 @@ public class ControllerClient implements Closeable {
     return request(ControllerRoute.GET_STORES_IN_CLUSTER, params, MultiStoreInfoResponse.class);
   }
 
+  /**
+   * This method gets a list of store names that are ready for compaction.
+   * @param clusterName, the name of the cluster to query for compaction eligible stores
+   * @return The list of store names that are ready for compaction.
+   */
+  public MultiStoreInfoResponse getStoresForCompaction(String clusterName) {
+    QueryParams params = new QueryParams().add(CLUSTER, clusterName);
+    return request(ControllerRoute.GET_STORES_FOR_COMPACTION, params, MultiStoreInfoResponse.class);
+  }
+
+  /**
+   * This method triggers an adhoc repush for storeName
+   * @param storeName
+   * @return //TODO LC:
+   */
+  public RepushJobResponse repushStore(String storeName) {
+    QueryParams params = newParams().add(NAME, storeName);
+    // TODO repush: Use byte[] to pass parameters instead of QueryParams as it is a post method. see
+    // (https://github.com/linkedin/venice/pull/1282#discussion_r1871510627)
+    // TODO repush: add params from admin tool for repush: e.g. version, fabric etc.
+    // TODO repush: add admin.repush()
+    return request(ControllerRoute.REPUSH_STORE, params, RepushJobResponse.class);
+  }
+
+  public MultiStoreInfoResponse getDeadStores(
+      String clusterName,
+      Optional<String> storeName,
+      Map<String, String> params) {
+    QueryParams queryParams = newParams().add(CLUSTER, clusterName);
+
+    // Add storeName if present
+    storeName.ifPresent(s -> queryParams.add(NAME, s));
+
+    // Add all parameters from the map including includeSystemStores
+    for (Map.Entry<String, String> entry: params.entrySet()) {
+      String key = entry.getKey();
+      String value = entry.getValue();
+
+      // Map our internal param names to the API constants
+      if (INCLUDE_SYSTEM_STORES.equals(key)) {
+        queryParams.add(INCLUDE_SYSTEM_STORES, value);
+      } else if (LOOK_BACK_MS.equals(key)) {
+        queryParams.add(LOOK_BACK_MS, value);
+      }
+    }
+
+    return request(ControllerRoute.GET_DEAD_STORES, queryParams, MultiStoreInfoResponse.class);
+  }
+
   public VersionResponse getStoreLargestUsedVersion(String clusterName, String storeName) {
     QueryParams params = newParams().add(CLUSTER, clusterName).add(NAME, storeName);
     return request(ControllerRoute.GET_STORE_LARGEST_USED_VERSION, params, VersionResponse.class);
@@ -1176,6 +1406,17 @@ public class ControllerClient implements Closeable {
   public StoreHealthAuditResponse listStorePushInfo(String storeName, boolean isPartitionDetailEnabled) {
     QueryParams params = newParams().add(NAME, storeName).add(PARTITION_DETAIL_ENABLED, isPartitionDetailEnabled);
     return request(ControllerRoute.LIST_STORE_PUSH_INFO, params, StoreHealthAuditResponse.class);
+  }
+
+  /**
+   * Returns each region's store-level {@link com.linkedin.venice.meta.StorageMode} for the store, keyed by
+   * region name (value is the {@code StorageMode} enum name). Against a parent controller this carries one
+   * entry per child region; against a child controller it carries a single entry for that region. Used by
+   * VPJ to decide, per region, whether to dual-write to external storage.
+   */
+  public MultiRegionStorageModeResponse getPerRegionStorageMode(String storeName) {
+    QueryParams params = newParams().add(NAME, storeName);
+    return request(ControllerRoute.GET_PER_REGION_STORAGE_MODE, params, MultiRegionStorageModeResponse.class);
   }
 
   public static D2ServiceDiscoveryResponse discoverCluster(
@@ -1197,37 +1438,25 @@ public class ControllerClient implements Closeable {
     try (ControllerTransport transport = new ControllerTransport(sslFactory)) {
       for (String url: urls) {
         try {
-          // Because the way to get parameter is different between controller and router, in order to support query
-          // cluster from both cluster and router, we send the path "/discover_cluster?storename=$storeName" at first,
-          // if it does not work, try "/discover_cluster/$storeName"
           try {
             QueryParams params = getQueryParamsToDiscoverCluster(storeName);
             return transport.request(url, ControllerRoute.CLUSTER_DISCOVERY, params, D2ServiceDiscoveryResponse.class);
           } catch (VeniceHttpException e) {
-            // TODO: Routers also support fetching the store name via query params. So, once sufficient time has passed,
-            // this check can be changed to break out of the loop on non-5XX errors.
-
-            // Do not attempt querying further if host explicitly returns that store was not found.
-            // If Controllers have been upgraded to recent versions, they will return the proper STORE_NOT_FOUND
-            // ErrorType.
             if (e.getErrorType() == ErrorType.STORE_NOT_FOUND) {
               lastException = e;
               break;
             }
 
-            // If Controllers have not been upgraded recently, they will return a 404 status with GENERAL_ERROR as the
-            // ErrorType.
             if (e.getErrorType() == ErrorType.GENERAL_ERROR && e.getHttpStatusCode() == 404) {
               lastException =
                   new VeniceHttpException(e.getHttpStatusCode(), e.getMessage(), e, ErrorType.STORE_NOT_FOUND);
               break;
             }
 
-            String routerPath = ControllerRoute.CLUSTER_DISCOVERY.getPath() + "/" + storeName;
-            return transport.executeGet(url, routerPath, new QueryParams(), D2ServiceDiscoveryResponse.class);
+            throw e;
           }
         } catch (Exception e) {
-          LOGGER.warn("Unable to discover cluster for store {} from {}", storeName, url);
+          LOGGER.warn("Unable to discover cluster for store {} from {}", storeName, url, e);
           if (ExceptionUtils.recursiveClassEquals(e, ConnectException.class)) {
             lastConnectException = e;
           } else {
@@ -1260,6 +1489,14 @@ public class ControllerClient implements Closeable {
     }
     QueryParams params = addCommonParams(queryParams);
     return request(ControllerRoute.UPDATE_CLUSTER_CONFIG, params, ControllerResponse.class);
+  }
+
+  public ControllerResponse updateDarkClusterConfig(UpdateDarkClusterConfigQueryParams queryParams) {
+    if (queryParams.getNameValuePairs().isEmpty()) {
+      throw new VeniceException("UpdateDarkClusterConfig command didn't change any specific dark cluster config");
+    }
+    QueryParams params = addCommonParams(queryParams);
+    return request(ControllerRoute.UPDATE_DARK_CLUSTER_CONFIG, params, ControllerResponse.class);
   }
 
   public ControllerResponse prepareDataRecovery(
@@ -1323,21 +1560,66 @@ public class ControllerClient implements Closeable {
     }
   }
 
+  public ControllerResponse markDatacenterDegraded(String datacenterName, int timeoutMinutes, String operatorId) {
+    QueryParams params = newParams().add(ControllerApiConstants.DATACENTER_NAME, datacenterName)
+        .add(ControllerApiConstants.TIMEOUT_MINUTES, timeoutMinutes)
+        .add(ControllerApiConstants.OPERATOR_ID, operatorId);
+    return request(ControllerRoute.MARK_DC_DEGRADED, params, ControllerResponse.class);
+  }
+
+  public ControllerResponse unmarkDatacenterDegraded(String datacenterName) {
+    QueryParams params = newParams().add(ControllerApiConstants.DATACENTER_NAME, datacenterName);
+    return request(ControllerRoute.UNMARK_DC_DEGRADED, params, ControllerResponse.class);
+  }
+
+  public DegradedDcResponse getDegradedDatacenters() {
+    QueryParams params = newParams();
+    return request(ControllerRoute.GET_DEGRADED_DCS, params, DegradedDcResponse.class);
+  }
+
   public AdminTopicMetadataResponse getAdminTopicMetadata(Optional<String> storeName) {
     QueryParams params = newParams().add(NAME, storeName);
     return request(ControllerRoute.GET_ADMIN_TOPIC_METADATA, params, AdminTopicMetadataResponse.class);
   }
 
-  public ControllerResponse updateAdminTopicMetadata(
+  public AdminTopicMetadataResponse updateAdminTopicMetadata(
       long executionId,
       Optional<String> storeName,
-      Optional<Long> offset,
-      Optional<Long> upstreamOffset) {
+      Optional<PubSubPositionJsonWireFormat> position,
+      Optional<PubSubPositionJsonWireFormat> upstreamPosition) {
     QueryParams params = newParams().add(EXECUTION_ID, executionId)
         .add(NAME, storeName)
-        .add(OFFSET, offset)
-        .add(UPSTREAM_OFFSET, upstreamOffset);
-    return request(ControllerRoute.UPDATE_ADMIN_TOPIC_METADATA, params, ControllerResponse.class);
+        .add(POSITION, position)
+        .add(UPSTREAM_POSITION, upstreamPosition);
+    return request(ControllerRoute.UPDATE_ADMIN_TOPIC_METADATA, params, AdminTopicMetadataResponse.class);
+  }
+
+  public AdminTopicMetadataResponse updateAdminOperationProtocolVersion(
+      String clusterName,
+      Long adminOperationProtocolVersion) {
+    QueryParams params =
+        newParams().add(CLUSTER, clusterName).add(ADMIN_OPERATION_PROTOCOL_VERSION, adminOperationProtocolVersion);
+    return request(ControllerRoute.UPDATE_ADMIN_OPERATION_PROTOCOL_VERSION, params, AdminTopicMetadataResponse.class);
+  }
+
+  public AdminOperationProtocolVersionControllerResponse getAdminOperationProtocolVersionFromControllers(
+      String clusterName) {
+    QueryParams params = newParams().add(CLUSTER, clusterName);
+    return request(
+        ControllerRoute.GET_ADMIN_OPERATION_VERSION_FROM_CONTROLLERS,
+        params,
+        AdminOperationProtocolVersionControllerResponse.class);
+  }
+
+  public AdminOperationProtocolVersionControllerResponse getLocalAdminOperationProtocolVersion(String controllerUrl) {
+    return request(
+        ControllerRoute.GET_LOCAL_ADMIN_OPERATION_PROTOCOL_VERSION,
+        newParams(),
+        AdminOperationProtocolVersionControllerResponse.class,
+        DEFAULT_REQUEST_TIMEOUT_MS,
+        DEFAULT_MAX_ATTEMPTS,
+        null,
+        controllerUrl);
   }
 
   public ControllerResponse deleteKafkaTopic(String topicName) {
@@ -1410,7 +1692,7 @@ public class ControllerClient implements Closeable {
   }
 
   private <T extends ControllerResponse> T request(ControllerRoute route, QueryParams params, Class<T> responseType) {
-    return request(route, params, responseType, DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_MAX_ATTEMPTS, null);
+    return request(route, params, responseType, DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_MAX_ATTEMPTS, null, null);
   }
 
   private <T extends ControllerResponse> T request(
@@ -1418,22 +1700,43 @@ public class ControllerClient implements Closeable {
       QueryParams params,
       Class<T> responseType,
       byte[] data) {
-    return request(route, params, responseType, DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_MAX_ATTEMPTS, data);
+    return request(route, params, responseType, DEFAULT_REQUEST_TIMEOUT_MS, DEFAULT_MAX_ATTEMPTS, data, null);
   }
 
+  /**
+   * This method is used to make a request to the controller.
+   * The request will be routed to LEADER controller if the controllerUrl is not provided.
+   * @param route : Controller Route
+   * @param params : Params for the request
+   * @param responseType : Type of the response
+   * @param timeoutMs : Timeout for the request
+   * @param maxAttempts : Number of attempts to make the request
+   * @param data : Data to be sent in the request
+   * @param controllerUrl : URL of the controller to send the request to. If not provided, send to the leader controller.
+   */
   private <T extends ControllerResponse> T request(
       ControllerRoute route,
       QueryParams params,
       Class<T> responseType,
       int timeoutMs,
       int maxAttempts,
-      byte[] data) {
+      byte[] data,
+      String controllerUrl) {
     Exception lastException = null;
     boolean logErrorMessage = true;
-    try (ControllerTransport transport = new ControllerTransport(sslFactory)) {
+    boolean requireLeaderDiscovery = controllerUrl == null || controllerUrl.isEmpty();
+    try (ControllerTransport transport = getNewControllerTransport()) {
       for (int attempt = 1; attempt <= maxAttempts; ++attempt) {
         try {
-          return transport.request(getLeaderControllerUrl(), route, params, responseType, timeoutMs, data);
+          // If the controllerUrl is not provided, use the leader controller URL.
+          // This option is useful when we want to forward request to specific controller (e.g. to standby controller)
+          return transport.request(
+              requireLeaderDiscovery ? getLeaderControllerUrl() : controllerUrl,
+              route,
+              params,
+              responseType,
+              timeoutMs,
+              data);
         } catch (ExecutionException | TimeoutException e) {
           // Controller is unreachable. Let's wait for a new leader to be elected.
           // Total wait time should be at least leader election time (~30 seconds)
@@ -1448,6 +1751,8 @@ public class ControllerClient implements Closeable {
           }
           // leader controller has changed. Let's wait for a new leader to realize it.
           lastException = e;
+        } catch (Exception e) {
+          lastException = e;
         }
 
         if (attempt < maxAttempts) {
@@ -1455,7 +1760,7 @@ public class ControllerClient implements Closeable {
               "Retrying controller request, attempt = {}/{}, controller = {}, route = {}, params = {}, timeout = {}",
               attempt,
               maxAttempts,
-              this.leaderControllerUrl,
+              (requireLeaderDiscovery ? this.leaderControllerUrl : controllerUrl),
               route.getPath(),
               params.getNameValuePairs(),
               timeoutMs,
@@ -1467,20 +1772,20 @@ public class ControllerClient implements Closeable {
       lastException = e;
     }
 
-    String message =
-        "An error occurred during controller request." + " controller = " + this.leaderControllerUrl + ", route = "
-            + route.getPath() + ", params = " + params.getAbbreviatedNameValuePairs() + ", timeout = " + timeoutMs;
+    String message = "An error occurred during controller request." + " controller = "
+        + (requireLeaderDiscovery ? this.leaderControllerUrl : controllerUrl) + ", route = " + route.getPath()
+        + ", params = " + params.getAbbreviatedNameValuePairs() + ", timeout = " + timeoutMs;
     return makeErrorResponse(message, lastException, responseType, logErrorMessage);
   }
 
-  private <T extends ControllerResponse> T makeErrorResponse(
+  private static <T extends ControllerResponse> T makeErrorResponse(
       String message,
       Exception exception,
       Class<T> responseType) {
     return makeErrorResponse(message, exception, responseType, true);
   }
 
-  private <T extends ControllerResponse> T makeErrorResponse(
+  private static <T extends ControllerResponse> T makeErrorResponse(
       String message,
       Exception exception,
       Class<T> responseType,
@@ -1509,5 +1814,10 @@ public class ControllerClient implements Closeable {
 
   public Collection<String> getControllerDiscoveryUrls() {
     return this.controllerDiscoveryUrls;
+  }
+
+  // For testing only
+  public ControllerTransport getNewControllerTransport() {
+    return new ControllerTransport(sslFactory);
   }
 }

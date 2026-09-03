@@ -8,8 +8,10 @@ import static com.linkedin.venice.utils.concurrent.BlockingQueueType.LINKED_BLOC
 import com.linkedin.alpini.base.concurrency.AsyncFuture;
 import com.linkedin.alpini.base.concurrency.TimeoutProcessor;
 import com.linkedin.alpini.base.concurrency.impl.SuccessAsyncFuture;
+import com.linkedin.alpini.base.misc.Metrics;
 import com.linkedin.alpini.base.registry.ResourceRegistry;
 import com.linkedin.alpini.base.registry.ShutdownableExecutors;
+import com.linkedin.alpini.netty4.misc.BasicFullHttpRequest;
 import com.linkedin.alpini.netty4.ssl.SslInitializer;
 import com.linkedin.alpini.router.api.LongTailRetrySupplier;
 import com.linkedin.alpini.router.api.ScatterGatherHelper;
@@ -17,10 +19,9 @@ import com.linkedin.alpini.router.impl.Router;
 import com.linkedin.d2.balancer.D2Client;
 import com.linkedin.venice.ConfigKeys;
 import com.linkedin.venice.acl.DynamicAccessController;
-import com.linkedin.venice.acl.handler.StoreAclHandler;
 import com.linkedin.venice.authorization.IdentityParser;
 import com.linkedin.venice.compression.CompressorFactory;
-import com.linkedin.venice.d2.D2ClientFactory;
+import com.linkedin.venice.d2.D2ConfigUtils;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.helix.HelixAdapterSerializer;
 import com.linkedin.venice.helix.HelixBaseRoutingRepository;
@@ -33,14 +34,18 @@ import com.linkedin.venice.helix.HelixReadOnlySchemaRepositoryAdapter;
 import com.linkedin.venice.helix.HelixReadOnlyStoreConfigRepository;
 import com.linkedin.venice.helix.HelixReadOnlyStoreRepository;
 import com.linkedin.venice.helix.HelixReadOnlyStoreRepositoryAdapter;
+import com.linkedin.venice.helix.HelixReadOnlyStoreViewConfigRepositoryAdapter;
 import com.linkedin.venice.helix.HelixReadOnlyZKSharedSchemaRepository;
 import com.linkedin.venice.helix.HelixReadOnlyZKSharedSystemStoreRepository;
 import com.linkedin.venice.helix.SafeHelixManager;
 import com.linkedin.venice.helix.ZkRoutersClusterManager;
+import com.linkedin.venice.meta.Instance;
+import com.linkedin.venice.meta.NameRepository;
 import com.linkedin.venice.meta.ReadOnlySchemaRepository;
 import com.linkedin.venice.meta.ReadOnlyStoreRepository;
 import com.linkedin.venice.pushstatushelper.PushStatusStoreReader;
 import com.linkedin.venice.read.RequestType;
+import com.linkedin.venice.router.acl.RouterStoreAclHandler;
 import com.linkedin.venice.router.api.DictionaryRetrievalService;
 import com.linkedin.venice.router.api.MetaStoreShadowReader;
 import com.linkedin.venice.router.api.RouterExceptionAndTrackingUtils;
@@ -50,11 +55,11 @@ import com.linkedin.venice.router.api.VeniceDelegateMode;
 import com.linkedin.venice.router.api.VeniceDispatcher;
 import com.linkedin.venice.router.api.VeniceHostFinder;
 import com.linkedin.venice.router.api.VeniceHostHealth;
-import com.linkedin.venice.router.api.VeniceMetricsProvider;
 import com.linkedin.venice.router.api.VeniceMultiKeyRoutingStrategy;
 import com.linkedin.venice.router.api.VenicePartitionFinder;
 import com.linkedin.venice.router.api.VenicePathParser;
 import com.linkedin.venice.router.api.VeniceResponseAggregator;
+import com.linkedin.venice.router.api.VeniceRole;
 import com.linkedin.venice.router.api.VeniceRoleFinder;
 import com.linkedin.venice.router.api.VeniceVersionFinder;
 import com.linkedin.venice.router.api.path.VenicePath;
@@ -68,6 +73,7 @@ import com.linkedin.venice.router.stats.AggRouterHttpRequestStats;
 import com.linkedin.venice.router.stats.HealthCheckStats;
 import com.linkedin.venice.router.stats.LongTailRetryStatsProvider;
 import com.linkedin.venice.router.stats.RouteHttpRequestStats;
+import com.linkedin.venice.router.stats.RouterMetricEntity;
 import com.linkedin.venice.router.stats.RouterStats;
 import com.linkedin.venice.router.stats.RouterThrottleStats;
 import com.linkedin.venice.router.stats.SecurityStats;
@@ -75,17 +81,21 @@ import com.linkedin.venice.router.stats.StaleVersionStats;
 import com.linkedin.venice.router.streaming.VeniceChunkedWriteHandler;
 import com.linkedin.venice.router.throttle.ReadRequestThrottler;
 import com.linkedin.venice.router.throttle.RouterThrottler;
-import com.linkedin.venice.router.utils.VeniceRouterUtils;
 import com.linkedin.venice.security.SSLFactory;
 import com.linkedin.venice.service.AbstractVeniceService;
 import com.linkedin.venice.servicediscovery.ServiceDiscoveryAnnouncer;
-import com.linkedin.venice.stats.TehutiUtils;
+import com.linkedin.venice.stats.ThreadPoolOtelMetricEntity;
 import com.linkedin.venice.stats.ThreadPoolStats;
 import com.linkedin.venice.stats.VeniceJVMStats;
+import com.linkedin.venice.stats.VeniceMetricsRepository;
 import com.linkedin.venice.stats.ZkClientStatusStats;
+import com.linkedin.venice.stats.metrics.MetricEntity;
+import com.linkedin.venice.stats.metrics.ModuleMetricEntityInterface;
 import com.linkedin.venice.throttle.EventThrottler;
+import com.linkedin.venice.utils.DaemonThreadFactory;
 import com.linkedin.venice.utils.HelixUtils;
 import com.linkedin.venice.utils.ReflectUtils;
+import com.linkedin.venice.utils.RetryUtils;
 import com.linkedin.venice.utils.SslUtils;
 import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.VeniceProperties;
@@ -99,23 +109,28 @@ import io.netty.channel.epoll.EpollEventLoopGroup;
 import io.netty.channel.epoll.EpollServerSocketChannel;
 import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
+import io.netty.handler.codec.http.FullHttpResponse;
+import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.util.concurrent.DefaultThreadFactory;
 import io.tehuti.metrics.MetricsRepository;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
+import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
-import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
-import java.util.function.LongSupplier;
-import javax.annotation.Nonnull;
 import org.apache.helix.InstanceType;
 import org.apache.helix.manager.zk.ZKHelixManager;
 import org.apache.helix.zookeeper.impl.client.ZkClient;
@@ -125,7 +140,8 @@ import org.apache.logging.log4j.Logger;
 
 public class RouterServer extends AbstractVeniceService {
   private static final Logger LOGGER = LogManager.getLogger(RouterServer.class);
-
+  public static final String DEFAULT_CLUSTER_DISCOVERY_D2_SERVICE_NAME = "venice-discovery";
+  private static final String ROUTER_RETRY_MANAGER_THREAD_PREFIX = "Router-retry-manager-thread";
   // Immutable state
   private final List<ServiceDiscoveryAnnouncer> serviceDiscoveryAnnouncers;
   private final MetricsRepository metricsRepository;
@@ -148,7 +164,7 @@ public class RouterServer extends AbstractVeniceService {
   private Optional<HelixHybridStoreQuotaRepository> hybridStoreQuotaRepository;
   private ReadOnlyStoreRepository metadataRepository;
   private RouterStats<AggRouterHttpRequestStats> routerStats;
-  private HelixReadOnlyStoreConfigRepository storeConfigRepository;
+  private HelixReadOnlyStoreViewConfigRepositoryAdapter storeConfigRepository;
 
   private PushStatusStoreReader pushStatusStoreReader;
   private HelixLiveInstanceMonitor liveInstanceMonitor;
@@ -169,6 +185,8 @@ public class RouterServer extends AbstractVeniceService {
   private ZkRoutersClusterManager routersClusterManager;
   private Optional<Router> router = Optional.empty();
   private Router secureRouter;
+  private D2Client d2Client;
+  private String d2ServiceName;
   private DictionaryRetrievalService dictionaryRetrievalService;
   private RouterThrottler readRequestThrottler;
 
@@ -184,7 +202,19 @@ public class RouterServer extends AbstractVeniceService {
   // A map of optional ChannelHandlers that retains insertion order to be added at the end of the router pipeline
   private final Map<String, ChannelHandler> optionalChannelHandlers = new LinkedHashMap<>();
 
-  private static final String ROUTER_SERVICE_NAME = "venice-router";
+  public static final String ROUTER_SERVICE_NAME = "venice-router";
+  public static final String ROUTER_SERVICE_METRIC_PREFIX = "router";
+
+  /**
+   * Returns the enum classes that compose {@link #ROUTER_SERVICE_METRIC_ENTITIES}. This is the
+   * single source of truth used by both production aggregation and tests.
+   */
+  public static List<Class<? extends ModuleMetricEntityInterface>> getMetricEntityEnumClasses() {
+    return Arrays.asList(RouterMetricEntity.class, ThreadPoolOtelMetricEntity.class);
+  }
+
+  public static final Collection<MetricEntity> ROUTER_SERVICE_METRIC_ENTITIES =
+      ModuleMetricEntityInterface.getUniqueMetricEntities(getMetricEntityEnumClasses());
 
   /**
    * Thread number used to monitor the listening port;
@@ -193,6 +223,12 @@ public class RouterServer extends AbstractVeniceService {
   private VeniceJVMStats jvmStats;
 
   private final AggHostHealthStats aggHostHealthStats;
+
+  private ScheduledExecutorService retryManagerExecutorService;
+  private ThreadPoolExecutor responseAggregationExecutor;
+  private ThreadPoolExecutor dnsResolveExecutor;
+
+  private InFlightRequestStat inFlightRequestStat;
 
   public static void main(String args[]) throws Exception {
     if (args.length != 1) {
@@ -214,7 +250,9 @@ public class RouterServer extends AbstractVeniceService {
     LOGGER.info("Cluster: {}", props.getString(ConfigKeys.CLUSTER_NAME));
     LOGGER.info("Port: {}", props.getInt(ConfigKeys.LISTENER_PORT));
     LOGGER.info("SSL Port: {}", props.getInt(ConfigKeys.LISTENER_SSL_PORT));
-    LOGGER.info("IO worker count: {}", props.getInt(ConfigKeys.ROUTER_IO_WORKER_COUNT));
+    LOGGER.info(
+        "IO worker count: {}",
+        props.getInt(ConfigKeys.ROUTER_IO_WORKER_COUNT, VeniceRouterConfig.DEFAULT_ROUTER_IO_WORKER_COUNT));
 
     Optional<SSLFactory> sslFactory;
     if (props.getBoolean(ConfigKeys.ROUTER_ENABLE_SSL, true)) {
@@ -228,7 +266,32 @@ public class RouterServer extends AbstractVeniceService {
       sslFactory = Optional.empty();
     }
 
-    RouterServer server = new RouterServer(props, new ArrayList<>(), Optional.empty(), sslFactory);
+    List<ServiceDiscoveryAnnouncer> d2Servers = new ArrayList<>();
+
+    if (props.getBoolean("router.d2.announce.enabled", false)) {
+      String zkAddress = props.getString(ConfigKeys.ZOOKEEPER_ADDRESS);
+      String announceHost = props.getString("router.d2.announce.host", "localhost");
+      int port = props.getInt(ConfigKeys.LISTENER_PORT);
+      String localUri = "http://" + announceHost + ":" + port;
+      Map<String, String> clusterToD2 = props.getMap(ConfigKeys.CLUSTER_TO_D2);
+
+      for (Map.Entry<String, String> entry: clusterToD2.entrySet()) {
+        String d2ServiceName = entry.getValue();
+        String d2ClusterName = d2ServiceName + "_d2_cluster";
+        D2ConfigUtils.setupD2Config(zkAddress, false, d2ClusterName, d2ServiceName);
+        d2Servers.addAll(D2ConfigUtils.getD2Servers(zkAddress, d2ClusterName, localUri));
+      }
+
+      // Always announce the global cluster discovery service (separate from per-cluster D2)
+      String discoveryServiceName = DEFAULT_CLUSTER_DISCOVERY_D2_SERVICE_NAME;
+      String discoveryClusterName = discoveryServiceName + "_d2_cluster";
+      D2ConfigUtils.setupD2Config(zkAddress, false, discoveryClusterName, discoveryServiceName);
+      d2Servers.addAll(D2ConfigUtils.getD2Servers(zkAddress, discoveryClusterName, localUri));
+
+      LOGGER.info("D2 announcement enabled with {} announcers for router URI: {}", d2Servers.size(), localUri);
+    }
+
+    RouterServer server = new RouterServer(props, d2Servers, Optional.empty(), sslFactory);
     server.start();
 
     Runtime.getRuntime().addShutdownHook(new Thread() {
@@ -261,7 +324,13 @@ public class RouterServer extends AbstractVeniceService {
         serviceDiscoveryAnnouncers,
         accessController,
         sslFactory,
-        TehutiUtils.getMetricsRepository(ROUTER_SERVICE_NAME));
+        VeniceMetricsRepository.getVeniceMetricsRepository(
+            ROUTER_SERVICE_NAME,
+            ROUTER_SERVICE_METRIC_PREFIX,
+            ROUTER_SERVICE_METRIC_ENTITIES,
+            properties.getAsMap()),
+        null,
+        "venice-discovery");
   }
 
   // for test purpose
@@ -275,27 +344,42 @@ public class RouterServer extends AbstractVeniceService {
       Optional<DynamicAccessController> accessController,
       Optional<SSLFactory> sslFactory,
       MetricsRepository metricsRepository) {
-    this(properties, serviceDiscoveryAnnouncers, accessController, sslFactory, metricsRepository, true);
+    this(
+        properties,
+        serviceDiscoveryAnnouncers,
+        accessController,
+        sslFactory,
+        metricsRepository,
+        null,
+        DEFAULT_CLUSTER_DISCOVERY_D2_SERVICE_NAME);
+  }
 
+  public RouterServer(
+      VeniceProperties properties,
+      List<ServiceDiscoveryAnnouncer> serviceDiscoveryAnnouncers,
+      Optional<DynamicAccessController> accessController,
+      Optional<SSLFactory> sslFactory,
+      MetricsRepository metricsRepository,
+      D2Client d2Client,
+      String d2ServiceName) {
+    this(properties, serviceDiscoveryAnnouncers, accessController, sslFactory, metricsRepository, true);
     HelixReadOnlyZKSharedSystemStoreRepository readOnlyZKSharedSystemStoreRepository =
         new HelixReadOnlyZKSharedSystemStoreRepository(zkClient, adapter, config.getSystemSchemaClusterName());
-    HelixReadOnlyStoreRepository readOnlyStoreRepository = new HelixReadOnlyStoreRepository(
-        zkClient,
-        adapter,
-        config.getClusterName(),
-        config.getRefreshAttemptsForZkReconnect(),
-        config.getRefreshIntervalForZkReconnectInMs());
+    HelixReadOnlyStoreRepository readOnlyStoreRepository =
+        new HelixReadOnlyStoreRepository(zkClient, adapter, config.getClusterName());
     this.metadataRepository = new HelixReadOnlyStoreRepositoryAdapter(
         readOnlyZKSharedSystemStoreRepository,
         readOnlyStoreRepository,
         config.getClusterName());
     this.routerStats = new RouterStats<>(
         requestType -> new AggRouterHttpRequestStats(
+            config.getClusterName(),
             metricsRepository,
             requestType,
             config.isKeyValueProfilingEnabled(),
             metadataRepository,
-            config.isUnregisterMetricForDeletedStoreEnabled()));
+            config.isUnregisterMetricForDeletedStoreEnabled(),
+            inFlightRequestStat.getTotalInflightRequestSensor()));
     this.schemaRepository = new HelixReadOnlySchemaRepositoryAdapter(
         new HelixReadOnlyZKSharedSchemaRepository(
             readOnlyZKSharedSystemStoreRepository,
@@ -318,15 +402,10 @@ public class RouterServer extends AbstractVeniceService {
     this.hybridStoreQuotaRepository = config.isHelixHybridStoreQuotaEnabled()
         ? Optional.of(new HelixHybridStoreQuotaRepository(manager))
         : Optional.empty();
-    this.storeConfigRepository = new HelixReadOnlyStoreConfigRepository(
-        zkClient,
-        adapter,
-        config.getRefreshAttemptsForZkReconnect(),
-        config.getRefreshIntervalForZkReconnectInMs());
+    this.storeConfigRepository =
+        new HelixReadOnlyStoreViewConfigRepositoryAdapter(new HelixReadOnlyStoreConfigRepository(zkClient, adapter));
     this.liveInstanceMonitor = new HelixLiveInstanceMonitor(this.zkClient, config.getClusterName());
 
-    D2Client d2Client = D2ClientFactory.getD2Client(config.getZkConnection(), Optional.empty());
-    String d2ServiceName = config.getClusterToD2Map().get(config.getClusterName());
     this.pushStatusStoreReader = new PushStatusStoreReader(
         d2Client,
         d2ServiceName,
@@ -356,7 +435,7 @@ public class RouterServer extends AbstractVeniceService {
     this.metaStoreShadowReader = Optional.empty();
     this.metricsRepository = metricsRepository;
 
-    this.aggHostHealthStats = new AggHostHealthStats(metricsRepository);
+    this.aggHostHealthStats = new AggHostHealthStats(config.getClusterName(), metricsRepository);
 
     this.serviceDiscoveryAnnouncers = serviceDiscoveryAnnouncers;
     this.accessController = accessController;
@@ -364,7 +443,7 @@ public class RouterServer extends AbstractVeniceService {
 
     Class<IdentityParser> identityParserClass = ReflectUtils.loadClass(config.getIdentityParserClassName());
     this.identityParser = ReflectUtils.callConstructor(identityParserClass, new Class[0], new Object[0]);
-
+    inFlightRequestStat = new InFlightRequestStat(config);
     verifySslOk();
   }
 
@@ -380,21 +459,33 @@ public class RouterServer extends AbstractVeniceService {
       Optional<HelixHybridStoreQuotaRepository> hybridStoreQuotaRepository,
       HelixReadOnlyStoreRepository metadataRepository,
       HelixReadOnlySchemaRepository schemaRepository,
-      HelixReadOnlyStoreConfigRepository storeConfigRepository,
+      HelixReadOnlyStoreViewConfigRepositoryAdapter storeConfigRepository,
       List<ServiceDiscoveryAnnouncer> serviceDiscoveryAnnouncers,
       Optional<SSLFactory> sslFactory,
       HelixLiveInstanceMonitor liveInstanceMonitor) {
-    this(properties, serviceDiscoveryAnnouncers, Optional.empty(), sslFactory, new MetricsRepository(), false);
+    this(
+        properties,
+        serviceDiscoveryAnnouncers,
+        Optional.empty(),
+        sslFactory,
+        VeniceMetricsRepository.getVeniceMetricsRepository(
+            ROUTER_SERVICE_NAME,
+            ROUTER_SERVICE_METRIC_PREFIX,
+            ROUTER_SERVICE_METRIC_ENTITIES,
+            properties.getAsMap()),
+        false);
     this.routingDataRepository = routingDataRepository;
     this.hybridStoreQuotaRepository = hybridStoreQuotaRepository;
     this.metadataRepository = metadataRepository;
     this.routerStats = new RouterStats<>(
         requestType -> new AggRouterHttpRequestStats(
+            config.getClusterName(),
             metricsRepository,
             requestType,
             config.isKeyValueProfilingEnabled(),
             metadataRepository,
-            config.isUnregisterMetricForDeletedStoreEnabled()));
+            config.isUnregisterMetricForDeletedStoreEnabled(),
+            inFlightRequestStat.getTotalInflightRequestSensor()));
     this.schemaRepository = schemaRepository;
     this.storeConfigRepository = storeConfigRepository;
     this.liveInstanceMonitor = liveInstanceMonitor;
@@ -481,11 +572,17 @@ public class RouterServer extends AbstractVeniceService {
         routeHttpRequestStats,
         aggHostHealthStats,
         routerStats);
-    scatterGatherMode = new VeniceDelegateMode(config, routerStats, routeHttpRequestStats);
+    scatterGatherMode =
+        new VeniceDelegateMode(config, routerStats, routeHttpRequestStats, dispatcher.getPerRouteStatsByType());
 
     if (config.isRouterHeartBeatEnabled()) {
-      heartbeat =
-          new RouterHeartbeat(liveInstanceMonitor, healthMonitor, config, sslFactoryForRequests, storageNodeClient);
+      heartbeat = new RouterHeartbeat(
+          liveInstanceMonitor,
+          healthMonitor,
+          config,
+          sslFactoryForRequests,
+          storageNodeClient,
+          config.getLogContext());
       heartbeat.startInner();
     }
 
@@ -505,7 +602,8 @@ public class RouterServer extends AbstractVeniceService {
         sslFactoryForRequests,
         metadataRepository,
         storageNodeClient,
-        compressorFactory);
+        compressorFactory,
+        metricsRepository);
 
     VeniceHostFinder hostFinder = new VeniceHostFinder(routingDataRepository, routerStats, healthMonitor);
 
@@ -518,13 +616,21 @@ public class RouterServer extends AbstractVeniceService {
         config.getClusterName(),
         compressorFactory,
         metricsRepository);
+
+    retryManagerExecutorService = Executors.newScheduledThreadPool(
+        config.getRetryManagerCorePoolSize(),
+        new DaemonThreadFactory(ROUTER_RETRY_MANAGER_THREAD_PREFIX, config.getLogContext()));
+
     VenicePathParser pathParser = new VenicePathParser(
         versionFinder,
         partitionFinder,
         routerStats,
         metadataRepository,
         config,
-        compressorFactory);
+        compressorFactory,
+        metricsRepository,
+        retryManagerExecutorService,
+        new NameRepository(this.config.getNameRepoMaxEntryCount()));
 
     MetaDataHandler metaDataHandler = new MetaDataHandler(
         routingDataRepository,
@@ -539,52 +645,43 @@ public class RouterServer extends AbstractVeniceService {
         config.getKafkaBootstrapServers(),
         config.isSslToKafka(),
         versionFinder,
-        pushStatusStoreReader);
+        pushStatusStoreReader,
+        metricsRepository);
 
     // Setup stat tracking for exceptional case
     RouterExceptionAndTrackingUtils.setRouterStats(routerStats);
 
     // Fixed retry future
-    AsyncFuture<LongSupplier> singleGetRetryFuture =
-        new SuccessAsyncFuture<>(config::getLongTailRetryForSingleGetThresholdMs);
-    LongTailRetrySupplier retrySupplier = new LongTailRetrySupplier<VenicePath, RouterKey>() {
-      private final TreeMap<Integer, Integer> longTailRetryConfigForBatchGet =
-          config.getLongTailRetryForBatchGetThresholdMs();
-
-      @Nonnull
-      @Override
-      public AsyncFuture<LongSupplier> getLongTailRetryMilliseconds(
-          @Nonnull VenicePath path,
-          @Nonnull String methodName) {
-        if (VeniceRouterUtils.isHttpGet(methodName)) {
-          // single-get
-          path.setLongTailRetryThresholdMs(config.getLongTailRetryForSingleGetThresholdMs());
-          return singleGetRetryFuture;
-        } else {
-          /**
-           * Long tail retry threshold is based on key count for batch-get request.
-           */
-          int keyNum = path.getPartitionKeys().size();
-          if (keyNum == 0) {
-            // Should not happen
-            throw new VeniceException("Met scatter-gather request without any keys");
-          }
-          /**
-           * Refer to {@link ConfigKeys.ROUTER_LONG_TAIL_RETRY_FOR_BATCH_GET_THRESHOLD_MS} to get more info.
-           */
-          int longTailRetryThresholdMs = longTailRetryConfigForBatchGet.floorEntry(keyNum).getValue();
-          path.setLongTailRetryThresholdMs(longTailRetryThresholdMs);
-          return new SuccessAsyncFuture<>(() -> longTailRetryThresholdMs);
-        }
-      }
-    };
+    LongTailRetrySupplier<VenicePath, RouterKey> retrySupplier =
+        (path, methodName) -> new SuccessAsyncFuture<>(path::getLongTailRetryThresholdMs);
 
     responseAggregator = new VeniceResponseAggregator(routerStats, metaStoreShadowReader);
     /**
      * No need to setup {@link com.linkedin.alpini.router.api.HostHealthMonitor} here since
      * {@link VeniceHostFinder} will always do health check.
      */
-    ScatterGatherHelper scatterGather = ScatterGatherHelper.builder()
+    // Create dedicated thread pool for response aggregation if enabled (size > 0), to move work off the Netty EventLoop
+    // (stageExecutor(ctx)) and isolate it from slow client I/O.
+    int responseAggregationThreadPoolSize = config.getResponseAggregationThreadPoolSize();
+    if (responseAggregationThreadPoolSize > 0) {
+      int responseAggregationQueueCapacity = config.getResponseAggregationQueueCapacity();
+      this.responseAggregationExecutor = ThreadPoolFactory.createThreadPool(
+          responseAggregationThreadPoolSize,
+          "ResponseAggregationThread",
+          config.getLogContext(),
+          responseAggregationQueueCapacity,
+          LINKED_BLOCKING_QUEUE);
+      new ThreadPoolStats(metricsRepository, responseAggregationExecutor, "response_aggregation_thread_pool");
+      LOGGER.info(
+          "Response aggregation thread pool enabled with size: {}, queue capacity: {}",
+          responseAggregationThreadPoolSize,
+          responseAggregationQueueCapacity);
+    } else {
+      LOGGER.info("Response aggregation thread pool disabled (size <= 0), using Netty EventLoop for aggregation");
+    }
+
+    ScatterGatherHelper scatterGather = ScatterGatherHelper
+        .<Instance, VenicePath, RouterKey, VeniceRole, BasicFullHttpRequest, FullHttpResponse, HttpResponseStatus>builder()
         .roleFinder(new VeniceRoleFinder())
         .pathParserExtended(pathParser)
         .partitionFinder(partitionFinder)
@@ -596,17 +693,15 @@ public class RouterServer extends AbstractVeniceService {
                 .withSingleGetTardyThreshold(config.getSingleGetTardyLatencyThresholdMs(), TimeUnit.MILLISECONDS)
                 .withMultiGetTardyThreshold(config.getMultiGetTardyLatencyThresholdMs(), TimeUnit.MILLISECONDS)
                 .withComputeTardyThreshold(config.getComputeTardyLatencyThresholdMs(), TimeUnit.MILLISECONDS))
-        .metricsProvider(new VeniceMetricsProvider())
+        .metricsProvider(request -> new Metrics())
         .longTailRetrySupplier(retrySupplier)
         .scatterGatherStatsProvider(new LongTailRetryStatsProvider(routerStats))
         .enableStackTraceResponseForException(true)
         .enableRetryRequestAlwaysUseADifferentHost(true)
+        .responseAggregationExecutor(responseAggregationExecutor)
         .build();
 
-    SecurityStats securityStats = new SecurityStats(
-        this.metricsRepository,
-        "security",
-        secureRouter != null ? () -> secureRouter.getConnectedCount() : () -> 0);
+    SecurityStats securityStats = new SecurityStats(this.metricsRepository, "security");
     RouterThrottleStats routerThrottleStats = new RouterThrottleStats(this.metricsRepository, "router_throttler_stats");
     routerEarlyThrottler = new EventThrottler(
         config.getMaxRouterReadCapacityCu(),
@@ -632,6 +727,9 @@ public class RouterServer extends AbstractVeniceService {
               .bossPoolBuilder(EventLoopGroup.class, ignored -> serverEventLoopGroup)
               .ioWorkerPoolBuilder(EventLoopGroup.class, ignored -> workerEventLoopGroup)
               .connectionLimit(config.getConnectionLimit())
+              .connectionHandleMode(config.getConnectionHandleMode())
+              .connectionCountRecorder(securityStats::recordLiveConnectionCount)
+              .rejectedConnectionCountRecorder(securityStats::recordRejectedConnectionCount)
               .timeoutProcessor(timeoutProcessor)
               .beforeHttpRequestHandler(ChannelPipeline.class, (pipeline) -> {
                 pipeline.addLast(
@@ -650,40 +748,39 @@ public class RouterServer extends AbstractVeniceService {
     }
 
     RouterSslVerificationHandler routerSslVerificationHandler = new RouterSslVerificationHandler(securityStats);
-    StoreAclHandler aclHandler =
-        accessController.isPresent() ? new StoreAclHandler(accessController.get(), metadataRepository) : null;
+    RouterStoreAclHandler aclHandler = accessController.isPresent()
+        ? new RouterStoreAclHandler(
+            identityParser,
+            accessController.get(),
+            metadataRepository,
+            config.getAclInMemoryCacheTTLMs())
+        : null;
     final SslInitializer sslInitializer;
     if (sslFactory.isPresent()) {
       sslInitializer = new SslInitializer(SslUtils.toAlpiniSSLFactory(sslFactory.get()), false);
-      if (config.getClientSslHandshakeThreads() > 0) {
-        if (config.isResolveBeforeSSL()) {
-          ExecutorService sslHandshakeExecutor = registry.factory(ShutdownableExecutors.class)
-              .newFixedThreadPool(
-                  config.getClientSslHandshakeThreads(),
-                  new DefaultThreadFactory("RouterDNSBeforeSSLThread", true, Thread.NORM_PRIORITY));
-          int clientSslHandshakeThreads = config.getClientSslHandshakeThreads();
-          int maxConcurrentResolution = config.getMaxConcurrentResolutions();
-          int clientResolutionRetryAttempts = config.getClientResolutionRetryAttempts();
-          long clientResolutionRetryBackoffMs = config.getClientResolutionRetryBackoffMs();
-          if (useEpoll) {
-            sslResolverEventLoopGroup = new EpollEventLoopGroup(clientSslHandshakeThreads, sslHandshakeExecutor);
-          } else {
-            sslResolverEventLoopGroup = new NioEventLoopGroup(clientSslHandshakeThreads, sslHandshakeExecutor);
-          }
-          sslInitializer.enableResolveBeforeSSL(
-              sslResolverEventLoopGroup,
-              clientResolutionRetryAttempts,
-              clientResolutionRetryBackoffMs,
-              maxConcurrentResolution);
+      if (config.getResolveThreads() > 0) {
+        this.dnsResolveExecutor = ThreadPoolFactory.createThreadPool(
+            config.getResolveThreads(),
+            "DNSResolveThread",
+            config.getLogContext(),
+            config.getResolveQueueCapacity(),
+            LINKED_BLOCKING_QUEUE);
+        new ThreadPoolStats(metricsRepository, this.dnsResolveExecutor, "dns_resolution_thread_pool");
+        int resolveThreads = config.getResolveThreads();
+        int maxConcurrentSslHandshakes = config.getMaxConcurrentSslHandshakes();
+        int clientResolutionRetryAttempts = config.getClientResolutionRetryAttempts();
+        long clientResolutionRetryBackoffMs = config.getClientResolutionRetryBackoffMs();
+        if (useEpoll) {
+          sslResolverEventLoopGroup = new EpollEventLoopGroup(resolveThreads, dnsResolveExecutor);
         } else {
-          ThreadPoolExecutor sslHandshakeExecutor = ThreadPoolFactory.createThreadPool(
-              config.getClientSslHandshakeThreads(),
-              "SSLHandShakeThread",
-              config.getClientSslHandshakeQueueCapacity(),
-              LINKED_BLOCKING_QUEUE);
-          new ThreadPoolStats(metricsRepository, sslHandshakeExecutor, "ssl_handshake_thread_pool");
-          sslInitializer.enableSslTaskExecutor(sslHandshakeExecutor);
+          sslResolverEventLoopGroup = new NioEventLoopGroup(resolveThreads, dnsResolveExecutor);
         }
+        sslInitializer.enableResolveBeforeSSL(
+            sslResolverEventLoopGroup,
+            clientResolutionRetryAttempts,
+            clientResolutionRetryBackoffMs,
+            maxConcurrentSslHandshakes,
+            config.isClientIPSpoofingCheckEnabled());
       }
       sslInitializer.setIdentityParser(identityParser::parseIdentityFromCert);
       securityStats.registerSslHandshakeSensors(sslInitializer);
@@ -712,7 +809,7 @@ public class RouterServer extends AbstractVeniceService {
       pipeline.addLast("VerifySslHandler", routerSslVerificationHandler);
       pipeline.addLast("MetadataHandler", metaDataHandler);
       pipeline.addLast("AdminOperationsHandler", adminOperationsHandler);
-      pipeline.addLast("StoreAclHandler", aclHandler);
+      pipeline.addLast("RouterStoreAclHandler", aclHandler);
       pipeline.addLast("RouterThrottleHandler", routerThrottleHandler);
       addStreamingHandler(pipeline);
       addOptionalChannelHandlersToPipeline(pipeline);
@@ -725,6 +822,9 @@ public class RouterServer extends AbstractVeniceService {
         .bossPoolBuilder(EventLoopGroup.class, ignored -> serverEventLoopGroup)
         .ioWorkerPoolBuilder(EventLoopGroup.class, ignored -> workerEventLoopGroup)
         .connectionLimit(config.getConnectionLimit())
+        .connectionHandleMode(config.getConnectionHandleMode())
+        .connectionCountRecorder(securityStats::recordLiveConnectionCount)
+        .rejectedConnectionCountRecorder(securityStats::recordRejectedConnectionCount)
         .timeoutProcessor(timeoutProcessor)
         .beforeHttpServerCodec(ChannelPipeline.class, sslFactory.isPresent() ? addSslInitializer : noop) // Compare once
                                                                                                          // per router.
@@ -781,6 +881,10 @@ public class RouterServer extends AbstractVeniceService {
     optionalChannelHandlers.put(key, channelHandler);
   }
 
+  public double getInFlightRequestRate() {
+    return inFlightRequestStat.getInFlightRequestRate();
+  }
+
   @Override
   public void stopInner() throws Exception {
     for (ServiceDiscoveryAnnouncer serviceDiscoveryAnnouncer: serviceDiscoveryAnnouncers) {
@@ -791,8 +895,6 @@ public class RouterServer extends AbstractVeniceService {
         LOGGER.error("Service discovery announcer {} failed to unregister properly", serviceDiscoveryAnnouncer, e);
       }
     }
-    // Graceful shutdown
-    Thread.sleep(TimeUnit.SECONDS.toMillis(config.getRouterNettyGracefulShutdownPeriodSeconds()));
     if (serverFuture != null && !serverFuture.cancel(false)) {
       serverFuture.awaitUninterruptibly();
     }
@@ -819,6 +921,20 @@ public class RouterServer extends AbstractVeniceService {
      * correctly.
      */
 
+    LOGGER.info("Waiting to make sure all in-flight requests are drained");
+    // Graceful shutdown: Wait till all the requests are drained
+    try {
+      RetryUtils.executeWithMaxAttempt(() -> {
+        double inFlightRequestRate = inFlightRequestStat.getInFlightRequestRate();
+        if (inFlightRequestRate > 0.0) {
+          throw new VeniceException("There are still in-flight requests in router :" + inFlightRequestRate);
+        }
+      }, 30, Duration.ofSeconds(1), Collections.singletonList(VeniceException.class));
+    } catch (VeniceException e) {
+      LOGGER.error(
+          "There are still in-flight request during router shutdown, still continuing shutdown, it might cause unhealthy request in client");
+    }
+    LOGGER.info("Drained all in-flight requests, starting to shutdown the router.");
     storageNodeClient.close();
     workerEventLoopGroup.shutdownGracefully();
     serverEventLoopGroup.shutdownGracefully();
@@ -843,6 +959,7 @@ public class RouterServer extends AbstractVeniceService {
 
     routersClusterManager.unregisterRouter(Utils.getHelixNodeIdentifier(config.getHostname(), config.getPort()));
     routersClusterManager.clear();
+    dictionaryRetrievalService.stop();
     routingDataRepository.clear();
     metadataRepository.clear();
     schemaRepository.clear();
@@ -850,7 +967,6 @@ public class RouterServer extends AbstractVeniceService {
     hybridStoreQuotaRepository.ifPresent(repo -> repo.clear());
     liveInstanceMonitor.clear();
     timeoutProcessor.shutdownNow();
-    dictionaryRetrievalService.stop();
     if (instanceConfigRepository != null) {
       instanceConfigRepository.clear();
     }
@@ -862,6 +978,15 @@ public class RouterServer extends AbstractVeniceService {
     }
     if (heartbeat != null) {
       heartbeat.stopInner();
+    }
+    if (retryManagerExecutorService != null) {
+      retryManagerExecutorService.shutdownNow();
+    }
+    if (responseAggregationExecutor != null) {
+      responseAggregationExecutor.shutdownNow();
+    }
+    if (dnsResolveExecutor != null) {
+      dnsResolveExecutor.shutdownNow();
     }
   }
 
@@ -899,7 +1024,7 @@ public class RouterServer extends AbstractVeniceService {
           // TODO: Remove this check once test constructor is removed or otherwise fixed.
           LOGGER.info("Not connecting to Helix because the HelixManager is null (the test constructor was used)");
         } else {
-          HelixUtils.connectHelixManager(manager, 30, 1);
+          HelixUtils.connectHelixManager(manager, config.getRefreshAttemptsForZkReconnect());
           LOGGER.info("{} finished connectHelixManager()", this);
         }
       } catch (VeniceException ve) {
@@ -945,7 +1070,7 @@ public class RouterServer extends AbstractVeniceService {
         /**
          * This statement should be invoked after {@link #manager} is connected.
          */
-        instanceConfigRepository = new HelixInstanceConfigRepository(manager, config.isUseGroupFieldInHelixDomain());
+        instanceConfigRepository = new HelixInstanceConfigRepository(manager);
         instanceConfigRepository.refresh();
         helixGroupSelector = new HelixGroupSelector(
             metricsRepository,
@@ -959,7 +1084,7 @@ public class RouterServer extends AbstractVeniceService {
       // Dictionary retrieval service should start only after "metadataRepository.refresh()" otherwise it won't be able
       // to preload dictionaries from SN.
       try {
-        dictionaryRetrievalService.startInner();
+        dictionaryRetrievalService.start();
       } catch (VeniceException e) {
         LOGGER.error("Encountered issue when starting dictionary retriever", e);
         handleExceptionInStartServices(e, async);

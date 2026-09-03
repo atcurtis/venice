@@ -1,7 +1,6 @@
 package com.linkedin.venice.endToEnd;
 
 import static com.linkedin.venice.ConfigKeys.FREEZE_INGESTION_IF_READY_TO_SERVE_OR_LOCAL_DATA_EXISTS;
-import static com.linkedin.venice.ConfigKeys.SERVER_PROMOTION_TO_LEADER_REPLICA_DELAY_SECONDS;
 import static com.linkedin.venice.integration.utils.VeniceClusterWrapper.DEFAULT_KEY_SCHEMA;
 import static com.linkedin.venice.integration.utils.VeniceClusterWrapper.DEFAULT_VALUE_SCHEMA;
 import static org.testng.Assert.assertEquals;
@@ -14,19 +13,21 @@ import com.linkedin.davinci.client.DaVinciClient;
 import com.linkedin.davinci.client.DaVinciConfig;
 import com.linkedin.davinci.client.factory.CachingDaVinciClientFactory;
 import com.linkedin.venice.D2.D2ClientUtils;
+import com.linkedin.venice.client.store.AvroGenericStoreClient;
+import com.linkedin.venice.client.store.ClientConfig;
+import com.linkedin.venice.client.store.ClientFactory;
 import com.linkedin.venice.controllerapi.UpdateStoreQueryParams;
 import com.linkedin.venice.controllerapi.VersionCreationResponse;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.helix.HelixReadOnlySchemaRepository;
 import com.linkedin.venice.integration.utils.DaVinciTestContext;
 import com.linkedin.venice.integration.utils.ServiceFactory;
+import com.linkedin.venice.integration.utils.VeniceClusterCreateOptions;
 import com.linkedin.venice.integration.utils.VeniceClusterWrapper;
-import com.linkedin.venice.meta.IngestionMode;
-import com.linkedin.venice.meta.Version;
+import com.linkedin.venice.meta.StoreInfo;
 import com.linkedin.venice.pubsub.PubSubProducerAdapterFactory;
 import com.linkedin.venice.serialization.VeniceKafkaSerializer;
 import com.linkedin.venice.serialization.avro.VeniceAvroKafkaSerializer;
-import com.linkedin.venice.utils.DataProviderUtils;
 import com.linkedin.venice.utils.IntegrationTestPushUtils;
 import com.linkedin.venice.utils.TestUtils;
 import com.linkedin.venice.utils.Utils;
@@ -42,8 +43,7 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
+import java.util.concurrent.atomic.AtomicReference;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.AfterMethod;
 import org.testng.annotations.BeforeClass;
@@ -54,7 +54,6 @@ import org.testng.annotations.Test;
  * Create this class to isolate the live update suppression test as it could lead to unknown writer creation failure.
  */
 public class DaVinciLiveUpdateSuppressionTest {
-  private static final Logger LOGGER = LogManager.getLogger(DaVinciLiveUpdateSuppressionTest.class);
   private static final int KEY_COUNT = 10;
   private static final int TEST_TIMEOUT = 120_000; // ms
   private VeniceClusterWrapper cluster;
@@ -64,8 +63,16 @@ public class DaVinciLiveUpdateSuppressionTest {
   public void setUp() {
     Utils.thisIsLocalhost();
     Properties clusterConfig = new Properties();
-    clusterConfig.put(SERVER_PROMOTION_TO_LEADER_REPLICA_DELAY_SECONDS, 1L);
-    cluster = ServiceFactory.getVeniceCluster(1, 2, 1, 1, 100, false, false, clusterConfig);
+    VeniceClusterCreateOptions options = new VeniceClusterCreateOptions.Builder().numberOfControllers(1)
+        .numberOfServers(2)
+        .numberOfRouters(1)
+        .replicationFactor(1)
+        .partitionSize(100)
+        .sslToStorageNodes(false)
+        .sslToKafka(false)
+        .extraProperties(clusterConfig)
+        .build();
+    cluster = ServiceFactory.getVeniceCluster(options);
     d2Client = new D2ClientBuilder().setZkHosts(cluster.getZk().getAddress())
         .setZkSessionTimeout(3, TimeUnit.SECONDS)
         .setZkStartupTimeout(3, TimeUnit.SECONDS)
@@ -90,12 +97,14 @@ public class DaVinciLiveUpdateSuppressionTest {
     }
   }
 
-  @Test(dataProvider = "Isolated-Ingestion", dataProviderClass = DataProviderUtils.class, timeOut = TEST_TIMEOUT * 2)
-  public void testLiveUpdateSuppression(IngestionMode ingestionMode) throws Exception {
+  @Test(timeOut = TEST_TIMEOUT * 2)
+  public void testLiveUpdateSuppression() throws Exception {
     final String storeName = Utils.getUniqueString("store");
+    AtomicReference<StoreInfo> storeInfo = new AtomicReference<>();
     cluster.useControllerClient(client -> {
       TestUtils.assertCommand(
           client.createNewStore(storeName, getClass().getName(), DEFAULT_KEY_SCHEMA, DEFAULT_VALUE_SCHEMA));
+      storeInfo.set(TestUtils.assertCommand(client.getStore(storeName)).getStore());
       cluster.createMetaSystemStore(storeName);
       client.updateStore(
           storeName,
@@ -112,16 +121,15 @@ public class DaVinciLiveUpdateSuppressionTest {
     VeniceKafkaSerializer valueSerializer = new VeniceAvroKafkaSerializer(DEFAULT_VALUE_SCHEMA);
 
     // Enable live update suppression
-    Map<String, Object> extraBackendConfigMap =
-        (ingestionMode.equals(IngestionMode.ISOLATED)) ? TestUtils.getIngestionIsolationPropertyMap() : new HashMap<>();
+    Map<String, Object> extraBackendConfigMap = new HashMap<>();
     extraBackendConfigMap.put(FREEZE_INGESTION_IF_READY_TO_SERVE_OR_LOCAL_DATA_EXISTS, true);
 
     Future[] writerFutures = new Future[KEY_COUNT];
     int valueSchemaId = HelixReadOnlySchemaRepository.VALUE_SCHEMA_STARTING_ID;
 
     try (VeniceWriter<Object, Object, byte[]> batchProducer = vwFactory.createVeniceWriter(
-        new VeniceWriterOptions.Builder(topic).setKeySerializer(keySerializer)
-            .setValueSerializer(valueSerializer)
+        new VeniceWriterOptions.Builder(topic).setKeyPayloadSerializer(keySerializer)
+            .setValuePayloadSerializer(valueSerializer)
             .build())) {
       batchProducer.broadcastStartOfPush(Collections.emptyMap());
       for (int i = 0; i < KEY_COUNT; i++) {
@@ -138,16 +146,21 @@ public class DaVinciLiveUpdateSuppressionTest {
             d2Client,
             new MetricsRepository(),
             Optional.empty(),
-            cluster.getZk().getAddress(),
+            cluster,
             storeName,
             new DaVinciConfig(),
             extraBackendConfigMap);
 
+    cluster.useControllerClient(client -> {
+      storeInfo.set(client.getStore(storeName).getStore());
+    });
+
     try (CachingDaVinciClientFactory ignored = daVinciTestContext.getDaVinciClientFactory();
         DaVinciClient<Integer, Integer> client = daVinciTestContext.getDaVinciClient();
         VeniceWriter<Object, Object, byte[]> realTimeProducer = vwFactory.createVeniceWriter(
-            new VeniceWriterOptions.Builder(Version.composeRealTimeTopic(storeName)).setKeySerializer(keySerializer)
-                .setValueSerializer(valueSerializer)
+            new VeniceWriterOptions.Builder(Utils.getRealTimeTopicName(storeInfo.get()))
+                .setKeyPayloadSerializer(keySerializer)
+                .setValuePayloadSerializer(valueSerializer)
                 .build())) {
       client.subscribe(Collections.singleton(0)).get();
       writerFutures = new Future[KEY_COUNT];
@@ -156,6 +169,18 @@ public class DaVinciLiveUpdateSuppressionTest {
       }
       for (int i = 0; i < KEY_COUNT; i++) {
         writerFutures[i].get();
+      }
+
+      // Wait until the RT data is in the VT
+      try (AvroGenericStoreClient thinClient = ClientFactory.getAndStartGenericAvroClient(
+          ClientConfig.defaultGenericClientConfig(storeName).setVeniceURL(cluster.getRandomRouterURL()))) {
+        for (int i = 0; i < KEY_COUNT; i++) {
+          int finalI = i;
+          TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, () -> {
+            int result = (int) thinClient.get(finalI).get();
+            assertEquals(result, finalI * 1000);
+          });
+        }
       }
 
       /**
@@ -190,7 +215,7 @@ public class DaVinciLiveUpdateSuppressionTest {
             d2Client,
             new MetricsRepository(),
             Optional.empty(),
-            cluster.getZk().getAddress(),
+            cluster,
             storeName,
             new DaVinciConfig(),
             extraBackendConfigMap);

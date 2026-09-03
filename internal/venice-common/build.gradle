@@ -7,12 +7,19 @@ dependencies {
     exclude group: 'org.slf4j'        // Avro pulls in slf4j 1.5 which is API incompatible with 1.6
   }
 
-  implementation (libraries.helix) { // TODO: Get rid of Helix dependency in venice-common
-    // Helix pulls in an ancient version of the zkclient, which lacks some APIs and clashes with Kafka's dependency
-    exclude group: 'com.github.sgroschupf'
-    // Helix use zk 3.6.9, which introduce netty 3.10 and will fail our test.
-    exclude module: 'zookeeper'
+  implementation('org.apache.helix:helix-core:1.4.1:jdk8') {
+    exclude group: 'org.apache.helix'
   }
+  implementation('org.apache.helix:helix-common:1.4.1:jdk8')  {
+    exclude group: 'org.apache.helix'
+  }
+  implementation('org.apache.helix:zookeeper-api:1.4.1:jdk8') {
+    exclude group: 'org.apache.helix'
+  }
+  implementation('org.apache.helix:metadata-store-directory-common:1.4.1:jdk8') {
+    exclude group: 'org.apache.helix'
+  }
+  implementation('org.apache.helix:metrics-common:1.4.1:jdk8')
 
   implementation (project(':internal:alpini:netty4:alpini-netty4-base')) { // for SSL Initializer
     exclude group: 'com.oracle', module: 'ojdbc14' // unused transitive dependency, doesn't exist in repo
@@ -43,6 +50,7 @@ dependencies {
   // It's necessary to pull in the most recent version of zkclient explicitly, otherwise Helix won't have it...
   implementation libraries.zkclient
   implementation libraries.zookeeper // TODO: Get rid of ZK dependency in venice-common
+  testImplementation libraries.openTelemetryTestSdk
 
   // Test dependencies are allowed to be bulkier.
   testImplementation libraries.kafkaClientsTest // TODO: Get rid of Kafka dependency in venice-common (used by TopicCreator)
@@ -64,4 +72,11 @@ sourceSets.main.resources.srcDir(generateSslCertificate)
 
 ext {
   jacocoCoverageThreshold = 0.33
+}
+
+checkerFramework {
+  extraJavacArgs = ['-Xmaxerrs', '256']
+  checkers = ['org.checkerframework.checker.nullness.NullnessChecker']
+  skipCheckerFramework = true
+  excludeTests = true
 }

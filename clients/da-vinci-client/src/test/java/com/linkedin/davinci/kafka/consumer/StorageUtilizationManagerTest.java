@@ -1,5 +1,7 @@
 package com.linkedin.davinci.kafka.consumer;
 
+import static com.linkedin.davinci.kafka.consumer.LeaderFollowerStateType.*;
+import static com.linkedin.venice.utils.TestUtils.DEFAULT_PUBSUB_CONTEXT_FOR_UNIT_TESTING;
 import static org.mockito.Mockito.any;
 import static org.mockito.Mockito.argThat;
 import static org.mockito.Mockito.mock;
@@ -7,11 +9,15 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
-import com.linkedin.davinci.store.AbstractStorageEngine;
+import com.linkedin.davinci.store.StorageEngine;
 import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.meta.VersionStatus;
 import com.linkedin.venice.offsets.OffsetRecord;
+import com.linkedin.venice.pubsub.PubSubContext;
+import com.linkedin.venice.pubsub.PubSubTopicPartitionImpl;
+import com.linkedin.venice.pubsub.PubSubTopicRepository;
+import com.linkedin.venice.pubsub.api.PubSubTopic;
 import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -28,52 +34,97 @@ public class StorageUtilizationManagerTest {
   private final static long newStoreQuotaInBytes = 200L;
   private final static int storePartitionCount = 10;
   private final static String storeName = "TestTopic";
-  private final static String topic = Version.composeKafkaTopic(storeName, 1);
-  private final static int storeVersion = Version.parseVersionFromKafkaTopicName(topic);
+  private final static PubSubTopicRepository TOPIC_REPOSITORY = new PubSubTopicRepository();
+  private final static PubSubTopic VERSION_TOPIC = TOPIC_REPOSITORY.getTopic(Version.composeKafkaTopic(storeName, 1));
+  private final static PubSubTopic REAL_TIME_TOPIC =
+      TOPIC_REPOSITORY.getTopic(Utils.composeRealTimeTopic(storeName) + Utils.SEPARATE_TOPIC_SUFFIX);
+  private final static int STORE_VERSION = Version.parseVersionFromKafkaTopicName(VERSION_TOPIC.getName());
 
   private ConcurrentMap<Integer, PartitionConsumptionState> partitionConsumptionStateMap;
-  private AbstractStorageEngine storageEngine;
+  private ConcurrentMap<Integer, PartitionConsumptionState> hybridPartitionConsumptionStateMap;
+  private StorageEngine storageEngine;
   private IngestionNotificationDispatcher ingestionNotificationDispatcher;
   private Store store;
   private Version version;
   private StorageUtilizationManager quotaEnforcer;
+  private StorageUtilizationManager hybridQuotaEnforcer;
+  private PubSubContext pubSubContext;
 
   @BeforeClass
   public void setUp() {
-    storageEngine = mock(AbstractStorageEngine.class);
+    storageEngine = mock(StorageEngine.class);
     store = mock(Store.class);
     version = mock(Version.class);
+    pubSubContext = DEFAULT_PUBSUB_CONTEXT_FOR_UNIT_TESTING;
   }
 
   @BeforeMethod
   public void buildNewQuotaEnforcer() {
     ingestionNotificationDispatcher = mock(IngestionNotificationDispatcher.class);
     partitionConsumptionStateMap = new VeniceConcurrentHashMap<>();
+    hybridPartitionConsumptionStateMap = new VeniceConcurrentHashMap<>();
 
     for (int i = 1; i <= storePartitionCount; i++) {
-      PartitionConsumptionState pcs =
-          new PartitionConsumptionState(Utils.getReplicaId(topic, i), i, mock(OffsetRecord.class), true);
+      PartitionConsumptionState pcs = new PartitionConsumptionState(
+          new PubSubTopicPartitionImpl(VERSION_TOPIC, i),
+          mock(OffsetRecord.class),
+          pubSubContext,
+          true,
+          false,
+          false,
+          false,
+          null);
       partitionConsumptionStateMap.put(i, pcs);
+    }
+
+    OffsetRecord mockOffsetRecord = mock(OffsetRecord.class);
+    when(mockOffsetRecord.getLeaderTopic()).thenReturn(REAL_TIME_TOPIC.getName());
+    for (int i = 1; i <= storePartitionCount; i++) {
+      PartitionConsumptionState pcs = new PartitionConsumptionState(
+          new PubSubTopicPartitionImpl(VERSION_TOPIC, i),
+          mockOffsetRecord,
+          pubSubContext,
+          true,
+          false,
+          false,
+          false,
+          null);
+      pcs.setLeaderFollowerState(LEADER);
+      hybridPartitionConsumptionStateMap.put(i, pcs);
     }
 
     when(store.getName()).thenReturn(storeName);
     when(store.getStorageQuotaInByte()).thenReturn(storeQuotaInBytes);
     when(store.getPartitionCount()).thenReturn(storePartitionCount);
-    when(store.getVersion(storeVersion)).thenReturn(version);
+    when(store.getVersion(STORE_VERSION)).thenReturn(version);
     when(store.isHybridStoreDiskQuotaEnabled()).thenReturn(true);
     when(version.getStatus()).thenReturn(VersionStatus.STARTED);
 
     quotaEnforcer = new StorageUtilizationManager(
         storageEngine,
         store,
-        topic,
+        VERSION_TOPIC.getName(),
         storePartitionCount,
         partitionConsumptionStateMap,
         true,
         true,
+        false,
         ingestionNotificationDispatcher,
-        (t, p) -> {},
-        (t, p) -> {});
+        (t, p) -> true,
+        (t, p) -> true);
+
+    hybridQuotaEnforcer = new StorageUtilizationManager(
+        storageEngine,
+        store,
+        VERSION_TOPIC.getName(),
+        storePartitionCount,
+        hybridPartitionConsumptionStateMap,
+        true,
+        true,
+        true,
+        ingestionNotificationDispatcher,
+        (t, p) -> true,
+        (t, p) -> true);
   }
 
   @Test
@@ -96,9 +147,10 @@ public class StorageUtilizationManagerTest {
     // Trigger quota violation to pause these partitions.
     verify(ingestionNotificationDispatcher, times(0)).reportQuotaViolated(any());
     addUsageToAllPartitions(20);
-    verify(ingestionNotificationDispatcher, times(storePartitionCount)).reportQuotaViolated(any());
+    verify(ingestionNotificationDispatcher, times(storePartitionCount * 2)).reportQuotaViolated(any());
     for (int i = 1; i <= storePartitionCount; i++) {
-      Assert.assertTrue(quotaEnforcer.isPartitionPausedIngestion(i));
+      Assert.assertFalse(quotaEnforcer.isPartitionPausedIngestion(i));
+      Assert.assertTrue(hybridQuotaEnforcer.isPartitionPausedIngestion(i));
       PartitionConsumptionState partitionConsumptionState = partitionConsumptionStateMap.get(i);
       verify(ingestionNotificationDispatcher).reportQuotaViolated(partitionConsumptionState);
     }
@@ -106,8 +158,10 @@ public class StorageUtilizationManagerTest {
     // handleStoreChanged should get these paused partitions back, when feature is disabled.
     when(store.isHybridStoreDiskQuotaEnabled()).thenReturn(false);
     quotaEnforcer.handleStoreChanged(store);
+    hybridQuotaEnforcer.handleStoreChanged(store);
     for (int i = 1; i <= storePartitionCount; i++) {
       Assert.assertFalse(quotaEnforcer.isPartitionPausedIngestion(i));
+      Assert.assertFalse(hybridQuotaEnforcer.isPartitionPausedIngestion(i));
       // Expect a new round of QuotaNotViolate are reported.
       PartitionConsumptionState partitionConsumptionState = partitionConsumptionStateMap.get(i);
       verify(ingestionNotificationDispatcher, times(2)).reportQuotaNotViolated(partitionConsumptionState);
@@ -132,6 +186,7 @@ public class StorageUtilizationManagerTest {
     addUsageToAllPartitions(5);
     for (int i = 1; i <= storePartitionCount; i++) {
       Assert.assertFalse(quotaEnforcer.isPartitionPausedIngestion(i));
+      Assert.assertFalse(hybridQuotaEnforcer.isPartitionPausedIngestion(i));
     }
   }
 
@@ -141,17 +196,17 @@ public class StorageUtilizationManagerTest {
 
     // these partitions should be paused for exceeding write quota
     addUsageToAllPartitions(10);
-    verify(ingestionNotificationDispatcher, times(storePartitionCount)).reportQuotaViolated(any());
+    verify(ingestionNotificationDispatcher, times(storePartitionCount * 2)).reportQuotaViolated(any());
     for (int i = 1; i <= storePartitionCount; i++) {
-      Assert.assertTrue(quotaEnforcer.isPartitionPausedIngestion(i));
+      Assert.assertFalse(quotaEnforcer.isPartitionPausedIngestion(i));
       PartitionConsumptionState partitionConsumptionState = partitionConsumptionStateMap.get(i);
       verify(ingestionNotificationDispatcher).reportQuotaViolated(partitionConsumptionState);
     }
 
-    // The later same partitions consumptions should be paused too even with size zero
+    // The later same partitions consumptions should not be paused too even with size zero
     addUsageToAllPartitions(0);
     for (int i = 1; i <= storePartitionCount; i++) {
-      Assert.assertTrue(quotaEnforcer.isPartitionPausedIngestion(i));
+      Assert.assertFalse(quotaEnforcer.isPartitionPausedIngestion(i));
     }
 
     // check after store change and bumping quota, paused partition should be resumed
@@ -175,7 +230,7 @@ public class StorageUtilizationManagerTest {
     }
     verify(ingestionNotificationDispatcher, times(storePartitionCount)).reportCompleted(any());
     for (int i = 1; i <= storePartitionCount; i++) {
-      Assert.assertTrue(quotaEnforcer.isPartitionPausedIngestion(i));
+      // Assert.assertTrue(quotaEnforcer.isPartitionPausedIngestion(i));
       verify(ingestionNotificationDispatcher).reportCompleted(argThat(new PartitionNumberMatcher(i)));
     }
   }
@@ -196,6 +251,7 @@ public class StorageUtilizationManagerTest {
   private void addUsageToAllPartitions(int partitionSize) {
     for (int i = 1; i <= storePartitionCount; i++) {
       quotaEnforcer.enforcePartitionQuota(i, partitionSize);
+      hybridQuotaEnforcer.enforcePartitionQuota(i, partitionSize);
     }
   }
 

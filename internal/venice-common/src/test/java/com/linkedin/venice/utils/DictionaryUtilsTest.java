@@ -1,6 +1,8 @@
 package com.linkedin.venice.utils;
 
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
@@ -18,8 +20,10 @@ import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.pubsub.ImmutablePubSubMessage;
 import com.linkedin.venice.pubsub.PubSubTopicPartitionImpl;
 import com.linkedin.venice.pubsub.PubSubTopicRepository;
+import com.linkedin.venice.pubsub.adapter.kafka.common.ApacheKafkaOffsetPosition;
+import com.linkedin.venice.pubsub.api.DefaultPubSubMessage;
 import com.linkedin.venice.pubsub.api.PubSubConsumerAdapter;
-import com.linkedin.venice.pubsub.api.PubSubMessage;
+import com.linkedin.venice.pubsub.api.PubSubPosition;
 import com.linkedin.venice.pubsub.api.PubSubTopic;
 import com.linkedin.venice.pubsub.api.PubSubTopicPartition;
 import java.nio.ByteBuffer;
@@ -42,11 +46,9 @@ public class DictionaryUtilsTest {
     byte[] dictionaryToSend = "TEST_DICT".getBytes();
 
     PubSubConsumerAdapter pubSubConsumer = mock(PubSubConsumerAdapter.class);
-    PubSubTopicRepository pubSubTopicRepository = mock(PubSubTopicRepository.class);
     PubSubTopicPartition topicPartition = new PubSubTopicPartitionImpl(topic, 0);
-    doReturn(topic).when(pubSubTopicRepository).getTopic(topic.getName());
 
-    KafkaKey controlMessageKey = new KafkaKey(MessageType.CONTROL_MESSAGE, null);
+    KafkaKey controlMessageKey = new KafkaKey(MessageType.CONTROL_MESSAGE, new byte[0]);
     StartOfPush startOfPush = new StartOfPush();
     startOfPush.compressionStrategy = CompressionStrategy.ZSTD_WITH_DICT.getValue();
     startOfPush.compressionDictionary = ByteBuffer.wrap(dictionaryToSend);
@@ -56,8 +58,13 @@ public class DictionaryUtilsTest {
     sopCM.controlMessageUnion = startOfPush;
     KafkaMessageEnvelope sopWithDictionaryValue =
         new KafkaMessageEnvelope(MessageType.CONTROL_MESSAGE.getValue(), null, sopCM, null);
-    PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> sopWithDictionary =
-        new ImmutablePubSubMessage<>(controlMessageKey, sopWithDictionaryValue, topicPartition, 0L, 0L, 0);
+    DefaultPubSubMessage sopWithDictionary = new ImmutablePubSubMessage(
+        controlMessageKey,
+        sopWithDictionaryValue,
+        topicPartition,
+        ApacheKafkaOffsetPosition.of(0),
+        0L,
+        0);
     doReturn(Collections.singletonMap(topicPartition, Collections.singletonList(sopWithDictionary)))
         .when(pubSubConsumer)
         .poll(anyLong());
@@ -65,6 +72,8 @@ public class DictionaryUtilsTest {
     ByteBuffer dictionaryFromKafka =
         DictionaryUtils.readDictionaryFromKafka(topic.getName(), pubSubConsumer, pubSubTopicRepository);
     Assert.assertEquals(dictionaryFromKafka.array(), dictionaryToSend);
+    verify(pubSubConsumer, times(1)).subscribe(eq(topicPartition), any(PubSubPosition.class));
+    verify(pubSubConsumer, times(1)).unSubscribe(topicPartition);
     verify(pubSubConsumer, times(1)).poll(anyLong());
   }
 
@@ -73,11 +82,9 @@ public class DictionaryUtilsTest {
     PubSubTopic topic = getTopic();
 
     PubSubConsumerAdapter pubSubConsumer = mock(PubSubConsumerAdapter.class);
-    PubSubTopicRepository pubSubTopicRepository = mock(PubSubTopicRepository.class);
     PubSubTopicPartition topicPartition = new PubSubTopicPartitionImpl(topic, 0);
-    doReturn(topic).when(pubSubTopicRepository).getTopic(topic.getName());
 
-    KafkaKey controlMessageKey = new KafkaKey(MessageType.CONTROL_MESSAGE, null);
+    KafkaKey controlMessageKey = new KafkaKey(MessageType.CONTROL_MESSAGE, new byte[0]);
     StartOfPush startOfPush = new StartOfPush();
 
     ControlMessage sopCM = new ControlMessage();
@@ -85,8 +92,13 @@ public class DictionaryUtilsTest {
     sopCM.controlMessageUnion = startOfPush;
     KafkaMessageEnvelope sopWithDictionaryValue =
         new KafkaMessageEnvelope(MessageType.CONTROL_MESSAGE.getValue(), null, sopCM, null);
-    PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> sopWithDictionary =
-        new ImmutablePubSubMessage<>(controlMessageKey, sopWithDictionaryValue, topicPartition, 0L, 0L, 0);
+    DefaultPubSubMessage sopWithDictionary = new ImmutablePubSubMessage(
+        controlMessageKey,
+        sopWithDictionaryValue,
+        topicPartition,
+        ApacheKafkaOffsetPosition.of(0),
+        0L,
+        0);
     doReturn(Collections.singletonMap(topicPartition, Collections.singletonList(sopWithDictionary)))
         .when(pubSubConsumer)
         .poll(anyLong());
@@ -94,6 +106,8 @@ public class DictionaryUtilsTest {
     ByteBuffer dictionaryFromKafka =
         DictionaryUtils.readDictionaryFromKafka(topic.getName(), pubSubConsumer, pubSubTopicRepository);
     Assert.assertNull(dictionaryFromKafka);
+    verify(pubSubConsumer, times(1)).subscribe(eq(topicPartition), any(PubSubPosition.class));
+    verify(pubSubConsumer, times(1)).unSubscribe(topicPartition);
     verify(pubSubConsumer, times(1)).poll(anyLong());
   }
 
@@ -102,9 +116,7 @@ public class DictionaryUtilsTest {
     PubSubTopic topic = getTopic();
 
     PubSubConsumerAdapter pubSubConsumer = mock(PubSubConsumerAdapter.class);
-    PubSubTopicRepository pubSubTopicRepository = mock(PubSubTopicRepository.class);
     PubSubTopicPartition topicPartition = new PubSubTopicPartitionImpl(topic, 0);
-    doReturn(topic).when(pubSubTopicRepository).getTopic(topic.getName());
 
     KafkaKey dataMessageKey = new KafkaKey(MessageType.PUT, "blah".getBytes());
 
@@ -112,8 +124,13 @@ public class DictionaryUtilsTest {
     putMessage.putValue = ByteBuffer.wrap("blah".getBytes());
     putMessage.schemaId = 1;
     KafkaMessageEnvelope putMessageValue = new KafkaMessageEnvelope(MessageType.PUT.getValue(), null, putMessage, null);
-    PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> sopWithDictionary =
-        new ImmutablePubSubMessage<>(dataMessageKey, putMessageValue, topicPartition, 0L, 0L, 0);
+    DefaultPubSubMessage sopWithDictionary = new ImmutablePubSubMessage(
+        dataMessageKey,
+        putMessageValue,
+        topicPartition,
+        ApacheKafkaOffsetPosition.of(0),
+        0L,
+        0);
     doReturn(Collections.singletonMap(topicPartition, Collections.singletonList(sopWithDictionary)))
         .when(pubSubConsumer)
         .poll(anyLong());
@@ -121,6 +138,8 @@ public class DictionaryUtilsTest {
     ByteBuffer dictionaryFromKafka =
         DictionaryUtils.readDictionaryFromKafka(topic.getName(), pubSubConsumer, pubSubTopicRepository);
     Assert.assertNull(dictionaryFromKafka);
+    verify(pubSubConsumer, times(1)).subscribe(eq(topicPartition), any(PubSubPosition.class));
+    verify(pubSubConsumer, times(1)).unSubscribe(topicPartition);
     verify(pubSubConsumer, times(1)).poll(anyLong());
   }
 
@@ -130,11 +149,9 @@ public class DictionaryUtilsTest {
     byte[] dictionaryToSend = "TEST_DICT".getBytes();
 
     PubSubConsumerAdapter pubSubConsumer = mock(PubSubConsumerAdapter.class);
-    PubSubTopicRepository pubSubTopicRepository = mock(PubSubTopicRepository.class);
     PubSubTopicPartition topicPartition = new PubSubTopicPartitionImpl(topic, 0);
-    doReturn(topic).when(pubSubTopicRepository).getTopic(topic.getName());
 
-    KafkaKey controlMessageKey = new KafkaKey(MessageType.CONTROL_MESSAGE, null);
+    KafkaKey controlMessageKey = new KafkaKey(MessageType.CONTROL_MESSAGE, new byte[0]);
     StartOfPush startOfPush = new StartOfPush();
     startOfPush.compressionStrategy = CompressionStrategy.ZSTD_WITH_DICT.getValue();
     startOfPush.compressionDictionary = ByteBuffer.wrap(dictionaryToSend);
@@ -144,8 +161,13 @@ public class DictionaryUtilsTest {
     sopCM.controlMessageUnion = startOfPush;
     KafkaMessageEnvelope sopWithDictionaryValue =
         new KafkaMessageEnvelope(MessageType.CONTROL_MESSAGE.getValue(), null, sopCM, null);
-    PubSubMessage<KafkaKey, KafkaMessageEnvelope, Long> sopWithDictionary =
-        new ImmutablePubSubMessage<>(controlMessageKey, sopWithDictionaryValue, topicPartition, 0L, 0L, 0);
+    DefaultPubSubMessage sopWithDictionary = new ImmutablePubSubMessage(
+        controlMessageKey,
+        sopWithDictionaryValue,
+        topicPartition,
+        ApacheKafkaOffsetPosition.of(0),
+        0L,
+        0);
     doReturn(Collections.emptyMap())
         .doReturn(Collections.singletonMap(topicPartition, Collections.singletonList(sopWithDictionary)))
         .when(pubSubConsumer)
@@ -153,7 +175,10 @@ public class DictionaryUtilsTest {
 
     ByteBuffer dictionaryFromKafka =
         DictionaryUtils.readDictionaryFromKafka(topic.getName(), pubSubConsumer, pubSubTopicRepository);
+    Assert.assertNotNull(dictionaryFromKafka);
     Assert.assertEquals(dictionaryFromKafka.array(), dictionaryToSend);
+    verify(pubSubConsumer, times(1)).subscribe(eq(topicPartition), any(PubSubPosition.class));
+    verify(pubSubConsumer, times(1)).unSubscribe(topicPartition);
     verify(pubSubConsumer, times(2)).poll(anyLong());
   }
 }

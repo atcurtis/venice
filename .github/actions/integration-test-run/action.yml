@@ -1,0 +1,85 @@
+name: 'Run Integration Test Shard'
+description: 'Sets up build environment and runs an integration test shard'
+inputs:
+  shard:
+    description: 'Shard number (e.g., 1, 2, 99)'
+    required: true
+  max-jitter-seconds:
+    description: 'Upper bound for the random start jitter that de-correlates shard setup (git fetch, dependency resolution). Set to 0 to disable.'
+    required: false
+    default: '30'
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Jitter start time of the jobs not to stampede CI system and build infrastructure
+      shell: bash
+      env:
+        MAX_JITTER_SECONDS: ${{ inputs.max-jitter-seconds }}
+      run: |
+        max_jitter_seconds="$MAX_JITTER_SECONDS"
+
+        if ! [[ "$max_jitter_seconds" =~ ^[0-9]+$ ]]; then
+          echo "Invalid max jitter window: $max_jitter_seconds"
+          exit 1
+        fi
+
+        if [ "$max_jitter_seconds" -gt 0 ]; then
+          jitter_seconds=$(( RANDOM % (max_jitter_seconds + 1) ))
+          echo "Jittering shard start by ${jitter_seconds}s"
+          sleep "$jitter_seconds"
+        fi
+    - uses: ./.github/actions/gradle-test-setup
+    - name: Run Integration Tests
+      shell: bash
+      run: ./gradlew --continue --no-daemon -DforkEvery=1 -DmaxParallelForks=1 integrationTests_${{ inputs.shard }}
+    - name: Package Build Artifacts
+      if: always()
+      shell: bash
+      run: |
+        mkdir ${{ github.job }}-artifacts
+        find . -path "**/build/reports/*" -or -path "**/build/test-results/*" > artifacts.list
+        find . -type f \( -name 'core.*' -o -name 'hs_err_pid*.log' \) -exec xz -9 {} \; -exec echo "{}.xz" \; >> artifacts.list
+        rsync -R --files-from=artifacts.list . ${{ github.job }}-artifacts
+        tar -zcvf ${{ github.job }}-jdk17-logs.tar.gz ${{ github.job }}-artifacts
+    - name: Upload Build Artifacts
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: ${{ github.job }}
+        path: ${{ github.job }}-jdk17-logs.tar.gz
+        retention-days: 30
+    - name: Upload Test Timing Data
+      if: always()
+      uses: actions/upload-artifact@v6
+      with:
+        name: test-timing-${{ github.job }}
+        path: internal/venice-test-common/build/test-timings/
+        retention-days: 30
+        if-no-files-found: ignore
+    - name: Summarize Test Failures
+      if: failure()
+      shell: bash
+      run: |
+        echo "## Failed Tests" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "| Test Class | Test Method | Duration |" >> $GITHUB_STEP_SUMMARY
+        echo "|------------|-------------|----------|" >> $GITHUB_STEP_SUMMARY
+        FAILURES=$(find . -path "**/build/test-results/integrationTest*/TEST-*.xml" -exec grep -lE 'failures="[1-9][0-9]*"|errors="[1-9][0-9]*"' {} \; 2>/dev/null | while read -r f; do
+          python3 - "$f" <<'PY' 2>/dev/null
+        import xml.etree.ElementTree as ET, sys
+        tree = ET.parse(sys.argv[1])
+        root = tree.getroot()
+        for tc in root.iter('testcase'):
+            if tc.find('failure') is not None or tc.find('error') is not None:
+                cls = tc.get('classname','').replace('|', '\\|')
+                name = tc.get('name','').replace('|', '\\|')
+                time = tc.get('time','')
+                print(f'| {cls} | {name} | {time}s |')
+        PY
+        done | sort -u)
+        if [ -n "$FAILURES" ]; then
+          echo "$FAILURES" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "| _(no test failures found in XML reports)_ | | |" >> $GITHUB_STEP_SUMMARY
+        fi

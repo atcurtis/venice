@@ -3,7 +3,7 @@ package com.linkedin.venice.fastclient;
 import static org.testng.Assert.assertEquals;
 import static org.testng.Assert.assertFalse;
 import static org.testng.Assert.assertNotNull;
-import static org.testng.Assert.assertNull;
+import static org.testng.Assert.assertThrows;
 import static org.testng.Assert.assertTrue;
 import static org.testng.Assert.fail;
 
@@ -15,8 +15,11 @@ import com.linkedin.venice.client.store.streaming.VeniceResponseMap;
 import com.linkedin.venice.controllerapi.UpdateStoreQueryParams;
 import com.linkedin.venice.controllerapi.VersionCreationResponse;
 import com.linkedin.venice.exceptions.ConfigurationException;
+import com.linkedin.venice.fastclient.meta.InstanceHealthMonitor;
+import com.linkedin.venice.fastclient.meta.InstanceHealthMonitorConfig;
 import com.linkedin.venice.fastclient.meta.StoreMetadataFetchMode;
 import com.linkedin.venice.fastclient.utils.AbstractClientEndToEndSetup;
+import com.linkedin.venice.fastclient.utils.ClientTestUtils;
 import com.linkedin.venice.integration.utils.PubSubBrokerWrapper;
 import com.linkedin.venice.integration.utils.VeniceServerWrapper;
 import com.linkedin.venice.pubsub.PubSubProducerAdapterFactory;
@@ -25,6 +28,7 @@ import com.linkedin.venice.serialization.avro.VeniceAvroKafkaSerializer;
 import com.linkedin.venice.utils.ExceptionUtils;
 import com.linkedin.venice.utils.IntegrationTestPushUtils;
 import com.linkedin.venice.utils.TestUtils;
+import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.writer.VeniceWriter;
 import com.linkedin.venice.writer.VeniceWriterOptions;
 import io.tehuti.metrics.MetricsRepository;
@@ -37,6 +41,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
+import org.apache.avro.AvroRuntimeException;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.logging.log4j.LogManager;
@@ -69,11 +74,30 @@ public class FastClientIndividualFeatureConfigurationTest extends AbstractClient
     ClientConfig.ClientConfigBuilder clientConfigBuilder =
         new ClientConfig.ClientConfigBuilder<>().setStoreName(storeName)
             .setR2Client(r2Client)
-            .setSpeculativeQueryEnabled(false);
-    AvroGenericStoreClient<String, GenericRecord> genericFastClient = getGenericFastClient(
-        clientConfigBuilder,
-        new MetricsRepository(),
-        StoreMetadataFetchMode.SERVER_BASED_METADATA);
+            .setInstanceHealthMonitor(
+                new InstanceHealthMonitor(
+                    InstanceHealthMonitorConfig.builder()
+                        .setClient(r2Client)
+                        .setRoutingRequestDefaultTimeoutMS(10000)
+                        .build()));
+    // Retry fast client creation: the @BeforeMethod updateStore() to enable storage node read
+    // quota is async; servers may not have processed the config yet, causing ConfigurationException.
+    MetricsRepository metricsRepository = new MetricsRepository();
+    AvroGenericStoreClient<String, GenericRecord> genericFastClient = null;
+    for (int attempt = 1; attempt <= 5; attempt++) {
+      try {
+        genericFastClient =
+            getGenericFastClient(clientConfigBuilder, metricsRepository, StoreMetadataFetchMode.SERVER_BASED_METADATA);
+        break;
+      } catch (ConfigurationException e) {
+        if (attempt == 5) {
+          throw e;
+        }
+        LOGGER.info("Fast client creation attempt {}/5 failed (quota not propagated yet), retrying...", attempt);
+        Utils.sleep(2000);
+      }
+    }
+    final AvroGenericStoreClient<String, GenericRecord> fastClient = genericFastClient;
     // Update the read quota to 1000 and make 500 requests, all requests should be allowed.
     veniceCluster.useControllerClient(controllerClient -> {
       TestUtils.assertCommand(
@@ -92,11 +116,9 @@ public class FastClientIndividualFeatureConfigurationTest extends AbstractClient
     for (int i = 0; i < veniceCluster.getVeniceServers().size(); i++) {
       serverMetrics.add(veniceCluster.getVeniceServers().get(i).getMetricsRepository());
     }
-    String readQuotaStorageNodeTokenBucketRemaining =
-        ".venice-storage-node-token-bucket--QuotaRcuTokensRemaining.Gauge";
-    String readQuotaRequestedQPSString = "." + storeName + "--quota_request.Rate";
+    String readQuotaRequestedQPSString = "." + storeName + "--current_quota_request.Gauge";
     String readQuotaRejectedQPSString = "." + storeName + "--quota_rejected_request.Rate";
-    String readQuotaRequestedKPSString = "." + storeName + "--quota_request_key_count.Rate";
+    String readQuotaRequestedKPSString = "." + storeName + "--current_quota_request_key_count.Gauge";
     String readQuotaRejectedKPSString = "." + storeName + "--quota_rejected_key_count.Rate";
     String readQuotaAllowedUnintentionally = "." + storeName + "--quota_unintentionally_allowed_key_count.Count";
     String readQuotaUsageRatio = "." + storeName + "--quota_requested_usage_ratio.Gauge";
@@ -107,7 +129,6 @@ public class FastClientIndividualFeatureConfigurationTest extends AbstractClient
     String routerConnectionCountRateString = ".server_connection_stats--router_connection_request.OccurrenceRate";
     TestUtils.waitForNonDeterministicAssertion(10, TimeUnit.SECONDS, () -> {
       for (MetricsRepository serverMetric: serverMetrics) {
-        assertNotNull(serverMetric.getMetric(readQuotaStorageNodeTokenBucketRemaining));
         assertNotNull(serverMetric.getMetric(readQuotaRequestedQPSString));
         assertNotNull(serverMetric.getMetric(readQuotaRejectedQPSString));
         assertNotNull(serverMetric.getMetric(readQuotaRequestedKPSString));
@@ -123,8 +144,9 @@ public class FastClientIndividualFeatureConfigurationTest extends AbstractClient
     });
     int quotaRequestedQPSSum = 0;
     int quotaRequestedKPSSum = 0;
-    int clientConnectionCountRateSum = 0;
-    int routerConnectionCountRateSum = 0;
+    double clientConnectionCountRateSum = 0;
+    double routerConnectionCountRateSum = 0;
+    Utils.sleep(3000); // sleep 3s as the connection tracking metrics are updated every 1s
     for (MetricsRepository serverMetric: serverMetrics) {
       quotaRequestedQPSSum += serverMetric.getMetric(readQuotaRequestedQPSString).value();
       quotaRequestedKPSSum += serverMetric.getMetric(readQuotaRequestedKPSString).value();
@@ -133,14 +155,14 @@ public class FastClientIndividualFeatureConfigurationTest extends AbstractClient
       assertEquals(serverMetric.getMetric(readQuotaRejectedQPSString).value(), 0d);
       assertEquals(serverMetric.getMetric(readQuotaRejectedKPSString).value(), 0d);
       assertEquals(serverMetric.getMetric(readQuotaAllowedUnintentionally).value(), 0d);
-      assertTrue(serverMetric.getMetric(readQuotaStorageNodeTokenBucketRemaining).value() > 0d);
     }
     assertTrue(quotaRequestedQPSSum >= 0, "Quota request sum: " + quotaRequestedQPSSum);
     assertTrue(quotaRequestedKPSSum >= 0, "Quota request key count sum: " + quotaRequestedKPSSum);
     assertTrue(clientConnectionCountRateSum > 0, "Servers should have more than 0 client connections");
-    assertEquals(routerConnectionCountRateSum, 0, "Servers should have 0 router connections");
+    assertEquals(routerConnectionCountRateSum, 0.0d, "Servers should have 0 router connections");
+
     // At least one server's usage ratio should eventually be a positive decimal
-    TestUtils.waitForNonDeterministicAssertion(5, TimeUnit.SECONDS, () -> {
+    TestUtils.waitForNonDeterministicAssertion(10, TimeUnit.SECONDS, () -> {
       double usageRatio = 0;
       for (MetricsRepository serverMetric: serverMetrics) {
         usageRatio = serverMetric.getMetric(readQuotaUsageRatio).value();
@@ -189,6 +211,21 @@ public class FastClientIndividualFeatureConfigurationTest extends AbstractClient
       LOGGER.info("RESTARTING servers");
       veniceCluster.stopAndRestartVeniceServer(veniceServerWrapper.getPort());
     }
+    serverMetrics.clear();
+    for (int i = 0; i < veniceCluster.getVeniceServers().size(); i++) {
+      serverMetrics.add(veniceCluster.getVeniceServers().get(i).getMetricsRepository());
+    }
+    // Wait for quota enforcement to reinitialize on restarted servers before making requests.
+    // Use retryOnThrowable=true because get() can throw ExecutionException during restart.
+    TestUtils.waitForNonDeterministicAssertion(15, TimeUnit.SECONDS, true, true, () -> {
+      fastClient.get(keyPrefix + 0).get();
+      for (MetricsRepository serverMetric: serverMetrics) {
+        assertNotNull(serverMetric.getMetric(readQuotaRequestedQPSString));
+        assertTrue(
+            serverMetric.getMetric(readQuotaRequestedQPSString).value() >= 0,
+            "Quota metrics not initialized yet");
+      }
+    });
     for (int j = 0; j < 5; j++) {
       for (int i = 0; i < recordCnt; i++) {
         String key = keyPrefix + i;
@@ -200,9 +237,8 @@ public class FastClientIndividualFeatureConfigurationTest extends AbstractClient
     for (MetricsRepository serverMetric: serverMetrics) {
       quotaRequestedQPSSum += serverMetric.getMetric(readQuotaRequestedQPSString).value();
       assertEquals(serverMetric.getMetric(readQuotaAllowedUnintentionally).value(), 0d);
-      assertTrue(serverMetric.getMetric(readQuotaStorageNodeTokenBucketRemaining).value() > 0d);
     }
-    assertTrue(quotaRequestedQPSSum >= 0, "Quota request sum: " + quotaRequestedQPSSum);
+    assertTrue(quotaRequestedQPSSum > 0, "Quota request sum: " + quotaRequestedQPSSum);
   }
 
   @Test(timeOut = TIME_OUT)
@@ -210,7 +246,12 @@ public class FastClientIndividualFeatureConfigurationTest extends AbstractClient
     ClientConfig.ClientConfigBuilder clientConfigBuilder =
         new ClientConfig.ClientConfigBuilder<>().setStoreName(storeName)
             .setR2Client(r2Client)
-            .setSpeculativeQueryEnabled(false);
+            .setInstanceHealthMonitor(
+                new InstanceHealthMonitor(
+                    InstanceHealthMonitorConfig.builder()
+                        .setClient(r2Client)
+                        .setRoutingRequestDefaultTimeoutMS(10000)
+                        .build()));
     AvroGenericStoreClient<String, GenericRecord> genericFastClient = getGenericFastClient(
         clientConfigBuilder,
         new MetricsRepository(),
@@ -244,9 +285,11 @@ public class FastClientIndividualFeatureConfigurationTest extends AbstractClient
           .project(VALUE_FIELD_NAME)
           .execute(Collections.singleton(key))
           .get(TIME_OUT, TimeUnit.MILLISECONDS);
-      fail();
+      fail("The compute request should have thrown an exception.");
     } catch (Exception clientException) {
-      assertTrue(ExceptionUtils.recursiveMessageContains(clientException, "Read compute is not enabled for the store"));
+      if (!ExceptionUtils.recursiveMessageContains(clientException, "Read compute is not enabled for the store")) {
+        fail("The exception message did not contain the expected string.", clientException);
+      }
     }
 
     VeniceResponseMap<String, ComputeGenericRecord> responseMapWhenComputeDisabled = genericFastClient.compute()
@@ -263,7 +306,12 @@ public class FastClientIndividualFeatureConfigurationTest extends AbstractClient
     ClientConfig.ClientConfigBuilder clientConfigBuilder =
         new ClientConfig.ClientConfigBuilder<>().setStoreName(storeName)
             .setR2Client(r2Client)
-            .setSpeculativeQueryEnabled(false);
+            .setInstanceHealthMonitor(
+                new InstanceHealthMonitor(
+                    InstanceHealthMonitorConfig.builder()
+                        .setClient(r2Client)
+                        .setRoutingRequestDefaultTimeoutMS(10000)
+                        .build()));
     AvroGenericStoreClient<String, GenericRecord> genericFastClient = getGenericFastClient(
         clientConfigBuilder,
         new MetricsRepository(),
@@ -278,7 +326,8 @@ public class FastClientIndividualFeatureConfigurationTest extends AbstractClient
     for (int i = 0; i < recordCnt; ++i) {
       String key = keyPrefix + i;
       assertEquals((int) resultMap.get(key).get(VALUE_FIELD_NAME), i);
-      assertNull(resultMap.get(key).get(SECOND_VALUE_FIELD_NAME));
+      // The newly added field should not be involved when reading data that was written with value schema v1
+      assertThrows(AvroRuntimeException.class, () -> resultMap.get(key).get(SECOND_VALUE_FIELD_NAME));
     }
     VersionCreationResponse creationResponse = veniceCluster.getNewVersion(storeName, false);
     assertFalse(creationResponse.isError());
@@ -289,8 +338,8 @@ public class FastClientIndividualFeatureConfigurationTest extends AbstractClient
     VeniceWriter<Object, Object, Object> veniceWriter =
         IntegrationTestPushUtils.getVeniceWriterFactory(pubSubBrokerWrapper, pubSubProducerAdapterFactory)
             .createVeniceWriter(
-                new VeniceWriterOptions.Builder(storeVersion).setKeySerializer(keySerializer)
-                    .setValueSerializer(new VeniceAvroKafkaSerializer(VALUE_SCHEMA_V2_STR))
+                new VeniceWriterOptions.Builder(storeVersion).setKeyPayloadSerializer(keySerializer)
+                    .setValuePayloadSerializer(new VeniceAvroKafkaSerializer(VALUE_SCHEMA_V2_STR))
                     .build());
     veniceWriter.broadcastStartOfPush(new HashMap<>());
     for (int i = 0; i < recordCnt; ++i) {
@@ -303,13 +352,17 @@ public class FastClientIndividualFeatureConfigurationTest extends AbstractClient
     veniceCluster.useControllerClient(controllerClient -> {
       TestUtils.waitForNonDeterministicPushCompletion(storeVersion, controllerClient, 30, TimeUnit.SECONDS);
     });
-    TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, () -> {
+    TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, true, () -> {
       final Map<String, GenericRecord> result = genericFastClient.batchGet(keys).get();
       assertEquals(result.size(), recordCnt);
       for (int i = 0; i < recordCnt; ++i) {
         String key = keyPrefix + i;
         assertEquals((int) result.get(key).get(VALUE_FIELD_NAME), i);
-        assertEquals(result.get(key).get(SECOND_VALUE_FIELD_NAME), i);
+        try {
+          assertEquals(result.get(key).get(SECOND_VALUE_FIELD_NAME), i);
+        } catch (AvroRuntimeException e) {
+          fail("The FC didn't notice the new store-version yet...");
+        }
       }
     });
   }
@@ -330,7 +383,12 @@ public class FastClientIndividualFeatureConfigurationTest extends AbstractClient
             .setR2Client(r2Client)
             .setLongTailRetryEnabledForBatchGet(true)
             .setLongTailRetryThresholdForBatchGetInMicroSeconds(10000)
-            .setSpeculativeQueryEnabled(false);
+            .setInstanceHealthMonitor(
+                new InstanceHealthMonitor(
+                    InstanceHealthMonitorConfig.builder()
+                        .setClient(r2Client)
+                        .setRoutingRequestDefaultTimeoutMS(10000)
+                        .build()));
     MetricsRepository clientMetric = new MetricsRepository();
     AvroGenericStoreClient<String, GenericRecord> genericFastClient =
         getGenericFastClient(clientConfigBuilder, clientMetric, StoreMetadataFetchMode.SERVER_BASED_METADATA);
@@ -370,7 +428,12 @@ public class FastClientIndividualFeatureConfigurationTest extends AbstractClient
             .setR2Client(r2Client)
             .setLongTailRetryEnabledForBatchGet(true)
             .setLongTailRetryThresholdForBatchGetInMicroSeconds(10000)
-            .setSpeculativeQueryEnabled(false);
+            .setInstanceHealthMonitor(
+                new InstanceHealthMonitor(
+                    InstanceHealthMonitorConfig.builder()
+                        .setClient(r2Client)
+                        .setRoutingRequestDefaultTimeoutMS(10000)
+                        .build()));
     MetricsRepository clientMetric = new MetricsRepository();
     AvroGenericStoreClient<String, GenericRecord> genericFastClient =
         getGenericFastClient(clientConfigBuilder, clientMetric, StoreMetadataFetchMode.SERVER_BASED_METADATA);
@@ -385,20 +448,15 @@ public class FastClientIndividualFeatureConfigurationTest extends AbstractClient
      */
     String multiGetRequestKeyCountMetric =
         ".total--" + RequestType.MULTI_GET.getMetricPrefix() + "request_key_count.Rate";
-    String multiGetSuccessRequestKeyCountMetric =
-        ".total--" + RequestType.MULTI_GET.getMetricPrefix() + "success_request_key_count.Rate";
-    boolean nonZeroRequestedKeyCount = false;
-    boolean nonZeroSuccessRequestKeyCount = false;
-    for (MetricsRepository serverMetric: serverMetrics) {
-      if (serverMetric.getMetric(multiGetRequestKeyCountMetric).value() > 0) {
-        nonZeroRequestedKeyCount = true;
+    TestUtils.waitForNonDeterministicAssertion(10, TimeUnit.SECONDS, () -> {
+      boolean nonZeroRequestedKeyCount = false;
+      for (MetricsRepository serverMetric: serverMetrics) {
+        if (serverMetric.getMetric(multiGetRequestKeyCountMetric).value() > 0) {
+          nonZeroRequestedKeyCount = true;
+        }
       }
-      if (serverMetric.getMetric(multiGetSuccessRequestKeyCountMetric).value() > 0) {
-        nonZeroSuccessRequestKeyCount = true;
-      }
-    }
-    assertTrue(nonZeroRequestedKeyCount);
-    assertTrue(nonZeroSuccessRequestKeyCount);
+      assertTrue(nonZeroRequestedKeyCount);
+    });
   }
 
   @Test(timeOut = TIME_OUT)
@@ -409,9 +467,15 @@ public class FastClientIndividualFeatureConfigurationTest extends AbstractClient
             .setLongTailRetryEnabledForBatchGet(true)
             .setLongTailRetryThresholdForBatchGetInMicroSeconds(10000)
             .setLongTailRetryBudgetEnforcementWindowInMs(1000)
-            .setSpeculativeQueryEnabled(false);
-    String multiGetLongTailRetryManagerStatsPrefix = ".multi-get-long-tail-retry-manager--";
-    String singleGetLongTailRetryManagerStatsPrefix = ".single-get-long-tail-retry-manager--";
+            .setInstanceHealthMonitor(
+                new InstanceHealthMonitor(
+                    InstanceHealthMonitorConfig.builder()
+                        .setClient(r2Client)
+                        .setRoutingRequestDefaultTimeoutMS(10000)
+                        .build()))
+            .setRetryBudgetEnabled(true);
+    String multiKeyLongTailRetryManagerStatsPrefix = ".multi-key-long-tail-retry-manager-" + storeName + "--";
+    String singleKeyLongTailRetryManagerStatsPrefix = ".single-key-long-tail-retry-manager-" + storeName + "--";
     MetricsRepository clientMetric = new MetricsRepository();
     AvroGenericStoreClient<String, GenericRecord> genericFastClient =
         getGenericFastClient(clientConfigBuilder, clientMetric, StoreMetadataFetchMode.SERVER_BASED_METADATA);
@@ -427,19 +491,19 @@ public class FastClientIndividualFeatureConfigurationTest extends AbstractClient
         10,
         TimeUnit.SECONDS,
         () -> assertTrue(
-            clientMetric.getMetric(multiGetLongTailRetryManagerStatsPrefix + "retry_limit_per_seconds.Gauge")
+            clientMetric.getMetric(multiKeyLongTailRetryManagerStatsPrefix + "retry_limit_per_seconds.Gauge")
                 .value() > 0,
             "Current value: "
-                + clientMetric.getMetric(multiGetLongTailRetryManagerStatsPrefix + "retry_limit_per_seconds.Gauge")
+                + clientMetric.getMetric(multiKeyLongTailRetryManagerStatsPrefix + "retry_limit_per_seconds.Gauge")
                     .value()));
-    assertTrue(clientMetric.getMetric(multiGetLongTailRetryManagerStatsPrefix + "retries_remaining.Gauge").value() > 0);
+    assertTrue(clientMetric.getMetric(multiKeyLongTailRetryManagerStatsPrefix + "retries_remaining.Gauge").value() > 0);
     assertEquals(
-        clientMetric.getMetric(multiGetLongTailRetryManagerStatsPrefix + "rejected_retry.OccurrenceRate").value(),
+        clientMetric.getMetric(multiKeyLongTailRetryManagerStatsPrefix + "rejected_retry.OccurrenceRate").value(),
         0d);
-    // single get long tail retry manager metrics shouldn't be initialized because it's not enabled
-    assertNull(clientMetric.getMetric(singleGetLongTailRetryManagerStatsPrefix + "retry_limit_per_seconds.Gauge"));
-    assertNull(clientMetric.getMetric(singleGetLongTailRetryManagerStatsPrefix + "retries_remaining.Gauge"));
-    assertNull(clientMetric.getMetric(singleGetLongTailRetryManagerStatsPrefix + "rejected_retry.OccurrenceRate"));
+    // single get long tail retry manager metrics should be initialized since retry is enabled by default
+    assertNotNull(clientMetric.getMetric(singleKeyLongTailRetryManagerStatsPrefix + "retry_limit_per_seconds.Gauge"));
+    assertNotNull(clientMetric.getMetric(singleKeyLongTailRetryManagerStatsPrefix + "retries_remaining.Gauge"));
+    assertNotNull(clientMetric.getMetric(singleKeyLongTailRetryManagerStatsPrefix + "rejected_retry.OccurrenceRate"));
   }
 
   @Test(timeOut = TIME_OUT)
@@ -447,7 +511,12 @@ public class FastClientIndividualFeatureConfigurationTest extends AbstractClient
     ClientConfig.ClientConfigBuilder clientConfigBuilder =
         new ClientConfig.ClientConfigBuilder<>().setStoreName(storeName)
             .setR2Client(r2Client)
-            .setSpeculativeQueryEnabled(false);
+            .setInstanceHealthMonitor(
+                new InstanceHealthMonitor(
+                    InstanceHealthMonitorConfig.builder()
+                        .setClient(r2Client)
+                        .setRoutingRequestDefaultTimeoutMS(10000)
+                        .build()));
     // Update store to disable storage node read quota
     veniceCluster.useControllerClient(controllerClient -> {
       TestUtils.assertCommand(
@@ -459,5 +528,43 @@ public class FastClientIndividualFeatureConfigurationTest extends AbstractClient
             clientConfigBuilder,
             new MetricsRepository(),
             StoreMetadataFetchMode.SERVER_BASED_METADATA));
+  }
+
+  @Test(timeOut = TIME_OUT)
+  public void testMultiKeyFanoutStats() throws IOException, ExecutionException, InterruptedException {
+    ClientConfig.ClientConfigBuilder clientConfigBuilder =
+        new ClientConfig.ClientConfigBuilder<>().setStoreName(storeName)
+            .setR2Client(r2Client)
+            .setLongTailRetryEnabledForBatchGet(true)
+            .setLongTailRetryThresholdForBatchGetInMicroSeconds(10000)
+            .setInstanceHealthMonitor(
+                new InstanceHealthMonitor(
+                    InstanceHealthMonitorConfig.builder()
+                        .setClient(r2Client)
+                        .setRoutingRequestDefaultTimeoutMS(10000)
+                        .build()));
+    MetricsRepository clientMetric = new MetricsRepository();
+    String metricPrefix = ClientTestUtils.getMetricPrefix(storeName, RequestType.MULTI_GET_STREAMING);
+    String fanoutSizeAverageMetricName = metricPrefix + "fanout_size.Avg";
+    String fanoutSizeMaxMetricName = metricPrefix + "fanout_size.Max";
+    AvroGenericStoreClient<String, GenericRecord> genericFastClient =
+        getGenericFastClient(clientConfigBuilder, clientMetric, StoreMetadataFetchMode.SERVER_BASED_METADATA);
+    Set<String> keys = new HashSet<>();
+    for (int i = 0; i < recordCnt; ++i) {
+      String key = keyPrefix + i;
+      keys.add(key);
+    }
+    TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, true, true, () -> {
+      for (int i = 0; i < 10; i++) {
+        final Map<String, GenericRecord> result = genericFastClient.batchGet(keys).get();
+        assertEquals(result.size(), keys.size());
+      }
+    });
+    TestUtils.waitForNonDeterministicAssertion(10, TimeUnit.SECONDS, () -> {
+      assertNotNull(clientMetric.getMetric(fanoutSizeAverageMetricName));
+      assertNotNull(clientMetric.getMetric(fanoutSizeMaxMetricName));
+      assertTrue(clientMetric.getMetric(fanoutSizeAverageMetricName).value() >= 1.0);
+      assertTrue(clientMetric.getMetric(fanoutSizeMaxMetricName).value() >= 1.0);
+    });
   }
 }

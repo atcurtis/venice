@@ -7,6 +7,7 @@ import com.linkedin.venice.controllerapi.UpdateStoreQueryParams;
 import com.linkedin.venice.exceptions.VeniceException;
 import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.Version;
+import com.linkedin.venice.meta.VersionStatus;
 import com.linkedin.venice.schema.SchemaEntry;
 import com.linkedin.venice.schema.avro.DirectionalSchemaCompatibilityType;
 import com.linkedin.venice.serialization.avro.AvroProtocolDefinition;
@@ -36,10 +37,34 @@ public final class SystemStoreInitializationHelper {
   // Visible for testing
   static final String DEFAULT_KEY_SCHEMA_STR = "\"int\"";
 
-  // How much time to wait between checks of store updates
-  private static Duration delayBetweenStoreUpdateRetries = Duration.ofSeconds(10);
+  // How much time to wait between checks of store updates. The total retry window is
+  // delayBetweenStoreUpdateRetries * maxRetryAttempts (~50s). Tests can reduce this via
+  // setDelayBetweenStoreUpdateRetries() to avoid slow system store initialization.
+  private static Duration delayBetweenStoreUpdateRetries = Duration.ofSeconds(5);
+  private static int maxRetryAttempts = 10;
 
   private SystemStoreInitializationHelper() {
+  }
+
+  public static void setupSystemStore(
+      String clusterName,
+      String systemStoreName,
+      AvroProtocolDefinition protocolDefinition,
+      Schema keySchema,
+      Function<Store, Boolean> updateStoreCheckSupplier,
+      UpdateStoreQueryParams updateStoreQueryParams,
+      Admin admin,
+      VeniceControllerMultiClusterConfig multiClusterConfigs) {
+    setupSystemStore(
+        clusterName,
+        systemStoreName,
+        protocolDefinition,
+        keySchema,
+        updateStoreCheckSupplier,
+        updateStoreQueryParams,
+        admin,
+        multiClusterConfigs,
+        protocolDefinition.getCurrentProtocolVersionSchema());
   }
 
   /**
@@ -62,8 +87,10 @@ public final class SystemStoreInitializationHelper {
       Function<Store, Boolean> updateStoreCheckSupplier,
       UpdateStoreQueryParams updateStoreQueryParams,
       Admin admin,
-      VeniceControllerMultiClusterConfig multiClusterConfigs) {
-    Map<Integer, Schema> protocolSchemaMap = Utils.getAllSchemasFromResources(protocolDefinition);
+      VeniceControllerMultiClusterConfig multiClusterConfigs,
+      Schema compiledSchema) {
+    LOGGER.info("Setting up system store: {} in cluster: {}", systemStoreName, clusterName);
+    Map<Integer, Schema> protocolSchemaMap = Utils.getAllSchemasFromResources(protocolDefinition, compiledSchema);
     Store store = admin.getStore(clusterName, systemStoreName);
     String keySchemaString = keySchema != null ? keySchema.toString() : DEFAULT_KEY_SCHEMA_STR;
     if (store == null) {
@@ -80,12 +107,12 @@ public final class SystemStoreInitializationHelper {
           Store internalStore = admin.getStore(clusterName, systemStoreName);
           Validate.notNull(internalStore);
           return internalStore;
-        }, 5, delayBetweenStoreUpdateRetries, Collections.singletonList(IllegalArgumentException.class));
+        }, maxRetryAttempts, delayBetweenStoreUpdateRetries, Collections.singletonList(IllegalArgumentException.class));
       } catch (IllegalArgumentException e) {
         throw new VeniceException("Unable to create or fetch store " + systemStoreName);
       }
     } else {
-      LOGGER.info("Internal store {} already exists in cluster {}", systemStoreName, clusterName);
+      LOGGER.info("Internal store: {} already exists in cluster: {}", systemStoreName, clusterName);
       if (keySchema != null) {
         /**
          * Only verify the key schema if it is explicitly specified by the caller, and we don't care
@@ -173,12 +200,14 @@ public final class SystemStoreInitializationHelper {
         }
 
         return internalStore;
-      }, 5, delayBetweenStoreUpdateRetries, Collections.singletonList(VeniceException.class));
+      }, maxRetryAttempts, delayBetweenStoreUpdateRetries, Collections.singletonList(VeniceException.class));
 
       LOGGER.info("Updated internal store " + systemStoreName + " in cluster " + clusterName);
     }
 
-    if (store.getCurrentVersion() <= 0) {
+    long onlineVersionCount =
+        store.getVersions().stream().filter(version -> version.getStatus() == VersionStatus.ONLINE).count();
+    if (onlineVersionCount == 0) {
       int partitionCount = multiClusterConfigs.getControllerConfig(clusterName).getMinNumberOfPartitions();
       int replicationFactor = admin.getReplicationFactor(clusterName, systemStoreName);
       Version version = admin.incrementVersionIdempotent(
@@ -196,14 +225,16 @@ public final class SystemStoreInitializationHelper {
         if (internalStore.getVersions().isEmpty()) {
           throw new VeniceException("Unable to initialize a version for store " + systemStoreName);
         }
-      }, 5, delayBetweenStoreUpdateRetries, Collections.singletonList(VeniceException.class));
+      }, maxRetryAttempts, delayBetweenStoreUpdateRetries, Collections.singletonList(VeniceException.class));
 
       LOGGER.info("Created a version for internal store {} in cluster {}", systemStoreName, clusterName);
     }
+
+    LOGGER.info("System store: {} in cluster: {} is set up", systemStoreName, clusterName);
   }
 
   // Visible for testing
-  static void setDelayBetweenStoreUpdateRetries(Duration delayForTests) {
+  public static void setDelayBetweenStoreUpdateRetries(Duration delayForTests) {
     delayBetweenStoreUpdateRetries = delayForTests;
   }
 }

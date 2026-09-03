@@ -7,7 +7,6 @@ import com.linkedin.venice.client.store.AbstractAvroStoreClient;
 import com.linkedin.venice.helix.StoreJSONSerializer;
 import com.linkedin.venice.helix.SystemStoreJSONSerializer;
 import com.linkedin.venice.meta.BufferReplayPolicy;
-import com.linkedin.venice.meta.DataReplicationPolicy;
 import com.linkedin.venice.meta.HybridStoreConfig;
 import com.linkedin.venice.meta.HybridStoreConfigImpl;
 import com.linkedin.venice.meta.OfflinePushStrategy;
@@ -67,15 +66,8 @@ public class StoreStateReaderTest {
   private ZKStore getStore() {
     int partitionCount = 10;
     PartitionerConfig partitionerConfig = new PartitionerConfigImpl();
-    Version version = new VersionImpl(storeName, 1, "test-job-id");
-    version.setPartitionCount(partitionCount);
 
-    HybridStoreConfig hybridStoreConfig = new HybridStoreConfigImpl(
-        1000,
-        1000,
-        -1,
-        DataReplicationPolicy.ACTIVE_ACTIVE,
-        BufferReplayPolicy.REWIND_FROM_EOP);
+    HybridStoreConfig hybridStoreConfig = new HybridStoreConfigImpl(1000, 1000, -1, BufferReplayPolicy.REWIND_FROM_EOP);
 
     ZKStore store = new ZKStore(
         storeName,
@@ -92,6 +84,8 @@ public class StoreStateReaderTest {
         partitionerConfig,
         3);
     store.setPartitionCount(partitionCount);
+    Version version = new VersionImpl(storeName, 1, "test-job-id");
+    version.setPartitionCount(partitionCount);
     store.setVersions(Collections.singletonList(version));
 
     return store;

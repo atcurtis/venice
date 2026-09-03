@@ -1,10 +1,13 @@
 package com.linkedin.venice.hadoop.input.kafka;
 
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.REPUSH_TTL_ENABLE;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.REPUSH_TTL_POLICY;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.REPUSH_TTL_START_TIMESTAMP;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.RMD_SCHEMA_DIR;
-import static com.linkedin.venice.hadoop.VenicePushJobConstants.VALUE_SCHEMA_DIR;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.KAFKA_INPUT_SOURCE_COMPRESSION_STRATEGY;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.KAFKA_INPUT_TOPIC;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.REPUSH_TTL_ENABLE;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.REPUSH_TTL_POLICY;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.REPUSH_TTL_START_TIMESTAMP;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.RMD_SCHEMA_DIR;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VALUE_SCHEMA_DIR;
+import static com.linkedin.venice.vpj.VenicePushJobConstants.VENICE_REPUSH_SOURCE_PUBSUB_BROKER;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
@@ -12,6 +15,7 @@ import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 
+import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.hadoop.AbstractVeniceFilter;
 import com.linkedin.venice.hadoop.FilterChain;
 import com.linkedin.venice.hadoop.input.kafka.avro.KafkaInputMapperKey;
@@ -37,6 +41,7 @@ import org.testng.annotations.Test;
 
 public class TestVeniceKafkaInputMapper extends AbstractTestVeniceMapper<VeniceKafkaInputMapper> {
   private static final AtomicReference<byte[]> EMPTY_BYTE_REF = new AtomicReference<>(new byte[0]);
+  private static final AtomicReference<Long> EMPTY_LONG_REF = new AtomicReference<>(-1L);
   private static final KafkaInputMapperKey EMPTY_KEY = new KafkaInputMapperKey();
   static {
     EMPTY_KEY.key = ByteBuffer.wrap("test_key".getBytes());
@@ -81,6 +86,9 @@ public class TestVeniceKafkaInputMapper extends AbstractTestVeniceMapper<VeniceK
     props.put(REPUSH_TTL_POLICY, TTLResolutionPolicy.RT_WRITE_ONLY.getValue());
     props.put(RMD_SCHEMA_DIR, "tmp");
     props.put(VALUE_SCHEMA_DIR, "tmp2");
+    props.put(KAFKA_INPUT_TOPIC, "test_v1");
+    props.put(VENICE_REPUSH_SOURCE_PUBSUB_BROKER, "dummy");
+    props.put(KAFKA_INPUT_SOURCE_COMPRESSION_STRATEGY, CompressionStrategy.NO_OP.toString());
     props.put(REPUSH_TTL_START_TIMESTAMP, System.currentTimeMillis() - 10L * Time.MS_PER_SECOND);
     Assert.assertFalse(newMapper().getFilterChain(new VeniceProperties(props)).isEmpty());
 
@@ -116,8 +124,14 @@ public class TestVeniceKafkaInputMapper extends AbstractTestVeniceMapper<VeniceK
     mapper.configureTask(any());
     int validCount = 0, filteredCount = 0;
     for (int i = 0; i < 5; i++) {
-      if (mapper
-          .process(EMPTY_KEY, generateKIFRecord(), EMPTY_BYTE_REF, EMPTY_BYTE_REF, mock(DataWriterTaskTracker.class))) {
+      if (mapper.process(
+          EMPTY_KEY,
+          generateKIFRecord(),
+          new byte[0],
+          EMPTY_BYTE_REF,
+          EMPTY_BYTE_REF,
+          EMPTY_BYTE_REF,
+          mock(DataWriterTaskTracker.class))) {
         validCount++;
       } else {
         filteredCount++;
@@ -138,7 +152,7 @@ public class TestVeniceKafkaInputMapper extends AbstractTestVeniceMapper<VeniceK
     // Trigger manually to set the dummy filterChain
     mapper.configureTask(any());
 
-    Assert.assertFalse(mapper.process(null, null, null, null, mock(DataWriterTaskTracker.class)));
+    Assert.assertFalse(mapper.process(null, null, null, null, null, null, mock(DataWriterTaskTracker.class)));
   }
 
   private KafkaInputMapperValue generateKIFRecord() {

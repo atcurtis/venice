@@ -1,28 +1,12 @@
 package com.linkedin.venice.endToEnd;
 
-import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_PLAIN_TABLE_FORMAT_ENABLED;
-import static com.linkedin.venice.CommonConfigKeys.SSL_ENABLED;
 import static com.linkedin.venice.ConfigKeys.ALLOW_CLUSTER_WIPE;
 import static com.linkedin.venice.ConfigKeys.MIN_NUMBER_OF_UNUSED_KAFKA_TOPICS_TO_PRESERVE;
 import static com.linkedin.venice.ConfigKeys.NATIVE_REPLICATION_SOURCE_FABRIC;
 import static com.linkedin.venice.ConfigKeys.PARENT_KAFKA_CLUSTER_FABRIC_LIST;
-import static com.linkedin.venice.ConfigKeys.SERVER_DATABASE_CHECKSUM_VERIFICATION_ENABLED;
 import static com.linkedin.venice.ConfigKeys.SERVER_DATABASE_SYNC_BYTES_INTERNAL_FOR_DEFERRED_WRITE_MODE;
-import static com.linkedin.venice.ConfigKeys.SERVER_PROMOTION_TO_LEADER_REPLICA_DELAY_SECONDS;
 import static com.linkedin.venice.ConfigKeys.TOPIC_CLEANUP_SLEEP_INTERVAL_BETWEEN_TOPIC_LIST_FETCH_MS;
 import static com.linkedin.venice.integration.utils.VeniceClusterWrapperConstants.DEFAULT_PARENT_DATA_CENTER_REGION_NAME;
-import static com.linkedin.venice.integration.utils.VeniceControllerWrapper.D2_SERVICE_NAME;
-import static com.linkedin.venice.integration.utils.VeniceControllerWrapper.PARENT_D2_SERVICE_NAME;
-import static com.linkedin.venice.samza.VeniceSystemFactory.DEPLOYMENT_ID;
-import static com.linkedin.venice.samza.VeniceSystemFactory.DOT;
-import static com.linkedin.venice.samza.VeniceSystemFactory.SYSTEMS_PREFIX;
-import static com.linkedin.venice.samza.VeniceSystemFactory.VENICE_AGGREGATE;
-import static com.linkedin.venice.samza.VeniceSystemFactory.VENICE_CHILD_CONTROLLER_D2_SERVICE;
-import static com.linkedin.venice.samza.VeniceSystemFactory.VENICE_CHILD_D2_ZK_HOSTS;
-import static com.linkedin.venice.samza.VeniceSystemFactory.VENICE_PARENT_CONTROLLER_D2_SERVICE;
-import static com.linkedin.venice.samza.VeniceSystemFactory.VENICE_PARENT_D2_ZK_HOSTS;
-import static com.linkedin.venice.samza.VeniceSystemFactory.VENICE_PUSH_TYPE;
-import static com.linkedin.venice.samza.VeniceSystemFactory.VENICE_STORE;
 import static com.linkedin.venice.utils.IntegrationTestPushUtils.sendStreamingRecordWithKeyPrefix;
 import static com.linkedin.venice.utils.TestWriteUtils.STRING_SCHEMA;
 
@@ -32,25 +16,23 @@ import com.linkedin.venice.client.store.ClientFactory;
 import com.linkedin.venice.common.VeniceSystemStoreUtils;
 import com.linkedin.venice.controller.Admin;
 import com.linkedin.venice.controllerapi.ControllerClient;
+import com.linkedin.venice.controllerapi.ControllerResponse;
 import com.linkedin.venice.controllerapi.ReadyForDataRecoveryResponse;
 import com.linkedin.venice.controllerapi.UpdateStoreQueryParams;
 import com.linkedin.venice.controllerapi.VersionCreationResponse;
 import com.linkedin.venice.helix.HelixReadOnlySchemaRepository;
+import com.linkedin.venice.integration.utils.IntegrationTestUtils;
 import com.linkedin.venice.integration.utils.PubSubBrokerWrapper;
-import com.linkedin.venice.integration.utils.ServiceFactory;
-import com.linkedin.venice.integration.utils.VeniceControllerWrapper;
 import com.linkedin.venice.integration.utils.VeniceMultiClusterWrapper;
-import com.linkedin.venice.integration.utils.VeniceTwoLayerMultiRegionMultiClusterWrapper;
-import com.linkedin.venice.meta.DataReplicationPolicy;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.pubsub.PubSubProducerAdapterFactory;
 import com.linkedin.venice.pubsub.PubSubTopicRepository;
-import com.linkedin.venice.samza.VeniceSystemFactory;
+import com.linkedin.venice.samza.VeniceSystemProducer;
+import com.linkedin.venice.utils.IntegrationTestPushUtils;
 import com.linkedin.venice.utils.TestUtils;
 import com.linkedin.venice.utils.Utils;
 import java.util.AbstractMap;
 import java.util.Arrays;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -59,77 +41,64 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
-import org.apache.samza.config.MapConfig;
-import org.apache.samza.system.SystemProducer;
 import org.testng.Assert;
-import org.testng.annotations.AfterClass;
 import org.testng.annotations.BeforeClass;
 import org.testng.annotations.Test;
 
 
-public class DataRecoveryTest {
+public class DataRecoveryTest extends AbstractMultiRegionTest {
   private static final long TEST_TIMEOUT = 120_000;
-  private static final int NUMBER_OF_CHILD_DATACENTERS = 2;
-  private static final int NUMBER_OF_CLUSTERS = 1;
-  private static final String[] CLUSTER_NAMES =
-      IntStream.range(0, NUMBER_OF_CLUSTERS).mapToObj(i -> "venice-cluster" + i).toArray(String[]::new);
   private static final int VERSION_ID_UNSET = -1;
 
-  private VeniceTwoLayerMultiRegionMultiClusterWrapper multiRegionMultiClusterWrapper;
-  private List<VeniceMultiClusterWrapper> childDatacenters;
-  private List<VeniceControllerWrapper> parentControllers;
   private String clusterName;
   private PubSubTopicRepository pubSubTopicRepository = new PubSubTopicRepository();
 
-  @BeforeClass(alwaysRun = true)
-  public void setUp() {
-    Utils.thisIsLocalhost();
+  @Override
+  protected Properties getExtraServerProperties() {
     Properties serverProperties = new Properties();
-    // If the delay is too short, dc-1 participant store new leader will skip local VT consumption, switch to remote VT,
-    // replicate duplicate SOP/EOP to local VT and miss TopicSwitch, resulting in stuck participant store push job.
-    serverProperties.put(SERVER_PROMOTION_TO_LEADER_REPLICA_DELAY_SECONDS, 5L);
-    serverProperties.setProperty(ROCKSDB_PLAIN_TABLE_FORMAT_ENABLED, "false");
-    serverProperties.setProperty(SERVER_DATABASE_CHECKSUM_VERIFICATION_ENABLED, "true");
     serverProperties.setProperty(SERVER_DATABASE_SYNC_BYTES_INTERNAL_FOR_DEFERRED_WRITE_MODE, "300");
+    return serverProperties;
+  }
 
+  @Override
+  protected Properties getExtraControllerProperties() {
     Properties controllerProps = new Properties();
     controllerProps.put(NATIVE_REPLICATION_SOURCE_FABRIC, DEFAULT_PARENT_DATA_CENTER_REGION_NAME);
     controllerProps.put(PARENT_KAFKA_CLUSTER_FABRIC_LIST, DEFAULT_PARENT_DATA_CENTER_REGION_NAME);
     controllerProps.put(ALLOW_CLUSTER_WIPE, "true");
-    controllerProps.put(TOPIC_CLEANUP_SLEEP_INTERVAL_BETWEEN_TOPIC_LIST_FETCH_MS, "1000");
+    // 1s cleanup interval is aggressive and can race with multi-region consumption,
+    // causing "Parent Kafka topic truncated". 5s gives regions time to finish consuming.
+    controllerProps.put(TOPIC_CLEANUP_SLEEP_INTERVAL_BETWEEN_TOPIC_LIST_FETCH_MS, "5000");
     controllerProps.put(MIN_NUMBER_OF_UNUSED_KAFKA_TOPICS_TO_PRESERVE, "0");
-    multiRegionMultiClusterWrapper = ServiceFactory.getVeniceTwoLayerMultiRegionMultiClusterWrapper(
-        NUMBER_OF_CHILD_DATACENTERS,
-        NUMBER_OF_CLUSTERS,
-        1,
-        1,
-        2,
-        1,
-        2,
-        Optional.of(controllerProps),
-        Optional.of(controllerProps),
-        Optional.of(serverProperties),
-        false);
-    childDatacenters = multiRegionMultiClusterWrapper.getChildRegions();
-    parentControllers = multiRegionMultiClusterWrapper.getParentControllers();
-    clusterName = CLUSTER_NAMES[0];
-
-    try (ControllerClient controllerClient =
-        new ControllerClient(clusterName, childDatacenters.get(1).getControllerConnectString())) {
-      // Verify the participant store is up and running in dest region.
-      // Participant store is needed for checking kill record existence and dest region readiness for data recovery.
-      String participantStoreName = VeniceSystemStoreUtils.getParticipantStoreNameForCluster(clusterName);
-      TestUtils.waitForNonDeterministicPushCompletion(
-          Version.composeKafkaTopic(participantStoreName, 1),
-          controllerClient,
-          2,
-          TimeUnit.MINUTES);
-    }
+    return controllerProps;
   }
 
-  @AfterClass(alwaysRun = true)
-  public void cleanUp() {
-    Utils.closeQuietlyWithErrorLogged(multiRegionMultiClusterWrapper);
+  @Override
+  @BeforeClass(alwaysRun = true)
+  public void setUp() {
+    Utils.thisIsLocalhost();
+    super.setUp();
+    clusterName = multiRegionMultiClusterWrapper.getClusterNames()[0];
+
+    // Verify the participant store is up and running in all regions before tests create user stores.
+    // Participant store is needed for checking kill record existence and dest region readiness for data recovery.
+    IntegrationTestUtils.waitForParticipantStorePushInAllRegions(clusterName, childDatacenters);
+  }
+
+  /**
+   * Meta system store and DaVinci push status store are auto-materialized on store creation.
+   * Their pushes must complete in every child DC before we issue the user store push, because
+   * the admin message pipeline processes messages sequentially and the auto-creation validation
+   * messages block until each system store push finishes.
+   */
+  private void waitForSystemStorePushes(String storeName, ControllerClient... dcClients) {
+    String metaStoreTopic = Version.composeKafkaTopic(VeniceSystemStoreUtils.getMetaStoreName(storeName), 1);
+    String pushStatusStoreTopic =
+        Version.composeKafkaTopic(VeniceSystemStoreUtils.getDaVinciPushStatusStoreName(storeName), 1);
+    for (ControllerClient dcClient: dcClients) {
+      TestUtils.waitForNonDeterministicPushCompletion(metaStoreTopic, dcClient, 2, TimeUnit.MINUTES);
+      TestUtils.waitForNonDeterministicPushCompletion(pushStatusStoreTopic, dcClient, 2, TimeUnit.MINUTES);
+    }
   }
 
   @Test(timeOut = TEST_TIMEOUT)
@@ -144,13 +113,13 @@ public class DataRecoveryTest {
             new ControllerClient(clusterName, childDatacenters.get(1).getControllerConnectString())) {
       List<ControllerClient> dcControllerClientList = Arrays.asList(dc0Client, dc1Client);
       TestUtils.createAndVerifyStoreInAllRegions(storeName, parentControllerClient, dcControllerClientList);
+      waitForSystemStorePushes(storeName, dc0Client, dc1Client);
       Assert.assertFalse(
           parentControllerClient
               .updateStore(
                   storeName,
                   new UpdateStoreQueryParams().setHybridRewindSeconds(10)
                       .setHybridOffsetLagThreshold(2)
-                      .setHybridDataReplicationPolicy(DataReplicationPolicy.AGGREGATE)
                       .setNativeReplicationEnabled(true)
                       .setPartitionCount(1))
               .isError());
@@ -160,7 +129,7 @@ public class DataRecoveryTest {
       TestUtils.waitForNonDeterministicPushCompletion(
           Version.composeKafkaTopic(storeName, 1),
           parentControllerClient,
-          30,
+          60,
           TimeUnit.SECONDS);
       ReadyForDataRecoveryResponse response =
           parentControllerClient.isStoreVersionReadyForDataRecovery("dc-0", "dc-1", storeName, 1, Optional.empty());
@@ -174,9 +143,13 @@ public class DataRecoveryTest {
             parentControllerClient.isStoreVersionReadyForDataRecovery("dc-0", "dc-1", storeName, 1, Optional.empty());
         Assert.assertTrue(readinessResponse.isReady(), readinessResponse.getReason());
       });
-      // Initiate data recovery
-      Assert.assertFalse(
-          parentControllerClient.dataRecovery("dc-0", "dc-1", storeName, 1, false, true, Optional.empty()).isError());
+      // Initiate data recovery. The readiness check queries the parent controller, but dataRecovery()
+      // also verifies readiness on the child controller, which may lag behind briefly.
+      TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, true, () -> {
+        ControllerResponse dr =
+            parentControllerClient.dataRecovery("dc-0", "dc-1", storeName, 1, false, true, Optional.empty());
+        Assert.assertFalse(dr.isError(), dr.getError());
+      });
       TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, true, () -> {
         Admin dc1Admin = childDatacenters.get(1).getLeaderController(clusterName).getVeniceAdmin();
         Assert.assertTrue(dc1Admin.getStore(clusterName, storeName).containsVersion(1));
@@ -200,10 +173,13 @@ public class DataRecoveryTest {
       Assert.assertFalse(
           parentControllerClient.prepareDataRecovery(src, dest, storeName, VERSION_ID_UNSET, Optional.empty())
               .isError());
-      // Initiate data recovery, a new version will be created in dest fabric.
-      Assert.assertFalse(
-          parentControllerClient.dataRecovery(src, dest, storeName, VERSION_ID_UNSET, false, true, Optional.empty())
-              .isError());
+      // Initiate data recovery, a new version will be created in dest fabric. Retry briefly in case
+      // the child controller hasn't fully cleaned up the previous version's artifacts yet.
+      TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, true, () -> {
+        ControllerResponse dr =
+            parentControllerClient.dataRecovery(src, dest, storeName, VERSION_ID_UNSET, false, true, Optional.empty());
+        Assert.assertFalse(dr.isError(), dr.getError());
+      });
       int finalVersion = version;
       TestUtils.waitForNonDeterministicAssertion(60, TimeUnit.SECONDS, true, () -> {
         Assert.assertEquals(destColoClient.getStore(storeName).getStore().getCurrentVersion(), finalVersion);
@@ -211,11 +187,13 @@ public class DataRecoveryTest {
       try (AvroGenericStoreClient<String, Object> client = ClientFactory.getAndStartGenericAvroClient(
           ClientConfig.defaultGenericClientConfig(storeName)
               .setVeniceURL(childDatacenters.get(1).getClusters().get(clusterName).getRandomRouterURL()))) {
-        for (int i = 0; i < 10; i++) {
-          Object v = client.get(String.valueOf(i)).get();
-          Assert.assertNotNull(v, "Batch data should be consumed already in data center " + dest);
-          Assert.assertEquals(v.toString(), String.valueOf(i));
-        }
+        TestUtils.waitForNonDeterministicAssertion(10, TimeUnit.SECONDS, true, () -> {
+          for (int i = 0; i < 10; i++) {
+            Object v = client.get(String.valueOf(i)).get();
+            Assert.assertNotNull(v, "Batch data should be consumed already in data center " + dest);
+            Assert.assertEquals(v.toString(), String.valueOf(i));
+          }
+        });
       }
     }
   }
@@ -231,6 +209,7 @@ public class DataRecoveryTest {
             new ControllerClient(clusterName, childDatacenters.get(1).getControllerConnectString())) {
       List<ControllerClient> dcControllerClientList = Arrays.asList(dc0Client, dc1Client);
       TestUtils.createAndVerifyStoreInAllRegions(storeName, parentControllerClient, dcControllerClientList);
+      waitForSystemStorePushes(storeName, dc0Client, dc1Client);
       Assert.assertFalse(
           parentControllerClient
               .updateStore(
@@ -265,7 +244,8 @@ public class DataRecoveryTest {
           IntStream.range(0, 10).mapToObj(i -> new AbstractMap.SimpleEntry<>(String.valueOf(i), String.valueOf(i))),
           HelixReadOnlySchemaRepository.VALUE_SCHEMA_STARTING_ID,
           pubSubProducerAdapterFactory,
-          additionalConfigs);
+          additionalConfigs,
+          pubSubBrokerWrappers.get(0).getPubSubPositionTypeRegistry());
       TestUtils.waitForNonDeterministicPushCompletion(
           versionCreationResponse.getKafkaTopic(),
           parentControllerClient,
@@ -305,13 +285,13 @@ public class DataRecoveryTest {
             new ControllerClient(clusterName, childDatacenters.get(1).getControllerConnectString())) {
       List<ControllerClient> dcControllerClientList = Arrays.asList(dc0Client, dc1Client);
       TestUtils.createAndVerifyStoreInAllRegions(storeName, parentControllerClient, dcControllerClientList);
+      waitForSystemStorePushes(storeName, dc0Client, dc1Client);
       Assert.assertFalse(
           parentControllerClient
               .updateStore(
                   storeName,
                   new UpdateStoreQueryParams().setHybridRewindSeconds(10)
                       .setHybridOffsetLagThreshold(2)
-                      .setHybridDataReplicationPolicy(DataReplicationPolicy.ACTIVE_ACTIVE)
                       .setNativeReplicationEnabled(true)
                       .setActiveActiveReplicationEnabled(true)
                       .setPartitionCount(1))
@@ -322,23 +302,11 @@ public class DataRecoveryTest {
       String versionTopic = Version.composeKafkaTopic(storeName, 1);
       TestUtils.waitForNonDeterministicPushCompletion(versionTopic, parentControllerClient, 60, TimeUnit.SECONDS);
 
-      Map<String, String> samzaConfig = new HashMap<>();
-      String configPrefix = SYSTEMS_PREFIX + "venice" + DOT;
-      samzaConfig.put(configPrefix + VENICE_PUSH_TYPE, Version.PushType.STREAM.toString());
-      samzaConfig.put(configPrefix + VENICE_STORE, storeName);
-      samzaConfig.put(configPrefix + VENICE_AGGREGATE, "false");
-      samzaConfig.put(VENICE_CHILD_D2_ZK_HOSTS, childDatacenters.get(0).getZkServerWrapper().getAddress());
-      samzaConfig.put(VENICE_CHILD_CONTROLLER_D2_SERVICE, D2_SERVICE_NAME);
-      samzaConfig.put(VENICE_PARENT_D2_ZK_HOSTS, parentControllers.get(0).getZkAddress());
-      samzaConfig.put(VENICE_PARENT_CONTROLLER_D2_SERVICE, PARENT_D2_SERVICE_NAME);
-      samzaConfig.put(DEPLOYMENT_ID, Utils.getUniqueString("venice-push-id"));
-      samzaConfig.put(SSL_ENABLED, "false");
-      VeniceSystemFactory factory = new VeniceSystemFactory();
-      SystemProducer veniceProducer = factory.getProducer("venice", new MapConfig(samzaConfig), null);
-      veniceProducer.start();
-
-      for (int i = 0; i < 10; i++) {
-        sendStreamingRecordWithKeyPrefix(veniceProducer, storeName, "dc-0_", i);
+      try (VeniceSystemProducer veniceProducer =
+          IntegrationTestPushUtils.getSamzaProducerForStream(multiRegionMultiClusterWrapper, 0, storeName)) {
+        for (int i = 0; i < 10; i++) {
+          sendStreamingRecordWithKeyPrefix(veniceProducer, storeName, "dc-0_", i);
+        }
       }
 
       // Prepare dc-1 for data recovery
@@ -349,9 +317,13 @@ public class DataRecoveryTest {
             parentControllerClient.isStoreVersionReadyForDataRecovery("dc-0", "dc-1", storeName, 1, Optional.empty());
         Assert.assertTrue(readinessResponse.isReady(), readinessResponse.getReason());
       });
-      // Initiate data recovery
-      Assert.assertFalse(
-          parentControllerClient.dataRecovery("dc-0", "dc-1", storeName, 1, false, true, Optional.empty()).isError());
+      // Initiate data recovery. The parent readiness check above queries the parent controller, but
+      // dataRecovery() also verifies readiness on the child controller, which may lag behind briefly.
+      TestUtils.waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, true, () -> {
+        ControllerResponse response =
+            parentControllerClient.dataRecovery("dc-0", "dc-1", storeName, 1, false, true, Optional.empty());
+        Assert.assertFalse(response.isError(), response.getError());
+      });
       TestUtils.waitForNonDeterministicPushCompletion(versionTopic, parentControllerClient, 60, TimeUnit.SECONDS);
 
       try (AvroGenericStoreClient<String, Object> client = ClientFactory.getAndStartGenericAvroClient(

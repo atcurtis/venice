@@ -1,10 +1,9 @@
 package com.linkedin.venice.endToEnd;
 
-import static com.linkedin.davinci.store.rocksdb.RocksDBServerConfig.ROCKSDB_PLAIN_TABLE_FORMAT_ENABLED;
 import static com.linkedin.venice.ConfigKeys.DEFAULT_MAX_NUMBER_OF_PARTITIONS;
 import static com.linkedin.venice.ConfigKeys.NATIVE_REPLICATION_SOURCE_FABRIC;
 import static com.linkedin.venice.ConfigKeys.PARENT_KAFKA_CLUSTER_FABRIC_LIST;
-import static com.linkedin.venice.ConfigKeys.SERVER_PROMOTION_TO_LEADER_REPLICA_DELAY_SECONDS;
+import static com.linkedin.venice.ConfigKeys.SERVER_AA_COLLECTION_FIELD_ELEMENT_REPLACEMENT_ENABLED;
 import static com.linkedin.venice.integration.utils.VeniceClusterWrapperConstants.DEFAULT_PARENT_DATA_CENTER_REGION_NAME;
 import static com.linkedin.venice.utils.IntegrationTestPushUtils.sendStreamingRecord;
 import static com.linkedin.venice.utils.TestUtils.assertCommand;
@@ -19,15 +18,12 @@ import com.linkedin.venice.client.store.AvroGenericStoreClient;
 import com.linkedin.venice.client.store.ClientConfig;
 import com.linkedin.venice.client.store.ClientFactory;
 import com.linkedin.venice.controllerapi.ControllerClient;
+import com.linkedin.venice.controllerapi.SchemaResponse;
 import com.linkedin.venice.controllerapi.StoreResponse;
 import com.linkedin.venice.controllerapi.UpdateStoreQueryParams;
-import com.linkedin.venice.integration.utils.ServiceFactory;
-import com.linkedin.venice.integration.utils.VeniceControllerWrapper;
 import com.linkedin.venice.integration.utils.VeniceMultiClusterWrapper;
-import com.linkedin.venice.integration.utils.VeniceTwoLayerMultiRegionMultiClusterWrapper;
 import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.samza.VeniceObjectWithTimestamp;
-import com.linkedin.venice.samza.VeniceSystemFactory;
 import com.linkedin.venice.samza.VeniceSystemProducer;
 import com.linkedin.venice.schema.writecompute.WriteComputeSchemaConverter;
 import com.linkedin.venice.utils.IntegrationTestPushUtils;
@@ -42,18 +38,14 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Properties;
 import java.util.concurrent.TimeUnit;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
 import org.apache.avro.Schema;
 import org.apache.avro.generic.GenericData;
 import org.apache.avro.generic.GenericRecord;
 import org.apache.avro.util.Utf8;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.apache.samza.config.MapConfig;
 import org.testng.Assert;
 import org.testng.annotations.AfterClass;
 import org.testng.annotations.AfterMethod;
@@ -62,30 +54,24 @@ import org.testng.annotations.BeforeMethod;
 import org.testng.annotations.Test;
 
 
-public class TestPartialUpdateWithActiveActiveReplication {
+public class TestPartialUpdateWithActiveActiveReplication extends AbstractMultiRegionTest {
   private static final Logger LOGGER = LogManager.getLogger(TestPartialUpdateWithActiveActiveReplication.class);
   private static final int TEST_TIMEOUT = 3 * Time.MS_PER_MINUTE;
   private static final int PUSH_TIMEOUT = TEST_TIMEOUT / 2;
-  private static final int NUMBER_OF_CHILD_DATACENTERS = 2;
-  private static final int NUMBER_OF_CLUSTERS = 1;
-  private static final String[] CLUSTER_NAMES =
-      IntStream.range(0, NUMBER_OF_CLUSTERS).mapToObj(i -> "venice-cluster" + i).toArray(String[]::new);
   public static final String REGULAR_FIELD = "regularField";
   public static final String LIST_FIELD = "listField";
   public static final String NULLABLE_LIST_FIELD = "nullableListField";
   public static final String MAP_FIELD = "mapField";
   public static final String NULLABLE_MAP_FIELD = "nullableMapField";
+  public static final String RECORD_LIST_FIELD = "recordListField";
+  public static final String ELEMENT_ID_FIELD = "id";
+  public static final String ELEMENT_IGNORED_FIELD = "metadata";
 
   private static final Map<String, Integer> MAP_FIELD_DEFAULT_VALUE = Collections.emptyMap();
-  private static final Map<String, Integer> NULLABLE_MAP_FIELD_DEFAULT_VALUE = null;
   private static final List<Integer> LIST_FIELD_DEFAULT_VALUE = Collections.emptyList();
-  private static final List<Integer> NULLABLE_LIST_FIELD_DEFAULT_VALUE = null;
 
   private static final String REGULAR_FIELD_DEFAULT_VALUE = "default_venice";
 
-  private List<VeniceMultiClusterWrapper> childDatacenters;
-  private List<VeniceControllerWrapper> parentControllers;
-  private VeniceTwoLayerMultiRegionMultiClusterWrapper multiRegionMultiClusterWrapper;
   private ControllerClient parentControllerClient;
   private ControllerClient dc0Client;
   private ControllerClient dc1Client;
@@ -103,37 +89,31 @@ public class TestPartialUpdateWithActiveActiveReplication {
 
   private Map<String, AvroGenericStoreClient<String, GenericRecord>> storeClients;
 
-  @BeforeClass(alwaysRun = true)
-  public void setUp() throws IOException {
-    Properties serverProperties = new Properties();
-    serverProperties.put(SERVER_PROMOTION_TO_LEADER_REPLICA_DELAY_SECONDS, 1L);
-    serverProperties.put(ROCKSDB_PLAIN_TABLE_FORMAT_ENABLED, false);
-
+  @Override
+  protected Properties getExtraControllerProperties() {
     Properties controllerProps = new Properties();
     controllerProps.put(DEFAULT_MAX_NUMBER_OF_PARTITIONS, 1);
     controllerProps.put(NATIVE_REPLICATION_SOURCE_FABRIC, "dc-0");
     controllerProps.put(PARENT_KAFKA_CLUSTER_FABRIC_LIST, DEFAULT_PARENT_DATA_CENTER_REGION_NAME);
+    return controllerProps;
+  }
 
-    multiRegionMultiClusterWrapper = ServiceFactory.getVeniceTwoLayerMultiRegionMultiClusterWrapper(
-        NUMBER_OF_CHILD_DATACENTERS,
-        NUMBER_OF_CLUSTERS,
-        1,
-        1,
-        2,
-        1,
-        2,
-        Optional.of(controllerProps),
-        Optional.of(controllerProps),
-        Optional.of(serverProperties),
-        false);
+  @Override
+  protected Properties getExtraServerProperties() {
+    Properties serverProps = new Properties();
+    // Enable the fix that replaces (rather than only re-timestamps) a collection-merge element on conflict, so content
+    // in order:ignore fields is propagated. Exercised by
+    // testAAReplicationForCollectionElementReplacementWithIgnoredField.
+    serverProps.setProperty(SERVER_AA_COLLECTION_FIELD_ELEMENT_REPLACEMENT_ENABLED, "true");
+    return serverProps;
+  }
 
-    parentControllers = multiRegionMultiClusterWrapper.getParentControllers();
-    childDatacenters = multiRegionMultiClusterWrapper.getChildRegions();
-
-    String clusterName = CLUSTER_NAMES[0];
-    String parentControllerURLs =
-        parentControllers.stream().map(VeniceControllerWrapper::getControllerUrl).collect(Collectors.joining(","));
-    parentControllerClient = new ControllerClient(clusterName, parentControllerURLs);
+  @Override
+  @BeforeClass(alwaysRun = true)
+  public void setUp() {
+    super.setUp();
+    String clusterName = CLUSTER_NAME;
+    parentControllerClient = new ControllerClient(clusterName, getParentControllerUrl());
     dc0Client = new ControllerClient(clusterName, childDatacenters.get(0).getControllerConnectString());
     dc1Client = new ControllerClient(clusterName, childDatacenters.get(1).getControllerConnectString());
     dcControllerClientList = Arrays.asList(dc0Client, dc1Client);
@@ -141,12 +121,13 @@ public class TestPartialUpdateWithActiveActiveReplication {
     dc1RouterUrl = childDatacenters.get(1).getClusters().get(clusterName).getRandomRouterURL();
   }
 
+  @Override
   @AfterClass(alwaysRun = true)
   public void cleanUp() {
     Utils.closeQuietlyWithErrorLogged(parentControllerClient);
     Utils.closeQuietlyWithErrorLogged(dc0Client);
     Utils.closeQuietlyWithErrorLogged(dc1Client);
-    Utils.closeQuietlyWithErrorLogged(multiRegionMultiClusterWrapper);
+    super.cleanUp();
   }
 
   @BeforeMethod
@@ -182,13 +163,10 @@ public class TestPartialUpdateWithActiveActiveReplication {
 
   // Create one system producer per region
   private void startVeniceSystemProducers() {
-    systemProducerMap = new HashMap<>(NUMBER_OF_CHILD_DATACENTERS);
-    VeniceSystemFactory factory = new VeniceSystemFactory();
-    for (int dcId = 0; dcId < NUMBER_OF_CHILD_DATACENTERS; dcId++) {
-      Map<String, String> samzaConfig =
-          IntegrationTestPushUtils.getSamzaProducerConfig(childDatacenters, dcId, storeName);
-      VeniceSystemProducer veniceProducer = factory.getClosableProducer("venice", new MapConfig(samzaConfig), null);
-      veniceProducer.start();
+    systemProducerMap = new HashMap<>(childDatacenters.size());
+    for (int dcId = 0; dcId < childDatacenters.size(); dcId++) {
+      VeniceSystemProducer veniceProducer =
+          IntegrationTestPushUtils.getSamzaProducerForStream(multiRegionMultiClusterWrapper, dcId, storeName);
       systemProducerMap.put(childDatacenters.get(dcId), veniceProducer);
     }
   }
@@ -347,8 +325,8 @@ public class TestPartialUpdateWithActiveActiveReplication {
     val3Prime.put(PERSON_F1_NAME, "val3PrimeF1");
     val3Prime.put(PERSON_F3_NAME, "val3PrimeF3");
     sendStreamingRecord(systemProducerMap.get(childDatacenters.get(1)), storeName, key3Prime, val3Prime);
-    validatePersonV1V2SupersetRecord(storeName, dc0RouterUrl, key3Prime, "val3PrimeF1", -1, "val3PrimeF3");
-    validatePersonV1V2SupersetRecord(storeName, dc1RouterUrl, key3Prime, "val3PrimeF1", -1, "val3PrimeF3");
+    validatePersonV2Record(storeName, dc0RouterUrl, key3Prime, "val3PrimeF1", "val3PrimeF3");
+    validatePersonV2Record(storeName, dc1RouterUrl, key3Prime, "val3PrimeF1", "val3PrimeF3");
   }
 
   private void validatePersonV1V2SupersetRecord(
@@ -418,11 +396,318 @@ public class TestPartialUpdateWithActiveActiveReplication {
     });
   }
 
+  private void validatePersonV2Record(
+      String storeName,
+      String routerUrl,
+      String key,
+      String expectedField1,
+      String expectedField3) {
+    AvroGenericStoreClient<String, GenericRecord> client = getStoreClient(storeName, routerUrl);
+    TestUtils.waitForNonDeterministicAssertion(120, TimeUnit.SECONDS, () -> {
+      GenericRecord retrievedValue = client.get(key).get();
+      if (expectedField1 == null && expectedField3 == null) {
+        assertNull(retrievedValue);
+        return;
+      }
+      assertNotNull(retrievedValue);
+      if (expectedField1 == null) {
+        assertNull(retrievedValue.get(PERSON_F1_NAME));
+      } else {
+        assertNotNull(retrievedValue.get(PERSON_F1_NAME));
+        assertEquals(retrievedValue.get(PERSON_F1_NAME).toString(), expectedField1);
+      }
+      if (expectedField3 == null) {
+        assertNull(retrievedValue.get(PERSON_F3_NAME));
+      } else {
+        Schema.Field field3 = retrievedValue.getSchema().getField(PERSON_F3_NAME);
+        assertNotNull(field3);
+        assertNotNull(retrievedValue.get(PERSON_F3_NAME));
+        assertEquals(retrievedValue.get(PERSON_F3_NAME).toString(), expectedField3);
+      }
+    });
+  }
+
   private AvroGenericStoreClient<String, GenericRecord> getStoreClient(String storeName, String routerUrl) {
     return storeClients.computeIfAbsent(
         routerUrl,
         k -> ClientFactory
             .getAndStartGenericAvroClient(ClientConfig.defaultGenericClientConfig(storeName).setVeniceURL(routerUrl)));
+  }
+
+  /**
+   * Verifies the collection-merge element-replacement fix end-to-end in an A/A + write-compute store. The array element
+   * record has a field marked {@code order: ignore}, so two elements that share the same {@code id} but differ in the
+   * ignored {@code metadata} field are considered equal by Avro comparison. A SET_UNION that adds such an element must
+   * replace the stored element (propagating the new ignored-field content), not merely re-timestamp it. The behavior is
+   * gated by {@code server.aa.collection.field.element.replacement.enabled}, enabled in
+   * {@link #getExtraServerProperties()} for this test class.
+   *
+   * <p>Both timestamp-ordering paths are exercised against the same stored element: first a strictly-newer timestamp
+   * ({@code activeTimestamp < modifyTimestamp}), where the incoming element wins on timestamp and replaces the stored
+   * one; then an equal timestamp ({@code activeTimestamp == modifyTimestamp}), where the equal-timestamp tie-break
+   * deterministically keeps whichever element wins a full-content comparison (including the ignored field), so all A/A
+   * regions converge regardless of arrival order.
+   */
+  @Test(timeOut = TEST_TIMEOUT)
+  public void testAAReplicationForCollectionElementReplacementWithIgnoredField() throws IOException {
+    Schema valueSchema =
+        AvroCompatibilityHelper.parse(loadFileAsString("PartialUpdateRecordListWithIgnoredField.avsc"));
+    Schema updateSchema = WriteComputeSchemaConverter.getInstance().convertFromValueRecordSchema(valueSchema);
+    Schema elementSchema = valueSchema.getField(RECORD_LIST_FIELD).schema().getElementType();
+
+    assertCommand(parentControllerClient.createNewStore(storeName, "owner", KEY_SCHEMA_STR, valueSchema.toString()));
+    UpdateStoreQueryParams params = new UpdateStoreQueryParams().setNativeReplicationEnabled(true)
+        .setActiveActiveReplicationEnabled(true)
+        .setStorageQuotaInByte(Store.UNLIMITED_STORAGE_QUOTA)
+        .setChunkingEnabled(false)
+        .setHybridRewindSeconds(25L)
+        .setHybridOffsetLagThreshold(1L)
+        .setWriteComputationEnabled(true);
+    assertCommand(parentControllerClient.updateStore(storeName, params));
+
+    runEmptyPushAndVerifyStoreVersion(storeName, 1);
+    startVeniceSystemProducers();
+
+    String key = "key1";
+
+    // First SET_UNION: add element {id: "e1", metadata: "v1"} at timestamp 1000.
+    GenericRecord firstElement = new GenericData.Record(elementSchema);
+    firstElement.put(ELEMENT_ID_FIELD, "e1");
+    firstElement.put(ELEMENT_IGNORED_FIELD, "v1");
+    UpdateBuilder firstUpdate = new UpdateBuilderImpl(updateSchema);
+    firstUpdate.setElementsToAddToListField(RECORD_LIST_FIELD, Collections.singletonList(firstElement));
+    sendStreamingRecord(systemProducerMap.get(childDatacenters.get(0)), storeName, key, firstUpdate.build(), 1000L);
+    verifyCollectionElementIgnoredField(storeName, dc0RouterUrl, key, "e1", "v1");
+
+    // Second SET_UNION: add element {id: "e1", metadata: "v2"} at a newer timestamp 2000. The element is equal to the
+    // stored one (only the order:ignore field differs), so this exercises the conflict path.
+    GenericRecord secondElement = new GenericData.Record(elementSchema);
+    secondElement.put(ELEMENT_ID_FIELD, "e1");
+    secondElement.put(ELEMENT_IGNORED_FIELD, "v2");
+    UpdateBuilder secondUpdate = new UpdateBuilderImpl(updateSchema);
+    secondUpdate.setElementsToAddToListField(RECORD_LIST_FIELD, Collections.singletonList(secondElement));
+    sendStreamingRecord(systemProducerMap.get(childDatacenters.get(0)), storeName, key, secondUpdate.build(), 2000L);
+
+    // The newer element replaces the stored one; both regions converge to the updated ignored-field content.
+    verifyCollectionElementIgnoredField(storeName, dc0RouterUrl, key, "e1", "v2");
+    verifyCollectionElementIgnoredField(storeName, dc1RouterUrl, key, "e1", "v2");
+
+    // Third SET_UNION: add element {id: "e1", metadata: "v3"} at the SAME timestamp 2000 as the now-stored element.
+    // The timestamps tie, so this exercises the equal-timestamp tie-break: "v3" wins a full-content comparison over
+    // the stored "v2" and replaces it, instead of the equal-timestamp write being dropped.
+    GenericRecord thirdElement = new GenericData.Record(elementSchema);
+    thirdElement.put(ELEMENT_ID_FIELD, "e1");
+    thirdElement.put(ELEMENT_IGNORED_FIELD, "v3");
+    UpdateBuilder thirdUpdate = new UpdateBuilderImpl(updateSchema);
+    thirdUpdate.setElementsToAddToListField(RECORD_LIST_FIELD, Collections.singletonList(thirdElement));
+    sendStreamingRecord(systemProducerMap.get(childDatacenters.get(0)), storeName, key, thirdUpdate.build(), 2000L);
+
+    // The equal-timestamp tie-break winner replaces the stored element; both regions converge to the new content.
+    verifyCollectionElementIgnoredField(storeName, dc0RouterUrl, key, "e1", "v3");
+    verifyCollectionElementIgnoredField(storeName, dc1RouterUrl, key, "e1", "v3");
+  }
+
+  private void verifyCollectionElementIgnoredField(
+      String storeName,
+      String routerUrl,
+      String key,
+      String expectedId,
+      String expectedIgnoredFieldValue) {
+    AvroGenericStoreClient<String, GenericRecord> client = getStoreClient(storeName, routerUrl);
+    // retryOnThrowable=true so a transient ExecutionException/InterruptedException from client.get(key).get() is
+    // retried
+    // rather than failing the test immediately.
+    TestUtils.waitForNonDeterministicAssertion(120, TimeUnit.SECONDS, false, true, () -> {
+      GenericRecord retrievedValue = client.get(key).get();
+      assertNotNull(retrievedValue);
+      @SuppressWarnings("unchecked")
+      List<GenericRecord> recordList = (List<GenericRecord>) retrievedValue.get(RECORD_LIST_FIELD);
+      assertNotNull(recordList);
+      assertEquals(recordList.size(), 1);
+      GenericRecord element = recordList.get(0);
+      assertEquals(element.get(ELEMENT_ID_FIELD).toString(), expectedId);
+      assertEquals(element.get(ELEMENT_IGNORED_FIELD).toString(), expectedIgnoredFieldValue);
+    });
+  }
+
+  /**
+   * Test schema evolution of a nested record field in an A/A store with partial update enabled.
+   *
+   * Scenario:
+   * - Value schema V1 has a nested "details" record field with 2 sub-fields (subField1, subField2), both with defaults.
+   * - Value schema V2 removes "subField2" from the nested "details" record.
+   * - Venice generates a superset schema that keeps both sub-fields in the nested record.
+   *   Since V1 already contains all fields, V1 itself IS the superset schema.
+   *
+   * Key behaviors verified by this test:
+   *
+   * 1. Full PUT (existing key with RMD from a prior V1 write):
+   *    Goes through {@code mergePutWithFieldLevelTimestamp()} — merge conflict resolver up-converts both
+   *    old and new values to the superset schema (V1), serializes merged bytes using V1, and returns
+   *    the merge-result/superset schema ID. The VT record therefore has matching bytes and schema ID.
+   *    The generic client and CDC client deserialize with the superset schema, so superset fields,
+   *    including subField2, remain visible to readers (with its default value after the full PUT).
+   *
+   * 2. Partial UPDATE (via write-compute):
+   *    Goes through {@code update()} — both bytes and schema ID use the superset schema consistently
+   *    (via {@code createOldValueAndRmd} which sets valueSchemaId to the superset/reader schema ID).
+   *    The generic client reads with V1 (superset) → subField2 IS visible.
+   */
+  @Test(timeOut = TEST_TIMEOUT)
+  public void testAAPartialUpdateWithNestedRecordSchemaEvolution() throws IOException {
+    final String ID_FIELD = "id";
+    final String DETAILS_FIELD = "details";
+    final String SUB_FIELD_1 = "subField1";
+    final String SUB_FIELD_2 = "subField2";
+    final String SUB_FIELD_2_DEFAULT = "default_sub2";
+
+    Schema valueSchemaV1 = AvroCompatibilityHelper.parse(loadFileAsString("writecompute/test/NestedRecordV1.avsc"));
+    Schema valueSchemaV2 = AvroCompatibilityHelper.parse(loadFileAsString("writecompute/test/NestedRecordV2.avsc"));
+    Schema wcSchemaV2 = WriteComputeSchemaConverter.getInstance().convertFromValueRecordSchema(valueSchemaV2);
+
+    assertCommand(parentControllerClient.createNewStore(storeName, "owner", KEY_SCHEMA_STR, valueSchemaV1.toString()));
+    UpdateStoreQueryParams params = new UpdateStoreQueryParams().setNativeReplicationEnabled(true)
+        .setActiveActiveReplicationEnabled(true)
+        .setStorageQuotaInByte(Store.UNLIMITED_STORAGE_QUOTA)
+        .setChunkingEnabled(false)
+        .setIncrementalPushEnabled(true)
+        .setHybridRewindSeconds(25L)
+        .setHybridOffsetLagThreshold(1L)
+        .setWriteComputationEnabled(true);
+    assertCommand(parentControllerClient.updateStore(storeName, params));
+
+    runEmptyPushAndVerifyStoreVersion(storeName, 1);
+    startVeniceSystemProducers();
+
+    // ==========================================
+    // Step 1: Full PUT with V1 - both sub-fields populated
+    // ==========================================
+    String key1 = "key1";
+    GenericRecord detailsV1 = new GenericData.Record(valueSchemaV1.getField(DETAILS_FIELD).schema());
+    detailsV1.put(SUB_FIELD_1, "value_sub1");
+    detailsV1.put(SUB_FIELD_2, "value_sub2");
+    GenericRecord val1 = new GenericData.Record(valueSchemaV1);
+    val1.put(ID_FIELD, "id1");
+    val1.put(DETAILS_FIELD, detailsV1);
+    sendStreamingRecord(systemProducerMap.get(childDatacenters.get(0)), storeName, key1, val1);
+    // V1 bytes + V1 schema ID → client reads with V1 → both sub-fields visible
+    verifyNestedRecordWithSuperset(storeName, dc0RouterUrl, key1, "id1", "value_sub1", "value_sub2");
+    verifyNestedRecordWithSuperset(storeName, dc1RouterUrl, key1, "id1", "value_sub1", "value_sub2");
+
+    // ==========================================
+    // Step 2: Register V2 which removes subField2 from nested Details record.
+    // Since V1 is already a superset of V2, V1 is designated as the superset schema.
+    // ==========================================
+    assertCommand(parentControllerClient.addValueSchema(storeName, valueSchemaV2.toString()));
+
+    // Wait for V2 to propagate from parent to child controllers. The Samza producers connect to
+    // child controllers for schema lookup, and V2 propagation via admin topic is asynchronous.
+    for (ControllerClient dcClient: dcControllerClientList) {
+      waitForNonDeterministicAssertion(30, TimeUnit.SECONDS, () -> {
+        SchemaResponse schemaResponse = dcClient.getValueSchemaID(storeName, valueSchemaV2.toString());
+        assertNotNull(schemaResponse);
+        Assert.assertFalse(schemaResponse.isError(), "V2 schema should be available on child controller");
+      });
+    }
+
+    // ==========================================
+    // Step 3: Full PUT with V2 on EXISTING key1 (which previously had subField2="value_sub2").
+    // Path: mergePutWithFieldLevelTimestamp() → merge up-converts to superset (V1), serializes
+    // merged bytes with V1 schema, and returns the merge-result/superset schema ID (V1).
+    // VT record: V1-encoded bytes + V1 schema ID → consistent.
+    // The full PUT replaces the entire record. V2 doesn't include subField2, so after up-conversion
+    // to superset, subField2 gets its default value. Since the new PUT timestamp > old, the new
+    // (default) value wins for subField2.
+    // ==========================================
+    Schema detailsSchemaV2 = valueSchemaV2.getField(DETAILS_FIELD).schema();
+    GenericRecord detailsV2ForKey1 = new GenericData.Record(detailsSchemaV2);
+    detailsV2ForKey1.put(SUB_FIELD_1, "updated_sub1");
+    GenericRecord val1Updated = new GenericData.Record(valueSchemaV2);
+    val1Updated.put(ID_FIELD, "id1_updated");
+    val1Updated.put(DETAILS_FIELD, detailsV2ForKey1);
+    sendStreamingRecord(systemProducerMap.get(childDatacenters.get(1)), storeName, key1, val1Updated);
+    // With the fix, the merge-result schema ID (superset/V1) is returned, so the client reads with
+    // the superset schema and subField2 is visible with its default value.
+    verifyNestedRecordWithSuperset(storeName, dc0RouterUrl, key1, "id1_updated", "updated_sub1", SUB_FIELD_2_DEFAULT);
+    verifyNestedRecordWithSuperset(storeName, dc1RouterUrl, key1, "id1_updated", "updated_sub1", SUB_FIELD_2_DEFAULT);
+
+    // ==========================================
+    // Step 4: Write key3 with V1 (both sub-fields), then partial update only "id" using V2 WC schema.
+    // The UPDATE path in MergeConflictResolver.update() uses superset schema for BOTH
+    // serialization and schema ID (via createOldValueAndRmd → setValueSchemaId(readerValueSchemaID)).
+    // VT record: V1(superset)-encoded bytes + V1(superset) schema ID → consistent.
+    // The "details" field is untouched by the partial update, preserving subField2's original value.
+    // ==========================================
+    String key3 = "key3";
+    GenericRecord detailsForKey3 = new GenericData.Record(valueSchemaV1.getField(DETAILS_FIELD).schema());
+    detailsForKey3.put(SUB_FIELD_1, "k3_sub1");
+    detailsForKey3.put(SUB_FIELD_2, "k3_sub2");
+    GenericRecord val3 = new GenericData.Record(valueSchemaV1);
+    val3.put(ID_FIELD, "id3");
+    val3.put(DETAILS_FIELD, detailsForKey3);
+    sendStreamingRecord(systemProducerMap.get(childDatacenters.get(0)), storeName, key3, val3);
+    verifyNestedRecordWithSuperset(storeName, dc0RouterUrl, key3, "id3", "k3_sub1", "k3_sub2");
+    verifyNestedRecordWithSuperset(storeName, dc1RouterUrl, key3, "id3", "k3_sub1", "k3_sub2");
+
+    // Partial update: only update "id", leave "details" unchanged
+    UpdateBuilder ub = new UpdateBuilderImpl(wcSchemaV2);
+    ub.setNewFieldValue(ID_FIELD, "id3_updated");
+    sendStreamingRecord(systemProducerMap.get(childDatacenters.get(0)), storeName, key3, ub.build());
+    // UPDATE path → superset bytes + superset ID → "details" untouched, subField2 still "k3_sub2"
+    verifyNestedRecordWithSuperset(storeName, dc0RouterUrl, key3, "id3_updated", "k3_sub1", "k3_sub2");
+    verifyNestedRecordWithSuperset(storeName, dc1RouterUrl, key3, "id3_updated", "k3_sub1", "k3_sub2");
+
+    // ==========================================
+    // Step 5: Partial update that replaces the entire "details" field with a V2 record (no subField2).
+    // UPDATE path → superset bytes + superset ID.
+    // The V2 "details" record is up-converted to superset Details schema, filling subField2 with default.
+    // ==========================================
+    UpdateBuilder ubDetails = new UpdateBuilderImpl(wcSchemaV2);
+    GenericRecord newDetailsV2 = new GenericData.Record(detailsSchemaV2);
+    newDetailsV2.put(SUB_FIELD_1, "k3_sub1_updated");
+    ubDetails.setNewFieldValue(DETAILS_FIELD, newDetailsV2);
+    sendStreamingRecord(systemProducerMap.get(childDatacenters.get(1)), storeName, key3, ubDetails.build());
+    // "details" replaced; subField2 reverts to default. Still visible because UPDATE uses superset ID.
+    verifyNestedRecordWithSuperset(
+        storeName,
+        dc0RouterUrl,
+        key3,
+        "id3_updated",
+        "k3_sub1_updated",
+        SUB_FIELD_2_DEFAULT);
+    verifyNestedRecordWithSuperset(
+        storeName,
+        dc1RouterUrl,
+        key3,
+        "id3_updated",
+        "k3_sub1_updated",
+        SUB_FIELD_2_DEFAULT);
+  }
+
+  /**
+   * Verify that a record stored with the superset schema ID is readable with all fields visible.
+   * Used for records written via full PUT (on existing keys, through mergePutWithFieldLevelTimestamp),
+   * partial UPDATE, or initial PUT with V1 (which is itself the superset).
+   */
+  private void verifyNestedRecordWithSuperset(
+      String storeName,
+      String routerUrl,
+      String key,
+      String expectedId,
+      String expectedSubField1,
+      String expectedSubField2) {
+    AvroGenericStoreClient<String, GenericRecord> client = getStoreClient(storeName, routerUrl);
+    TestUtils.waitForNonDeterministicAssertion(120, TimeUnit.SECONDS, () -> {
+      GenericRecord retrievedValue = client.get(key).get();
+      assertNotNull(retrievedValue);
+      assertEquals(retrievedValue.get("id").toString(), expectedId);
+      GenericRecord details = (GenericRecord) retrievedValue.get("details");
+      assertNotNull(details, "details field should not be null");
+      assertEquals(details.get("subField1").toString(), expectedSubField1);
+      // subField2 should be present because the record was stored with superset schema ID
+      assertNotNull(details.getSchema().getField("subField2"), "subField2 should be present in the superset schema");
+      assertEquals(details.get("subField2").toString(), expectedSubField2);
+    });
   }
 
   @Test(timeOut = TEST_TIMEOUT)

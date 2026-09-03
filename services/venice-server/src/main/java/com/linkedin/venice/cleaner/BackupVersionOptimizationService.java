@@ -3,13 +3,15 @@ package com.linkedin.venice.cleaner;
 import static com.linkedin.venice.meta.VersionStatus.ONLINE;
 
 import com.linkedin.davinci.storage.StorageEngineRepository;
-import com.linkedin.davinci.store.AbstractStorageEngine;
+import com.linkedin.davinci.store.StorageEngine;
 import com.linkedin.venice.meta.ReadOnlyStoreRepository;
 import com.linkedin.venice.meta.Store;
 import com.linkedin.venice.meta.Version;
 import com.linkedin.venice.service.AbstractVeniceService;
 import com.linkedin.venice.stats.BackupVersionOptimizationServiceStats;
 import com.linkedin.venice.utils.DaemonThreadFactory;
+import com.linkedin.venice.utils.LogContext;
+import com.linkedin.venice.utils.Utils;
 import com.linkedin.venice.utils.concurrent.VeniceConcurrentHashMap;
 import java.util.HashSet;
 import java.util.Map;
@@ -79,8 +81,7 @@ public class BackupVersionOptimizationService extends AbstractVeniceService impl
 
   private final Map<String, ResourceState> resourceStateMap = new VeniceConcurrentHashMap<>();
 
-  private final ScheduledExecutorService executor =
-      Executors.newSingleThreadScheduledExecutor(new DaemonThreadFactory("BackupVersionCleanupService"));
+  private final ScheduledExecutorService executor;
 
   private boolean stop = false;
 
@@ -97,12 +98,15 @@ public class BackupVersionOptimizationService extends AbstractVeniceService impl
       StorageEngineRepository storageEngineRepository,
       long noReadThresholdMSForDatabaseOptimization,
       long scheduleIntervalSeconds,
-      BackupVersionOptimizationServiceStats stats) {
+      BackupVersionOptimizationServiceStats stats,
+      LogContext logContext) {
     this.storeRepository = storeRepository;
     this.storageEngineRepository = storageEngineRepository;
     this.noReadThresholdMSForDatabaseOptimization = noReadThresholdMSForDatabaseOptimization;
     this.scheduleIntervalSeconds = scheduleIntervalSeconds;
     this.stats = stats;
+    this.executor =
+        Executors.newSingleThreadScheduledExecutor(new DaemonThreadFactory("BackupVersionCleanupService", logContext));
   }
 
   private Runnable getOptimizationRunnable() {
@@ -114,7 +118,7 @@ public class BackupVersionOptimizationService extends AbstractVeniceService impl
        * Optimize the storage engine for inactive storage partitions
        */
       final Set<String> validResourceSet = new HashSet<>();
-      for (AbstractStorageEngine engine: storageEngineRepository.getAllLocalStorageEngines()) {
+      for (StorageEngine engine: storageEngineRepository.getAllLocalStorageEngines()) {
         String resourceName = engine.getStoreVersionName();
         validResourceSet.add(resourceName);
         String storeName = Version.parseStoreFromVersionTopic(resourceName);
@@ -151,14 +155,17 @@ public class BackupVersionOptimizationService extends AbstractVeniceService impl
           for (int partitionId: partitionIdSet) {
             try {
               engine.reopenStoragePartition(partitionId);
-              stats.recordBackupVersionDatabaseOptimization();
+              stats.recordBackupVersionDatabaseOptimization(storeName);
             } catch (Exception e) {
-              LOGGER.error("Failed to optimize database for resource: {}, partition: {}", resourceName, partitionId, e);
+              LOGGER.error(
+                  "Failed to optimize database for topic-partition: {}",
+                  Utils.getReplicaId(resourceName, partitionId),
+                  e);
+              stats.recordBackupVersionDatabaseOptimizationError(storeName);
               errored = true;
             }
           }
           if (errored) {
-            stats.recordBackupVersionDatabaseOptimizationError();
             LOGGER.warn(
                 "Encountered issue when optimizing database for resource: {}, "
                     + "and please check the above logs to find more details, and will retry the optimization in next iteration",

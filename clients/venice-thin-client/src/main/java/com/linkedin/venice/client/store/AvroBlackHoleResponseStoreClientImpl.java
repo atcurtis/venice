@@ -7,7 +7,7 @@ import com.linkedin.venice.client.store.streaming.TrackingStreamingCallback;
 import com.linkedin.venice.client.store.transport.TransportClient;
 import com.linkedin.venice.client.store.transport.TransportClientStreamingCallback;
 import com.linkedin.venice.compute.ComputeRequestWrapper;
-import com.linkedin.venice.serializer.RecordSerializer;
+import com.linkedin.venice.read.RequestHeadersProvider;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -43,18 +43,16 @@ public class AvroBlackHoleResponseStoreClientImpl<K, V> extends AvroGenericStore
 
     byte[] serializedComputeRequest = serializeComputeRequest(computeRequestWrapper, keys);
 
-    Map<String, String> headerMap = COMPUTE_HEADER_MAP_FOR_STREAMING_V3;
-
     getTransportClient().streamPost(
         getComputeRequestPath(),
-        headerMap,
+        RequestHeadersProvider
+            .getStreamingComputeHeaderMap(keys.size(), computeRequestWrapper.getValueSchemaID(), false),
         serializedComputeRequest,
         new BlackHoleStreamingCallback<>(keys.size(), DelegatingTrackingCallback.wrap(callback)),
         keys.size());
   }
 
   private byte[] serializeComputeRequest(ComputeRequestWrapper computeRequestWrapper, Collection<K> keys) {
-    RecordSerializer keySerializer = getKeySerializerWithoutRetry();
     List<ByteBuffer> serializedKeyList = new ArrayList<>(keys.size());
     ByteBuffer serializedComputeRequest = ByteBuffer.wrap(computeRequestWrapper.serialize());
     for (K key: keys) {

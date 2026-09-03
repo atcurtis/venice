@@ -1,0 +1,234 @@
+name: Build and Publish Docker Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      git_tag:
+        description: "Tag to build Docker images from"
+        required: true
+        default: "0.4.17"
+      publish_to_dockerhub:
+        description: "Also publish images to Docker Hub (venicedb/*). Requires VENICEDB_DOCKERHUB_FOR_OSS_REPO secret."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  docker-build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      DOCKER_TARGETS: "venice-controller venice-server venice-router venice-client"
+
+    steps:
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Preflight - require VENICEDB_DOCKERHUB_FOR_OSS_REPO secret
+        if: ${{ inputs.publish_to_dockerhub }}
+        env:
+          DOCKERHUB_TOKEN: ${{ secrets.VENICEDB_DOCKERHUB_FOR_OSS_REPO }}
+        run: |
+          if [ -z "${DOCKERHUB_TOKEN:-}" ]; then
+            echo "::error title=Missing secret::publish_to_dockerhub=true but VENICEDB_DOCKERHUB_FOR_OSS_REPO secret is not configured for this repository. Add it under Settings > Secrets and variables > Actions before enabling Docker Hub publishing."
+            exit 1
+          fi
+
+      - name: Login to Docker Hub
+        if: ${{ inputs.publish_to_dockerhub }}
+        uses: docker/login-action@v3
+        with:
+          username: venicedb
+          password: ${{ secrets.VENICEDB_DOCKERHUB_FOR_OSS_REPO }}
+
+      # Step 1: Check out the repository
+      - name: Check out the repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      # Step 2: Set up JDK
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          java-version: "17"
+          distribution: "temurin"
+          cache: "gradle"
+
+      # Step 3: Fetch all branches and tags
+      - name: Fetch all branches and tags
+        run: |
+          git remote set-head origin --auto
+          git remote add upstream https://github.com/linkedin/venice
+          git fetch upstream
+          git fetch --tags
+
+      # Step 4: Validate and check out the tag
+      - name: Check out tag and validate
+        id: validate_tag
+        env:
+          TAG: ${{ github.event.inputs.git_tag }}
+        run: |
+          set -euo pipefail
+          # Validate tag matches expected semantic version format (e.g., 0.4.676)
+          if [[ -z "$TAG" || ! "$TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error title=Invalid tag::git_tag must match [0-9]+.[0-9]+.[0-9]+ (e.g. 0.4.676)"
+            exit 1
+          fi
+
+          # Verify the tag exists
+          if ! git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "::error title=Tag Not Found::Tag '$TAG' does not exist. Available recent tags: $(git tag --sort=-creatordate | head -5 | tr '\n' ' ')"
+            exit 1
+          fi
+
+          # Resolve the tag to a commit SHA first (avoids passing a potentially option-looking ref to checkout)
+          COMMIT_SHA=$(git rev-parse "refs/tags/$TAG^{commit}")
+
+          # Check out the commit in detached HEAD safely
+          git -c advice.detachedHead=false checkout --detach "$COMMIT_SHA"
+
+          # Persist validated tag for later steps (already in correct format)
+          echo "DOCKER_TAG=$TAG" >> "$GITHUB_ENV"
+
+          # Get latest commit information
+          # COMMIT_SHA already resolved above
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+          COMMIT_DATE=$(git log -1 --pretty=%cd --date=format:"%Y-%m-%d %H:%M:%S")
+
+          echo "Latest commit SHA: $COMMIT_SHA"
+          echo "Latest commit date: $COMMIT_DATE"
+
+          # Set outputs
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "commit_date=$COMMIT_DATE" >> "$GITHUB_OUTPUT"
+
+      # Step 5: Run Docker image build and push script
+      - name: Build Docker images
+        timeout-minutes: 45
+        env:
+          TAG_VERSION: ${{ env.DOCKER_TAG }}
+        run: |
+          set -euo pipefail
+          echo "Building Docker images for tag: $TAG_VERSION"
+          bash docker/build-venice-docker-images.sh "ghcr.io/${{ github.repository }}" "$TAG_VERSION" "$DOCKER_TARGETS"
+
+      # Step 6: List generated Docker images
+      - name: List generated Docker images
+        run: |
+          echo "Listing all Docker images:"
+          docker images
+
+      # Step 7: Verify that images were created
+      - name: Verify Docker images were created
+        env:
+          TAG_VERSION: ${{ env.DOCKER_TAG }}
+        run: |
+          set -euo pipefail
+          IFS=' ' read -ra TARGETS <<< "$DOCKER_TARGETS"
+          for target in "${TARGETS[@]}"; do
+            IMAGE_NAME="ghcr.io/${{ github.repository }}/$target:$TAG_VERSION"
+            if ! docker inspect "$IMAGE_NAME" >/dev/null 2>&1; then
+              echo "::error title=Image Not Found::Docker image $IMAGE_NAME was not created during build step"
+              exit 1
+            fi
+            echo "✓ Verified: $IMAGE_NAME"
+          done
+
+      # Step 8: Publish Docker images to repo's GHCR
+      - name: Push Docker images to repo's GHCR
+        id: publish_images
+        env:
+          TAG_VERSION: ${{ env.DOCKER_TAG }}
+        run: |
+          set -euo pipefail
+          IFS=' ' read -ra targets <<< "$DOCKER_TARGETS"
+          IMAGE_URLS=""
+          for target in "${targets[@]}"; do
+            IMAGE_NAME="ghcr.io/${{ github.repository }}/$target:$TAG_VERSION"
+            echo "Pushing: $IMAGE_NAME"
+            if docker push "$IMAGE_NAME"; then
+              echo "✓ Successfully pushed: $IMAGE_NAME"
+              IMAGE_URLS+="- $target - [$IMAGE_NAME](https://ghcr.io/${{ github.repository }}/$target:$TAG_VERSION)\n"
+            else
+              echo "::error title=Push Failed::Failed to push $IMAGE_NAME to registry"
+              exit 1
+            fi
+          done
+          # Save IMAGE_URLS to GITHUB_OUTPUT for later use in the workflow
+          {
+            echo "image_urls<<EOF"
+            echo -e "$IMAGE_URLS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Display clickable image URLs
+        run: |
+          echo "## Published Docker Images"
+          echo -e "${{ steps.publish_images.outputs.image_urls }}"
+
+      # Step 8b: Optionally tag and push to Docker Hub (venicedb/*)
+      - name: Tag and push Docker images to Docker Hub
+        if: ${{ inputs.publish_to_dockerhub }}
+        id: publish_dockerhub
+        env:
+          TAG_VERSION: ${{ env.DOCKER_TAG }}
+        run: |
+          set -euo pipefail
+          IFS=' ' read -ra targets <<< "$DOCKER_TARGETS"
+          DOCKERHUB_URLS=""
+          for target in "${targets[@]}"; do
+            SRC="ghcr.io/${{ github.repository }}/$target:$TAG_VERSION"
+            DST="venicedb/$target:$TAG_VERSION"
+            echo "Tagging $SRC -> $DST"
+            docker tag "$SRC" "$DST"
+            echo "Pushing: $DST"
+            if docker push "$DST"; then
+              echo "✓ Successfully pushed: $DST"
+              DOCKERHUB_URLS+="- $target - [$DST](https://hub.docker.com/r/venicedb/$target/tags?name=$TAG_VERSION)\n"
+            else
+              echo "::error title=Docker Hub Push Failed::Failed to push $DST"
+              exit 1
+            fi
+          done
+          {
+            echo "dockerhub_urls<<EOF"
+            echo -e "$DOCKERHUB_URLS"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Display Docker Hub image URLs
+        if: ${{ inputs.publish_to_dockerhub }}
+        run: |
+          echo "## Published to Docker Hub"
+          echo -e "${{ steps.publish_dockerhub.outputs.dockerhub_urls }}"
+
+      # Step 9: Annotate workflow with Docker image metadata
+      - name: Annotate workflow with Docker image metadata
+        if: success()
+        env:
+          TAG_VERSION: ${{ env.DOCKER_TAG }}
+        run: |
+          set -euo pipefail
+          PUBLISHED_DATE=$(date +"%Y-%m-%d %H:%M:%S")
+          {
+            echo "**Docker Images Published:** ✅"
+            echo "**Published Date:** $PUBLISHED_DATE"
+            echo "**Git Tag Used:** $TAG_VERSION"
+            echo "**Latest Commit SHA:** ${{ steps.validate_tag.outputs.commit_sha }}"
+            echo "**Latest Commit Date:** ${{ steps.validate_tag.outputs.commit_date }}"
+            echo "**Docker Image URLs (GHCR):**"
+            echo -e "${{ steps.publish_images.outputs.image_urls }}"
+            if [[ "${{ inputs.publish_to_dockerhub }}" == "true" ]]; then
+              echo "**Docker Image URLs (Docker Hub):**"
+              echo -e "${{ steps.publish_dockerhub.outputs.dockerhub_urls }}"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

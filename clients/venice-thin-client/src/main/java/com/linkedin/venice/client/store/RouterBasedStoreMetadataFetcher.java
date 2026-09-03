@@ -1,0 +1,109 @@
+package com.linkedin.venice.client.store;
+
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.linkedin.venice.client.store.transport.TransportClient;
+import com.linkedin.venice.client.store.transport.TransportClientResponse;
+import com.linkedin.venice.controllerapi.MultiStoreResponse;
+import com.linkedin.venice.exceptions.VeniceException;
+import com.linkedin.venice.utils.ObjectMapperFactory;
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+
+/**
+ * Router-based implementation for fetching store metadata that is not cluster-specific.
+ * Unlike {@link com.linkedin.venice.client.schema.RouterBasedStoreSchemaFetcher}, this class
+ * is not tied to a specific store and operates on metadata available globally across clusters.
+ *
+ * This class uses a {@link TransportClient} directly (rather than {@link AbstractAvroStoreClient})
+ * because {@code AbstractAvroStoreClient} is store-scoped, whereas {@code /stores} is a
+ * cluster-agnostic router endpoint. The underlying transport may be D2-, HTTPS-, or HTTP-backed
+ * depending on how the caller configured the {@link ClientConfig} passed to
+ * {@link ClientFactory#createStoreMetadataFetcher(ClientConfig)}.
+ */
+public class RouterBasedStoreMetadataFetcher implements StoreMetadataFetcher {
+  public static final String TYPE_STORES = "stores";
+
+  private static final ObjectMapper OBJECT_MAPPER = ObjectMapperFactory.getInstance();
+
+  // Ignore unknown fields while parsing json response.
+  static {
+    OBJECT_MAPPER.configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+  }
+
+  static final long GET_TIMEOUT_IN_SECONDS = 30;
+
+  private final TransportClient transportClient;
+
+  /**
+   * Constructs a fetcher that owns the underlying {@link TransportClient} built from
+   * {@code clientConfig}; closing this fetcher closes the transport.
+   */
+  public RouterBasedStoreMetadataFetcher(ClientConfig clientConfig) {
+    this(ClientFactory.getTransportClient(clientConfig));
+  }
+
+  // VisibleForTesting
+  RouterBasedStoreMetadataFetcher(TransportClient transportClient) {
+    this.transportClient = transportClient;
+  }
+
+  // VisibleForTesting
+  TransportClient getTransportClient() {
+    return transportClient;
+  }
+
+  /**
+   * Returns all store names available across all clusters, as seen by the router's
+   * non-cluster-specific {@link com.linkedin.venice.helix.HelixReadOnlyStoreConfigRepository}.
+   */
+  @Override
+  public Set<String> getAllStoreNames() {
+    byte[] responseBody;
+    try {
+      TransportClientResponse response =
+          transportClient.get(TYPE_STORES, Collections.emptyMap()).get(GET_TIMEOUT_IN_SECONDS, TimeUnit.SECONDS);
+      if (response == null) {
+        throw new VeniceException("Received null response from router for path: " + TYPE_STORES);
+      }
+      responseBody = response.getBody();
+      if (responseBody == null) {
+        throw new VeniceException("Received empty response body from router for path: " + TYPE_STORES);
+      }
+    } catch (ExecutionException | InterruptedException | TimeoutException e) {
+      if (e instanceof InterruptedException) {
+        Thread.currentThread().interrupt();
+      }
+      throw new VeniceException("Failed to fetch store names from router for path: " + TYPE_STORES, e);
+    }
+
+    MultiStoreResponse multiStoreResponse;
+    try {
+      multiStoreResponse = OBJECT_MAPPER.readValue(responseBody, MultiStoreResponse.class);
+    } catch (IOException e) {
+      throw new VeniceException("Failed to deserialize store names response", e);
+    }
+
+    if (multiStoreResponse.isError()) {
+      throw new VeniceException("Received error while fetching store names: " + multiStoreResponse.getError());
+    }
+
+    String[] stores = multiStoreResponse.getStores();
+    if (stores == null) {
+      return Collections.emptySet();
+    }
+    return new HashSet<>(Arrays.asList(stores));
+  }
+
+  @Override
+  public void close() throws IOException {
+    transportClient.close();
+  }
+}

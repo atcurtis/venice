@@ -1,13 +1,23 @@
 package com.linkedin.venice.controller;
 
 public class NodeRemovableResult {
-  private boolean isRemovable = true;
-  private String blockingResource;
-  private BlockingRemoveReason blockingReason;
-  private String details;
+  private final String instanceId;
+  private final boolean isRemovable;
+  private final String blockingResource;
+  private final BlockingRemoveReason blockingReason;
+  private final String details;
 
-  private NodeRemovableResult() {
-
+  private NodeRemovableResult(
+      String instanceId,
+      boolean isRemovable,
+      String blockingResource,
+      BlockingRemoveReason blockingReason,
+      String details) {
+    this.instanceId = instanceId;
+    this.isRemovable = isRemovable;
+    this.blockingResource = blockingResource;
+    this.blockingReason = blockingReason;
+    this.details = details;
   }
 
   public boolean isRemovable() {
@@ -26,28 +36,34 @@ public class NodeRemovableResult {
     return details;
   }
 
-  public static NodeRemovableResult removableResult(String details) {
-    NodeRemovableResult result = new NodeRemovableResult();
-    result.details = details;
-    return result;
+  public String getFormattedMessage() {
+    if (isRemovable) {
+      return "Instance is removable";
+    }
+
+    return getBlockingReason() + "(" + getBlockingResource() + ": " + getDetails() + ")";
+  }
+
+  public static NodeRemovableResult removableResult(String instanceId, String details) {
+    return new NodeRemovableResult(instanceId, true, null, null, details);
   }
 
   /**
    * @return a {@link NodeRemovableResult} object with specified parameters.
    */
   public static NodeRemovableResult nonRemovableResult(
+      String instanceId,
       String blockingResource,
       BlockingRemoveReason blockingReason,
       String details) {
-    NodeRemovableResult result = new NodeRemovableResult();
-    result.isRemovable = false;
-    result.blockingResource = blockingResource;
-    result.blockingReason = blockingReason;
-    result.details = details;
-    return result;
+    return new NodeRemovableResult(instanceId, false, blockingResource, blockingReason, details);
+  }
+
+  public String getInstanceId() {
+    return instanceId;
   }
 
   public enum BlockingRemoveReason {
-    WILL_LOSE_DATA, WILL_TRIGGER_LOAD_REBALANCE, WILL_FAIL_PUSH;
+    WILL_LOSE_DATA, WILL_TRIGGER_LOAD_REBALANCE
   }
 }

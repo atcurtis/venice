@@ -7,7 +7,16 @@ public class ControllerApiConstants {
   public static final String SOURCE_GRID_FABRIC = "source_grid_fabric";
   public static final String BATCH_JOB_HEARTBEAT_ENABLED = "batch_job_heartbeat_enabled";
 
-  public static final String NAME = "store_name";
+  public static final String IS_ABORT_MIGRATION_CLEANUP = "is_abort_migration_cleanup";
+  public static final String STORE_NAME = "store_name";
+
+  public static final String AUTO_STORE_MIGRATION_CURRENT_STEP = "auto_store_migration_current_step";
+  public static final String AUTO_STORE_MIGRATION_ABORT_ON_FAILURE = "auto_store_migration_abort_on_failure";
+  public static final String AUTO_STORE_MIGRATION_PAUSE_AFTER_STEP = "auto_store_migration_pause_after_step";
+  /**
+   * @deprecated Use {@link #STORE_NAME} instead.
+   */
+  public static final String NAME = STORE_NAME;
   public static final String STORE_PARTITION = "store_partition";
   public static final String STORE_VERSION = "store_version";
   public static final String OWNER = "owner";
@@ -25,8 +34,12 @@ public class ControllerApiConstants {
   public static final String FROZEN = "frozen";
   public static final String ERROR = "error";
   public static final String STORAGE_NODE_ID = "storage_node_id"; /* host_port */
-  public static final String LOCKED_STORAGE_NODE_IDS = "locked_storage_node_ids";
-  public static final String INSTANCE_VIEW = "instance_view";
+
+  // We need the following 3 constants for Helix API aggregatedHealthStatus
+  public static final String CLUSTER_ID = "cluster_id";
+  public static final String INSTANCES = "instances";
+  public static final String TO_BE_STOPPED_INSTANCES = "to_be_stopped_instances";
+
   public static final String KEY_SCHEMA = "key_schema";
   public static final String VALUE_SCHEMA = "value_schema";
   public static final String DERIVED_SCHEMA = "derived_schema";
@@ -34,11 +47,12 @@ public class ControllerApiConstants {
   public static final String SCHEMA_COMPAT_TYPE = "schema_compat_type";
   public static final String DERIVED_SCHEMA_ID = "derived_schema_id";
   public static final String TOPIC = "topic";
-  public static final String OFFSET = "offset";
+  public static final String POSITION = "position";
   public static final String OPERATION = "operation";
   public static final String READ_OPERATION = "read";
   public static final String WRITE_OPERATION = "write";
   public static final String READ_WRITE_OPERATION = READ_OPERATION + WRITE_OPERATION;
+  public static final String PARTITION_RECORD_COUNTS = "partition_record_counts";
   public static final String EXECUTION_ID = "execution_id";
   public static final String ENABLE_READS = "enable_reads";
   public static final String ENABLE_WRITES = "enable_writes";
@@ -51,15 +65,18 @@ public class ControllerApiConstants {
   public static final String TIME_LAG_TO_GO_ONLINE = "time_lag_to_go_online";
   public static final String DATA_REPLICATION_POLICY = "data_replication_policy";
   public static final String BUFFER_REPLAY_POLICY = "buffer_replay_policy";
+  public static final String REAL_TIME_TOPIC_NAME = "real_time_topic_name";
   public static final String COMPRESSION_STRATEGY = "compression_strategy";
   public static final String CLIENT_DECOMPRESSION_ENABLED = "client_decompression_enabled";
   public static final String CHUNKING_ENABLED = "chunking_enabled";
   public static final String RMD_CHUNKING_ENABLED = "rmd_chunking_enabled";
   public static final String INCREMENTAL_PUSH_ENABLED = "incremental_push_enabled";
+  public static final String SEPARATE_REAL_TIME_TOPIC_ENABLED = "separate_realtime_topic_enabled";
   public static final String SINGLE_GET_ROUTER_CACHE_ENABLED = "single_get_router_cache_enabled";
   public static final String BATCH_GET_ROUTER_CACHE_ENABLED = "batch_get_router_cache_enabled";
   public static final String BATCH_GET_LIMIT = "batch_get_limit";
   public static final String LARGEST_USED_VERSION_NUMBER = "largest_used_version_number";
+  public static final String LARGEST_USED_RT_VERSION_NUMBER = "largest_used_rt_version_number";
   public static final String NUM_VERSIONS_TO_PRESERVE = "num_versions_to_preserve";
   public static final String DISABLE_META_STORE = "disable_meta_store";
   public static final String DISABLE_DAVINCI_PUSH_STATUS_STORE = "disable_davinci_push_status_store";
@@ -77,7 +94,18 @@ public class ControllerApiConstants {
   public static final String PUSH_STRATEGY = "push_strategy";
 
   public static final String ACCESS_CONTROLLED = "access_controlled";
+
+  /**
+   * @deprecated Use {@link #ENABLE_STORE_MIGRATION} instead. This constant is kept for backward compatibility
+   * and will be removed in a future release.
+   */
+  @Deprecated
   public static final String STORE_MIGRATION = "store_migration";
+
+  /**
+   * Constant for enabling store migration. Replaces the deprecated {@link #STORE_MIGRATION}.
+   */
+  public static final String ENABLE_STORE_MIGRATION = "enable_store_migration";
 
   public static final String PUSH_JOB_STATUS = "push_job_status";
   public static final String PUSH_JOB_DURATION = "push_job_duration";
@@ -89,17 +117,32 @@ public class ControllerApiConstants {
   public static final String BOOTSTRAP_TO_ONLINE_TIMEOUT_IN_HOURS = "bootstrap_to_online_timeout_in_hours";
 
   public static final String INCLUDE_SYSTEM_STORES = "include_system_stores";
+  public static final String LOOK_BACK_MS = "look_back_ms";
 
   public static final String STORE_VIEW = "store_view";
   public static final String STORE_VIEW_NAME = "store_view_name";
   public static final String STORE_VIEW_CLASS = "store_view_class";
   public static final String STORE_VIEW_PARAMS = "store_view_params";
   public static final String DISABLE_STORE_VIEW = "disable_store_view";
+  public static final String FLINK_VENICE_VIEWS_ENABLED = "flink_venice_views_enabled";
 
   public static final String NATIVE_REPLICATION_ENABLED = "native_replication_enabled";
   public static final String PUSH_STREAM_SOURCE_ADDRESS = "push_stream_source_address";
 
   public static final String BACKUP_STRATEGY = "backup_strategy";
+
+  public static final String INGESTION_PAUSE_MODE = "ingestion_pause_mode";
+  public static final String INGESTION_PAUSED_REGIONS = "ingestion_paused_regions";
+
+  public static final String STORAGE_MODE = "storage_mode";
+  /** Optional {@link com.linkedin.venice.meta.VersionStorageModeUpdateReason} name; absent means UNSPECIFIED. */
+  public static final String VERSION_STORAGE_MODE_UPDATE_REASON = "version_storage_mode_update_reason";
+  public static final String EXTERNAL_STORAGE_READ_MODE = "external_storage_read_mode";
+
+  /** Optional forecasted Venice Units (VU) capacity ask for a store; absent means not provided. */
+  public static final String VENICE_UNITS = "venice_units";
+  /** Optional requested class of service for a store; absent means not provided. */
+  public static final String WORKLOAD_TYPE = "workload_type";
 
   public static final String AUTO_SCHEMA_REGISTER_FOR_PUSHJOB_ENABLED = "auto_auto_register_for_pushjob_enabled";
 
@@ -108,6 +151,10 @@ public class ControllerApiConstants {
   public static final String FUTURE_VERSION_ETL_ENABLED = "future_version_etl_enabled";
 
   public static final String ETLED_PROXY_USER_ACCOUNT = "etled_proxy_user_account";
+
+  public static final String ETL_STRATEGY = "etl_strategy";
+
+  public static final String ETL_ACTIVE_FABRICS = "etl_active_fabrics";
 
   public static final String SKIP_DIV = "skip_div";
 
@@ -146,6 +193,8 @@ public class ControllerApiConstants {
   public static final String REPLICATION_METADATA_VERSION_ID = "replication_metadata_version_id";
 
   public static final String PARTITION_DETAIL_ENABLED = "partition_detail_enabled";
+
+  public static final String REPUSH_TTL_SECONDS = "repush_ttl_seconds";
 
   /**
    * How many records that one server could consume from Kafka at most in one second from the specified regions.
@@ -200,12 +249,13 @@ public class ControllerApiConstants {
    */
   public static final String SOURCE_FABRIC_VERSION_INCLUDED = "source.fabric.version.included";
 
-  public static final String LOCKED_NODE_ID_LIST_SEPARATOR = ",";
-
   public static final String KAFKA_TOPIC_LOG_COMPACTION_ENABLED = "kafka.topic.log.compaction.enabled";
   public static final String KAFKA_TOPIC_RETENTION_IN_MS = "kafka.topic.retention.in.ms";
   public static final String KAFKA_TOPIC_MIN_IN_SYNC_REPLICA = "kafka.topic.min.in.sync.replica";
-  public static final String UPSTREAM_OFFSET = "upstream_offset";
+  public static final String KAFKA_TOPIC_UNCLEAN_LEADER_ELECTION_ENABLED =
+      "kafka.topic.unclean.leader.election.enabled";
+  public static final String UPSTREAM_POSITION = "upstream_position";
+  public static final String ADMIN_OPERATION_PROTOCOL_VERSION = "admin_operation_protocol_version";
 
   public static final String PERSONA_NAME = "persona_name";
   public static final String PERSONA_OWNERS = "persona_owners";
@@ -220,16 +270,53 @@ public class ControllerApiConstants {
    * String representation of the list of regions that is separated by comma for targeted region push
    */
   public static final String TARGETED_REGIONS = "targeted_regions";
+  public static final String TARGET_REGION_PUSH_WITH_DEFERRED_SWAP = "target_region_push_with_deferred_swap";
 
   public static final String STORAGE_NODE_READ_QUOTA_ENABLED = "storage_node_read_quota_enabled";
 
+  public static final String COMPACTION_ENABLED = "compaction_enabled";
+  public static final String COMPACTION_THRESHOLD_MILLISECONDS = "compaction_threshold_milliseconds";
+  public static final String PUB_SUB_ENCRYPTION_KEY_URN = "pub_sub_encryption_key_urn";
   public static final String MIN_COMPACTION_LAG_SECONDS = "min_compaction_lag_seconds";
-
   public static final String MAX_COMPACTION_LAG_SECONDS = "max_compaction_lag_seconds";
+
+  public static final String MAX_RECORD_SIZE_BYTES = "max_record_size_bytes";
+  public static final String MAX_NEARLINE_RECORD_SIZE_BYTES = "max_nearline_record_size_bytes";
+
+  public static final String THROUGHPUT_QUOTA_IN_BYTES = "throughput_quota_in_bytes";
+  public static final String THROUGHPUT_QUOTA_IN_RECORDS = "throughput_quota_in_records";
 
   public static final String UNUSED_SCHEMA_DELETION_ENABLED = "unused_schema_deletion_enabled";
 
-  public static final String BLOB_TRANSFER_ENABLED = "blob.transfer.enabled";
+  public static final String BLOB_TRANSFER_ENABLED = "blob_transfer_enabled";
+  public static final String BLOB_TRANSFER_IN_SERVER_ENABLED = "blob_transfer_in_server_enabled";
+  public static final String BLOB_DB_ENABLED = "blob_db_enabled";
 
   public static final String HEARTBEAT_TIMESTAMP = "heartbeat_timestamp";
+
+  public static final String NEARLINE_PRODUCER_COMPRESSION_ENABLED = "nearline_producer_compression_enabled";
+  public static final String NEARLINE_PRODUCER_COUNT_PER_WRITER = "nearline_producer_count_per_writer";
+  public static final String DATACENTER_NAME = "datacenter_name";
+  public static final String TIMEOUT_MINUTES = "timeout_minutes";
+  public static final String OPERATOR_ID = "operator_id";
+
+  public static final String TARGET_SWAP_REGION = "target_swap_region";
+  public static final String TARGET_SWAP_REGION_WAIT_TIME = "target_swap_region_wait_time";
+  public static final String IS_DAVINCI_HEARTBEAT_REPORTED = "is_davinci_heartbeat_reported";
+  public static final String TARGET_REGION_PROMOTED = "target_region_promoted";
+  public static final String GLOBAL_RT_DIV_ENABLED = "global_rt_div_enabled";
+  public static final String ENUM_SCHEMA_EVOLUTION_ALLOWED = "enum_schema_evolution_allowed";
+  public static final String STORE_LIFECYCLE_HOOKS_LIST = "store_lifecycle_hooks_list";
+  public static final String PREVIOUS_CURRENT_VERSION = "previous_current_version";
+
+  /**
+   * Params for repush job
+   */
+  public static final String SOURCE_REGION = "source_region";
+  public static final String TTL_REPUSH_ENABLED = "ttl_repush_enabled";
+
+  /**
+   * Params for dark cluster
+   */
+  public static final String STORES_TO_REPLICATE = "stores_to_replicate";
 }

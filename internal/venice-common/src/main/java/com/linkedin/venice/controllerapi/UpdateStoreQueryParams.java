@@ -7,30 +7,49 @@ import static com.linkedin.venice.controllerapi.ControllerApiConstants.AUTO_SCHE
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.BACKUP_STRATEGY;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.BACKUP_VERSION_RETENTION_MS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.BATCH_GET_LIMIT;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.BLOB_DB_ENABLED;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.BLOB_TRANSFER_ENABLED;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.BLOB_TRANSFER_IN_SERVER_ENABLED;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.BOOTSTRAP_TO_ONLINE_TIMEOUT_IN_HOURS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.BUFFER_REPLAY_POLICY;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.CHUNKING_ENABLED;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.CLIENT_DECOMPRESSION_ENABLED;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.COMPACTION_ENABLED;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.COMPACTION_THRESHOLD_MILLISECONDS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.COMPRESSION_STRATEGY;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.DATA_REPLICATION_POLICY;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.DISABLE_DAVINCI_PUSH_STATUS_STORE;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.DISABLE_META_STORE;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.DISABLE_STORE_VIEW;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.ENABLE_READS;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.ENABLE_STORE_MIGRATION;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.ENABLE_WRITES;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.ENUM_SCHEMA_EVOLUTION_ALLOWED;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.ETLED_PROXY_USER_ACCOUNT;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.ETL_ACTIVE_FABRICS;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.ETL_STRATEGY;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.EXTERNAL_STORAGE_READ_MODE;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.FLINK_VENICE_VIEWS_ENABLED;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.FUTURE_VERSION_ETL_ENABLED;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.GLOBAL_RT_DIV_ENABLED;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.HYBRID_STORE_DISK_QUOTA_ENABLED;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.HYBRID_STORE_OVERHEAD_BYPASS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.INCREMENTAL_PUSH_ENABLED;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.INGESTION_PAUSED_REGIONS;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.INGESTION_PAUSE_MODE;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.IS_DAVINCI_HEARTBEAT_REPORTED;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.LARGEST_USED_RT_VERSION_NUMBER;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.LARGEST_USED_VERSION_NUMBER;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.LATEST_SUPERSET_SCHEMA_ID;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.MAX_COMPACTION_LAG_SECONDS;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.MAX_NEARLINE_RECORD_SIZE_BYTES;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.MAX_RECORD_SIZE_BYTES;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.MIGRATION_DUPLICATE_STORE;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.MIN_COMPACTION_LAG_SECONDS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.NATIVE_REPLICATION_ENABLED;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.NATIVE_REPLICATION_SOURCE_FABRIC;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.NEARLINE_PRODUCER_COMPRESSION_ENABLED;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.NEARLINE_PRODUCER_COUNT_PER_WRITER;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.NUM_VERSIONS_TO_PRESERVE;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.OFFSET_LAG_TO_GO_ONLINE;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.OWNER;
@@ -38,9 +57,12 @@ import static com.linkedin.venice.controllerapi.ControllerApiConstants.PARTITION
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PARTITIONER_PARAMS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PARTITION_COUNT;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PERSONA_NAME;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.PREVIOUS_CURRENT_VERSION;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.PUB_SUB_ENCRYPTION_KEY_URN;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.PUSH_STREAM_SOURCE_ADDRESS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.READ_COMPUTATION_ENABLED;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.READ_QUOTA_IN_CU;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.REAL_TIME_TOPIC_NAME;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.REGIONS_FILTER;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.REGULAR_VERSION_ETL_ENABLED;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.REPLICATE_ALL_CONFIGS;
@@ -48,20 +70,32 @@ import static com.linkedin.venice.controllerapi.ControllerApiConstants.REPLICATI
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.REPLICATION_METADATA_PROTOCOL_VERSION_ID;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.REWIND_TIME_IN_SECONDS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.RMD_CHUNKING_ENABLED;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.SEPARATE_REAL_TIME_TOPIC_ENABLED;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORAGE_MODE;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORAGE_NODE_READ_QUOTA_ENABLED;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORAGE_QUOTA_IN_BYTE;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORE_LIFECYCLE_HOOKS_LIST;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORE_MIGRATION;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORE_VIEW;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORE_VIEW_CLASS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORE_VIEW_NAME;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.STORE_VIEW_PARAMS;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.TARGET_REGION_PROMOTED;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.TARGET_SWAP_REGION;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.TARGET_SWAP_REGION_WAIT_TIME;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.THROUGHPUT_QUOTA_IN_BYTES;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.THROUGHPUT_QUOTA_IN_RECORDS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.TIME_LAG_TO_GO_ONLINE;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.TTL_REPUSH_ENABLED;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.UNUSED_SCHEMA_DELETION_ENABLED;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.UPDATED_CONFIGS_LIST;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.VENICE_UNITS;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.VERSION;
+import static com.linkedin.venice.controllerapi.ControllerApiConstants.WORKLOAD_TYPE;
 import static com.linkedin.venice.controllerapi.ControllerApiConstants.WRITE_COMPUTATION_ENABLED;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.exceptions.VeniceException;
@@ -69,11 +103,19 @@ import com.linkedin.venice.meta.BackupStrategy;
 import com.linkedin.venice.meta.BufferReplayPolicy;
 import com.linkedin.venice.meta.DataReplicationPolicy;
 import com.linkedin.venice.meta.ETLStoreConfig;
+import com.linkedin.venice.meta.ExternalStorageReadMode;
 import com.linkedin.venice.meta.HybridStoreConfig;
+import com.linkedin.venice.meta.IngestionPauseMode;
+import com.linkedin.venice.meta.LifecycleHooksRecord;
 import com.linkedin.venice.meta.PartitionerConfig;
+import com.linkedin.venice.meta.StorageMode;
 import com.linkedin.venice.meta.StoreInfo;
+import com.linkedin.venice.meta.VeniceETLStrategy;
+import com.linkedin.venice.utils.ConfigCommonUtils;
 import com.linkedin.venice.utils.ObjectMapperFactory;
 import java.io.IOException;
+import java.util.Arrays;
+import java.util.Collections;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -82,6 +124,16 @@ import java.util.stream.Collectors;
 
 
 public class UpdateStoreQueryParams extends QueryParams {
+  /**
+   * Wire representation of an explicit request to clear a nullable store config back to {@code null}.
+   *
+   * Query params are string valued, so a nullable config needs three distinguishable states: the
+   * param is absent (leave the config unchanged), the param carries a value (set the config to it),
+   * or the param is present but empty (clear the config). The empty string is used for the last case
+   * because it is not a legal value for any of the configs that support clearing.
+   */
+  static final String CLEAR_VALUE = "";
+
   public UpdateStoreQueryParams(Map<String, String> initialParams) {
     super(initialParams);
   }
@@ -101,12 +153,15 @@ public class UpdateStoreQueryParams extends QueryParams {
    * @param srcStore The original store
    */
   public UpdateStoreQueryParams(StoreInfo srcStore, boolean storeMigrating) {
+    String pubSubEncryptionKeyUrn = srcStore.getPubSubEncryptionKeyUrn();
     // Copy everything except for currentVersion, daVinciPushStatusStoreEnabled, latestSuperSetValueSchemaId,
     // storeMetaSystemStoreEnabled, storeMetadataSystemStoreEnabled
     UpdateStoreQueryParams updateStoreQueryParams =
         new UpdateStoreQueryParams().setAccessControlled(srcStore.isAccessControlled())
             .setActiveActiveReplicationEnabled(srcStore.isActiveActiveReplicationEnabled())
             .setBackupStrategy(srcStore.getBackupStrategy())
+            .setIngestionPauseMode(srcStore.getIngestionPauseMode())
+            .setIngestionPausedRegions(srcStore.getIngestionPausedRegions())
             .setBackupVersionRetentionMs(srcStore.getBackupVersionRetentionMs())
             .setBatchGetLimit(srcStore.getBatchGetLimit())
             .setBootstrapToOnlineTimeoutInHours(srcStore.getBootstrapToOnlineTimeoutInHours())
@@ -119,6 +174,7 @@ public class UpdateStoreQueryParams extends QueryParams {
             .setHybridStoreDiskQuotaEnabled(srcStore.isHybridStoreDiskQuotaEnabled())
             .setIncrementalPushEnabled(srcStore.isIncrementalPushEnabled())
             .setLargestUsedVersionNumber(srcStore.getLargestUsedVersionNumber())
+            .setLargestUsedRTVersionNumber(srcStore.getLargestUsedRTVersionNumber())
             .setNativeReplicationEnabled(srcStore.isNativeReplicationEnabled())
             .setNativeReplicationSourceFabric(srcStore.getNativeReplicationSourceFabric())
             .setNumVersionsToPreserve(srcStore.getNumVersionsToPreserve())
@@ -127,19 +183,49 @@ public class UpdateStoreQueryParams extends QueryParams {
             .setPushStreamSourceAddress(srcStore.getPushStreamSourceAddress())
             .setReadComputationEnabled(srcStore.isReadComputationEnabled())
             .setReadQuotaInCU(srcStore.getReadQuotaInCU())
-            .setReplicationFactor(srcStore.getReplicationFactor())
+            // replicationFactor is set conditionally below — see the if (storeMigrating) ... else branch.
             .setAutoSchemaPushJobEnabled(srcStore.isSchemaAutoRegisterFromPushJobEnabled())
             .setStorageQuotaInByte(srcStore.getStorageQuotaInByte())
             .setWriteComputationEnabled(srcStore.isWriteComputationEnabled())
             .setStorageNodeReadQuotaEnabled(srcStore.isStorageNodeReadQuotaEnabled())
             .setBlobTransferEnabled(srcStore.isBlobTransferEnabled())
+            .setBlobTransferInServerEnabled(
+                ConfigCommonUtils.ActivationState.valueOf(srcStore.getBlobTransferInServerEnabled()))
+            .setBlobDbEnabled(ConfigCommonUtils.ActivationState.valueOf(srcStore.getBlobDbEnabled()))
+            .setMaxRecordSizeBytes(srcStore.getMaxRecordSizeBytes())
+            .setMaxNearlineRecordSizeBytes(srcStore.getMaxNearlineRecordSizeBytes())
+            .setThroughputQuotaInBytes(srcStore.getThroughputQuotaInBytes())
+            .setThroughputQuotaInRecords(srcStore.getThroughputQuotaInRecords())
+            .setTargetRegionSwap(srcStore.getTargetRegionSwap())
+            .setTargetRegionSwapWaitTime(srcStore.getTargetRegionSwapWaitTime())
+            .setGlobalRtDivEnabled(srcStore.isGlobalRtDivEnabled())
+            .setCompactionEnabled(srcStore.isCompactionEnabled())
+            .setCompactionThresholdMilliseconds(srcStore.getCompactionThreshold())
+            .setMaxCompactionLagSeconds(srcStore.getMaxCompactionLagSeconds())
+            .setMinCompactionLagSeconds(srcStore.getMinCompactionLagSeconds())
+            .setNearlineProducerCountPerWriter(srcStore.getNearlineProducerCountPerWriter())
+            .setIsDavinciHeartbeatReported(srcStore.getIsDavinciHeartbeatReported())
+            .setTTLRepushEnabled(srcStore.isTTLRepushEnabled())
             // TODO: This needs probably some refinement, but since we only support one kind of view type today, this is
             // still easy to parse
             .setStoreViews(
                 srcStore.getViewConfigs()
                     .entrySet()
                     .stream()
-                    .collect(Collectors.toMap(Map.Entry::getKey, e -> e.getValue().toString())));
+                    .collect(Collectors.toMap(Map.Entry::getKey, e -> e.getValue().toString())))
+            .setFlinkVeniceViewsEnabled(srcStore.isFlinkVeniceViewsEnabled());
+
+    if (pubSubEncryptionKeyUrn != null && !pubSubEncryptionKeyUrn.trim().isEmpty()) {
+      updateStoreQueryParams.setPubSubEncryptionKeyUrn(pubSubEncryptionKeyUrn);
+    }
+
+    if (srcStore.getVeniceUnits() != null) {
+      updateStoreQueryParams.setVeniceUnits(srcStore.getVeniceUnits());
+    }
+
+    if (srcStore.getWorkloadType() != null) {
+      updateStoreQueryParams.setWorkloadType(srcStore.getWorkloadType());
+    }
 
     if (srcStore.getReplicationMetadataVersionId() != -1) {
       updateStoreQueryParams.setReplicationMetadataVersionID(srcStore.getReplicationMetadataVersionId());
@@ -150,6 +236,12 @@ public class UpdateStoreQueryParams extends QueryParams {
                                                             // bootstrap in dest cluster
           .setStoreMigration(true)
           .setMigrationDuplicateStore(true); // Mark as duplicate store, to which L/F SN refers to avoid multi leaders
+      // Replication factor is intentionally NOT carried over during cross-cluster migration: the destination
+      // cluster's createNewStore has already applied its own default RF, and the destination cluster's
+      // topology (e.g. number of Helix fault zones / groups under HELIX_ASSISTED_ROUTING, which requires
+      // RF = num_groups) may require a different RF than the source cluster.
+    } else {
+      updateStoreQueryParams.setReplicationFactor(srcStore.getReplicationFactor());
     }
 
     ETLStoreConfig etlStoreConfig = srcStore.getEtlStoreConfig();
@@ -157,6 +249,7 @@ public class UpdateStoreQueryParams extends QueryParams {
       updateStoreQueryParams.setEtledProxyUserAccount(etlStoreConfig.getEtledUserProxyAccount());
       updateStoreQueryParams.setRegularVersionETLEnabled(etlStoreConfig.isRegularVersionETLEnabled());
       updateStoreQueryParams.setFutureVersionETLEnabled(etlStoreConfig.isFutureVersionETLEnabled());
+      updateStoreQueryParams.setETLStrategy(etlStoreConfig.getETLStrategy());
     }
 
     HybridStoreConfig hybridStoreConfig = srcStore.getHybridStoreConfig();
@@ -167,6 +260,7 @@ public class UpdateStoreQueryParams extends QueryParams {
           .setHybridTimeLagThreshold(hybridStoreConfig.getProducerTimestampLagThresholdToGoOnlineInSeconds());
       updateStoreQueryParams.setHybridDataReplicationPolicy(hybridStoreConfig.getDataReplicationPolicy());
       updateStoreQueryParams.setHybridBufferReplayPolicy(hybridStoreConfig.getBufferReplayPolicy());
+      updateStoreQueryParams.setRealTimeTopicName(hybridStoreConfig.getRealTimeTopicName());
     }
 
     PartitionerConfig partitionerConfig = srcStore.getPartitionerConfig();
@@ -244,6 +338,14 @@ public class UpdateStoreQueryParams extends QueryParams {
 
   public Optional<Integer> getLargestUsedVersionNumber() {
     return getInteger(LARGEST_USED_VERSION_NUMBER);
+  }
+
+  public UpdateStoreQueryParams setLargestUsedRTVersionNumber(int largestUsedRTVersionNumber) {
+    return putInteger(LARGEST_USED_RT_VERSION_NUMBER, largestUsedRTVersionNumber);
+  }
+
+  public Optional<Integer> getLargestUsedRTVersionNumber() {
+    return getInteger(LARGEST_USED_RT_VERSION_NUMBER);
   }
 
   public UpdateStoreQueryParams setEnableReads(boolean enableReads) {
@@ -352,6 +454,14 @@ public class UpdateStoreQueryParams extends QueryParams {
     return Optional.ofNullable(params.get(BUFFER_REPLAY_POLICY)).map(BufferReplayPolicy::valueOf);
   }
 
+  public UpdateStoreQueryParams setRealTimeTopicName(String realTimeTopicName) {
+    return putString(REAL_TIME_TOPIC_NAME, realTimeTopicName);
+  }
+
+  public Optional<String> getRealTimeTopicName() {
+    return getString(REAL_TIME_TOPIC_NAME);
+  }
+
   public UpdateStoreQueryParams setAccessControlled(boolean accessControlled) {
     return putBoolean(ACCESS_CONTROLLED, accessControlled);
   }
@@ -402,6 +512,14 @@ public class UpdateStoreQueryParams extends QueryParams {
     return getBoolean(INCREMENTAL_PUSH_ENABLED);
   }
 
+  public UpdateStoreQueryParams setSeparateRealTimeTopicEnabled(boolean separateRealTimeTopicEnabled) {
+    return putBoolean(SEPARATE_REAL_TIME_TOPIC_ENABLED, separateRealTimeTopicEnabled);
+  }
+
+  public Optional<Boolean> getSeparateRealTimeTopicEnabled() {
+    return getBoolean(SEPARATE_REAL_TIME_TOPIC_ENABLED);
+  }
+
   public UpdateStoreQueryParams setBatchGetLimit(int batchGetLimit) {
     return putInteger(BATCH_GET_LIMIT, batchGetLimit);
   }
@@ -419,10 +537,14 @@ public class UpdateStoreQueryParams extends QueryParams {
   }
 
   public UpdateStoreQueryParams setStoreMigration(boolean migrating) {
-    return putBoolean(STORE_MIGRATION, migrating);
+    return putBoolean(STORE_MIGRATION, migrating).putBoolean(ENABLE_STORE_MIGRATION, migrating);
   }
 
   public Optional<Boolean> getStoreMigration() {
+    Optional<Boolean> storeMigration = getBoolean(ENABLE_STORE_MIGRATION);
+    if (storeMigration.isPresent()) {
+      return storeMigration;
+    }
     return getBoolean(STORE_MIGRATION);
   }
 
@@ -470,6 +592,14 @@ public class UpdateStoreQueryParams extends QueryParams {
     return getStringMap(STORE_VIEW);
   }
 
+  public UpdateStoreQueryParams setFlinkVeniceViewsEnabled(boolean flinkVeniceViewsEnabled) {
+    return putBoolean(FLINK_VENICE_VIEWS_ENABLED, flinkVeniceViewsEnabled);
+  }
+
+  public Optional<Boolean> getFlinkVeniceViewsEnabled() {
+    return getBoolean(FLINK_VENICE_VIEWS_ENABLED);
+  }
+
   public UpdateStoreQueryParams setPushStreamSourceAddress(String pushStreamSourceAddress) {
     return putString(PUSH_STREAM_SOURCE_ADDRESS, pushStreamSourceAddress);
   }
@@ -489,6 +619,115 @@ public class UpdateStoreQueryParams extends QueryParams {
 
   public Optional<BackupStrategy> getBackupStrategy() {
     return Optional.ofNullable(params.get(BACKUP_STRATEGY)).map(BackupStrategy::valueOf);
+  }
+
+  public UpdateStoreQueryParams setIngestionPauseMode(IngestionPauseMode mode) {
+    params.put(INGESTION_PAUSE_MODE, mode.name());
+    return this;
+  }
+
+  public Optional<IngestionPauseMode> getIngestionPauseMode() {
+    return Optional.ofNullable(params.get(INGESTION_PAUSE_MODE)).map(IngestionPauseMode::valueOf);
+  }
+
+  public UpdateStoreQueryParams setStorageMode(StorageMode storageMode) {
+    params.put(STORAGE_MODE, storageMode.name());
+    return this;
+  }
+
+  public Optional<StorageMode> getStorageMode() {
+    return Optional.ofNullable(params.get(STORAGE_MODE)).map(StorageMode::valueOf);
+  }
+
+  /**
+   * Sets the store's Venice Units. Passing {@code null} records an explicit request to clear the
+   * config back to {@code null}, which is distinct from not calling this method at all (which
+   * leaves the config unchanged). See {@link #CLEAR_VALUE}.
+   */
+  public UpdateStoreQueryParams setVeniceUnits(Integer veniceUnits) {
+    return veniceUnits == null ? putString(VENICE_UNITS, CLEAR_VALUE) : putInteger(VENICE_UNITS, veniceUnits);
+  }
+
+  /**
+   * @return whether the caller provided a value for this config at all, including an explicit
+   *         request to clear it. When this returns {@code false} the config must be left unchanged.
+   */
+  public boolean isVeniceUnitsSpecified() {
+    return params.containsKey(VENICE_UNITS);
+  }
+
+  /**
+   * @return the requested Venice Units, or {@code null} if the caller asked for the config to be
+   *         cleared. Only meaningful when {@link #isVeniceUnitsSpecified()} returns {@code true};
+   *         otherwise this also returns {@code null}.
+   */
+  public Integer getVeniceUnits() {
+    String value = params.get(VENICE_UNITS);
+    return CLEAR_VALUE.equals(value) ? null : Optional.ofNullable(value).map(Integer::valueOf).orElse(null);
+  }
+
+  /**
+   * Sets the store's workload type. Passing {@code null} records an explicit request to clear the
+   * config back to {@code null}, which is distinct from not calling this method at all (which
+   * leaves the config unchanged). See {@link #CLEAR_VALUE}.
+   */
+  public UpdateStoreQueryParams setWorkloadType(String workloadType) {
+    return putString(WORKLOAD_TYPE, workloadType == null ? CLEAR_VALUE : workloadType);
+  }
+
+  /**
+   * @return whether the caller provided a value for this config at all, including an explicit
+   *         request to clear it. When this returns {@code false} the config must be left unchanged.
+   */
+  public boolean isWorkloadTypeSpecified() {
+    return params.containsKey(WORKLOAD_TYPE);
+  }
+
+  /**
+   * @return the requested workload type, or {@code null} if the caller asked for the config to be
+   *         cleared. Only meaningful when {@link #isWorkloadTypeSpecified()} returns {@code true};
+   *         otherwise this also returns {@code null}.
+   */
+  public String getWorkloadType() {
+    String value = params.get(WORKLOAD_TYPE);
+    return CLEAR_VALUE.equals(value) ? null : value;
+  }
+
+  public UpdateStoreQueryParams setExternalStorageReadMode(ExternalStorageReadMode externalStorageReadMode) {
+    params.put(EXTERNAL_STORAGE_READ_MODE, externalStorageReadMode.name());
+    return this;
+  }
+
+  public Optional<ExternalStorageReadMode> getExternalStorageReadMode() {
+    return Optional.ofNullable(params.get(EXTERNAL_STORAGE_READ_MODE)).map(ExternalStorageReadMode::valueOf);
+  }
+
+  public UpdateStoreQueryParams setIngestionPausedRegions(List<String> regions) {
+    // Normalize on write so get/set are symmetric and callers can't persist region names with
+    // leading/trailing whitespace that would then fail to match getRegionName() on child controllers.
+    params.put(INGESTION_PAUSED_REGIONS, String.join(",", normalizeRegions(regions)));
+    return this;
+  }
+
+  public Optional<List<String>> getIngestionPausedRegions() {
+    return Optional.ofNullable(params.get(INGESTION_PAUSED_REGIONS))
+        .map(s -> normalizeRegions(Arrays.asList(s.split(","))));
+  }
+
+  /**
+   * Trims whitespace and drops null/empty tokens. Used by both {@link #setIngestionPausedRegions(List)}
+   * and {@link #getIngestionPausedRegions()}, and by the admin-tool CLI parsing so that all entry
+   * points apply the same canonicalization.
+   */
+  public static List<String> normalizeRegions(List<String> regions) {
+    if (regions == null) {
+      return Collections.emptyList();
+    }
+    return regions.stream()
+        .filter(Objects::nonNull)
+        .map(String::trim)
+        .filter(r -> !r.isEmpty())
+        .collect(Collectors.toList());
   }
 
   public UpdateStoreQueryParams setRegularVersionETLEnabled(boolean regularVersionETLEnabled) {
@@ -514,6 +753,34 @@ public class UpdateStoreQueryParams extends QueryParams {
 
   public Optional<String> getETLedProxyUserAccount() {
     return Optional.ofNullable(params.get(ETLED_PROXY_USER_ACCOUNT));
+  }
+
+  public UpdateStoreQueryParams setETLStrategy(VeniceETLStrategy etlStrategy) {
+    params.put(ETL_STRATEGY, etlStrategy.name());
+    return this;
+  }
+
+  public Optional<VeniceETLStrategy> getETLStrategy() {
+    return Optional.ofNullable(params.get(ETL_STRATEGY)).map(VeniceETLStrategy::valueOf);
+  }
+
+  /**
+   * Allowlist of fabrics where the controller fires onboardETL / offboardETL. Omitting this
+   * field (or leaving the underlying param absent) means "no restriction; fire in every fabric"
+   * (default behavior). A non-empty list restricts firing to only the listed fabrics.
+   * <p>
+   * An empty list is rejected by the parent controller validator; to disable ETL across all
+   * fabrics, set {@code regularVersionETLEnabled} and {@code futureVersionETLEnabled} to false
+   * instead. This field is purely an allowlist on the fabric dimension and does not double as an
+   * on/off switch.
+   */
+  public UpdateStoreQueryParams setEtlActiveFabrics(List<String> fabrics) {
+    params.put(ETL_ACTIVE_FABRICS, String.join(",", normalizeRegions(fabrics)));
+    return this;
+  }
+
+  public Optional<List<String>> getEtlActiveFabrics() {
+    return Optional.ofNullable(params.get(ETL_ACTIVE_FABRICS)).map(s -> normalizeRegions(Arrays.asList(s.split(","))));
   }
 
   public Optional<Boolean> getNativeReplicationEnabled() {
@@ -626,6 +893,14 @@ public class UpdateStoreQueryParams extends QueryParams {
     return getLong(MIN_COMPACTION_LAG_SECONDS);
   }
 
+  public UpdateStoreQueryParams setPubSubEncryptionKeyUrn(String pubSubEncryptionKeyUrn) {
+    return putString(PUB_SUB_ENCRYPTION_KEY_URN, pubSubEncryptionKeyUrn);
+  }
+
+  public Optional<String> getPubSubEncryptionKeyUrn() {
+    return getString(PUB_SUB_ENCRYPTION_KEY_URN);
+  }
+
   public Optional<String> getViewName() {
     return getString(STORE_VIEW_NAME);
   }
@@ -658,12 +933,60 @@ public class UpdateStoreQueryParams extends QueryParams {
     return (UpdateStoreQueryParams) add(DISABLE_STORE_VIEW, true);
   }
 
+  public UpdateStoreQueryParams setCompactionEnabled(boolean compactionEnabled) {
+    return putBoolean(COMPACTION_ENABLED, compactionEnabled);
+  }
+
+  public Optional<Boolean> getCompactionEnabled() {
+    return getBoolean(COMPACTION_ENABLED);
+  }
+
+  public UpdateStoreQueryParams setCompactionThresholdMilliseconds(long compactionThresholdMilliseconds) {
+    return putLong(COMPACTION_THRESHOLD_MILLISECONDS, compactionThresholdMilliseconds);
+  }
+
+  public Optional<Long> getCompactionThresholdMilliseconds() {
+    return getLong(COMPACTION_THRESHOLD_MILLISECONDS);
+  }
+
   public UpdateStoreQueryParams setMaxCompactionLagSeconds(long maxCompactionLagSeconds) {
     return putLong(MAX_COMPACTION_LAG_SECONDS, maxCompactionLagSeconds);
   }
 
   public Optional<Long> getMaxCompactionLagSeconds() {
     return getLong(MAX_COMPACTION_LAG_SECONDS);
+  }
+
+  public UpdateStoreQueryParams setMaxRecordSizeBytes(int maxRecordSizeBytes) {
+    return putInteger(MAX_RECORD_SIZE_BYTES, maxRecordSizeBytes);
+  }
+
+  public Optional<Integer> getMaxRecordSizeBytes() {
+    return getInteger(MAX_RECORD_SIZE_BYTES);
+  }
+
+  public UpdateStoreQueryParams setMaxNearlineRecordSizeBytes(int maxNearlineRecordSizeBytes) {
+    return putInteger(MAX_NEARLINE_RECORD_SIZE_BYTES, maxNearlineRecordSizeBytes);
+  }
+
+  public Optional<Integer> getMaxNearlineRecordSizeBytes() {
+    return getInteger(MAX_NEARLINE_RECORD_SIZE_BYTES);
+  }
+
+  public UpdateStoreQueryParams setThroughputQuotaInBytes(long throughputQuotaInBytes) {
+    return putLong(THROUGHPUT_QUOTA_IN_BYTES, throughputQuotaInBytes);
+  }
+
+  public Optional<Long> getThroughputQuotaInBytes() {
+    return getLong(THROUGHPUT_QUOTA_IN_BYTES);
+  }
+
+  public UpdateStoreQueryParams setThroughputQuotaInRecords(long throughputQuotaInRecords) {
+    return putLong(THROUGHPUT_QUOTA_IN_RECORDS, throughputQuotaInRecords);
+  }
+
+  public Optional<Long> getThroughputQuotaInRecords() {
+    return getLong(THROUGHPUT_QUOTA_IN_RECORDS);
   }
 
   public UpdateStoreQueryParams setUnusedSchemaDeletionEnabled(boolean unusedSchemaDeletionEnabled) {
@@ -680,6 +1003,127 @@ public class UpdateStoreQueryParams extends QueryParams {
 
   public Optional<Boolean> getBlobTransferEnabled() {
     return getBoolean(BLOB_TRANSFER_ENABLED);
+  }
+
+  public UpdateStoreQueryParams setBlobTransferInServerEnabled(
+      ConfigCommonUtils.ActivationState blobTransferInServerEnabled) {
+    return putString(BLOB_TRANSFER_IN_SERVER_ENABLED, blobTransferInServerEnabled.name());
+  }
+
+  public Optional<String> getBlobTransferInServerEnabled() {
+    return getString(BLOB_TRANSFER_IN_SERVER_ENABLED);
+  }
+
+  public UpdateStoreQueryParams setBlobDbEnabled(ConfigCommonUtils.ActivationState blobDbEnabled) {
+    return putString(BLOB_DB_ENABLED, blobDbEnabled.name());
+  }
+
+  public Optional<String> getBlobDbEnabled() {
+    return getString(BLOB_DB_ENABLED);
+  }
+
+  public UpdateStoreQueryParams setNearlineProducerCompressionEnabled(boolean compressionEnabled) {
+    return putBoolean(NEARLINE_PRODUCER_COMPRESSION_ENABLED, compressionEnabled);
+  }
+
+  public Optional<Boolean> getNearlineProducerCompressionEnabled() {
+    return getBoolean(NEARLINE_PRODUCER_COMPRESSION_ENABLED);
+  }
+
+  public UpdateStoreQueryParams setNearlineProducerCountPerWriter(int producerCnt) {
+    return putInteger(NEARLINE_PRODUCER_COUNT_PER_WRITER, producerCnt);
+  }
+
+  public Optional<Integer> getNearlineProducerCountPerWriter() {
+    return getInteger(NEARLINE_PRODUCER_COUNT_PER_WRITER);
+  }
+
+  public UpdateStoreQueryParams setTargetRegionSwap(String targetRegion) {
+    return putString(TARGET_SWAP_REGION, targetRegion);
+  }
+
+  public Optional<String> getTargetSwapRegion() {
+    return getString(TARGET_SWAP_REGION);
+  }
+
+  public UpdateStoreQueryParams setTargetRegionSwapWaitTime(int waitTime) {
+    return putInteger(TARGET_SWAP_REGION_WAIT_TIME, waitTime);
+  }
+
+  public Optional<Integer> getTargetRegionSwapWaitTime() {
+    return getInteger(TARGET_SWAP_REGION_WAIT_TIME);
+  }
+
+  public UpdateStoreQueryParams setIsDavinciHeartbeatReported(boolean isReported) {
+    return putBoolean(IS_DAVINCI_HEARTBEAT_REPORTED, isReported);
+  }
+
+  public Optional<Boolean> getIsDavinciHeartbeatReported() {
+    return getBoolean(IS_DAVINCI_HEARTBEAT_REPORTED);
+  }
+
+  public UpdateStoreQueryParams setTargetRegionPromoted(boolean targetRegionPromoted) {
+    return putBoolean(TARGET_REGION_PROMOTED, targetRegionPromoted);
+  }
+
+  public Optional<Boolean> getTargetRegionPromoted() {
+    return getBoolean(TARGET_REGION_PROMOTED);
+  }
+
+  public UpdateStoreQueryParams setGlobalRtDivEnabled(boolean globalRtDivEnabled) {
+    return putBoolean(GLOBAL_RT_DIV_ENABLED, globalRtDivEnabled);
+  }
+
+  public Optional<Boolean> isEnumSchemaEvolutionAllowed() {
+    return getBoolean(ENUM_SCHEMA_EVOLUTION_ALLOWED);
+  }
+
+  public UpdateStoreQueryParams setEnumSchemaEvolutionAllowed(boolean enumSchemaEvolutionAllowed) {
+    return putBoolean(ENUM_SCHEMA_EVOLUTION_ALLOWED, enumSchemaEvolutionAllowed);
+  }
+
+  public Optional<Boolean> isGlobalRtDivEnabled() {
+    return getBoolean(GLOBAL_RT_DIV_ENABLED);
+  }
+
+  public UpdateStoreQueryParams setTTLRepushEnabled(boolean ttlRepushEnabled) {
+    return putBoolean(TTL_REPUSH_ENABLED, ttlRepushEnabled);
+  }
+
+  public Optional<Boolean> isTTLRepushEnabled() {
+    return getBoolean(TTL_REPUSH_ENABLED);
+  }
+
+  public UpdateStoreQueryParams setStoreLifecycleHooks(List<LifecycleHooksRecord> storeLifecycleHooks) {
+    try {
+      return (UpdateStoreQueryParams) add(
+          STORE_LIFECYCLE_HOOKS_LIST,
+          OBJECT_MAPPER.writeValueAsString(storeLifecycleHooks));
+    } catch (JsonProcessingException e) {
+      throw new VeniceException(e.getMessage());
+    }
+  }
+
+  public Optional<List<LifecycleHooksRecord>> getStoreLifecycleHooks() {
+    if (params.get(STORE_LIFECYCLE_HOOKS_LIST) == null) {
+      return Optional.empty();
+    }
+    try {
+      return Optional.of(
+          OBJECT_MAPPER
+              .readValue(params.get(STORE_LIFECYCLE_HOOKS_LIST), new TypeReference<List<LifecycleHooksRecord>>() {
+              }));
+    } catch (IOException e) {
+      throw new VeniceException(e.getMessage());
+    }
+  }
+
+  public UpdateStoreQueryParams setPreviousCurrentVersion(int previousCurrentVersion) {
+    return putInteger(PREVIOUS_CURRENT_VERSION, previousCurrentVersion);
+  }
+
+  public Optional<Integer> getPreviousCurrentVersion() {
+    return getInteger(PREVIOUS_CURRENT_VERSION);
   }
 
   // ***************** above this line are getters and setters *****************

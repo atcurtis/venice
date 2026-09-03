@@ -3,6 +3,7 @@ package com.linkedin.venice.router.api;
 import static com.linkedin.venice.HttpConstants.VENICE_COMPRESSION_STRATEGY;
 import static com.linkedin.venice.HttpConstants.VENICE_SCHEMA_ID;
 import static com.linkedin.venice.HttpConstants.VENICE_SUPPORTED_COMPRESSION_STRATEGY;
+import static com.linkedin.venice.utils.TestUtils.getVenicePathParser;
 import static io.netty.handler.codec.http.HttpResponseStatus.MOVED_PERMANENTLY;
 import static io.netty.handler.codec.http.HttpResponseStatus.NOT_FOUND;
 import static io.netty.handler.codec.http.HttpResponseStatus.OK;
@@ -15,12 +16,14 @@ import static org.mockito.Mockito.when;
 import com.linkedin.alpini.base.misc.HeaderNames;
 import com.linkedin.alpini.base.misc.MetricNames;
 import com.linkedin.alpini.base.misc.Metrics;
-import com.linkedin.alpini.base.misc.TimeValue;
+import com.linkedin.alpini.netty4.handlers.BasicHttpObjectAggregator;
 import com.linkedin.alpini.netty4.misc.BasicFullHttpRequest;
 import com.linkedin.venice.HttpConstants;
 import com.linkedin.venice.compression.CompressionStrategy;
 import com.linkedin.venice.compression.CompressorFactory;
 import com.linkedin.venice.exceptions.VeniceException;
+import com.linkedin.venice.meta.NameRepository;
+import com.linkedin.venice.meta.StoreVersionName;
 import com.linkedin.venice.read.RequestType;
 import com.linkedin.venice.router.api.path.VenicePath;
 import com.linkedin.venice.router.stats.AggRouterHttpRequestStats;
@@ -38,6 +41,7 @@ import io.netty.handler.codec.http.HttpHeaderNames;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import io.netty.handler.codec.http.HttpVersion;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -55,6 +59,7 @@ import org.testng.annotations.Test;
 
 public class TestVeniceResponseAggregator {
   private static final Schema STRING_SCHEMA = Schema.parse("\"string\"");
+  private final NameRepository nameRepository = new NameRepository();
 
   private VenicePath getPath(
       String storeName,
@@ -66,8 +71,10 @@ public class TestVeniceResponseAggregator {
     doReturn(requestType).when(path).getRequestType();
     doReturn(storeName).when(path).getStoreName();
     doReturn(null).when(path).getChunkedResponse();
-    doReturn(new VeniceResponseDecompressor(false, routerStats, request, storeName, 1, compressorFactory)).when(path)
-        .getResponseDecompressor();
+    VenicePathParser pathParser = getVenicePathParser(compressorFactory, false);
+    StoreVersionName storeVersionName = this.nameRepository.getStoreVersionName(storeName, 1);
+    VeniceResponseDecompressor decompressor = pathParser.getDecompressor(storeVersionName, request);
+    doReturn(decompressor).when(path).getResponseDecompressor();
     return path;
   }
 
@@ -158,18 +165,19 @@ public class TestVeniceResponseAggregator {
     when(mockRouterStat.getStatsByType(RequestType.COMPUTE)).thenReturn(mockStatsForCompute);
 
     Metrics metrics = new Metrics();
-    String headerName = Utils.getUniqueString();
-    String headerValue = Utils.getUniqueString();
     CompressorFactory compressorFactory = mock(CompressorFactory.class);
     VenicePath path = getPath(storeName, RequestType.MULTI_GET, mockRouterStat, request, compressorFactory);
-    when(path.getResponseHeaders()).thenReturn(Optional.of(Collections.singletonMap(headerName, headerValue)));
     when(path.getChunkedResponse()).thenReturn(null); // non-streaming
     metrics.setPath(path);
+    List<RouterKey> partitionKeys = new ArrayList<>();
+    partitionKeys.add(new RouterKey("key1".getBytes(StandardCharsets.UTF_8)));
+    partitionKeys.add(new RouterKey("key2".getBytes(StandardCharsets.UTF_8)));
+    partitionKeys.add(new RouterKey("key3".getBytes(StandardCharsets.UTF_8)));
+    doReturn(partitionKeys).when(path).getPartitionKeys();
 
     VeniceResponseAggregator responseAggregator = new VeniceResponseAggregator(mockRouterStat, Optional.empty());
     FullHttpResponse finalResponse = responseAggregator.buildResponse(request, metrics, gatheredResponses);
     Assert.assertEquals(finalResponse.status(), OK);
-    Assert.assertEquals(finalResponse.headers().get(headerName), headerValue);
 
     byte[] finalContent;
     if (finalResponse.content() instanceof CompositeByteBuf) {
@@ -217,9 +225,9 @@ public class TestVeniceResponseAggregator {
     // test aggregator is able to identify quota exceeded response and
     // record it properly
     FullHttpResponse response5 = buildFullHttpResponse(TOO_MANY_REQUESTS, new byte[0], headers);
-    metrics.setMetric(MetricNames.ROUTER_SERVER_TIME, new TimeValue(1, TimeUnit.MILLISECONDS));
+    metrics.setMetric(MetricNames.ROUTER_SERVER_TIME, 1_000_000);
     responseAggregator.buildResponse(request, metrics, Collections.singletonList(response5));
-    verify(mockStatsForMultiGet).recordThrottledRequest(storeName, 1.0);
+    verify(mockStatsForMultiGet).recordThrottledRequest(storeName, 1.0, TOO_MANY_REQUESTS, 3);
   }
 
   @Test
@@ -268,11 +276,8 @@ public class TestVeniceResponseAggregator {
     storageNodeResponse2.headers().add(VENICE_SCHEMA_ID, "1");
     storageNodeResponse2.headers().add(HttpHeaderNames.CONTENT_TYPE, HttpConstants.AVRO_BINARY);
 
-    FullHttpResponse routerResponse = responseAggregator.processMultiGetResponses(
-        Arrays.asList(storageNodeResponse1, storageNodeResponse2),
-        storeName,
-        1,
-        Optional.empty());
+    FullHttpResponse routerResponse = responseAggregator
+        .processMultiGetResponses(Arrays.asList(storageNodeResponse1, storageNodeResponse2), storeName, 1, null);
 
     Assert.assertEquals(routerResponse.status(), OK);
     Assert.assertEquals(
@@ -306,11 +311,8 @@ public class TestVeniceResponseAggregator {
     storageNodeResponse2.headers().add(VENICE_SCHEMA_ID, "1");
     storageNodeResponse2.headers().add(HttpHeaderNames.CONTENT_TYPE, HttpConstants.AVRO_BINARY);
 
-    FullHttpResponse routerResponse = responseAggregator.processMultiGetResponses(
-        Arrays.asList(storageNodeResponse1, storageNodeResponse2),
-        storeName,
-        1,
-        Optional.empty());
+    FullHttpResponse routerResponse = responseAggregator
+        .processMultiGetResponses(Arrays.asList(storageNodeResponse1, storageNodeResponse2), storeName, 1, null);
 
     Assert.assertEquals(routerResponse.status(), NOT_FOUND);
     Assert.assertEquals(
@@ -345,15 +347,92 @@ public class TestVeniceResponseAggregator {
     storageNodeResponse2.headers().add(VENICE_SCHEMA_ID, "1");
     storageNodeResponse2.headers().add(HttpHeaderNames.CONTENT_TYPE, HttpConstants.AVRO_BINARY);
 
-    FullHttpResponse routerResponse = responseAggregator.processMultiGetResponses(
-        Arrays.asList(storageNodeResponse1, storageNodeResponse2),
-        storeName,
-        1,
-        Optional.empty());
+    FullHttpResponse routerResponse = responseAggregator
+        .processMultiGetResponses(Arrays.asList(storageNodeResponse1, storageNodeResponse2), storeName, 1, null);
 
     Assert.assertEquals(routerResponse.status(), NOT_FOUND);
     Assert.assertEquals(
         routerResponse.headers().get(VENICE_COMPRESSION_STRATEGY),
         String.valueOf(CompressionStrategy.NO_OP.getValue()));
+  }
+
+  @Test
+  public void testBodyAggregationLatencyRecordedForMultiGetStreaming() {
+    String storeName = Utils.getUniqueString("test_store");
+
+    // Build a streaming OK response with compression strategy header
+    FullHttpResponse subResponse = new DefaultFullHttpResponse(HttpVersion.HTTP_1_1, OK, Unpooled.EMPTY_BUFFER);
+    subResponse.headers().add(VENICE_COMPRESSION_STRATEGY, CompressionStrategy.NO_OP.getValue());
+
+    // Create request with BODY_AGGREGATION_LATENCY_NS attribute set (simulates BasicHttpObjectAggregator)
+    BasicFullHttpRequest request =
+        new BasicFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.POST, "/storage/" + storeName, -1, -1);
+    long fakeLatencyNs = TimeUnit.MILLISECONDS.toNanos(42);
+    request.attr(BasicHttpObjectAggregator.BODY_AGGREGATION_LATENCY_NS).set(fakeLatencyNs);
+
+    AggRouterHttpRequestStats mockStreamingStats = mock(AggRouterHttpRequestStats.class);
+    AggRouterHttpRequestStats mockSingleGetStats = mock(AggRouterHttpRequestStats.class);
+    RouterStats mockRouterStat = mock(RouterStats.class);
+    when(mockRouterStat.getStatsByType(RequestType.MULTI_GET_STREAMING)).thenReturn(mockStreamingStats);
+    when(mockRouterStat.getStatsByType(RequestType.SINGLE_GET)).thenReturn(mockSingleGetStats);
+
+    VenicePath path = mock(VenicePath.class);
+    doReturn(RequestType.MULTI_GET_STREAMING).when(path).getRequestType();
+    doReturn(storeName).when(path).getStoreName();
+    doReturn(1).when(path).getVersionNumber();
+    doReturn(true).when(path).isStreamingRequest();
+    doReturn(false).when(path).isRetryRequest();
+    doReturn(-1).when(path).getHelixGroupId();
+    List<RouterKey> partitionKeys = Collections.singletonList(new RouterKey("key1".getBytes(StandardCharsets.UTF_8)));
+    doReturn(partitionKeys).when(path).getPartitionKeys();
+
+    Metrics metrics = new Metrics();
+    metrics.setPath(path);
+
+    VeniceResponseAggregator responseAggregator = new VeniceResponseAggregator(mockRouterStat, Optional.empty());
+    responseAggregator.buildResponse(request, metrics, Collections.singletonList(subResponse));
+
+    // Verify body aggregation latency was recorded (42ms from the fake latency)
+    verify(mockStreamingStats).recordBodyAggregationLatency(storeName, 42.0);
+  }
+
+  @Test
+  public void testBodyAggregationLatencyNotRecordedForNonStreamingMultiGet() {
+    String storeName = Utils.getUniqueString("test_store");
+    Map<String, String> headers = new HashMap<>();
+    headers.put(HttpHeaderNames.CONTENT_TYPE.toString(), "avro/binary");
+    headers.put(HttpConstants.VENICE_SCHEMA_ID, "1");
+
+    FullHttpResponse subResponse = buildFullHttpResponse(OK, getResponseContentWithSchemaString("value"), headers);
+
+    BasicFullHttpRequest request =
+        new BasicFullHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.POST, "/storage/" + storeName, -1, -1);
+    // Set body aggregation latency even for non-streaming — should NOT be recorded
+    request.attr(BasicHttpObjectAggregator.BODY_AGGREGATION_LATENCY_NS).set(TimeUnit.MILLISECONDS.toNanos(100));
+
+    AggRouterHttpRequestStats mockMultiGetStats = mock(AggRouterHttpRequestStats.class);
+    AggRouterHttpRequestStats mockSingleGetStats = mock(AggRouterHttpRequestStats.class);
+    RouterStats mockRouterStat = mock(RouterStats.class);
+    when(mockRouterStat.getStatsByType(RequestType.MULTI_GET)).thenReturn(mockMultiGetStats);
+    when(mockRouterStat.getStatsByType(RequestType.SINGLE_GET)).thenReturn(mockSingleGetStats);
+
+    CompressorFactory compressorFactory = mock(CompressorFactory.class);
+    VenicePath path = getPath(storeName, RequestType.MULTI_GET, mockRouterStat, request, compressorFactory);
+    doReturn(false).when(path).isStreamingRequest();
+    doReturn(false).when(path).isRetryRequest();
+    doReturn(-1).when(path).getHelixGroupId();
+    List<RouterKey> partitionKeys = Collections.singletonList(new RouterKey("key1".getBytes(StandardCharsets.UTF_8)));
+    doReturn(partitionKeys).when(path).getPartitionKeys();
+
+    Metrics metrics = new Metrics();
+    metrics.setPath(path);
+
+    VeniceResponseAggregator responseAggregator = new VeniceResponseAggregator(mockRouterStat, Optional.empty());
+    responseAggregator.buildResponse(request, metrics, Collections.singletonList(subResponse));
+
+    // Body aggregation latency should NOT be recorded for non-streaming MULTI_GET
+    verify(mockMultiGetStats, org.mockito.Mockito.never()).recordBodyAggregationLatency(
+        org.mockito.ArgumentMatchers.anyString(),
+        org.mockito.ArgumentMatchers.anyDouble());
   }
 }
